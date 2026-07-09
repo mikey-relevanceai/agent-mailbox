@@ -19,3 +19,14 @@ Agent sessions (react, never poll)
 ```
 
 Adapters never know how wake works. The bridge owns topics and per-subscriber cursors. Harness integrators own arm/re-arm so the agent does not.
+
+## Repo map
+
+| Path | Role |
+|---|---|
+| `crates/mailbox` | Bridge CLI (`cargo run -p mailbox`) |
+| `crates/mailbox-protocol` | Shared wire/domain types |
+| `crates/mailbox-harness` | Session wake / re-arm helpers |
+| `adapters/` | External adapter processes |
+
+Agent-facing working agreements: [AGENTS.md](../AGENTS.md).

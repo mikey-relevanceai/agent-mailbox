@@ -1,0 +1,10 @@
+[package]
+name = "mailbox-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Harness integrators for waking agent sessions (Claude Code first)"
+
+[dependencies]
+mailbox-protocol = { workspace = true }

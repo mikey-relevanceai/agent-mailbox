@@ -1,0 +1,15 @@
+[package]
+name = "mailbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent mailbox bridge CLI — durable topics, subscriptions, and wake kicks"
+
+[[bin]]
+name = "mailbox"
+path = "src/main.rs"
+
+[dependencies]
+mailbox-protocol = { workspace = true }
+mailbox-harness = { workspace = true }

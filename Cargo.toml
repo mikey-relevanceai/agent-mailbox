@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mailbox",
+    "crates/mailbox-protocol",
+    "crates/mailbox-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mikey-relevanceai/agent-mailbox"
+
+[workspace.dependencies]
+mailbox-protocol = { path = "crates/mailbox-protocol" }
+mailbox-harness = { path = "crates/mailbox-harness" }

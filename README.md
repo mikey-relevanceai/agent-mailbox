@@ -6,9 +6,30 @@ Agent mailbox is a system designed to allow agents to be woken up via asynchrono
 - the deployment of your changes
 - monitoring of those changes in production
 
+## Layout
+
+```text
+crates/
+  mailbox/            # bridge CLI binary
+  mailbox-protocol/   # shared publish/subscribe types
+  mailbox-harness/    # harness wake helpers (Claude Code first)
+adapters/             # subprocess adapters (protocol only; no bridge imports)
+docs/
+```
+
+## Develop
+
+Requires a stable Rust toolchain (`rustup`). From the repo root:
+
+```bash
+cargo check --workspace
+cargo test --workspace
+cargo run -p mailbox
+```
+
 ## Docs
 
-See [docs/00-index.md](docs/00-index.md) for the full list.
+See [docs/00-index.md](docs/00-index.md) for the full list. Agent-oriented repo guidance lives in [AGENTS.md](AGENTS.md).
 
 - [Wake and re-arm](docs/01-wake-and-rearm.md)
 - [Tech stack](docs/02-tech-stack.md)

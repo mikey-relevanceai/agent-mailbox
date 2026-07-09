@@ -10,10 +10,13 @@ Reasons: single static binary for distribution, strong control over FS and
 concurrency, and a natural home for a later WASM/WASI host. Go was considered
 and rejected.
 
-## Layout (target)
+## Layout
+
+Scaffolded as a Cargo workspace (edition 2024):
 
 ```text
 agent-mailbox/
+  Cargo.toml           # workspace root
   crates/
     mailbox/           # CLI + bridge core
     mailbox-protocol/  # shared types: publish, subscribe, events, cursors
@@ -22,7 +25,7 @@ agent-mailbox/
   docs/
 ```
 
-Exact crate split can move; the important boundary is **protocol vs transport**.
+Exact module split inside crates can move; the important boundary is **protocol vs transport**.
 
 ## Extensibility: adapters
 
