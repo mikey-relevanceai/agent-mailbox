@@ -10,7 +10,7 @@ ADRs ([`../adr/`](../adr/)) record the durable *choice*. Designs record the
 
 | Design | Status | Notes |
 |---|---|---|
-| [01-mvp-github-watch](01-mvp-github-watch.md) | Draft | agent-ipc-github parity; supervised adapters; no zombie pollers |
+| [01-mvp-github-watch](01-mvp-github-watch.md) | Draft | GitHub PR watch (conflicts, reviews, CI); refcounted multi-session interest; no zombie pollers |
 
 Likely next designs:
 

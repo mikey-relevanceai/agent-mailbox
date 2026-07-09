@@ -113,8 +113,8 @@ pollers**. Design: [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md
 3. Claude harness waiter wakes without agent re-arm.
 4. Delivery cursor advances so mid-turn publishes surface on the next `Stop`.
 5. Two subscribers each see the event with independent cursors.
-6. GitHub watch: double-start stays one process; unwatch / SessionEnd kills the
-   poller; bridge restart does not resume orphan watches.
+6. GitHub watch: one process per PR; two sessions share it; first SessionEnd
+   leaves the poller up; last interest gone stops it; no orphan resume.
 
 ## Non-goals (for now)
 
