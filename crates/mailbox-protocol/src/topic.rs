@@ -1,0 +1,365 @@
+//! Topic identifiers and the GitHub-PR topic grammar.
+//!
+//! # Topic grammar
+//!
+//! A [`Topic`] is a non-empty, bounded string with no ASCII control characters
+//! or whitespace. Topics are a dot-delimited namespace by convention
+//! (`<domain>.<kind>.<selector>`), but this layer only enforces the character
+//! rules — the *meaning* of a topic is owned by whoever mints it.
+//!
+//! The one structured topic this crate knows about is a GitHub pull request:
+//!
+//! ```text
+//! github.pr.<owner>/<repo>#<number>
+//! e.g.  github.pr.octocat/hello-world#42
+//! ```
+//!
+//! This is deliberately a *parsed* type ([`GithubPr`]), not a stringly
+//! convention: constructing a topic and parsing one back go through one place,
+//! so the format cannot drift between producers and consumers (parse, don't
+//! validate).
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::TopicError;
+
+/// Upper bound on topic length. Generous for `owner/repo#n` style ids while
+/// still bounding memory for anything that reaches us over the wire.
+const MAX_TOPIC_LEN: usize = 512;
+
+/// Prefix shared by every GitHub pull-request topic.
+const GITHUB_PR_PREFIX: &str = "github.pr.";
+
+/// A validated topic identifier.
+///
+/// Deserialization goes through [`Topic::try_from`] (`#[serde(try_from)]`), so a
+/// `Topic` decoded from an untrusted line is guaranteed to satisfy the grammar
+/// — there is no way to construct an invalid one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Topic(String);
+
+impl Topic {
+    /// Parse and validate an arbitrary string into a `Topic`.
+    pub fn parse(raw: impl Into<String>) -> Result<Self, TopicError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(TopicError::Empty);
+        }
+        if raw.len() > MAX_TOPIC_LEN {
+            return Err(TopicError::TooLong {
+                len: raw.len(),
+                max: MAX_TOPIC_LEN,
+            });
+        }
+        if let Some(ch) = raw.chars().find(|c| c.is_control() || c.is_whitespace()) {
+            return Err(TopicError::ForbiddenChar { ch });
+        }
+        Ok(Self(raw))
+    }
+
+    /// Borrow the topic as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse this topic as a GitHub pull-request topic, if it is one.
+    pub fn as_github_pr(&self) -> Result<GithubPr, TopicError> {
+        GithubPr::parse_topic(self)
+    }
+}
+
+impl fmt::Display for Topic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Topic {
+    type Error = TopicError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Topic::parse(value)
+    }
+}
+
+impl From<Topic> for String {
+    fn from(topic: Topic) -> Self {
+        topic.0
+    }
+}
+
+/// A GitHub pull request, the structured form of a `github.pr.*` [`Topic`].
+///
+/// Construct one with [`GithubPr::new`] (validates the segments once) and turn
+/// it into its canonical topic with [`GithubPr::topic`]. Round-tripping a
+/// canonical topic through [`Topic::as_github_pr`] yields an equal value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GithubPr {
+    owner: String,
+    repo: String,
+    number: u64,
+}
+
+impl GithubPr {
+    /// Validate the parts of a PR reference and build a `GithubPr`.
+    ///
+    /// `owner`/`repo` may not be empty or contain the topic delimiters
+    /// (`/`, `#`), whitespace, or control characters; `number` must be
+    /// positive. We intentionally do not re-implement GitHub's full naming
+    /// rules — GitHub enforces those — we only guarantee the value is a
+    /// losslessly-encodable, unambiguous topic segment.
+    pub fn new(
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        number: u64,
+    ) -> Result<Self, TopicError> {
+        let owner = owner.into();
+        let repo = repo.into();
+        Self::check_segment("owner", &owner)?;
+        Self::check_segment("repo", &repo)?;
+        if number == 0 {
+            return Err(TopicError::InvalidPrNumber {
+                value: number.to_string(),
+            });
+        }
+        let pr = Self {
+            owner,
+            repo,
+            number,
+        };
+        // Validate the assembled topic through the SAME path `topic()` uses, so
+        // `new`'s invariant matches `topic()`'s precondition. Without this an
+        // over-long segment could pass the per-segment checks yet blow the
+        // topic-length bound, and `topic()`'s `expect` would later panic on a
+        // value this constructor called `Ok`.
+        Topic::parse(pr.canonical())?;
+        Ok(pr)
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// The canonical topic for this PR. Deterministic: equal inputs always
+    /// produce the same string.
+    pub fn topic(&self) -> Topic {
+        // `new` already ran this exact string through `Topic::parse`, so the
+        // whole-topic grammar (including the length bound) is guaranteed to
+        // hold and the expect is unreachable for any value the constructor
+        // returned `Ok`.
+        Topic::parse(self.canonical()).expect("canonical github.pr topic is always a valid topic")
+    }
+
+    /// Assemble the canonical topic string. The single source of truth for the
+    /// grammar, shared by `new` (validation) and `topic()` (construction).
+    fn canonical(&self) -> String {
+        format!(
+            "{GITHUB_PR_PREFIX}{}/{}#{}",
+            self.owner, self.repo, self.number
+        )
+    }
+
+    /// Parse a topic of the form `github.pr.<owner>/<repo>#<number>`.
+    fn parse_topic(topic: &Topic) -> Result<Self, TopicError> {
+        let rest = topic
+            .as_str()
+            .strip_prefix(GITHUB_PR_PREFIX)
+            .ok_or(TopicError::NotGithubPr)?;
+
+        // `owner/repo#number`: split on the first `/` then the last `#`, so a
+        // `.` in a repo name (e.g. `repo.js`) does not confuse us.
+        let (owner, repo_and_number) = rest.split_once('/').ok_or(TopicError::NotGithubPr)?;
+        let (repo, number) = repo_and_number
+            .rsplit_once('#')
+            .ok_or(TopicError::NotGithubPr)?;
+
+        Self::check_segment("owner", owner)?;
+        Self::check_segment("repo", repo)?;
+
+        let number: u64 = number.parse().map_err(|_| TopicError::InvalidPrNumber {
+            value: number.to_string(),
+        })?;
+        if number == 0 {
+            return Err(TopicError::InvalidPrNumber {
+                value: number.to_string(),
+            });
+        }
+
+        Ok(Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        })
+    }
+
+    fn check_segment(field: &'static str, value: &str) -> Result<(), TopicError> {
+        let invalid = value.is_empty()
+            || value
+                .chars()
+                .any(|c| matches!(c, '/' | '#') || c.is_control() || c.is_whitespace());
+        if invalid {
+            return Err(TopicError::InvalidSegment {
+                field,
+                value: value.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_topic() {
+        assert_eq!(Topic::parse(""), Err(TopicError::Empty));
+    }
+
+    #[test]
+    fn rejects_whitespace_and_control_chars() {
+        assert!(matches!(
+            Topic::parse("has space"),
+            Err(TopicError::ForbiddenChar { ch: ' ' })
+        ));
+        assert!(matches!(
+            Topic::parse("has\nnewline"),
+            Err(TopicError::ForbiddenChar { .. })
+        ));
+    }
+
+    #[test]
+    fn github_pr_topic_is_stable() {
+        // Same inputs always produce the same canonical string.
+        let a = GithubPr::new("octocat", "hello-world", 42).unwrap();
+        let b = GithubPr::new("octocat", "hello-world", 42).unwrap();
+        assert_eq!(a.topic(), b.topic());
+        assert_eq!(a.topic().as_str(), "github.pr.octocat/hello-world#42");
+    }
+
+    #[test]
+    fn github_pr_parse_construct_round_trips() {
+        let pr = GithubPr::new("octocat", "hello-world", 42).unwrap();
+        let parsed = pr.topic().as_github_pr().unwrap();
+        assert_eq!(pr, parsed);
+    }
+
+    #[test]
+    fn dot_in_repo_name_round_trips() {
+        // Regression guard: `.` is not a delimiter, so `repo.js` must survive.
+        let pr = GithubPr::new("acme", "widget.js", 7).unwrap();
+        assert_eq!(pr.topic().as_str(), "github.pr.acme/widget.js#7");
+        assert_eq!(pr.topic().as_github_pr().unwrap(), pr);
+    }
+
+    #[test]
+    fn rejects_non_github_pr_topics() {
+        let topic = Topic::parse("slack.channel.C123").unwrap();
+        assert_eq!(topic.as_github_pr(), Err(TopicError::NotGithubPr));
+    }
+
+    #[test]
+    fn rejects_zero_and_non_numeric_pr() {
+        assert!(matches!(
+            GithubPr::new("o", "r", 0),
+            Err(TopicError::InvalidPrNumber { .. })
+        ));
+        let bad = Topic::parse("github.pr.o/r#abc").unwrap();
+        assert!(matches!(
+            bad.as_github_pr(),
+            Err(TopicError::InvalidPrNumber { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_segments() {
+        let bad = Topic::parse("github.pr./r#1").unwrap();
+        assert!(matches!(
+            bad.as_github_pr(),
+            Err(TopicError::InvalidSegment { field: "owner", .. })
+        ));
+        // Mirror for an empty repo segment.
+        let bad_repo = Topic::parse("github.pr.o/#1").unwrap();
+        assert!(matches!(
+            bad_repo.as_github_pr(),
+            Err(TopicError::InvalidSegment { field: "repo", .. })
+        ));
+    }
+
+    #[test]
+    fn topic_parse_length_boundary() {
+        // Exactly at the bound is fine; one byte over is rejected.
+        let ok = "a".repeat(MAX_TOPIC_LEN);
+        assert_eq!(Topic::parse(ok.clone()).unwrap().as_str(), ok);
+        let over = "a".repeat(MAX_TOPIC_LEN + 1);
+        assert!(matches!(
+            Topic::parse(over),
+            Err(TopicError::TooLong { len, max }) if len == MAX_TOPIC_LEN + 1 && max == MAX_TOPIC_LEN
+        ));
+    }
+
+    #[test]
+    fn github_pr_new_topic_length_boundary() {
+        // Regression guard for the latent panic: `new` must reject an
+        // over-long assembled topic rather than returning a value whose
+        // `topic()` later panics. Build an owner that makes the canonical
+        // string land on exactly MAX_TOPIC_LEN, then one longer.
+        let fixed = GITHUB_PR_PREFIX.len() + "/r#1".len(); // repo="r", number=1
+        let owner_ok = "o".repeat(MAX_TOPIC_LEN - fixed);
+        let pr = GithubPr::new(owner_ok, "r", 1).unwrap();
+        assert_eq!(pr.topic().as_str().len(), MAX_TOPIC_LEN);
+
+        let owner_over = "o".repeat(MAX_TOPIC_LEN - fixed + 1);
+        assert!(matches!(
+            GithubPr::new(owner_over, "r", 1),
+            Err(TopicError::TooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn github_pr_new_rejects_delimiters_and_control_in_segments() {
+        for (owner, repo) in [
+            ("a/b", "repo"),
+            ("owner", "re#po"),
+            ("ow ner", "repo"),
+            ("owner", "re\tpo"),
+        ] {
+            assert!(
+                matches!(
+                    GithubPr::new(owner, repo, 1),
+                    Err(TopicError::InvalidSegment { .. })
+                ),
+                "expected {owner:?}/{repo:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_topic_missing_delimiters() {
+        // Prefix present but no `/`.
+        let no_slash = Topic::parse("github.pr.ownerrepo#5").unwrap();
+        assert_eq!(no_slash.as_github_pr(), Err(TopicError::NotGithubPr));
+        // Prefix and `/` present but no `#`.
+        let no_hash = Topic::parse("github.pr.owner/repo").unwrap();
+        assert_eq!(no_hash.as_github_pr(), Err(TopicError::NotGithubPr));
+    }
+
+    #[test]
+    fn parse_topic_pr_number_out_of_u64_range() {
+        let overflow = Topic::parse("github.pr.o/r#99999999999999999999").unwrap();
+        assert!(matches!(
+            overflow.as_github_pr(),
+            Err(TopicError::InvalidPrNumber { .. })
+        ));
+    }
+}
