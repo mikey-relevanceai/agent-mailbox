@@ -7,6 +7,14 @@ Design notes for the experiment. Read in order if you're new; otherwise jump by 
 | 00 | [Index](00-index.md) | This page |
 | 01 | [Wake and re-arm](01-wake-and-rearm.md) | Idle-session wake via Claude Code `asyncRewake`, delivery cursors, Codex gap |
 | 02 | [Tech stack](02-tech-stack.md) | Rust bridge, subprocess adapters (WASI later), security process split, early test bar |
+| 03 | [Working agreements](03-working-agreements.md) | ADRs, designs, branch/PR default, mikey-in-a-box install |
+
+Also:
+
+| Path | What it covers |
+|---|---|
+| [adr/](adr/README.md) | Architecture Decision Records |
+| [design/](design/README.md) | Major system / subsystem designs |
 
 ## Mental model
 
