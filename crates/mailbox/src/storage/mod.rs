@@ -13,10 +13,13 @@
 //! One dedicated OS thread owns the `rusqlite::Connection`. The public
 //! [`Storage`] handle holds only a channel to that thread — cloning the handle
 //! clones the channel, never the connection — so there is exactly one writer
-//! and no second path to the database. Reads travel the same channel and are
-//! answered by the same connection in the same process; this build never opens
-//! a side connection (if one is ever added for reads, ADR-0003 requires it be
-//! read-only). See [`writer`] for the mechanism.
+//! and no second path to the *write* connection. Reads for the bus travel the
+//! same channel and are answered by that connection in the same process.
+//!
+//! The single exception is [`ReadOnlyStore`]: the one permitted read-only side
+//! connection (ADR-0003 explicitly allows read-only side opens for wake). It is
+//! opened by the separate waiter process with `SQLITE_OPEN_READ_ONLY` (no
+//! create) and never mutates — the missed-kick unread check. See [`reader`].
 //!
 //! # Errors
 //!
@@ -25,6 +28,7 @@
 
 mod error;
 mod model;
+mod reader;
 mod schema;
 mod writer;
 
@@ -39,6 +43,10 @@ pub use error::StorageError;
 pub use model::{
     Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
 };
+// The one permitted read-only side connection (ADR-0003), used by the wake
+// waiter. Crate-private like its `Command` sibling — its only consumer is the
+// `wake` module.
+pub(crate) use reader::ReadOnlyStore;
 
 use writer::Command;
 
@@ -50,6 +58,12 @@ const ENV_HOME: &str = "AGENT_MAILBOX_HOME";
 /// Directory (under home) and file name of the default database.
 const DEFAULT_DIR: &str = ".agent-mailbox";
 const DEFAULT_FILE: &str = "mailbox.db";
+/// Subdirectory (beside the database file) that holds per-session waiter FIFOs.
+/// Deriving it from the resolved DB path — rather than re-resolving HOME — means
+/// the wake FIFOs automatically follow every storage override (`AGENT_MAILBOX_DB`,
+/// `AGENT_MAILBOX_HOME`, or a test's explicit path) and can never drift from the
+/// database they signal about.
+const WAITERS_SUBDIR: &str = "waiters";
 
 /// Capacity of the writer command channel.
 ///
@@ -98,6 +112,19 @@ impl StorageConfig {
     /// The resolved database file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory that holds per-session waiter FIFOs, beside the database
+    /// file (`<db-parent>/waiters`). Derived from the resolved DB path so the
+    /// wake channel follows the same env overrides as storage (see
+    /// [`WAITERS_SUBDIR`]). Falls back to a bare relative `waiters` only if the
+    /// DB path has no parent (a bare filename), matching how [`Storage::open`]
+    /// treats an empty parent.
+    pub fn waiters_dir(&self) -> PathBuf {
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(WAITERS_SUBDIR),
+            _ => PathBuf::from(WAITERS_SUBDIR),
+        }
     }
 }
 
@@ -276,6 +303,18 @@ impl Storage {
             reply,
         })
         .await
+    }
+
+    /// List the sessions currently subscribed to `topic`.
+    ///
+    /// The kick side of wake: after a publish lands, the bridge asks this so it
+    /// can signal each subscribed session's waiter FIFO (payload-free — only the
+    /// fact "there is mail on this topic" crosses the wake boundary). A read that
+    /// travels the single-writer channel like every other op, so it observes a
+    /// consistent view relative to the publish that preceded it.
+    pub async fn sessions_subscribed(&self, topic: Topic) -> Result<Vec<SessionId>, StorageError> {
+        self.call(|reply| Command::SessionsSubscribed { topic, reply })
+            .await
     }
 
     /// Create the watch for this entity, or return the existing one's id if a

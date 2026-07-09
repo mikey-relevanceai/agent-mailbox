@@ -44,11 +44,12 @@
 //! and never interprets or logs them.
 
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use mailbox_protocol::{AdapterId, Event, Timestamp, Topic};
 
 use crate::storage::{Storage, StorageError};
+use crate::wake::Waker;
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
 pub use crate::storage::{SessionId, SubscribeOutcome};
@@ -117,9 +118,15 @@ impl Delivery {
 ///
 /// Cheap to clone — it holds a [`Storage`] handle, which is itself just a channel
 /// to the single writer. Every clone talks to the same durable log.
+///
+/// A bus optionally carries a [`Waker`]: when present, [`Bus::publish`] kicks the
+/// FIFO of every session subscribed to the published topic (payload-free wake).
+/// Without one, publish is a pure durable append — useful for tests and for any
+/// caller that does not own the wake channel.
 #[derive(Clone, Debug)]
 pub struct Bus {
     storage: Storage,
+    waker: Option<Waker>,
 }
 
 /// The per-topic outcome of one [`Bus::subscribe`] call, in the order requested.
@@ -130,17 +137,46 @@ pub struct Bus {
 pub type SubscribeSummary = Vec<(Topic, SubscribeOutcome)>;
 
 impl Bus {
-    /// Build a bus over an open [`Storage`] handle.
+    /// Build a bus over an open [`Storage`] handle, with no wake channel: publish
+    /// appends durably but kicks no waiters.
     pub fn new(storage: Storage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            waker: None,
+        }
+    }
+
+    /// Build a bus that kicks waiters on publish, using `waker` as the wake
+    /// primitive. The bridge wires this so a publish wakes idle sessions; the
+    /// bus depends only on the [`Waker`] abstraction, so the primitive (FIFO
+    /// today, socket later) can change without touching this layer.
+    pub fn with_waker(storage: Storage, waker: Waker) -> Self {
+        Self {
+            storage,
+            waker: Some(waker),
+        }
     }
 
     /// Publish `body` to `topic` under `adapter`, appending it to the durable log
     /// and assigning the next per-topic offset.
     ///
-    /// A thin pass-through to storage: appending and offset assignment are
-    /// already one atomic writer op, and publish carries no bus-level policy. The
-    /// body is stored verbatim and never interpreted (ADR-0001).
+    /// Appending and offset assignment are already one atomic writer op, and
+    /// publish carries no bus-level policy over the body — it is stored verbatim
+    /// and never interpreted (ADR-0001).
+    ///
+    /// # Kick-on-publish (payload-free)
+    ///
+    /// After the event is durably appended, a bus with a [`Waker`] signals every
+    /// session subscribed to `topic`. The kick is a bare byte and the topic name
+    /// is used only for logging — no body ever crosses the wake boundary. The
+    /// kick happens *after* the durable append, which is what makes the waiter's
+    /// open→check→block ordering race-free (see [`crate::wake`]).
+    ///
+    /// A kick is best-effort and must never fail a publish: the event is already
+    /// durable, and a session with no live waiter is normal. If listing the
+    /// subscribers itself fails (a store error on the read path), we log and
+    /// return the published event anyway — a late waiter's unread check still
+    /// covers the mail.
     pub async fn publish(
         &self,
         topic: Topic,
@@ -148,10 +184,24 @@ impl Bus {
         timestamp: Timestamp,
         body: Value,
     ) -> Result<Event, BusError> {
-        Ok(self
+        let event = self
             .storage
-            .publish(topic, adapter, timestamp, body)
-            .await?)
+            .publish(topic.clone(), adapter, timestamp, body)
+            .await?;
+
+        if let Some(waker) = &self.waker {
+            match self.storage.sessions_subscribed(topic.clone()).await {
+                Ok(sessions) => waker.kick_all(&sessions, &topic),
+                Err(err) => warn!(
+                    topic = topic.as_str(),
+                    error = %err,
+                    "could not list subscribers to kick after publish; \
+                     relying on waiter unread-check"
+                ),
+            }
+        }
+
+        Ok(event)
     }
 
     /// Subscribe `session` to each of `topics`, baselining its delivery cursor to

@@ -16,10 +16,20 @@ use mailbox_protocol::{Cursor, Event, Offset};
 /// watch. Sourced from the harness (hook `session_id`); the bridge treats it as
 /// an opaque label. Branded so it cannot be swapped with a `Topic` or any other
 /// string at a call site.
+///
+/// The inner string is private and minted only through [`SessionId::new`] — the
+/// same "opaque, constructed at the edge" story as [`WatchId`] — so a call site
+/// cannot reach in and treat it as a bare `String`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionId(pub String);
+pub struct SessionId(String);
 
 impl SessionId {
+    /// Wrap a session label coming from the harness. Accepts anything
+    /// string-like so call sites need not pre-convert.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     /// Borrow as a string slice (for binding into SQL).
     pub fn as_str(&self) -> &str {
         &self.0

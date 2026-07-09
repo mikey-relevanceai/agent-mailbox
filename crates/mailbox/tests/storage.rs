@@ -251,8 +251,8 @@ async fn ac4_fresh_create_then_idempotent_reopen() {
 async fn two_subscribers_have_independent_cursors() {
     let (storage, _dir) = fresh_store().await;
     let topic = pr_topic(5);
-    let alice = SessionId("alice".to_string());
-    let bob = SessionId("bob".to_string());
+    let alice = SessionId::new("alice".to_string());
+    let bob = SessionId::new("bob".to_string());
 
     // Subscribe on the empty topic so both baseline to "from the start".
     storage
@@ -292,7 +292,7 @@ async fn two_subscribers_have_independent_cursors() {
     );
 
     // Unknown subscriber has no cursor.
-    let carol = SessionId("carol".to_string());
+    let carol = SessionId::new("carol".to_string());
     assert_eq!(storage.cursor(carol, topic).await.unwrap(), None);
 }
 
@@ -390,8 +390,8 @@ async fn watch_upsert_is_idempotent_by_entity() {
 async fn interest_refcount_add_remove() {
     let (storage, _dir) = fresh_store().await;
     let watch = storage.upsert_watch(watch_spec(7)).await.unwrap();
-    let s1 = SessionId("s1".to_string());
-    let s2 = SessionId("s2".to_string());
+    let s1 = SessionId::new("s1".to_string());
+    let s2 = SessionId::new("s2".to_string());
 
     assert_eq!(storage.add_interest(watch, s1.clone()).await.unwrap(), 1);
     // Idempotent: re-adding the same session does not double-count.
@@ -438,7 +438,7 @@ async fn subscribe_unsubscribe_semantics() {
     let path = dir.path().join("mailbox.db");
     let storage = Storage::open(StorageConfig::at(&path)).await.unwrap();
     let topic = pr_topic(30);
-    let session = SessionId("s".to_string());
+    let session = SessionId::new("s".to_string());
 
     let count = || count_rows(&path, "SELECT COUNT(*) FROM subscription");
 

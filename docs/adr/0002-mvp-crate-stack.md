@@ -20,6 +20,7 @@ service.
 | Library errors | `thiserror` | Typed errors in crates |
 | Binary edge errors | `anyhow` | `main` / CLI only |
 | SQLite | `rusqlite` with `features = ["bundled"]` | See [ADR-0003](0003-single-writer-sqlite.md) |
+| Unix primitives | `nix` with `features = ["fs", "poll"]` | Safe `mkfifo`/`flock`/`poll`/`O_NONBLOCK` wrappers for the wake FIFO; the workspace `unsafe_code = "deny"` lint forbids the equivalent raw `libc` calls |
 | HTTP (later) | `axum` + `tower-http` | Local observability UI only; **not** in MVP |
 
 `bundled` compiles SQLite into the binary so builds and installs do not need a

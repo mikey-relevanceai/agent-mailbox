@@ -112,6 +112,13 @@ pub(crate) enum Command {
         topic: Topic,
         reply: oneshot::Sender<Result<Option<Offset>, StorageError>>,
     },
+    /// List the sessions subscribed to a topic (the kick side of wake). A read,
+    /// but routed through the writer channel like every other op so it never
+    /// opens a second connection.
+    SessionsSubscribed {
+        topic: Topic,
+        reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
+    },
     UpsertWatch {
         spec: WatchSpec,
         reply: oneshot::Sender<Result<WatchId, StorageError>>,
@@ -271,6 +278,13 @@ fn handle(conn: &mut Connection, cmd: Command) {
             let result = do_get_cursor(conn, &session, &topic);
             log_on_err(&result, "get_cursor", || {
                 format!("session={} topic={}", session.as_str(), topic.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::SessionsSubscribed { topic, reply } => {
+            let result = do_sessions_subscribed(conn, &topic);
+            log_on_err(&result, "sessions_subscribed", || {
+                format!("topic={}", topic.as_str())
             });
             let _ = reply.send(result);
         }
@@ -521,6 +535,21 @@ fn do_get_cursor(
 /// The current head (highest assigned offset) of `topic`, or `None` if the
 /// topic has no events yet. `MAX(offset)` over an empty set is SQL `NULL`, which
 /// maps to `None` — the "no head to baseline to" case.
+/// The sessions subscribed to `topic`. Order is not significant (the caller
+/// kicks each independently), so no `ORDER BY`.
+fn do_sessions_subscribed(
+    conn: &Connection,
+    topic: &Topic,
+) -> Result<Vec<SessionId>, StorageError> {
+    let mut stmt = conn.prepare("SELECT session_id FROM subscription WHERE topic = ?1")?;
+    let rows = stmt.query_map(params![topic.as_str()], |row| row.get::<_, String>(0))?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(SessionId::new(row?));
+    }
+    Ok(sessions)
+}
+
 fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, StorageError> {
     let head: Option<i64> = tx.query_row(
         "SELECT MAX(offset) FROM event WHERE topic = ?1",
@@ -1070,10 +1099,44 @@ mod tests {
     }
 
     #[test]
+    fn sessions_subscribed_is_empty_for_unsubscribed_topic() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.sub.x").unwrap();
+        // A topic nobody subscribed to yields no sessions (a zero-subscriber
+        // publish then kicks no one).
+        assert!(do_sessions_subscribed(&conn, &topic).unwrap().is_empty());
+
+        // Subscribing a different topic must not leak into this one.
+        do_subscribe_and_baseline(
+            &mut conn,
+            &SessionId::new("s"),
+            &Topic::parse("t.other").unwrap(),
+        )
+        .unwrap();
+        assert!(do_sessions_subscribed(&conn, &topic).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sessions_subscribed_returns_all_subscribers() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.sub.y").unwrap();
+        do_subscribe_and_baseline(&mut conn, &SessionId::new("alice"), &topic).unwrap();
+        do_subscribe_and_baseline(&mut conn, &SessionId::new("bob"), &topic).unwrap();
+
+        let mut got: Vec<String> = do_sessions_subscribed(&conn, &topic)
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["alice", "bob"]);
+    }
+
+    #[test]
     fn advance_cursor_tx_is_monotonic() {
         // A lower advance can never rewind delivery, even within one transaction.
         let mut conn = migrated();
-        let session = SessionId("s".to_string());
+        let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.test.x").unwrap();
         {
             let tx = conn.transaction().unwrap();
@@ -1090,7 +1153,7 @@ mod tests {
     #[test]
     fn subscribe_and_baseline_idempotent_leaves_cursor_untouched() {
         let mut conn = migrated();
-        let session = SessionId("s".to_string());
+        let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.test.x").unwrap();
         insert_event(&conn, "t.test.x", 0);
         insert_event(&conn, "t.test.x", 1);
@@ -1125,7 +1188,7 @@ mod tests {
     #[test]
     fn subscribe_and_baseline_on_empty_topic_sets_no_cursor() {
         let mut conn = migrated();
-        let session = SessionId("s".to_string());
+        let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.empty.x").unwrap();
 
         let outcome = do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
@@ -1138,7 +1201,7 @@ mod tests {
     #[test]
     fn read_unread_advances_cursor_only_when_a_topic_returned_events() {
         let mut conn = migrated();
-        let session = SessionId("s".to_string());
+        let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.read.x").unwrap();
 
         // Subscribe to an empty topic: no cursor row yet.
@@ -1168,7 +1231,7 @@ mod tests {
     #[test]
     fn read_unread_honors_per_topic_limit() {
         let mut conn = migrated();
-        let session = SessionId("s".to_string());
+        let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.limit.x").unwrap();
         do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
         for i in 0..5 {

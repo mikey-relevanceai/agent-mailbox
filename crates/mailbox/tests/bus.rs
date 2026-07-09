@@ -36,7 +36,7 @@ fn adapter() -> AdapterId {
 }
 
 fn session(name: &str) -> SessionId {
-    SessionId(name.to_string())
+    SessionId::new(name.to_string())
 }
 
 /// Publish `count` events to `topic`, bodies `{ "i": 0.. }`.
