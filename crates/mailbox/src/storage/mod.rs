@@ -1,0 +1,365 @@
+//! Durable, single-writer SQLite storage for the bridge.
+//!
+//! # What this is
+//!
+//! The bridge's durable core: the append-only topic log, subscriptions,
+//! per-subscriber delivery cursors, supervised-watch bookkeeping, refcounted
+//! interest, and adapter baselines. It is bridge-internal (ADR-0003): adapters
+//! and the harness never touch it, they speak `mailbox-protocol` and let the
+//! bridge mutate.
+//!
+//! # Single writer (ADR-0003)
+//!
+//! One dedicated OS thread owns the `rusqlite::Connection`. The public
+//! [`Storage`] handle holds only a channel to that thread — cloning the handle
+//! clones the channel, never the connection — so there is exactly one writer
+//! and no second path to the database. Reads travel the same channel and are
+//! answered by the same connection in the same process; this build never opens
+//! a side connection (if one is ever added for reads, ADR-0003 requires it be
+//! read-only). See [`writer`] for the mechanism.
+//!
+//! # Errors
+//!
+//! Every method returns [`StorageError`]; a database failure is a value, not a
+//! panic.
+
+mod error;
+mod model;
+mod schema;
+mod writer;
+
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
+
+use mailbox_protocol::{AdapterId, Cursor, Event, Offset, Timestamp, Topic};
+
+pub use error::StorageError;
+pub use model::{Pid, ReadPage, SessionId, Watch, WatchId, WatchKind, WatchSpec, WatchState};
+
+use writer::Command;
+
+/// Environment variable that overrides the full database file path.
+const ENV_DB_PATH: &str = "AGENT_MAILBOX_DB";
+/// Environment variable that overrides the home directory used for the default
+/// path. Falls back to `HOME`. Lets tests and sandboxes avoid the real home.
+const ENV_HOME: &str = "AGENT_MAILBOX_HOME";
+/// Directory (under home) and file name of the default database.
+const DEFAULT_DIR: &str = ".agent-mailbox";
+const DEFAULT_FILE: &str = "mailbox.db";
+
+/// Capacity of the writer command channel.
+///
+/// The channel is BOUNDED so a sustained publish burst applies backpressure
+/// (callers await a send permit) instead of growing an unbounded queue — each
+/// queued command can hold a full event body, so an unbounded queue is an OOM
+/// waiting to happen. 1024 is a generous buffer for local agent volumes: deep
+/// enough to absorb normal bursts without callers ever waiting, shallow enough
+/// that a runaway producer is throttled to the writer's pace rather than
+/// buffering gigabytes. Bounded-vs-unbounded is the safety property here; the
+/// exact number is not load-bearing.
+const COMMAND_CHANNEL_CAPACITY: usize = 1024;
+
+/// Where the database lives and how to open it.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    path: PathBuf,
+}
+
+impl StorageConfig {
+    /// Use an explicit database file path. The parent directory is created on
+    /// open if missing. Tests use this with a tempdir so they never touch the
+    /// real home directory.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Resolve the path from the environment, else the default
+    /// `~/.agent-mailbox/mailbox.db`.
+    ///
+    /// Precedence: [`ENV_DB_PATH`] (full path) → [`ENV_HOME`]/`HOME` +
+    /// `.agent-mailbox/mailbox.db`. Errors with [`StorageError::NoStoragePath`]
+    /// if none is available rather than guessing.
+    pub fn from_env() -> Result<Self, StorageError> {
+        if let Some(path) = env_path(ENV_DB_PATH) {
+            return Ok(Self { path });
+        }
+        let home = env_path(ENV_HOME)
+            .or_else(|| env_path("HOME"))
+            .ok_or(StorageError::NoStoragePath)?;
+        Ok(Self {
+            path: home.join(DEFAULT_DIR).join(DEFAULT_FILE),
+        })
+    }
+
+    /// The resolved database file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Read a non-empty environment variable as a path.
+fn env_path(key: &str) -> Option<PathBuf> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => None,
+    }
+}
+
+/// Async handle to the durable store.
+///
+/// Cheap to clone (it is just a channel sender); every clone talks to the same
+/// single writer. Dropping the last clone closes the channel and stops the
+/// writer thread.
+#[derive(Clone, Debug)]
+pub struct Storage {
+    cmd_tx: mpsc::Sender<Command>,
+}
+
+impl Storage {
+    /// Open (creating if needed) the database at `config`'s path and start the
+    /// writer thread. Returns once the schema is migrated and the writer is
+    /// ready, or with the open/migration error.
+    pub async fn open(config: StorageConfig) -> Result<Self, StorageError> {
+        let path = config.path;
+
+        // Create the containing directory up front so a fresh install works
+        // without the user pre-creating ~/.agent-mailbox.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|source| StorageError::CreateDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (init_tx, init_rx) = oneshot::channel();
+
+        // The connection is created and owned entirely inside this thread; only
+        // `cmd_tx` escapes. That ownership is what makes "single writer"
+        // structural rather than a convention.
+        std::thread::Builder::new()
+            .name("mailbox-storage-writer".to_string())
+            .spawn(move || writer::run(path, cmd_rx, init_tx))
+            .map_err(StorageError::WriterSpawn)?;
+
+        match init_rx.await {
+            Ok(Ok(())) => Ok(Self { cmd_tx }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(StorageError::WriterGone),
+        }
+    }
+
+    /// Post a command to the writer and await its reply. The single choke point
+    /// through which every public method reaches the database.
+    async fn call<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> Command,
+    ) -> Result<T, StorageError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // Awaiting the send is what turns a full queue into backpressure rather
+        // than unbounded growth; a closed channel (writer gone) surfaces here.
+        self.cmd_tx
+            .send(make(reply_tx))
+            .await
+            .map_err(|_| StorageError::WriterGone)?;
+        reply_rx.await.map_err(|_| StorageError::WriterGone)?
+    }
+
+    /// Append an event to a topic's durable log, assigning the next per-topic
+    /// [`Offset`] and a fresh opaque [`mailbox_protocol::EventId`]. The `body`
+    /// is stored verbatim and never interpreted.
+    pub async fn publish(
+        &self,
+        topic: Topic,
+        adapter: AdapterId,
+        timestamp: Timestamp,
+        body: Value,
+    ) -> Result<Event, StorageError> {
+        self.call(|reply| Command::Publish {
+            topic,
+            adapter,
+            timestamp,
+            body,
+            reply,
+        })
+        .await
+    }
+
+    /// Read a page of events on `topic` starting from `cursor`, up to `limit`
+    /// (bridge default if `None`). The returned [`ReadPage::next`] cursor
+    /// continues where this page ended.
+    pub async fn read_events(
+        &self,
+        topic: Topic,
+        cursor: Cursor,
+        limit: Option<u32>,
+    ) -> Result<ReadPage, StorageError> {
+        self.call(|reply| Command::ReadEvents {
+            topic,
+            cursor,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// Record that `session` is subscribed to `topic` (idempotent).
+    pub async fn subscribe(&self, session: SessionId, topic: Topic) -> Result<(), StorageError> {
+        self.call(|reply| Command::Subscribe {
+            session,
+            topic,
+            reply,
+        })
+        .await
+    }
+
+    /// Drop `session`'s subscription to `topic` (idempotent).
+    pub async fn unsubscribe(&self, session: SessionId, topic: Topic) -> Result<(), StorageError> {
+        self.call(|reply| Command::Unsubscribe {
+            session,
+            topic,
+            reply,
+        })
+        .await
+    }
+
+    /// Advance `session`'s delivery cursor on `topic` to `offset`. Monotonic:
+    /// a lower offset never rewinds an existing cursor.
+    pub async fn advance_cursor(
+        &self,
+        session: SessionId,
+        topic: Topic,
+        offset: Offset,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| Command::AdvanceCursor {
+            session,
+            topic,
+            offset,
+            reply,
+        })
+        .await
+    }
+
+    /// The highest offset delivered to `session` on `topic`, or `None` if it
+    /// has never been advanced.
+    pub async fn cursor(
+        &self,
+        session: SessionId,
+        topic: Topic,
+    ) -> Result<Option<Offset>, StorageError> {
+        self.call(|reply| Command::GetCursor {
+            session,
+            topic,
+            reply,
+        })
+        .await
+    }
+
+    /// Create the watch for this entity, or return the existing one's id if a
+    /// watch for the same `(kind, repo, pr)` already exists (idempotent start).
+    pub async fn upsert_watch(&self, spec: WatchSpec) -> Result<WatchId, StorageError> {
+        self.call(|reply| Command::UpsertWatch { spec, reply })
+            .await
+    }
+
+    /// Set a watch's lifecycle [`WatchState`] (and, for `Running`, its pid).
+    pub async fn set_watch_state(
+        &self,
+        id: WatchId,
+        state: WatchState,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| Command::SetWatchState { id, state, reply })
+            .await
+    }
+
+    /// Fetch a watch by id, or `None` if it does not exist.
+    pub async fn get_watch(&self, id: WatchId) -> Result<Option<Watch>, StorageError> {
+        self.call(|reply| Command::GetWatch { id, reply }).await
+    }
+
+    /// Add `session`'s interest in `watch`, returning the new refcount
+    /// (idempotent per session).
+    pub async fn add_interest(
+        &self,
+        watch: WatchId,
+        session: SessionId,
+    ) -> Result<u64, StorageError> {
+        self.call(|reply| Command::AddInterest {
+            watch,
+            session,
+            reply,
+        })
+        .await
+    }
+
+    /// Remove `session`'s interest in `watch`, returning the remaining refcount.
+    /// When this reaches 0 the caller should tear the adapter down.
+    pub async fn remove_interest(
+        &self,
+        watch: WatchId,
+        session: SessionId,
+    ) -> Result<u64, StorageError> {
+        self.call(|reply| Command::RemoveInterest {
+            watch,
+            session,
+            reply,
+        })
+        .await
+    }
+
+    /// The number of sessions currently interested in `watch`.
+    pub async fn interest_count(&self, watch: WatchId) -> Result<u64, StorageError> {
+        self.call(|reply| Command::InterestCount { watch, reply })
+            .await
+    }
+
+    /// The stored adapter baseline for `watch`, or `None` if unset. Opaque JSON
+    /// shaped by the adapter; storage does not interpret it.
+    pub async fn get_baseline(&self, watch: WatchId) -> Result<Option<Value>, StorageError> {
+        self.call(|reply| Command::GetBaseline { watch, reply })
+            .await
+    }
+
+    /// Set (upsert) the adapter baseline for `watch`.
+    pub async fn set_baseline(&self, watch: WatchId, baseline: Value) -> Result<(), StorageError> {
+        self.call(|reply| Command::SetBaseline {
+            watch,
+            baseline,
+            reply,
+        })
+        .await
+    }
+
+    /// Run `PRAGMA integrity_check`; `Ok(())` means the database is consistent.
+    pub async fn integrity_check(&self) -> Result<(), StorageError> {
+        self.call(|reply| Command::IntegrityCheck { reply }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mailbox_protocol::GithubPr;
+
+    /// If the writer is gone (receiver dropped, i.e. the thread died or the
+    /// store was torn down), every call fails cleanly with `WriterGone` rather
+    /// than hanging or panicking.
+    #[tokio::test]
+    async fn calls_fail_with_writer_gone_when_receiver_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        // Drop the receiver so the channel is closed — models a dead writer.
+        drop(cmd_rx);
+        let storage = Storage { cmd_tx };
+
+        let topic = GithubPr::new("o", "r", 1).unwrap().topic();
+        let err = storage
+            .read_events(topic, Cursor::Oldest, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::WriterGone));
+    }
+}
