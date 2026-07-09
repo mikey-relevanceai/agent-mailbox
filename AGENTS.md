@@ -28,10 +28,12 @@ Full detail: [docs/03-working-agreements.md](docs/03-working-agreements.md).
 - **Adapters never import bridge internals.** They speak the protocol only (CLI / socket today; WASI later). Live under `adapters/`.
 - **Protocol vs transport.** Wire/domain types live in `mailbox-protocol`. How an adapter is hosted (`SubprocessTransport` now, `WasiTransport` later) is a replaceable host boundary — do not leak transport into protocol or storage.
 - **Payload-free wake.** Kicks carry no model-visible body; events are read from the durable log. Wake is ingress, not authority.
+- **Single-writer SQLite.** Only the bridge mutates the DB; others speak the protocol ([ADR-0003](docs/adr/0003-single-writer-sqlite.md)).
+- **Supervised adapters.** Long-running pollers are owned by the bridge (start/stop/idempotent); agents must not leave naked background `gh` loops ([design/01](docs/design/01-mvp-github-watch.md)).
 - **v0 network:** no TCP listen. CLI and/or user-scoped Unix socket only.
 - **Language:** Rust for the bridge. Do not introduce Go.
 
-See [ADR-0001](docs/adr/0001-rust-bridge-subprocess-adapters.md).
+See [ADR-0001](docs/adr/0001-rust-bridge-subprocess-adapters.md), [ADR-0002](docs/adr/0002-mvp-crate-stack.md).
 
 ## Crate map
 
@@ -77,3 +79,4 @@ Follow the mikey-in-a-box skills when they apply (architecture, type-driven desi
 | [docs/03-working-agreements.md](docs/03-working-agreements.md) | ADRs, designs, PRs, mikey-in-a-box install |
 | [docs/adr/](docs/adr/README.md) | Decision log |
 | [docs/design/](docs/design/README.md) | Subsystem designs |
+| [docs/design/01-mvp-github-watch.md](docs/design/01-mvp-github-watch.md) | MVP GitHub watch / no zombie pollers |

@@ -10,9 +10,9 @@ ADRs ([`../adr/`](../adr/)) record the durable *choice*. Designs record the
 
 | Design | Status | Notes |
 |---|---|---|
-| _(none yet)_ | — | Add `NN-short-name.md` when a subsystem is designed |
+| [01-mvp-github-watch](01-mvp-github-watch.md) | Draft | agent-ipc-github parity; supervised adapters; no zombie pollers |
 
-Likely early designs (not written yet):
+Likely next designs:
 
 - Bridge core (topics, publish, subscriptions, delivery vs processed cursors)
 - Adapter host / subprocess transport
