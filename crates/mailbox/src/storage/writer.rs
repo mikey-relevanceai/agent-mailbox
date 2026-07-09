@@ -26,7 +26,9 @@ use tracing::{error, info, warn};
 use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Topic};
 
 use super::error::StorageError;
-use super::model::{Pid, ReadPage, SessionId, Watch, WatchId, WatchKind, WatchSpec, WatchState};
+use super::model::{
+    Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
+};
 
 /// Default page size when a reader does not specify a limit. Bounds memory for
 /// a catch-up read without forcing every caller to pick a number.
@@ -80,21 +82,30 @@ pub(crate) enum Command {
         limit: Option<u32>,
         reply: oneshot::Sender<Result<ReadPage, StorageError>>,
     },
-    Subscribe {
-        session: SessionId,
-        topic: Topic,
-        reply: oneshot::Sender<Result<(), StorageError>>,
-    },
     Unsubscribe {
         session: SessionId,
         topic: Topic,
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    AdvanceCursor {
+    /// Subscribe (idempotent) AND baseline the delivery cursor to the topic head
+    /// in ONE transaction. Composed here — not from two awaited handle calls — so
+    /// there is no window in which a concurrent publish lands between "recorded
+    /// the subscription" and "set the baseline" and is either missed or replayed.
+    SubscribeAndBaseline {
         session: SessionId,
         topic: Topic,
-        offset: Offset,
-        reply: oneshot::Sender<Result<(), StorageError>>,
+        reply: oneshot::Sender<Result<SubscribeOutcome, StorageError>>,
+    },
+    /// Read a session's unread events across ALL its subscribed topics AND advance
+    /// each topic's cursor to the last returned offset, in ONE transaction. This
+    /// atomic read-then-advance is the load-bearing exactly-once operation: an
+    /// event is unread until it has been returned by exactly one such command, and
+    /// the cursor advance that "consumes" it commits with the read that produced
+    /// it, so no interleaving can deliver it twice or drop it.
+    ReadUnread {
+        session: SessionId,
+        limit: Option<u32>,
+        reply: oneshot::Sender<Result<Vec<Event>, StorageError>>,
     },
     GetCursor {
         session: SessionId,
@@ -241,17 +252,6 @@ fn handle(conn: &mut Connection, cmd: Command) {
             });
             let _ = reply.send(result);
         }
-        Command::Subscribe {
-            session,
-            topic,
-            reply,
-        } => {
-            let result = do_subscribe(conn, &session, &topic);
-            log_on_err(&result, "subscribe", || {
-                format!("session={} topic={}", session.as_str(), topic.as_str())
-            });
-            let _ = reply.send(result);
-        }
         Command::Unsubscribe {
             session,
             topic,
@@ -259,18 +259,6 @@ fn handle(conn: &mut Connection, cmd: Command) {
         } => {
             let result = do_unsubscribe(conn, &session, &topic);
             log_on_err(&result, "unsubscribe", || {
-                format!("session={} topic={}", session.as_str(), topic.as_str())
-            });
-            let _ = reply.send(result);
-        }
-        Command::AdvanceCursor {
-            session,
-            topic,
-            offset,
-            reply,
-        } => {
-            let result = do_advance_cursor(conn, &session, &topic, offset);
-            log_on_err(&result, "advance_cursor", || {
                 format!("session={} topic={}", session.as_str(), topic.as_str())
             });
             let _ = reply.send(result);
@@ -283,6 +271,28 @@ fn handle(conn: &mut Connection, cmd: Command) {
             let result = do_get_cursor(conn, &session, &topic);
             log_on_err(&result, "get_cursor", || {
                 format!("session={} topic={}", session.as_str(), topic.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::SubscribeAndBaseline {
+            session,
+            topic,
+            reply,
+        } => {
+            let result = do_subscribe_and_baseline(conn, &session, &topic);
+            log_on_err(&result, "subscribe_and_baseline", || {
+                format!("session={} topic={}", session.as_str(), topic.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::ReadUnread {
+            session,
+            limit,
+            reply,
+        } => {
+            let result = do_read_unread(conn, &session, limit);
+            log_on_err(&result, "read_unread", || {
+                format!("session={}", session.as_str())
             });
             let _ = reply.send(result);
         }
@@ -478,14 +488,6 @@ fn do_read_events(
     Ok(ReadPage { events, next })
 }
 
-fn do_subscribe(conn: &Connection, session: &SessionId, topic: &Topic) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT OR IGNORE INTO subscription (session_id, topic) VALUES (?1, ?2)",
-        params![session.as_str(), topic.as_str()],
-    )?;
-    Ok(())
-}
-
 fn do_unsubscribe(
     conn: &Connection,
     session: &SessionId,
@@ -494,26 +496,6 @@ fn do_unsubscribe(
     conn.execute(
         "DELETE FROM subscription WHERE session_id = ?1 AND topic = ?2",
         params![session.as_str(), topic.as_str()],
-    )?;
-    Ok(())
-}
-
-fn do_advance_cursor(
-    conn: &Connection,
-    session: &SessionId,
-    topic: &Topic,
-    offset: Offset,
-) -> Result<(), StorageError> {
-    // Reject an out-of-range offset rather than storing a negative (which would
-    // later match `offset > ?` for the whole log).
-    let stored = offset_to_sqlite(offset)?;
-    // MAX(...) keeps the cursor monotonic: a late/duplicate advance can never
-    // rewind delivery. Encodes the assumption that cursors only move forward.
-    conn.execute(
-        "INSERT INTO delivery_cursor (session_id, topic, offset) VALUES (?1, ?2, ?3)
-         ON CONFLICT(session_id, topic)
-         DO UPDATE SET offset = MAX(offset, excluded.offset)",
-        params![session.as_str(), topic.as_str(), stored],
     )?;
     Ok(())
 }
@@ -534,6 +516,241 @@ fn do_get_cursor(
         Some(value) => Ok(Some(sqlite_to_offset(value)?)),
         None => Ok(None),
     }
+}
+
+/// The current head (highest assigned offset) of `topic`, or `None` if the
+/// topic has no events yet. `MAX(offset)` over an empty set is SQL `NULL`, which
+/// maps to `None` — the "no head to baseline to" case.
+fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, StorageError> {
+    let head: Option<i64> = tx.query_row(
+        "SELECT MAX(offset) FROM event WHERE topic = ?1",
+        params![topic.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(head)
+}
+
+/// Move `session`'s cursor on `topic` forward to `offset` inside `tx`.
+///
+/// # Exclusive ownership of the delivery cursor
+///
+/// For a bus subscriber the `delivery_cursor` row is owned SOLELY by the
+/// read-and-advance path (`do_read_unread`) and the baseline set at subscribe
+/// (`do_subscribe_and_baseline`). There is deliberately no public/general
+/// `advance_cursor`: an external writer nudging the cursor past the head would
+/// make `do_read_unread` silently skip the gap — a permanent lost delivery. The
+/// `MAX(offset, excluded.offset)` upsert keeps the cursor monotonic (a late or
+/// duplicate advance can never rewind delivery); this helper is `tx`-scoped so
+/// the advance always commits atomically with the read that produced `offset`.
+fn advance_cursor_tx(
+    tx: &rusqlite::Transaction,
+    session: &SessionId,
+    topic: &Topic,
+    offset: i64,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "INSERT INTO delivery_cursor (session_id, topic, offset) VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id, topic)
+         DO UPDATE SET offset = MAX(offset, excluded.offset)",
+        params![session.as_str(), topic.as_str(), offset],
+    )?;
+    Ok(())
+}
+
+/// Subscribe idempotently, and — only when the subscription is genuinely new —
+/// baseline the delivery cursor to the topic head, all in one transaction.
+///
+/// # Why baseline only on a fresh subscription
+///
+/// Baselining unconditionally would break idempotency: a second `subscribe`
+/// while already subscribed would jump the cursor to the head and silently skip
+/// events the session had not yet read. So we baseline exactly when the
+/// `INSERT OR IGNORE` actually inserts a row (`changed == 1`). The two cursorless
+/// states are kept distinct in [`SubscribeOutcome`] for honest logging.
+///
+/// # Why to the head, and why that is always forward
+///
+/// A new (or re-subscribing) session must not replay history — it only cares
+/// about events published after it declared interest (docs/01, baseline-on-
+/// subscribe). The head only ever grows, so setting the cursor to it is always a
+/// forward move; reusing the monotonic advance keeps that guarantee even against
+/// a stale cursor left behind by an earlier unsubscribe.
+fn do_subscribe_and_baseline(
+    conn: &mut Connection,
+    session: &SessionId,
+    topic: &Topic,
+) -> Result<SubscribeOutcome, StorageError> {
+    // Silent on success (the bus layer owns the subscribe log, like unsubscribe);
+    // storage only logs failures via `log_on_err`.
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO subscription (session_id, topic) VALUES (?1, ?2)",
+        params![session.as_str(), topic.as_str()],
+    )?;
+    if changed == 0 {
+        // Idempotent no-op: leave the cursor exactly where it was.
+        tx.commit()?;
+        return Ok(SubscribeOutcome::AlreadySubscribed);
+    }
+
+    let baseline = match topic_head(&tx, topic)? {
+        Some(head) => {
+            advance_cursor_tx(&tx, session, topic, head)?;
+            Some(sqlite_to_offset(head)?)
+        }
+        // Empty topic: no head yet. Leaving the cursor unset means the next read
+        // starts at Oldest and the first post-subscribe publish (offset 0) is
+        // delivered — which is exactly a "published after I subscribed" event.
+        //
+        // SAFETY (baseline invariant): an absent cursor reading from the oldest
+        // event is correct ONLY because the log is append-only. If events could
+        // ever be deleted/compacted, "oldest surviving event" would no longer
+        // equal "first event after subscribe", and this would replay history to a
+        // fresh subscriber. Any future retention/compaction must write an explicit
+        // baseline cursor here instead of relying on absence.
+        None => None,
+    };
+    tx.commit()?;
+
+    Ok(SubscribeOutcome::Subscribed { baseline })
+}
+
+/// Read a session's unread events across every topic it subscribes to, advancing
+/// each topic's cursor to the last event returned.
+///
+/// # Advance-on-read, no explicit ack (docs/01)
+///
+/// The agent-facing loop is subscribe → idle → wake → read → react; there is no
+/// separate ack step. So this command both returns the unread page AND advances
+/// the cursor: an event is "delivered" precisely once, at the moment it is
+/// returned. A publish that arrives after this read has committed sits beyond the
+/// cursor and is therefore surfaced on the session's NEXT read — not lost, not
+/// delivered twice. The delivery cursor is owned exclusively by this path (and
+/// the subscribe baseline); see [`advance_cursor_tx`].
+///
+/// # Per-topic transaction isolation (blast-radius containment)
+///
+/// Each subscribed topic's read+advance runs in its OWN transaction. That still
+/// gives exactly-once — the read and the advance for a topic commit or roll back
+/// together — while containing failures: one topic with a corrupt row (an
+/// un-parseable topic string, a non-JSON body, a negative offset) does not roll
+/// back or starve the session's OTHER topics. A failing topic is logged and
+/// skipped; the events successfully read from healthy topics are still returned.
+/// Topics are visited in ascending order for a deterministic cross-topic order.
+fn do_read_unread(
+    conn: &mut Connection,
+    session: &SessionId,
+    limit: Option<u32>,
+) -> Result<Vec<Event>, StorageError> {
+    // Clamp the per-topic page to the same hard cap as `do_read_events`; anything
+    // beyond it surfaces on the next read via the advanced cursor.
+    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT) as i64;
+
+    // Snapshot the subscribed topics up front (ORDER BY for a deterministic
+    // cross-topic delivery order). A plain read on the connection; each topic
+    // then gets its own transaction below.
+    let topics: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT topic FROM subscription WHERE session_id = ?1 ORDER BY topic ASC")?;
+        let rows = stmt.query_map(params![session.as_str()], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut delivered: Vec<Event> = Vec::new();
+    for topic_str in &topics {
+        match read_topic_unread(conn, session, topic_str, limit) {
+            Ok(mut events) => delivered.append(&mut events),
+            // Contain the blast radius: a single bad topic must not fail the whole
+            // read. Log the reason (topic + error, NEVER the body) and move on.
+            Err(err) => {
+                error!(
+                    session = session.as_str(),
+                    topic = topic_str.as_str(),
+                    error = %err,
+                    "skipped a topic during read (its transaction rolled back); other topics unaffected"
+                );
+            }
+        }
+    }
+
+    Ok(delivered)
+}
+
+/// Read + advance one topic for `session` in a single transaction, returning the
+/// events delivered (possibly empty). Isolated per topic so a failure here rolls
+/// back only this topic (see [`do_read_unread`]).
+fn read_topic_unread(
+    conn: &mut Connection,
+    session: &SessionId,
+    topic_str: &str,
+    limit: i64,
+) -> Result<Vec<Event>, StorageError> {
+    // A subscription row can only hold a topic this bridge accepted, so a value
+    // that fails the grammar now is corrupt storage, not user input.
+    let topic = Topic::parse(topic_str).map_err(|_| StorageError::Corrupt {
+        detail: format!("invalid topic {topic_str:?} stored in subscription"),
+    })?;
+
+    let tx = conn.transaction()?;
+
+    let after: i64 = tx
+        .query_row(
+            "SELECT offset FROM delivery_cursor WHERE session_id = ?1 AND topic = ?2",
+            params![session.as_str(), topic_str],
+            |row| row.get(0),
+        )
+        .optional()?
+        // No cursor row => never delivered on this topic => read from the oldest
+        // event (offsets start at 0, so "> -1" is "everything"). Safe only because
+        // the log is append-only — see the baseline note in
+        // `do_subscribe_and_baseline`.
+        .unwrap_or(-1);
+
+    let events: Vec<Event> = {
+        let mut stmt = tx.prepare(
+            "SELECT offset, event_id, timestamp, body
+             FROM event
+             WHERE topic = ?1 AND offset > ?2
+             ORDER BY offset ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![topic_str, after, limit], |row| {
+            let offset: i64 = row.get(0)?;
+            let event_id: String = row.get(1)?;
+            let timestamp: i64 = row.get(2)?;
+            let body_text: String = row.get(3)?;
+            Ok((offset, event_id, timestamp, body_text))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (offset, event_id, timestamp, body_text) = row?;
+            let body: Value = serde_json::from_str(&body_text)?;
+            out.push(Event {
+                id: EventId(event_id),
+                offset: sqlite_to_offset(offset)?,
+                topic: topic.clone(),
+                timestamp: Timestamp(timestamp),
+                body,
+            });
+        }
+        out
+    };
+
+    if let Some(last) = events.last() {
+        let last_offset = offset_to_sqlite(last.offset)?;
+        advance_cursor_tx(&tx, session, &topic, last_offset)?;
+        info!(
+            session = session.as_str(),
+            topic = topic.as_str(),
+            count = events.len(),
+            new_offset = last.offset.0,
+            "delivered unread events and advanced cursor"
+        );
+    }
+
+    tx.commit()?;
+    Ok(events)
 }
 
 fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, StorageError> {
@@ -831,13 +1048,145 @@ mod tests {
         assert!(matches!(err, StorageError::Corrupt { .. }));
     }
 
+    /// Insert one event at `(topic, offset)` with a trivial body. Test-only.
+    fn insert_event(conn: &Connection, topic: &str, offset: i64) {
+        conn.execute(
+            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
+             VALUES (?1, ?2, ?3, 'a', 0, '{}')",
+            params![topic, offset, format!("evt-{topic}-{offset}")],
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn advance_cursor_rejects_out_of_range_offset() {
-        let conn = migrated();
+    fn offset_conversions_reject_out_of_range() {
+        // The load-bearing integer-world crossing: a u64 above i64::MAX cannot be
+        // stored, and a negative i64 read back is corrupt (would make `> ?` match
+        // the whole log). These guards are what the cursor code relies on.
+        let over = offset_to_sqlite(Offset(u64::MAX)).unwrap_err();
+        assert!(matches!(over, StorageError::OffsetOutOfRange { offset } if offset == u64::MAX));
+        let neg = sqlite_to_offset(-1).unwrap_err();
+        assert!(matches!(neg, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn advance_cursor_tx_is_monotonic() {
+        // A lower advance can never rewind delivery, even within one transaction.
+        let mut conn = migrated();
         let session = SessionId("s".to_string());
         let topic = Topic::parse("t.test.x").unwrap();
-        let err = do_advance_cursor(&conn, &session, &topic, Offset(u64::MAX)).unwrap_err();
-        assert!(matches!(err, StorageError::OffsetOutOfRange { offset } if offset == u64::MAX));
+        {
+            let tx = conn.transaction().unwrap();
+            advance_cursor_tx(&tx, &session, &topic, 5).unwrap();
+            advance_cursor_tx(&tx, &session, &topic, 2).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            do_get_cursor(&conn, &session, &topic).unwrap(),
+            Some(Offset(5))
+        );
+    }
+
+    #[test]
+    fn subscribe_and_baseline_idempotent_leaves_cursor_untouched() {
+        let mut conn = migrated();
+        let session = SessionId("s".to_string());
+        let topic = Topic::parse("t.test.x").unwrap();
+        insert_event(&conn, "t.test.x", 0);
+        insert_event(&conn, "t.test.x", 1);
+
+        // First subscribe baselines to the head (offset 1): no replay of 0/1.
+        let first = do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
+        assert_eq!(
+            first,
+            SubscribeOutcome::Subscribed {
+                baseline: Some(Offset(1))
+            }
+        );
+        assert_eq!(
+            do_get_cursor(&conn, &session, &topic).unwrap(),
+            Some(Offset(1))
+        );
+
+        // A publish after subscribe, still UNREAD by this session.
+        insert_event(&conn, "t.test.x", 2);
+
+        // Re-subscribing while still subscribed is a no-op that must NOT advance
+        // the cursor past the unread event 2.
+        let again = do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
+        assert_eq!(again, SubscribeOutcome::AlreadySubscribed);
+        assert_eq!(
+            do_get_cursor(&conn, &session, &topic).unwrap(),
+            Some(Offset(1)),
+            "idempotent subscribe must leave the cursor untouched"
+        );
+    }
+
+    #[test]
+    fn subscribe_and_baseline_on_empty_topic_sets_no_cursor() {
+        let mut conn = migrated();
+        let session = SessionId("s".to_string());
+        let topic = Topic::parse("t.empty.x").unwrap();
+
+        let outcome = do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
+        // No head to baseline to; the cursor stays absent so the first future
+        // publish (offset 0) is still delivered.
+        assert_eq!(outcome, SubscribeOutcome::Subscribed { baseline: None });
+        assert_eq!(do_get_cursor(&conn, &session, &topic).unwrap(), None);
+    }
+
+    #[test]
+    fn read_unread_advances_cursor_only_when_a_topic_returned_events() {
+        let mut conn = migrated();
+        let session = SessionId("s".to_string());
+        let topic = Topic::parse("t.read.x").unwrap();
+
+        // Subscribe to an empty topic: no cursor row yet.
+        do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
+        assert_eq!(do_get_cursor(&conn, &session, &topic).unwrap(), None);
+
+        // Reading with nothing unread must NOT create/advance a cursor.
+        let empty = do_read_unread(&mut conn, &session, None).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            do_get_cursor(&conn, &session, &topic).unwrap(),
+            None,
+            "no events => cursor must stay absent"
+        );
+
+        // Once an event exists, the read returns it and advances the cursor.
+        insert_event(&conn, "t.read.x", 0);
+        let page = do_read_unread(&mut conn, &session, None).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].offset, Offset(0));
+        assert_eq!(
+            do_get_cursor(&conn, &session, &topic).unwrap(),
+            Some(Offset(0))
+        );
+    }
+
+    #[test]
+    fn read_unread_honors_per_topic_limit() {
+        let mut conn = migrated();
+        let session = SessionId("s".to_string());
+        let topic = Topic::parse("t.limit.x").unwrap();
+        do_subscribe_and_baseline(&mut conn, &session, &topic).unwrap();
+        for i in 0..5 {
+            insert_event(&conn, "t.limit.x", i);
+        }
+
+        // The per-topic limit caps one read; the cursor advances only to what was
+        // returned, so the remainder surfaces on the next read.
+        let first = do_read_unread(&mut conn, &session, Some(2)).unwrap();
+        assert_eq!(
+            first.iter().map(|e| e.offset.0).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let second = do_read_unread(&mut conn, &session, Some(2)).unwrap();
+        assert_eq!(
+            second.iter().map(|e| e.offset.0).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]

@@ -36,7 +36,9 @@ use tokio::sync::{mpsc, oneshot};
 use mailbox_protocol::{AdapterId, Cursor, Event, Offset, Timestamp, Topic};
 
 pub use error::StorageError;
-pub use model::{Pid, ReadPage, SessionId, Watch, WatchId, WatchKind, WatchSpec, WatchState};
+pub use model::{
+    Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
+};
 
 use writer::Command;
 
@@ -207,17 +209,14 @@ impl Storage {
         .await
     }
 
-    /// Record that `session` is subscribed to `topic` (idempotent).
-    pub async fn subscribe(&self, session: SessionId, topic: Topic) -> Result<(), StorageError> {
-        self.call(|reply| Command::Subscribe {
-            session,
-            topic,
-            reply,
-        })
-        .await
-    }
-
     /// Drop `session`'s subscription to `topic` (idempotent).
+    ///
+    /// Deliberately there is NO general `subscribe` or `advance_cursor` on this
+    /// handle: a subscription must always be created together with its baseline
+    /// (see [`Storage::subscribe_and_baseline`]) — an un-baselined subscription
+    /// row would make [`Storage::read_unread`] replay the whole log — and the
+    /// delivery cursor is owned exclusively by the read-and-advance path, so no
+    /// caller may nudge it independently (that could silently skip events).
     pub async fn unsubscribe(&self, session: SessionId, topic: Topic) -> Result<(), StorageError> {
         self.call(|reply| Command::Unsubscribe {
             session,
@@ -227,18 +226,38 @@ impl Storage {
         .await
     }
 
-    /// Advance `session`'s delivery cursor on `topic` to `offset`. Monotonic:
-    /// a lower offset never rewinds an existing cursor.
-    pub async fn advance_cursor(
+    /// Subscribe `session` to `topic` and baseline its delivery cursor to the
+    /// topic head, atomically (one writer transaction). Idempotent: a repeat
+    /// subscribe is a no-op that leaves the cursor untouched. See
+    /// [`SubscribeOutcome`] and the writer's `do_subscribe_and_baseline` for the
+    /// baseline-on-subscribe rationale.
+    pub async fn subscribe_and_baseline(
         &self,
         session: SessionId,
         topic: Topic,
-        offset: Offset,
-    ) -> Result<(), StorageError> {
-        self.call(|reply| Command::AdvanceCursor {
+    ) -> Result<SubscribeOutcome, StorageError> {
+        self.call(|reply| Command::SubscribeAndBaseline {
             session,
             topic,
-            offset,
+            reply,
+        })
+        .await
+    }
+
+    /// Read `session`'s unread events across ALL its subscribed topics — each
+    /// strictly after that session's per-topic cursor — and advance those cursors
+    /// to the last event returned, atomically (one writer transaction). This is
+    /// the exactly-once delivery primitive (advance-on-read, no ack). `limit`
+    /// bounds the page PER topic (bridge default if `None`); anything beyond it
+    /// surfaces on the next read.
+    pub async fn read_unread(
+        &self,
+        session: SessionId,
+        limit: Option<u32>,
+    ) -> Result<Vec<Event>, StorageError> {
+        self.call(|reply| Command::ReadUnread {
+            session,
+            limit,
             reply,
         })
         .await

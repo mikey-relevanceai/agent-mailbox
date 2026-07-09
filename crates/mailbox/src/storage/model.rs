@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{Cursor, Event};
+use mailbox_protocol::{Cursor, Event, Offset};
 
 /// Identity of a Claude/Codex session that expresses interest in a topic or
 /// watch. Sourced from the harness (hook `session_id`); the bridge treats it as
@@ -138,4 +138,25 @@ pub struct Watch {
 pub struct ReadPage {
     pub events: Vec<Event>,
     pub next: Cursor,
+}
+
+/// What an atomic subscribe-and-baseline did.
+///
+/// A named enum rather than an ambiguous `Option<Offset>` so the two
+/// distinct-but-both-cursorless outcomes ("already subscribed, cursor left
+/// alone" vs "newly subscribed on an empty topic, no head to baseline to") can
+/// never be confused at a call site or in a log line. The baseline policy that
+/// produces this lives in [`crate::storage::Storage::subscribe_and_baseline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeOutcome {
+    /// The session was already subscribed; this call was an idempotent no-op and
+    /// deliberately left the delivery cursor untouched (re-subscribing must not
+    /// skip events the session has not yet read).
+    AlreadySubscribed,
+    /// A fresh subscription was created. The delivery cursor was baselined to the
+    /// topic's current head so history is not replayed: `Some(head)` when the
+    /// topic already had events (the session starts strictly after `head`), or
+    /// `None` when the topic was empty (no head yet, so the next read starts at
+    /// the oldest event — which will itself be a post-subscribe publish).
+    Subscribed { baseline: Option<Offset> },
 }

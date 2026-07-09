@@ -244,14 +244,25 @@ async fn ac4_fresh_create_then_idempotent_reopen() {
 
 // ---- Cursor independence -----------------------------------------------------
 
-/// Two subscribers advance their delivery cursors on the same topic
-/// independently.
+/// Two subscribers on the same topic advance their delivery cursors
+/// independently — driven through the supported read-and-advance path (the only
+/// way a delivery cursor moves now that `advance_cursor` is gone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_subscribers_have_independent_cursors() {
     let (storage, _dir) = fresh_store().await;
     let topic = pr_topic(5);
     let alice = SessionId("alice".to_string());
     let bob = SessionId("bob".to_string());
+
+    // Subscribe on the empty topic so both baseline to "from the start".
+    storage
+        .subscribe_and_baseline(alice.clone(), topic.clone())
+        .await
+        .unwrap();
+    storage
+        .subscribe_and_baseline(bob.clone(), topic.clone())
+        .await
+        .unwrap();
 
     for i in 0..5u64 {
         storage
@@ -265,32 +276,19 @@ async fn two_subscribers_have_independent_cursors() {
             .unwrap();
     }
 
-    storage
-        .advance_cursor(alice.clone(), topic.clone(), Offset(3))
-        .await
-        .unwrap();
-    storage
-        .advance_cursor(bob.clone(), topic.clone(), Offset(1))
-        .await
-        .unwrap();
+    // Each reads a different amount, advancing its own cursor to its last event.
+    let alice_page = storage.read_unread(alice.clone(), Some(4)).await.unwrap();
+    assert_eq!(alice_page.len(), 4); // offsets 0..3
+    let bob_page = storage.read_unread(bob.clone(), Some(2)).await.unwrap();
+    assert_eq!(bob_page.len(), 2); // offsets 0,1
 
-    assert_eq!(
-        storage.cursor(alice.clone(), topic.clone()).await.unwrap(),
-        Some(Offset(3))
-    );
-    assert_eq!(
-        storage.cursor(bob.clone(), topic.clone()).await.unwrap(),
-        Some(Offset(1))
-    );
-
-    // Cursor is monotonic: a lower advance does not rewind.
-    storage
-        .advance_cursor(alice.clone(), topic.clone(), Offset(2))
-        .await
-        .unwrap();
     assert_eq!(
         storage.cursor(alice, topic.clone()).await.unwrap(),
         Some(Offset(3))
+    );
+    assert_eq!(
+        storage.cursor(bob, topic.clone()).await.unwrap(),
+        Some(Offset(1))
     );
 
     // Unknown subscriber has no cursor.
@@ -429,10 +427,13 @@ async fn baseline_set_get_roundtrip() {
 
 // ---- subscribe / unsubscribe -------------------------------------------------
 
-/// Subscribe is idempotent (no duplicate row, no error); unsubscribe removes the
-/// row; unsubscribing something not subscribed is a harmless no-op.
+/// Subscribe (via the baselining path — the only supported one) is idempotent
+/// (no duplicate row, no error, cursor untouched on repeat); unsubscribe removes
+/// the row; unsubscribing something not subscribed is a harmless no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_unsubscribe_semantics() {
+    use mailbox::storage::SubscribeOutcome;
+
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mailbox.db");
     let storage = Storage::open(StorageConfig::at(&path)).await.unwrap();
@@ -441,17 +442,20 @@ async fn subscribe_unsubscribe_semantics() {
 
     let count = || count_rows(&path, "SELECT COUNT(*) FROM subscription");
 
-    storage
-        .subscribe(session.clone(), topic.clone())
+    let first = storage
+        .subscribe_and_baseline(session.clone(), topic.clone())
         .await
         .unwrap();
+    // Empty topic, so a fresh subscription with no baseline.
+    assert_eq!(first, SubscribeOutcome::Subscribed { baseline: None });
     assert_eq!(count(), 1);
 
-    // Double-subscribe: no error, no duplicate.
-    storage
-        .subscribe(session.clone(), topic.clone())
+    // Double-subscribe: no error, no duplicate, reported as an idempotent no-op.
+    let again = storage
+        .subscribe_and_baseline(session.clone(), topic.clone())
         .await
         .unwrap();
+    assert_eq!(again, SubscribeOutcome::AlreadySubscribed);
     assert_eq!(count(), 1);
 
     // Unsubscribe removes the row.
@@ -469,8 +473,9 @@ async fn subscribe_unsubscribe_semantics() {
 // ---- Offset range guard (confirmed bug fix) ----------------------------------
 
 /// A read after an out-of-range cursor returns an empty page (not a wrapped
-/// replay of the whole log), and advancing to an out-of-range offset is a hard
-/// error (not a stored negative).
+/// replay of the whole log). (The write-side guard — rejecting an out-of-range
+/// offset rather than storing a negative — is covered by the writer unit test
+/// `offset_conversions_reject_out_of_range`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn out_of_range_offsets_do_not_wrap() {
     let (storage, _dir) = fresh_store().await;
@@ -499,13 +504,6 @@ async fn out_of_range_offsets_do_not_wrap() {
         .await
         .unwrap();
     assert!(page.events.is_empty());
-
-    // Advancing to an out-of-range offset is rejected rather than stored negative.
-    let err = storage
-        .advance_cursor(SessionId("s".to_string()), topic, Offset(u64::MAX))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, StorageError::OffsetOutOfRange { .. }));
 }
 
 // ---- Future schema version rejection (end to end) ----------------------------
