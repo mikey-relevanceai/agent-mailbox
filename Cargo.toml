@@ -15,3 +15,10 @@ repository = "https://github.com/mikey-relevanceai/agent-mailbox"
 [workspace.dependencies]
 mailbox-protocol = { path = "crates/mailbox-protocol" }
 mailbox-harness = { path = "crates/mailbox-harness" }
+
+# Workspace-wide lints, inherited by each crate via `[lints] workspace = true`.
+# Kept minimal: the bridge and adapters are pure safe Rust (subprocess/WASI, no
+# FFI), so any `unsafe` is a red flag worth stopping in CI. `deny` (not `forbid`)
+# leaves a documented `#[allow(unsafe_code)]` escape hatch if that ever changes.
+[workspace.lints.rust]
+unsafe_code = "deny"

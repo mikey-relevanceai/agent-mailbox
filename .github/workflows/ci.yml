@@ -1,0 +1,46 @@
+name: CI
+
+# Gate every PR and every push to main on the same checks. Any failing step
+# fails the job (no continue-on-error / no `|| true`) — that is the point.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Superseded runs on the same ref waste CI minutes; drop them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep cargo output plain and readable so a failure is easy to act on.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / check / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml fixes the channel + components; `rustup show` resolves
+      # and installs it, so CI runs the same stable channel a local checkout does.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # Keep CI fast without hand-rolling a cache key for the registry + target dir.
+      - uses: Swatinem/rust-cache@v2
+
+      # Same commands a developer runs locally (see AGENTS.md). Ordered
+      # cheapest-to-fail first so feedback is fast.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check
+        run: cargo check --workspace
+
+      - name: Test
+        run: cargo test --workspace

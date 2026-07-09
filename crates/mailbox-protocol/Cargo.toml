@@ -6,4 +6,7 @@ license.workspace = true
 repository.workspace = true
 description = "Shared types for agent-mailbox publish/subscribe messages"
 
+[lints]
+workspace = true
+
 [dependencies]

@@ -10,6 +10,9 @@ description = "Agent mailbox bridge CLI — durable topics, subscriptions, and w
 name = "mailbox"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 mailbox-protocol = { workspace = true }
 mailbox-harness = { workspace = true }

@@ -6,5 +6,8 @@ license.workspace = true
 repository.workspace = true
 description = "Harness integrators for waking agent sessions (Claude Code first)"
 
+[lints]
+workspace = true
+
 [dependencies]
 mailbox-protocol = { workspace = true }

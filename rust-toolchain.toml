@@ -1,0 +1,10 @@
+# Fix the toolchain channel + components so CI and every local checkout run
+# rustfmt and clippy from the same stable channel (rustup auto-installs this on
+# the first cargo invocation). Note: `stable` floats — CI on a fresh runner
+# resolves to whatever stable is newest when it runs, so this pins the channel,
+# not a byte-identical version. Developed against stable 1.96.1 / edition 2024;
+# switch `channel` to a literal version (e.g. "1.96.1") if reproducible-to-the-
+# -patch toolchains ever matter.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

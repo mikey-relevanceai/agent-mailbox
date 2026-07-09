@@ -50,10 +50,10 @@ See [ADR-0001](docs/adr/0001-rust-bridge-subprocess-adapters.md), [ADR-0002](doc
 Requires stable Rust via `rustup`. From the repo root:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo fmt --all --check                                    # CI gate; drop --check to format
+cargo clippy --workspace --all-targets -- -D warnings      # CI gate
+cargo check --workspace                                    # CI gate
+cargo test --workspace                                     # CI gate
 cargo run -p mailbox
 ```
 
