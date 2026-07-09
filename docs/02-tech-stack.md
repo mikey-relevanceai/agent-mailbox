@@ -92,21 +92,29 @@ Subprocess remains valid forever for “I already trust this binary / script.”
 
 v0: no TCP listen. CLI and/or user-scoped Unix socket only.
 
-## Storage (provisional)
+## Storage
 
-**SQLite** in `~/.agent-mailbox/` (or project override) for events, topics, and
-per-subscriber cursors. Revisit if single-machine append-only files prove enough
-for the experiment — SQLite is the default assumption for multi-cursor correctness.
+**SQLite** via `rusqlite` (`bundled`) under `~/.agent-mailbox/` (or project
+override). **Single writer** — all mutations go through the bridge; other
+processes queue via CLI/socket ([ADR-0003](adr/0003-single-writer-sqlite.md)).
+
+Crate choices for MVP: [ADR-0002](adr/0002-mvp-crate-stack.md).
+
+## MVP target
+
+Parity with the existing `agent-ipc` / `agent-ipc-github` skills: supervised
+GitHub PR watch, edge-triggered publish, harness-owned wake, **no zombie
+pollers**. Design: [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md).
 
 ## Early test bar
-
-Not “does GitHub polling work,” but:
 
 1. Stub adapter publishes on a schedule via the subprocess protocol.
 2. One or more sessions subscribe to the same topic.
 3. Claude harness waiter wakes without agent re-arm.
 4. Delivery cursor advances so mid-turn publishes surface on the next `Stop`.
 5. Two subscribers each see the event with independent cursors.
+6. GitHub watch: one process per PR; two sessions share it; first SessionEnd
+   leaves the poller up; last interest gone stops it; no orphan resume.
 
 ## Non-goals (for now)
 

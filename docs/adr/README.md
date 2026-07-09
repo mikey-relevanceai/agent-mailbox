@@ -8,6 +8,8 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-rust-bridge-subprocess-adapters.md) | Rust bridge, subprocess adapters, local-only v0 | Accepted |
+| [0002](0002-mvp-crate-stack.md) | MVP crate stack (serde, tracing, clap, rusqlite bundled, …) | Accepted |
+| [0003](0003-single-writer-sqlite.md) | Single-writer SQLite; others queue via the bridge | Accepted |
 
 ## When to write one
 

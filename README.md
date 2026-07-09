@@ -34,4 +34,4 @@ See [docs/00-index.md](docs/00-index.md) for the full list. Agent-oriented repo 
 - [Wake and re-arm](docs/01-wake-and-rearm.md)
 - [Tech stack](docs/02-tech-stack.md)
 - [Working agreements](docs/03-working-agreements.md) — ADRs, designs, PRs, mikey-in-a-box install
-- [ADRs](docs/adr/README.md) · [Designs](docs/design/README.md)
+- [ADRs](docs/adr/README.md) · [Designs](docs/design/README.md) · [MVP GitHub watch](docs/design/01-mvp-github-watch.md)

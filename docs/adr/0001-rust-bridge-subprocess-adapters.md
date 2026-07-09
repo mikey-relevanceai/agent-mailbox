@@ -16,12 +16,15 @@ not multi-subscriber topics or automatic re-arm.
 2. **Adapters:** Separate processes speaking a versioned protocol; transport
    behind an abstraction aimed at WASM/WASI later.
 3. **Network (v0):** No TCP listen — CLI and/or user-scoped Unix socket only.
-4. **Storage (provisional):** SQLite for events, topics, and per-subscriber
-   cursors.
+4. **Storage:** SQLite via `rusqlite` (`bundled`), **single writer** in the
+   bridge ([ADR-0003](0003-single-writer-sqlite.md)).
 5. **Wake:** Claude Code first via hook-owned `asyncRewake`; Codex has no
    equivalent yet (manual arm fallback).
 6. **Security shape:** Payload-free wake; treat adapter event bodies as
    untrusted content; prefer a separate ingress process if/when webhooks appear.
+
+MVP crate details: [ADR-0002](0002-mvp-crate-stack.md). MVP product slice:
+[design/01-mvp-github-watch](../design/01-mvp-github-watch.md).
 
 ## Consequences
 
