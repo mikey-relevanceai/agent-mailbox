@@ -5,3 +5,10 @@ Agent mailbox is a system designed to allow agents to be woken up via asynchrono
 - changes in pull request state
 - the deployment of your changes
 - monitoring of those changes in production
+
+## Docs
+
+See [docs/00-index.md](docs/00-index.md) for the full list.
+
+- [Wake and re-arm](docs/01-wake-and-rearm.md)
+- [Tech stack](docs/02-tech-stack.md)

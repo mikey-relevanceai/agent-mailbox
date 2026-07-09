@@ -1,0 +1,112 @@
+# Tech stack
+
+Decisions for the bridge and how adapters talk to it.
+
+## Language
+
+**Rust** for the bridge (`mailbox` CLI / optional local daemon).
+
+Reasons: single static binary for distribution, strong control over FS and
+concurrency, and a natural home for a later WASM/WASI host. Go was considered
+and rejected.
+
+## Layout (target)
+
+```text
+agent-mailbox/
+  crates/
+    mailbox/           # CLI + bridge core
+    mailbox-protocol/  # shared types: publish, subscribe, events, cursors
+    mailbox-harness/   # Claude Code hook helpers (may stay thin shell + calls)
+  adapters/            # reference adapters (any language; speak the protocol)
+  docs/
+```
+
+Exact crate split can move; the important boundary is **protocol vs transport**.
+
+## Extensibility: adapters
+
+### v0 — subprocess
+
+Adapters are separate processes. They do not link against bridge internals.
+They communicate through a small, versioned protocol:
+
+- **Publish:** `mailbox publish …` (CLI) and/or a Unix socket / stdin JSON line
+  protocol with the same messages.
+- **Lifecycle:** bridge (or a supervisor) may spawn/stop adapters; adapters may
+  also be started by hand for experiments.
+
+Early adapters only need to **speak the protocol correctly**. Polling GitHub (or
+anything real) is optional; a stub that publishes a fake edge on an interval is
+enough to test wake, cursors, and multi-subscriber fan-out.
+
+### Abstraction boundary
+
+Transport is behind a trait (name TBD), e.g. conceptually:
+
+```text
+AdapterHost
+  ├─ SubprocessTransport   ← v0
+  └─ WasiTransport         ← later
+```
+
+Everything above that boundary sees only:
+
+- start / stop adapter instance
+- deliver config
+- receive `Publish` (and later acks / health)
+
+Adapters never import bridge storage or wake logic. Swapping subprocess → WASI
+should not change topics, cursors, or harness integrators.
+
+### Later — WASM/WASI
+
+Goal: run untrusted or semi-trusted adapter code without `npm i -g`-shaped
+supply-chain risk.
+
+WASI adapters would:
+
+- run in a sandbox (no ambient FS/network unless granted)
+- call host functions that map to the same publish/subscribe protocol
+- be distributed as `.wasm` artifacts the bridge verifies/loads
+
+Capabilities (HTTP, `gh` auth, clocks) become **explicit imports**, not “whatever
+the process user can do.” Polling adapters that need network get a narrow
+allowlist; pure transformers get almost nothing.
+
+Subprocess remains valid forever for “I already trust this binary / script.”
+
+## Security posture by process
+
+| Component | Process | Trust |
+|---|---|---|
+| Bridge core | `mailbox` | Trusted; owns DB, cursors, kicks |
+| Harness waiter | Claude hook / child of session | Trusted per user session |
+| Subprocess adapter | separate OS process | Same user; treat events as untrusted *content* |
+| WASI adapter (later) | sandboxed guest | Least privilege; host mediates I/O |
+| Ingress (later, if webhooks) | separate process preferred | Hostile network; verify then enqueue only |
+
+v0: no TCP listen. CLI and/or user-scoped Unix socket only.
+
+## Storage (provisional)
+
+**SQLite** in `~/.agent-mailbox/` (or project override) for events, topics, and
+per-subscriber cursors. Revisit if single-machine append-only files prove enough
+for the experiment — SQLite is the default assumption for multi-cursor correctness.
+
+## Early test bar
+
+Not “does GitHub polling work,” but:
+
+1. Stub adapter publishes on a schedule via the subprocess protocol.
+2. One or more sessions subscribe to the same topic.
+3. Claude harness waiter wakes without agent re-arm.
+4. Delivery cursor advances so mid-turn publishes surface on the next `Stop`.
+5. Two subscribers each see the event with independent cursors.
+
+## Non-goals (for now)
+
+- In-process Rust plugin ABI for adapters
+- Cloud bus / multi-tenant routing
+- Codex `asyncRewake` parity (manual arm fallback only)
+- Real adapter capability surface beyond “can publish”
