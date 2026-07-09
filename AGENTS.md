@@ -4,7 +4,7 @@ Orientation for agents working in this repo. **Read [docs/00-index.md](docs/00-i
 
 ## Keeping this file updated
 
-When you change architecture, crate boundaries, commands, or agent-facing conventions, update this file and/or the relevant `docs/*.md` in the same change.
+When you change architecture, crate boundaries, commands, or agent-facing conventions, update this file and/or the relevant `docs/*.md` in the same change. Significant decisions also need an [ADR](docs/adr/README.md).
 
 ## What this is
 
@@ -14,6 +14,15 @@ Local durable **topic bus** for coding agents: adapters publish world-change eve
 Adapters → publish → Bridge (topics + cursors + kicks) → harness wake → Agent
 ```
 
+## Working agreements (must follow)
+
+Full detail: [docs/03-working-agreements.md](docs/03-working-agreements.md).
+
+1. **Branch + PR by default.** Do not push commits to `main` unless the human explicitly asks for that in the current request.
+2. **ADRs** for durable decisions under `docs/adr/`.
+3. **Design docs** for major systems/subsystems under `docs/design/`.
+4. **mikey-in-a-box** — install and follow those skills (install steps in the working-agreements doc).
+
 ## Hard boundaries
 
 - **Adapters never import bridge internals.** They speak the protocol only (CLI / socket today; WASI later). Live under `adapters/`.
@@ -21,6 +30,8 @@ Adapters → publish → Bridge (topics + cursors + kicks) → harness wake → 
 - **Payload-free wake.** Kicks carry no model-visible body; events are read from the durable log. Wake is ingress, not authority.
 - **v0 network:** no TCP listen. CLI and/or user-scoped Unix socket only.
 - **Language:** Rust for the bridge. Do not introduce Go.
+
+See [ADR-0001](docs/adr/0001-rust-bridge-subprocess-adapters.md).
 
 ## Crate map
 
@@ -30,7 +41,7 @@ Adapters → publish → Bridge (topics + cursors + kicks) → harness wake → 
 | `crates/mailbox-protocol` | Shared publish/subscribe types |
 | `crates/mailbox-harness` | Session wake / re-arm helpers |
 | `adapters/` | External adapter processes |
-| `docs/` | Numbered design notes (`00-`, `01-`, …) |
+| `docs/` | Numbered notes, ADRs, designs |
 
 ## Commands
 
@@ -63,3 +74,6 @@ Follow the mikey-in-a-box skills when they apply (architecture, type-driven desi
 | [docs/00-index.md](docs/00-index.md) | Starting point / repo map |
 | [docs/01-wake-and-rearm.md](docs/01-wake-and-rearm.md) | Wake loop, delivery cursors, Claude vs Codex |
 | [docs/02-tech-stack.md](docs/02-tech-stack.md) | Rust, subprocess→WASI, security process split |
+| [docs/03-working-agreements.md](docs/03-working-agreements.md) | ADRs, designs, PRs, mikey-in-a-box install |
+| [docs/adr/](docs/adr/README.md) | Decision log |
+| [docs/design/](docs/design/README.md) | Subsystem designs |

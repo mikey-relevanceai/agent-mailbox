@@ -1,6 +1,7 @@
 # Tech stack
 
-Decisions for the bridge and how adapters talk to it.
+Decisions for the bridge and how adapters talk to it. Formalized as
+[ADR-0001](adr/0001-rust-bridge-subprocess-adapters.md).
 
 ## Language
 
