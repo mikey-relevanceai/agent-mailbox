@@ -32,6 +32,9 @@ const MAX_TOPIC_LEN: usize = 512;
 /// Prefix shared by every GitHub pull-request topic.
 const GITHUB_PR_PREFIX: &str = "github.pr.";
 
+/// Prefix shared by every stub-adapter topic (`stub.<label>`).
+const STUB_PREFIX: &str = "stub.";
+
 /// A validated topic identifier.
 ///
 /// Deserialization goes through [`Topic::try_from`] (`#[serde(try_from)]`), so a
@@ -88,6 +91,36 @@ impl From<Topic> for String {
     fn from(topic: Topic) -> Self {
         topic.0
     }
+}
+
+/// The canonical topic for a stub-adapter watch labelled `label`.
+///
+/// The stub topic scheme is `stub.<label>` (e.g. `stub.demo`) — the trivial
+/// reference adapter's namespace, minted here so the bridge (the stub resolver)
+/// and any consumer agree on one format (parse, don't validate). `label` may not
+/// be empty, contain whitespace/control characters, or carry the `/`/`#`
+/// delimiters the other topic schemes use (keeping stub topics visually distinct
+/// and unambiguous). A `.` in the label is allowed, so a label can itself carve
+/// sub-namespaces (`stub.team.ci`).
+pub fn stub_topic(label: &str) -> Result<Topic, TopicError> {
+    if label.is_empty() {
+        return Err(TopicError::InvalidSegment {
+            field: "label",
+            value: label.to_string(),
+        });
+    }
+    if label
+        .chars()
+        .any(|c| matches!(c, '/' | '#') || c.is_control() || c.is_whitespace())
+    {
+        return Err(TopicError::InvalidSegment {
+            field: "label",
+            value: label.to_string(),
+        });
+    }
+    // Route through `Topic::parse` too, so the length bound and the full grammar
+    // apply to the assembled `stub.<label>` string, not just the label segment.
+    Topic::parse(format!("{STUB_PREFIX}{label}"))
 }
 
 /// A GitHub pull request, the structured form of a `github.pr.*` [`Topic`].
@@ -260,6 +293,27 @@ mod tests {
         let pr = GithubPr::new("acme", "widget.js", 7).unwrap();
         assert_eq!(pr.topic().as_str(), "github.pr.acme/widget.js#7");
         assert_eq!(pr.topic().as_github_pr().unwrap(), pr);
+    }
+
+    #[test]
+    fn stub_topic_is_valid_and_prefixed() {
+        let topic = stub_topic("demo").unwrap();
+        assert_eq!(topic.as_str(), "stub.demo");
+        // A dotted label carves a sub-namespace and is still valid.
+        assert_eq!(stub_topic("team.ci").unwrap().as_str(), "stub.team.ci");
+    }
+
+    #[test]
+    fn stub_topic_rejects_bad_labels() {
+        for bad in ["", "has space", "with/slash", "with#hash", "tab\tlabel"] {
+            assert!(
+                matches!(
+                    stub_topic(bad),
+                    Err(TopicError::InvalidSegment { field: "label", .. })
+                ),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 
     #[test]

@@ -14,8 +14,9 @@ use super::error::StorageError;
 /// The schema version this build creates and understands.
 ///
 /// v2 (card 08) adds `watch_interest.last_seen` for the TTL sweeper — see
-/// [`SCHEMA_V2`].
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+/// [`SCHEMA_V2`]. v3 (card 09) widens the interval to milliseconds and adds
+/// `watch.publish_count` for the stub adapter — see [`SCHEMA_V3`].
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// Version 1 of the schema.
 ///
@@ -105,6 +106,24 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE watch_interest ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Version 3 of the schema (card 09): support the stub adapter's parameters on
+/// the shared watch row.
+///
+/// - **`interval_secs` → `interval_ms`.** The interval is now stored in
+///   milliseconds, so a sub-second stub interval (`--interval-ms 200`) survives
+///   the round trip instead of truncating to whole seconds. Existing rows are
+///   backfilled `* 1000`, so a pre-upgrade `github-pr` interval is unchanged.
+/// - **`publish_count`.** A finite publish count for the stub (`0` = unbounded).
+///   `github-pr` rows leave it at the `0` default. It is a *non-identity* column
+///   (the watch is keyed by `(kind, repo, pr)`), so re-watching a stub label with
+///   a different count updates the one row rather than forking a second entity
+///   that would double-publish to the same `stub.<label>` topic.
+const SCHEMA_V3: &str = r#"
+ALTER TABLE watch RENAME COLUMN interval_secs TO interval_ms;
+UPDATE watch SET interval_ms = interval_ms * 1000;
+ALTER TABLE watch ADD COLUMN publish_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -133,6 +152,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 2 {
         sql.push_str(SCHEMA_V2);
+    }
+    if current < 3 {
+        sql.push_str(SCHEMA_V3);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"

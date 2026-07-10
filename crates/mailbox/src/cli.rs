@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 
 use mailbox::storage::{SessionId, StorageConfig};
 use mailbox::wake::{Waiter, WakeOutcome};
-use mailbox_protocol::{AdapterId, GithubPr, Topic};
+use mailbox_protocol::{AdapterId, GithubPr, Topic, stub_topic};
 
 use crate::client;
 use crate::control::{
@@ -148,6 +148,9 @@ pub struct WatchArgs {
 pub enum WatchTargetCmd {
     /// Watch a GitHub pull request.
     GithubPr(GithubPrWatchArgs),
+    /// Watch a stub publisher (the reference adapter; card 09). Publishes a
+    /// synthetic event on an interval to prove the whole path end to end.
+    Stub(StubWatchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -162,6 +165,20 @@ pub struct GithubPrWatchArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct StubWatchArgs {
+    /// Stub label; the topic is `stub.<label>`.
+    pub label: String,
+    /// Interval between synthetic publishes, in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    /// How many events to publish; `0` (the default) means publish forever.
+    #[arg(long, default_value_t = 0)]
+    pub count: u64,
+    #[command(flatten)]
+    pub session: SessionOpt,
+}
+
+#[derive(Args, Debug)]
 pub struct UnwatchArgs {
     #[command(subcommand)]
     pub target: UnwatchTargetCmd,
@@ -171,12 +188,22 @@ pub struct UnwatchArgs {
 pub enum UnwatchTargetCmd {
     /// Stop watching a GitHub pull request.
     GithubPr(GithubPrUnwatchArgs),
+    /// Stop watching a stub publisher.
+    Stub(StubUnwatchArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct GithubPrUnwatchArgs {
     /// PR reference: `owner/repo#number`.
     pub spec: String,
+    #[command(flatten)]
+    pub session: SessionOpt,
+}
+
+#[derive(Args, Debug)]
+pub struct StubUnwatchArgs {
+    /// Stub label previously passed to `watch stub`.
+    pub label: String,
     #[command(flatten)]
     pub session: SessionOpt,
 }
@@ -254,30 +281,36 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
 }
 
 async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> {
-    let WatchTargetCmd::GithubPr(gh) = args.target;
-    let target = parse_pr_spec(&gh.spec)?;
-    send(
-        format,
-        Request::Watch {
+    let request = match args.target {
+        WatchTargetCmd::GithubPr(gh) => Request::Watch {
             session: gh.session.session,
-            target,
+            target: parse_pr_spec(&gh.spec)?,
             interval_secs: gh.interval,
         },
-    )
-    .await
+        WatchTargetCmd::Stub(stub) => Request::WatchStub {
+            session: stub.session.session,
+            // Validate the label at the edge (same as the daemon) so a bad label
+            // is a clean local error, not a round-trip.
+            label: parse_stub_label(&stub.label)?,
+            interval_ms: stub.interval_ms,
+            count: stub.count,
+        },
+    };
+    send(format, request).await
 }
 
 async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<()> {
-    let UnwatchTargetCmd::GithubPr(gh) = args.target;
-    let target = parse_pr_spec(&gh.spec)?;
-    send(
-        format,
-        Request::Unwatch {
+    let request = match args.target {
+        UnwatchTargetCmd::GithubPr(gh) => Request::Unwatch {
             session: gh.session.session,
-            target,
+            target: parse_pr_spec(&gh.spec)?,
         },
-    )
-    .await
+        UnwatchTargetCmd::Stub(stub) => Request::UnwatchStub {
+            session: stub.session.session,
+            label: parse_stub_label(&stub.label)?,
+        },
+    };
+    send(format, request).await
 }
 
 async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
@@ -365,6 +398,12 @@ fn request_context(request: &Request) -> String {
             target.number,
             session.as_str()
         ),
+        Request::WatchStub { session, label, .. } => {
+            format!("watching stub {label} for {}", session.as_str())
+        }
+        Request::UnwatchStub { session, label } => {
+            format!("unwatching stub {label} for {}", session.as_str())
+        }
         Request::Status { session } => format!("status for {}", session.as_str()),
     }
 }
@@ -459,14 +498,19 @@ fn render_status(report: &StatusReport) {
                 WatchStateWire::Stopped => ("stopped", "stopped".to_string()),
                 WatchStateWire::Failed => ("failed", "gave up after repeated crashes".to_string()),
             };
+            // The github entity is `repo#pr`; a stub is just its label (pr is an
+            // unused 0 sentinel there, so showing `#0` would be noise).
+            let entity = match watch.kind {
+                WatchKindWire::GithubPr => format!("{}#{}", watch.repo, watch.pr),
+                WatchKindWire::Stub => watch.repo.clone(),
+            };
             println!(
-                "  {} {}#{}  state={} interest={} interval={}s child={}",
+                "  {} {}  state={} interest={} interval={} child={}",
                 kind_label(watch.kind),
-                watch.repo,
-                watch.pr,
+                entity,
                 state,
                 watch.interest,
-                watch.interval_secs,
+                format_interval(watch.interval_ms),
                 child
             );
         }
@@ -484,6 +528,18 @@ fn render_status(report: &StatusReport) {
 fn kind_label(kind: WatchKindWire) -> &'static str {
     match kind {
         WatchKindWire::GithubPr => "github-pr",
+        WatchKindWire::Stub => "stub",
+    }
+}
+
+/// Render an interval given in milliseconds as `<n>s` when it is a whole number
+/// of seconds (the github case), else `<n>ms` (so a sub-second stub interval is
+/// shown honestly rather than truncated to `0s`).
+fn format_interval(interval_ms: u64) -> String {
+    if interval_ms != 0 && interval_ms.is_multiple_of(1000) {
+        format!("{}s", interval_ms / 1000)
+    } else {
+        format!("{interval_ms}ms")
     }
 }
 
@@ -514,6 +570,14 @@ fn parse_pr_spec(spec: &str) -> anyhow::Result<GithubPrTarget> {
         repo: repo.to_string(),
         number,
     })
+}
+
+/// Validate a stub label through the same `stub.<label>` grammar the daemon uses,
+/// so a bad label is caught early and identically. Returns the label unchanged on
+/// success (the daemon rebuilds the topic from it).
+fn parse_stub_label(label: &str) -> anyhow::Result<String> {
+    stub_topic(label).with_context(|| format!("invalid stub label {label:?}"))?;
+    Ok(label.to_string())
 }
 
 /// Run `wait` synchronously (no tokio runtime): open the read-only store and

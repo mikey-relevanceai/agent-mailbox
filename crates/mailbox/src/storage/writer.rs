@@ -28,6 +28,7 @@ use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Top
 use super::error::StorageError;
 use super::model::{
     Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
+    WatchTarget,
 };
 
 /// Default page size when a reader does not specify a limit. Bounds memory for
@@ -343,9 +344,9 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "upsert_watch", || {
                 format!(
                     "kind={} repo={} pr={}",
-                    spec.kind.as_str(),
-                    spec.repo,
-                    spec.pr
+                    spec.target.kind().as_str(),
+                    spec.target.repo_column(),
+                    spec.target.pr_column()
                 )
             });
             let _ = reply.send(result);
@@ -843,28 +844,36 @@ fn read_topic_unread(
 }
 
 fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, StorageError> {
-    // Idempotent by (kind, repo, pr): a second session watching the same PR
-    // reuses the row and its (possibly running) state. We only refresh the
-    // interval; lifecycle state is owned by SetWatchState, never reset here.
-    // Saturate rather than wrap on the (practically impossible) overflow of a
-    // poll interval or PR number that exceeds i64 — a wrapped negative would be
-    // silently wrong, whereas a clamp is at worst a harmless over-large value.
-    let interval_secs = i64::try_from(spec.interval.as_secs()).unwrap_or(i64::MAX);
-    let pr = i64::try_from(spec.pr).unwrap_or(i64::MAX);
+    // Idempotent by (kind, repo, pr): a second session watching the same entity
+    // reuses the row and its (possibly running) state. The interval and the
+    // (stub) publish count are non-identity fields refreshed on a re-watch;
+    // lifecycle state is owned by SetWatchState, never reset here. Saturate rather
+    // than wrap on the (practically impossible) overflow of an interval, PR
+    // number, or count that exceeds i64 — a wrapped negative would be silently
+    // wrong, whereas a clamp is at worst a harmless over-large value.
+    let interval_ms = i64::try_from(spec.interval.as_millis()).unwrap_or(i64::MAX);
+    let pr = i64::try_from(spec.target.pr_column()).unwrap_or(i64::MAX);
+    let count = i64::try_from(spec.target.count_column()).unwrap_or(i64::MAX);
     let id: i64 = conn.query_row(
-        "INSERT INTO watch (kind, repo, pr, interval_secs, state, child_pid)
-         VALUES (?1, ?2, ?3, ?4, 'desired', NULL)
+        "INSERT INTO watch (kind, repo, pr, interval_ms, publish_count, state, child_pid)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'desired', NULL)
          ON CONFLICT(kind, repo, pr)
-         DO UPDATE SET interval_secs = excluded.interval_secs
+         DO UPDATE SET interval_ms = excluded.interval_ms, publish_count = excluded.publish_count
          RETURNING id",
-        params![spec.kind.as_str(), spec.repo, pr, interval_secs],
+        params![
+            spec.target.kind().as_str(),
+            spec.target.repo_column(),
+            pr,
+            interval_ms,
+            count
+        ],
         |row| row.get(0),
     )?;
     info!(
         watch = id,
-        kind = spec.kind.as_str(),
-        repo = %spec.repo,
-        pr = spec.pr,
+        kind = spec.target.kind().as_str(),
+        repo = %spec.target.repo_column(),
+        pr = spec.target.pr_column(),
         "upserted watch (created or reused existing entity)"
     );
     Ok(WatchId::new(id))
@@ -894,21 +903,23 @@ fn do_set_watch_state(
 fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, StorageError> {
     let row = conn
         .query_row(
-            "SELECT kind, repo, pr, interval_secs, state, child_pid FROM watch WHERE id = ?1",
+            "SELECT kind, repo, pr, interval_ms, state, child_pid, publish_count
+             FROM watch WHERE id = ?1",
             params![id.get()],
             |row| {
                 let kind: String = row.get(0)?;
                 let repo: String = row.get(1)?;
                 let pr: i64 = row.get(2)?;
-                let interval_secs: i64 = row.get(3)?;
+                let interval_ms: i64 = row.get(3)?;
                 let state: String = row.get(4)?;
                 let child_pid: Option<i64> = row.get(5)?;
-                Ok((kind, repo, pr, interval_secs, state, child_pid))
+                let count: i64 = row.get(6)?;
+                Ok((kind, repo, pr, interval_ms, state, child_pid, count))
             },
         )
         .optional()?;
 
-    let Some((kind, repo, pr, interval_secs, state, child_pid)) = row else {
+    let Some((kind, repo, pr, interval_ms, state, child_pid, count)) = row else {
         return Ok(None);
     };
 
@@ -917,9 +928,10 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
         kind,
         repo,
         pr,
-        interval_secs,
+        interval_ms,
         &state,
         child_pid,
+        count,
     )?))
 }
 
@@ -929,30 +941,33 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
 /// [`do_get_watch`] apply to every listed row.
 fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, repo, pr, interval_secs, state, child_pid FROM watch ORDER BY id ASC",
+        "SELECT id, kind, repo, pr, interval_ms, state, child_pid, publish_count
+         FROM watch ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
         let id: i64 = row.get(0)?;
         let kind: String = row.get(1)?;
         let repo: String = row.get(2)?;
         let pr: i64 = row.get(3)?;
-        let interval_secs: i64 = row.get(4)?;
+        let interval_ms: i64 = row.get(4)?;
         let state: String = row.get(5)?;
         let child_pid: Option<i64> = row.get(6)?;
-        Ok((id, kind, repo, pr, interval_secs, state, child_pid))
+        let count: i64 = row.get(7)?;
+        Ok((id, kind, repo, pr, interval_ms, state, child_pid, count))
     })?;
 
     let mut watches = Vec::new();
     for row in rows {
-        let (id, kind, repo, pr, interval_secs, state, child_pid) = row?;
+        let (id, kind, repo, pr, interval_ms, state, child_pid, count) = row?;
         watches.push(build_watch(
             WatchId::new(id),
             kind,
             repo,
             pr,
-            interval_secs,
+            interval_ms,
             &state,
             child_pid,
+            count,
         )?);
     }
     Ok(watches)
@@ -961,34 +976,62 @@ fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
 /// Reconstruct a [`Watch`] read model from its stored columns, rejecting any
 /// value this store could not legitimately have written as [`StorageError::Corrupt`].
 /// Shared by [`do_get_watch`] and [`do_list_watches`] so the guards stay in one place.
+#[allow(clippy::too_many_arguments)]
 fn build_watch(
     id: WatchId,
     kind: String,
     repo: String,
     pr: i64,
-    interval_secs: i64,
+    interval_ms: i64,
     state: &str,
     child_pid: Option<i64>,
+    count: i64,
 ) -> Result<Watch, StorageError> {
     let kind = WatchKind::parse(&kind).ok_or_else(|| StorageError::Corrupt {
         detail: format!("unknown watch kind {kind:?} for watch {}", id.get()),
     })?;
-    // These columns can only hold values this store wrote, so a negative pr or
-    // interval is corrupt data, not a value to silently wrap.
+    // These columns can only hold values this store wrote, so a negative pr,
+    // interval, or count is corrupt data, not a value to silently wrap.
     let pr = u64::try_from(pr).map_err(|_| StorageError::Corrupt {
         detail: format!("negative pr {pr} for watch {}", id.get()),
     })?;
-    let interval_secs = u64::try_from(interval_secs).map_err(|_| StorageError::Corrupt {
-        detail: format!("negative interval {interval_secs} for watch {}", id.get()),
+    let interval_ms = u64::try_from(interval_ms).map_err(|_| StorageError::Corrupt {
+        detail: format!("negative interval {interval_ms} for watch {}", id.get()),
     })?;
+    let count = u64::try_from(count).map_err(|_| StorageError::Corrupt {
+        detail: format!("negative publish count {count} for watch {}", id.get()),
+    })?;
+    // Parse the flat columns into the sum type here, at the corruption-checking
+    // boundary, so "a github watch with a publish count" or "a stub watch with a
+    // PR number" are rejected as corrupt and unrepresentable downstream. Only
+    // this store writes these rows, and it always writes the unused column as 0.
+    let target = match kind {
+        WatchKind::GithubPr => {
+            if count != 0 {
+                return Err(StorageError::Corrupt {
+                    detail: format!(
+                        "github-pr watch {} carries a non-zero publish count {count}",
+                        id.get()
+                    ),
+                });
+            }
+            WatchTarget::GithubPr { repo, pr }
+        }
+        WatchKind::Stub => {
+            if pr != 0 {
+                return Err(StorageError::Corrupt {
+                    detail: format!("stub watch {} carries a non-zero pr {pr}", id.get()),
+                });
+            }
+            WatchTarget::Stub { label: repo, count }
+        }
+    };
     let state = reconstruct_state(state, child_pid, id)?;
 
     Ok(Watch {
         id,
-        kind,
-        repo,
-        pr,
-        interval: std::time::Duration::from_secs(interval_secs),
+        target,
+        interval: std::time::Duration::from_millis(interval_ms),
         state,
     })
 }
@@ -1283,8 +1326,8 @@ mod tests {
         let conn = migrated();
         // Insert a row with a kind string the enum does not know.
         conn.execute(
-            "INSERT INTO watch (id, kind, repo, pr, interval_secs, state, child_pid)
-             VALUES (1, 'bogus-kind', 'o/r', 1, 60, 'desired', NULL)",
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'bogus-kind', 'o/r', 1, 60000, 0, 'desired', NULL)",
             [],
         )
         .unwrap();
@@ -1293,11 +1336,55 @@ mod tests {
     }
 
     #[test]
+    fn stub_watch_round_trips_subsecond_interval_and_count() {
+        let conn = migrated();
+        // A sub-second interval must survive (the whole reason interval is stored
+        // in ms), and the publish count round-trips on the shared row.
+        let id = do_upsert_watch(
+            &conn,
+            &WatchSpec {
+                target: WatchTarget::Stub {
+                    label: "demo".to_string(),
+                    count: 5,
+                },
+                interval: std::time::Duration::from_millis(200),
+            },
+        )
+        .unwrap();
+        let watch = do_get_watch(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            watch.target,
+            WatchTarget::Stub {
+                label: "demo".to_string(),
+                count: 5
+            }
+        );
+        assert_eq!(watch.interval, std::time::Duration::from_millis(200));
+
+        // Re-watching the same label updates interval/count in place (one entity).
+        let again = do_upsert_watch(
+            &conn,
+            &WatchSpec {
+                target: WatchTarget::Stub {
+                    label: "demo".to_string(),
+                    count: 0,
+                },
+                interval: std::time::Duration::from_millis(750),
+            },
+        )
+        .unwrap();
+        assert_eq!(again, id, "same (kind, repo, pr) reuses the row");
+        let watch = do_get_watch(&conn, id).unwrap().unwrap();
+        assert_eq!(watch.interval, std::time::Duration::from_millis(750));
+        assert_eq!(watch.target.count_column(), 0);
+    }
+
+    #[test]
     fn get_watch_rejects_negative_pr() {
         let conn = migrated();
         conn.execute(
-            "INSERT INTO watch (id, kind, repo, pr, interval_secs, state, child_pid)
-             VALUES (1, 'github-pr', 'o/r', -5, 60, 'desired', NULL)",
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'github-pr', 'o/r', -5, 60000, 0, 'desired', NULL)",
             [],
         )
         .unwrap();

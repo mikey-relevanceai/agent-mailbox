@@ -67,8 +67,9 @@ use tracing::{info, warn};
 use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
+use mailbox::resolver::StubResolver;
 use mailbox::storage::{SessionId, Storage, StorageConfig};
-use mailbox::supervisor::{RestartPolicy, Supervisor, UnavailableResolver, reconcile_startup};
+use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
 use crate::control::{GithubPrTarget, Request, Response, StatusReport, decode_frame, encode_frame};
@@ -162,14 +163,14 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    (design/01 rule 6). A live session must re-`watch` to restart a poller.
     reconcile_startup(&storage).await?;
 
-    // 5. Build the watch supervisor. Card 08 ships no real adapter, so the
-    //    resolver reports "unavailable" for every kind — `watch` records intent
-    //    and the poller stays unspawned until card 10 plugs in the real
-    //    `github-pr` adapter here. The supervision machinery itself is fully live.
+    // 5. Build the watch supervisor with the stub resolver (card 09): a `stub`
+    //    watch spawns the reference adapter, while `github-pr` still resolves to
+    //    "no adapter" and stays `Desired` until card 10 plugs in the real poller.
+    //    The supervision machinery itself is fully live for both.
     let supervisor = Supervisor::spawn(
         storage.clone(),
         bus.clone(),
-        Arc::new(UnavailableResolver),
+        Arc::new(StubResolver),
         RestartPolicy::default(),
     );
 
@@ -453,6 +454,8 @@ fn request_op(request: &Request) -> &'static str {
         Request::Read { .. } => "read",
         Request::Watch { .. } => "watch",
         Request::Unwatch { .. } => "unwatch",
+        Request::WatchStub { .. } => "watch_stub",
+        Request::UnwatchStub { .. } => "unwatch_stub",
         Request::Status { .. } => "status",
     }
 }
@@ -467,6 +470,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::Read { session, .. }
         | Request::Watch { session, .. }
         | Request::Unwatch { session, .. }
+        | Request::WatchStub { session, .. }
+        | Request::UnwatchStub { session, .. }
         | Request::Status { session } => Some(session),
     }
 }
@@ -515,6 +520,15 @@ async fn dispatch(
         } => watch(bus, storage, supervisor, session, target, interval_secs).await,
         Request::Unwatch { session, target } => {
             unwatch(bus, storage, supervisor, session, target).await
+        }
+        Request::WatchStub {
+            session,
+            label,
+            interval_ms,
+            count,
+        } => watch_stub(bus, storage, supervisor, session, label, interval_ms, count).await,
+        Request::UnwatchStub { session, label } => {
+            unwatch_stub(bus, storage, supervisor, session, label).await
         }
         Request::Status { session } => status(storage, session).await,
     }
@@ -614,6 +628,55 @@ async fn unwatch(
         Err(message) => return Response::error(message),
     };
     match mailbox::watch::drop_interest(bus, storage, supervisor, &pr, session).await {
+        Ok(dropped) => Response::Unwatched {
+            topic: dropped.topic,
+            outcome: dropped.outcome.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::record_stub`] (the stub twin of
+/// [`watch`]). The daemon stamps the interval in milliseconds into a `Duration`.
+#[allow(clippy::too_many_arguments)]
+async fn watch_stub(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    label: String,
+    interval_ms: u64,
+    count: u64,
+) -> Response {
+    match mailbox::watch::record_stub(
+        bus,
+        storage,
+        supervisor,
+        &label,
+        Duration::from_millis(interval_ms),
+        count,
+        session,
+    )
+    .await
+    {
+        Ok(recorded) => Response::Watched {
+            topic: recorded.topic,
+            interest: recorded.interest,
+            subscribe: recorded.subscribe.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::drop_interest_stub`].
+async fn unwatch_stub(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    label: String,
+) -> Response {
+    match mailbox::watch::drop_interest_stub(bus, storage, supervisor, &label, session).await {
         Ok(dropped) => Response::Unwatched {
             topic: dropped.topic,
             outcome: dropped.outcome.into(),

@@ -308,7 +308,7 @@ fn ac3_status_shows_watch_with_interest_count() {
     assert_eq!(w["kind"], "github-pr");
     assert_eq!(w["repo"], "octocat/hello-world");
     assert_eq!(w["pr"], 42);
-    assert_eq!(w["interval_secs"], 30);
+    assert_eq!(w["interval_ms"], 30_000);
     assert_eq!(w["interest"], 1, "one interested session");
     assert_eq!(w["state"], "desired");
     // The pid lives inside the running state; a desired watch has no pid key at

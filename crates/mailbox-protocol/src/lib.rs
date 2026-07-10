@@ -52,4 +52,4 @@ pub use message::{
     Ack, ErrorCode, Event, Message, ProtocolError, Publish, ReadRequest, ReadResponse, Subscribe,
     Unsubscribe,
 };
-pub use topic::{GithubPr, Topic};
+pub use topic::{GithubPr, Topic, stub_topic};

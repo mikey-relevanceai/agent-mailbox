@@ -7,6 +7,15 @@
 - Related: [01-wake-and-rearm](../01-wake-and-rearm.md), prior skill
   `agent-ipc` / `agent-ipc-github`
 
+> **Card 09 status note.** The `stub` watch kind + its resolver landed as the
+> **reference implementation** of this design: a trivial adapter (`stub.<label>`,
+> `mailbox-stub-adapter`) that publishes a synthetic edge on an interval, driving
+> the full supervised path (watch → interest → spawn → publish → wake → read) end
+> to end. It is distinct from the still-pending **`github-pr` poller** (card 10),
+> which will implement the actual GitHub polling / baseline / edge-detection
+> described below. `serve`'s resolver now spawns the stub for `stub` watches and
+> still returns "no adapter" for `github-pr` until that poller ships.
+
 ## Goal
 
 Replace the existing skill-based IPC loop for **GitHub PR watching**: wake idle

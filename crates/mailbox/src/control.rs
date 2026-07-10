@@ -79,6 +79,18 @@ pub enum Request {
         session: SessionId,
         target: GithubPrTarget,
     },
+    /// Declare `session`'s interest in a `stub` watch and subscribe it to the
+    /// `stub.<label>` topic. The stub carries its own params (interval in
+    /// milliseconds, publish count) rather than the github `interval_secs`, so it
+    /// is a distinct variant rather than an overloaded `Watch`.
+    WatchStub {
+        session: SessionId,
+        label: String,
+        interval_ms: u64,
+        count: u64,
+    },
+    /// Drop `session`'s interest in a `stub` watch and unsubscribe it.
+    UnwatchStub { session: SessionId, label: String },
     /// Report watches (interest + child pid) and this session's unread counts.
     Status { session: SessionId },
 }
@@ -222,12 +234,15 @@ impl StatusReport {
 pub enum WatchKindWire {
     #[serde(rename = "github-pr")]
     GithubPr,
+    #[serde(rename = "stub")]
+    Stub,
 }
 
 impl From<WatchKind> for WatchKindWire {
     fn from(kind: WatchKind) -> Self {
         match kind {
             WatchKind::GithubPr => WatchKindWire::GithubPr,
+            WatchKind::Stub => WatchKindWire::Stub,
         }
     }
 }
@@ -267,12 +282,14 @@ impl From<WatchState> for WatchStateWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchStatus {
     pub kind: WatchKindWire,
-    /// `owner/repo`.
+    /// The flat `repo` column: `owner/repo` for github, the label for stub.
     pub repo: String,
-    /// PR number.
+    /// The flat `pr` column: the PR number for github, `0` for stub.
     pub pr: u64,
-    /// Desired poll interval, seconds.
-    pub interval_secs: u64,
+    /// Desired poll interval, **milliseconds** — carried at millisecond precision
+    /// so a sub-second stub interval (`--interval-ms 200`) is not flattened to
+    /// `0s` in `status` (schema v3 widened storage to ms for exactly this reason).
+    pub interval_ms: u64,
     /// Interested sessions (the refcount that keeps a poller alive).
     pub interest: u64,
     /// Lifecycle state (+ child pid when running). Card 06 is always `desired`
@@ -283,11 +300,13 @@ pub struct WatchStatus {
 
 impl From<WatchEntry> for WatchStatus {
     fn from(entry: WatchEntry) -> Self {
+        // Project the sum-typed target back onto the flat wire fields (the wire
+        // mirrors the flat storage row): kind + repo/label + pr.
         WatchStatus {
-            kind: entry.kind.into(),
-            repo: entry.repo,
-            pr: entry.pr,
-            interval_secs: entry.interval.as_secs(),
+            kind: entry.target.kind().into(),
+            repo: entry.target.repo_column().to_string(),
+            pr: entry.target.pr_column(),
+            interval_ms: u64::try_from(entry.interval.as_millis()).unwrap_or(u64::MAX),
             interest: entry.interest,
             state: entry.state.into(),
         }
@@ -404,7 +423,7 @@ mod tests {
             kind: WatchKindWire::GithubPr,
             repo: "o/r".to_string(),
             pr: 1,
-            interval_secs: 30,
+            interval_ms: 30_000,
             interest: 1,
             state: WatchStateWire::Desired,
         };

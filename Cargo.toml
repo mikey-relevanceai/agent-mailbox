@@ -4,6 +4,7 @@ members = [
     "crates/mailbox",
     "crates/mailbox-protocol",
     "crates/mailbox-harness",
+    "adapters/stub-adapter",
 ]
 
 [workspace.package]

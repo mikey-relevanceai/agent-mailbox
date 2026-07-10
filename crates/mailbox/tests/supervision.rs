@@ -1,5 +1,11 @@
 //! Watch-supervision acceptance tests (card 08), driven against REAL child
-//! processes (the `test_adapter` fixture) through the real storage/bus/host.
+//! processes through the real storage/bus/host.
+//!
+//! ac-09-3: the happy-path ACs (a normal long-running adapter) now drive the
+//! REAL reference stub adapter (`mailbox-stub-adapter`) via
+//! [`StubResolverFixture`] — the stub is the canonical happy-path adapter. The
+//! `test_adapter` fixture is retained only for the edge cases the stub does not
+//! model: repeated crash, ignore-SIGTERM, and never-spawns (nonexistent) paths.
 //!
 //! Proves the core product guarantee — one bridge-owned adapter per external
 //! entity, alive exactly while some session cares — end to end:
@@ -48,15 +54,6 @@ struct FixtureResolver {
 }
 
 impl FixtureResolver {
-    fn interval(period_ms: u64) -> Self {
-        Self {
-            program: fixture_program(),
-            mode: "interval",
-            extra: json!({ "interval_ms": period_ms }),
-            args: Vec::new(),
-        }
-    }
-
     fn crash() -> Self {
         Self {
             program: fixture_program(),
@@ -86,8 +83,9 @@ impl FixtureResolver {
 
 impl AdapterResolver for FixtureResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
-        let topic = topic_for_watch(watch)
-            .ok_or_else(|| ResolveError::Invalid(format!("bad repo {:?}", watch.repo)))?;
+        let topic = topic_for_watch(watch).ok_or_else(|| {
+            ResolveError::Invalid(format!("bad repo {:?}", watch.target.repo_column()))
+        })?;
         let mut config = json!({ "mode": self.mode, "topic": topic.as_str() });
         if let (Some(obj), Some(extra)) = (config.as_object_mut(), self.extra.as_object()) {
             for (k, v) in extra {
@@ -146,18 +144,94 @@ async fn fresh_storage() -> (Storage, TempDir) {
     (storage, dir)
 }
 
-async fn fresh(resolver: FixtureResolver) -> (Bus, Storage, Supervisor, TempDir) {
+async fn fresh<R: AdapterResolver>(resolver: R) -> (Bus, Storage, Supervisor, TempDir) {
     fresh_with(resolver, fast_policy()).await
 }
 
-async fn fresh_with(
-    resolver: FixtureResolver,
+async fn fresh_with<R: AdapterResolver>(
+    resolver: R,
     policy: RestartPolicy,
 ) -> (Bus, Storage, Supervisor, TempDir) {
     let (storage, dir) = fresh_storage().await;
     let bus = Bus::new(storage.clone());
-    let supervisor = Supervisor::spawn(storage.clone(), bus.clone(), Arc::new(resolver), policy);
+    let supervisor = Supervisor::spawn(
+        storage.clone(),
+        bus.clone(),
+        Arc::new(resolver) as Arc<dyn AdapterResolver>,
+        policy,
+    );
     (bus, storage, supervisor, dir)
+}
+
+/// The reference stub adapter binary (`mailbox-stub-adapter`), built if missing.
+///
+/// ac-09-3: the happy-path supervision ACs drive the REAL stub adapter (not the
+/// ad-hoc `test_adapter` fixture), locating it beside the `test_adapter` bin in
+/// the shared target dir. `cargo test --workspace` builds it during the build
+/// phase; the on-demand build is a fallback for `cargo test -p mailbox` alone.
+fn stub_program() -> String {
+    let dir = std::path::Path::new(env!("CARGO_BIN_EXE_test_adapter"))
+        .parent()
+        .expect("test_adapter bin has a parent dir")
+        .to_path_buf();
+    let bin = dir.join("mailbox-stub-adapter");
+    if !bin.exists() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = std::process::Command::new(cargo)
+            .args(["build", "-p", "mailbox-stub-adapter"])
+            .status()
+            .expect("build mailbox-stub-adapter");
+        assert!(status.success(), "failed to build mailbox-stub-adapter");
+    }
+    bin.to_str().expect("stub bin path is utf8").to_string()
+}
+
+/// A resolver that runs the REAL reference stub adapter, publishing to each
+/// watch's own topic every `interval_ms` forever. This is the canonical
+/// happy-path long-running adapter (ac-09-3) — a drop-in for the old
+/// `FixtureResolver::interval`, but exercising the shipped binary.
+struct StubResolverFixture {
+    program: String,
+    interval_ms: u64,
+    count: u64,
+}
+
+impl StubResolverFixture {
+    /// Publish forever every `period_ms` (the supervised steady-stream case).
+    fn interval(period_ms: u64) -> Self {
+        Self {
+            program: stub_program(),
+            interval_ms: period_ms,
+            count: 0,
+        }
+    }
+
+    /// Publish exactly `count` events then exit cleanly (a FINITE adapter). Used
+    /// to prove a clean exit-0 is terminal, not a crash-restart.
+    fn finite(period_ms: u64, count: u64) -> Self {
+        Self {
+            program: stub_program(),
+            interval_ms: period_ms,
+            count,
+        }
+    }
+}
+
+impl AdapterResolver for StubResolverFixture {
+    fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
+        let topic = topic_for_watch(watch).ok_or_else(|| {
+            ResolveError::Invalid(format!("bad repo {:?}", watch.target.repo_column()))
+        })?;
+        let config = json!({
+            "topic": topic.as_str(),
+            "interval_ms": self.interval_ms,
+            "count": self.count,
+        });
+        Ok(ResolvedAdapter {
+            spec: AdapterSpec::new(self.program.clone(), AdapterId("stub-fixture".to_string())),
+            config: AdapterConfig::new(config),
+        })
+    }
 }
 
 fn pr(n: u64) -> GithubPr {
@@ -219,7 +293,7 @@ async fn assert_pid_reaped(pid: u32) {
 /// Two sessions watch the same PR → ONE child process; both receive events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac1_two_sessions_one_child_both_receive_events() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(1);
     let topic = watched.topic();
 
@@ -288,7 +362,7 @@ async fn ac1_two_sessions_one_child_both_receive_events() {
 /// Then the last session leaves → child gone; zero further activity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac2_ac3_child_survives_first_leaver_then_dies_with_last() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(2);
     let topic = watched.topic();
     let s1 = SessionId::new("s1");
@@ -381,7 +455,7 @@ async fn ac2_ac3_child_survives_first_leaver_then_dies_with_last() {
 /// live pid); after the last interest is dropped it stays stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac4_crash_with_interest_restarts_once() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(3);
     let s1 = SessionId::new("s1");
 
@@ -496,6 +570,71 @@ async fn ac4_repeated_crash_gives_up_and_publishes_error() {
     supervisor.shutdown().await.unwrap();
 }
 
+// ---- clean exit-0 is terminal, NOT a crash-restart (card-09 review, item A) ----
+
+/// A supervised FINITE adapter (`stub --count N`) that publishes its batch and
+/// exits 0 while interest is still held is DONE, not crashed: the batch is
+/// published EXACTLY ONCE, the watch ends `Stopped` (never `Failed`), and no
+/// `adapter_gave_up` event is surfaced. Paired with `ac4_crash_with_interest_
+/// restarts_once` (a crash — signal death — DOES restart), this pins the
+/// clean-exit-vs-crash distinction so it cannot silently regress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clean_finite_exit_is_terminal_not_restarted() {
+    const COUNT: u64 = 3;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::finite(15, COUNT)).await;
+    let watched = pr(11);
+    let topic = watched.topic();
+    let s1 = SessionId::new("s1");
+
+    // Interest is HELD for the whole test (never dropped), so a naive supervisor
+    // would treat the clean exit as a crash and restart.
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1,
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+
+    // The finite adapter publishes its batch then exits 0 → the watch becomes
+    // Stopped (terminal), NOT restarted, even though interest remains.
+    poll_until("finite adapter completed and marked stopped", || {
+        let storage = storage.clone();
+        async move { (watch_state(&storage, watch_id).await == WatchState::Stopped).then_some(()) }
+    })
+    .await;
+
+    // Exactly one batch: the durable log holds precisely COUNT events (no
+    // republish loop), and it stays there.
+    assert_eq!(durable_count(&storage, &topic).await, COUNT as usize);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        durable_count(&storage, &topic).await,
+        COUNT as usize,
+        "a completed finite adapter must not be restarted and republish its batch"
+    );
+
+    // It must NOT have been marked Failed, and no give-up event was surfaced.
+    assert_eq!(watch_state(&storage, watch_id).await, WatchState::Stopped);
+    let events = storage
+        .read_events(topic.clone(), Cursor::Oldest, None)
+        .await
+        .unwrap()
+        .events;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.body.get("event").and_then(|v| v.as_str()) == Some("adapter_gave_up")),
+        "a healthy finite adapter must not produce a give-up event; got {events:?}"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
 // ---- AC5: bridge restart, no resume -------------------------------------------
 
 /// On bridge restart a previously-running watch is NOT resumed: reconcile marks
@@ -508,9 +647,10 @@ async fn ac5_bridge_restart_does_not_resume_watch() {
     // Simulate the pre-restart state: a running watch with a surviving interest.
     let watch_id = storage
         .upsert_watch(mailbox::storage::WatchSpec {
-            kind: mailbox::storage::WatchKind::GithubPr,
-            repo: "octocat/hello-world".to_string(),
-            pr: 5,
+            target: mailbox::storage::WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 5,
+            },
             interval: Duration::from_secs(60),
         })
         .await
@@ -557,9 +697,10 @@ async fn reconcile_startup_only_touches_running_watches() {
     let (storage, _dir) = fresh_storage().await;
 
     let mk = |n: u64| mailbox::storage::WatchSpec {
-        kind: mailbox::storage::WatchKind::GithubPr,
-        repo: "octocat/hello-world".to_string(),
-        pr: n,
+        target: mailbox::storage::WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: n,
+        },
         interval: Duration::from_secs(60),
     };
     let desired = storage.upsert_watch(mk(1)).await.unwrap();
@@ -614,7 +755,7 @@ fn raw_child_pid(db_dir: &std::path::Path, watch_id: WatchId) -> Option<i64> {
 /// A fresh interest is not swept; a stale one is, and its adapter is stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(6);
     let s1 = SessionId::new("s1");
 
@@ -782,7 +923,7 @@ async fn repeated_start_failures_give_up() {
 /// lifecycle: spawn, stop, and the crash-backoff window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_pid_none_implies_state_not_running() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(9);
     let s1 = SessionId::new("s1");
 

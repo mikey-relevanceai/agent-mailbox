@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use mailbox::storage::{
-    SessionId, Storage, StorageConfig, StorageError, WatchKind, WatchSpec, WatchState,
+    SessionId, Storage, StorageConfig, StorageError, WatchSpec, WatchState, WatchTarget,
 };
 use mailbox_protocol::{AdapterId, Cursor, GithubPr, Offset, Timestamp, Topic};
 use serde_json::json;
@@ -340,9 +340,10 @@ async fn read_after_cursor_returns_only_newer_events() {
 
 fn watch_spec(pr: u64) -> WatchSpec {
     WatchSpec {
-        kind: WatchKind::GithubPr,
-        repo: "octocat/hello-world".to_string(),
-        pr,
+        target: WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr,
+        },
         interval: Duration::from_secs(60),
     }
 }
@@ -370,8 +371,13 @@ async fn watch_upsert_is_idempotent_by_entity() {
     assert_eq!(id1, id2);
 
     let watch = storage.get_watch(id1).await.unwrap().unwrap();
-    assert_eq!(watch.pr, 42);
-    assert_eq!(watch.kind, WatchKind::GithubPr);
+    assert_eq!(
+        watch.target,
+        WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: 42
+        }
+    );
     assert_eq!(
         watch.state,
         WatchState::Running {
@@ -648,15 +654,17 @@ async fn list_watches_enumerates_all_watches() {
     assert!(storage.list_watches().await.unwrap().is_empty());
 
     let spec1 = WatchSpec {
-        kind: WatchKind::GithubPr,
-        repo: "octocat/hello-world".to_string(),
-        pr: 1,
+        target: WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: 1,
+        },
         interval: Duration::from_secs(30),
     };
     let spec2 = WatchSpec {
-        kind: WatchKind::GithubPr,
-        repo: "octocat/hello-world".to_string(),
-        pr: 2,
+        target: WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: 2,
+        },
         interval: Duration::from_secs(60),
     };
     storage.upsert_watch(spec1).await.unwrap();
@@ -666,7 +674,7 @@ async fn list_watches_enumerates_all_watches() {
     assert_eq!(watches.len(), 2);
     // A fresh watch is Desired with no child pid (card 06 never runs one).
     assert!(watches.iter().all(|w| w.state == WatchState::Desired));
-    let prs: Vec<u64> = watches.iter().map(|w| w.pr).collect();
+    let prs: Vec<u64> = watches.iter().map(|w| w.target.pr_column()).collect();
     assert_eq!(prs, vec![1, 2], "stable id order");
 }
 
@@ -820,7 +828,17 @@ async fn populated_v1_db_migrates_to_v2() {
     // The watch and its interest survived the migration.
     let watches = storage.list_watches().await.unwrap();
     assert_eq!(watches.len(), 1);
-    assert_eq!(watches[0].pr, 42);
+    // v3 renamed interval_secs -> interval_ms and backfilled *1000, so the 60s
+    // pre-upgrade github interval is unchanged; the new publish_count defaults to
+    // 0 (a github target carries no count).
+    assert_eq!(
+        watches[0].target,
+        WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: 42
+        }
+    );
+    assert_eq!(watches[0].interval, Duration::from_secs(60));
     let watch = watches[0].id;
     assert_eq!(storage.interest_count(watch).await.unwrap(), 1);
 
@@ -829,4 +847,75 @@ async fn populated_v1_db_migrates_to_v2() {
     let emptied = storage.sweep_stale_interests(1).await.unwrap();
     assert_eq!(emptied, vec![watch]);
     assert_eq!(storage.interest_count(watch).await.unwrap(), 0);
+}
+
+/// A populated **v2** database migrates to v3 (the realistic upgrade — v2 was the
+/// pre-card-09 schema): the `interval_secs` column is renamed to `interval_ms`
+/// and backfilled `*1000`, `publish_count` is added defaulting to 0, existing
+/// rows survive, and re-opening (already v3) is a clean no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn populated_v2_db_migrates_to_v3() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mailbox.db");
+
+    // Build a real v2 DB by hand: the v2 watch DDL (interval_secs, no
+    // publish_count), watch_interest WITH last_seen, user_version=2, and a
+    // populated github watch row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE watch (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind          TEXT    NOT NULL,
+                repo          TEXT    NOT NULL,
+                pr            INTEGER NOT NULL,
+                interval_secs INTEGER NOT NULL,
+                state         TEXT    NOT NULL,
+                child_pid     INTEGER,
+                UNIQUE(kind, repo, pr)
+            );
+            CREATE TABLE watch_interest (
+                watch_id   INTEGER NOT NULL REFERENCES watch(id) ON DELETE CASCADE,
+                session_id TEXT    NOT NULL,
+                last_seen  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (watch_id, session_id)
+            );
+            INSERT INTO watch (id, kind, repo, pr, interval_secs, state, child_pid)
+                VALUES (1, 'github-pr', 'octocat/hello-world', 42, 90, 'desired', NULL);
+            INSERT INTO watch_interest (watch_id, session_id, last_seen) VALUES (1, 's1', 5000);
+            PRAGMA user_version = 2;
+            "#,
+        )
+        .unwrap();
+    }
+
+    // Open through the real Storage: this runs the v2->v3 migration.
+    let storage = Storage::open(StorageConfig::at(&path)).await.unwrap();
+
+    let watches = storage.list_watches().await.unwrap();
+    assert_eq!(watches.len(), 1);
+    assert_eq!(
+        watches[0].target,
+        WatchTarget::GithubPr {
+            repo: "octocat/hello-world".to_string(),
+            pr: 42
+        }
+    );
+    // interval_secs 90 -> interval_ms 90000 (unchanged 90s), publish_count -> 0.
+    assert_eq!(watches[0].interval, Duration::from_secs(90));
+    assert_eq!(storage.interest_count(watches[0].id).await.unwrap(), 1);
+    // The interest's last_seen survived (a positive cutoff below it does not sweep).
+    let emptied = storage.sweep_stale_interests(1000).await.unwrap();
+    assert!(
+        emptied.is_empty(),
+        "last_seen=5000 is newer than cutoff 1000"
+    );
+
+    // Re-opening an already-v3 DB is a clean no-op (idempotent migration).
+    drop(storage);
+    let storage = Storage::open(StorageConfig::at(&path)).await.unwrap();
+    let watches = storage.list_watches().await.unwrap();
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].interval, Duration::from_secs(90));
 }

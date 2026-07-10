@@ -92,11 +92,16 @@ impl Pid {
 /// What kind of external entity a watch polls.
 ///
 /// A closed enum (not a free string) so adding a watch kind forces every match
-/// site to handle it. Only `github-pr` exists for the MVP.
+/// site to handle it. `github-pr` is the MVP product target; `stub` is the
+/// trivial reference adapter (card 09) that proves the whole path before any
+/// real poller exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WatchKind {
     /// A GitHub pull request poller (`github-pr`).
     GithubPr,
+    /// The reference stub publisher (`stub`), keyed by its `(kind, repo=label, pr=0)`
+    /// identity — a synthetic edge emitter for tests and experiments.
+    Stub,
 }
 
 impl WatchKind {
@@ -106,6 +111,7 @@ impl WatchKind {
     pub fn as_str(self) -> &'static str {
         match self {
             WatchKind::GithubPr => "github-pr",
+            WatchKind::Stub => "stub",
         }
     }
 
@@ -113,6 +119,7 @@ impl WatchKind {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "github-pr" => Some(WatchKind::GithubPr),
+            "stub" => Some(WatchKind::Stub),
             _ => None,
         }
     }
@@ -140,6 +147,58 @@ pub enum WatchState {
     Failed,
 }
 
+/// The entity a watch is *for*, as a sum type so each kind carries only the
+/// fields it actually uses.
+///
+/// The durable `watch` row is flat (`kind`, `repo`, `pr`, `publish_count`) — a
+/// legacy shape shared by both kinds. This domain type is the parsed form of
+/// that row, minted at the storage boundary ([`crate::storage`]'s `build_watch`)
+/// so nonsense states are unrepresentable downstream: a `github-pr` cannot carry
+/// a publish count, and a `stub` cannot carry a PR number. Everything above
+/// storage destructures the variant instead of re-deriving meaning from the flat
+/// `repo`/`pr` fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchTarget {
+    /// A GitHub pull request: `owner/repo` + PR number.
+    GithubPr { repo: String, pr: u64 },
+    /// A stub publisher: a label + how many events to publish (`0` = unbounded).
+    Stub { label: String, count: u64 },
+}
+
+impl WatchTarget {
+    /// The discriminant persisted in the `watch.kind` column.
+    pub fn kind(&self) -> WatchKind {
+        match self {
+            WatchTarget::GithubPr { .. } => WatchKind::GithubPr,
+            WatchTarget::Stub { .. } => WatchKind::Stub,
+        }
+    }
+
+    /// The flat `repo` column: `owner/repo` for github, the label for stub.
+    pub fn repo_column(&self) -> &str {
+        match self {
+            WatchTarget::GithubPr { repo, .. } => repo,
+            WatchTarget::Stub { label, .. } => label,
+        }
+    }
+
+    /// The flat `pr` column: the PR number for github, `0` (unused) for stub.
+    pub fn pr_column(&self) -> u64 {
+        match self {
+            WatchTarget::GithubPr { pr, .. } => *pr,
+            WatchTarget::Stub { .. } => 0,
+        }
+    }
+
+    /// The flat `publish_count` column: `0` (unused) for github, the count for stub.
+    pub fn count_column(&self) -> u64 {
+        match self {
+            WatchTarget::GithubPr { .. } => 0,
+            WatchTarget::Stub { count, .. } => *count,
+        }
+    }
+}
+
 /// What to persist when creating or reusing a watch.
 ///
 /// The creation model: no `id` (the store assigns it) and no lifecycle state
@@ -148,12 +207,10 @@ pub enum WatchState {
 /// into an insert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchSpec {
-    pub kind: WatchKind,
-    /// `owner/repo` string. Opaque to storage; the adapter/CLI validates it.
-    pub repo: String,
-    /// Pull-request number.
-    pub pr: u64,
-    /// Desired poll interval.
+    /// The entity this watch is for (kind + its per-kind fields).
+    pub target: WatchTarget,
+    /// Desired poll interval. Stored with millisecond precision so a sub-second
+    /// stub interval survives the round trip.
     pub interval: Duration,
 }
 
@@ -161,9 +218,8 @@ pub struct WatchSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watch {
     pub id: WatchId,
-    pub kind: WatchKind,
-    pub repo: String,
-    pub pr: u64,
+    /// The entity this watch is for (kind + its per-kind fields).
+    pub target: WatchTarget,
     pub interval: Duration,
     pub state: WatchState,
 }

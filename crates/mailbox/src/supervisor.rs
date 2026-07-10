@@ -57,13 +57,15 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 
-use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic, stub_topic};
 
 use crate::bus::Bus;
 use crate::clock::now_millis;
 use crate::host::subprocess::{AdapterSpec, SubprocessTransport};
 use crate::host::{AdapterConfig, AdapterExit, AdapterHost};
-use crate::storage::{Pid, Storage, StorageError, Watch, WatchId, WatchKind, WatchState};
+use crate::storage::{
+    Pid, Storage, StorageError, Watch, WatchId, WatchKind, WatchState, WatchTarget,
+};
 
 /// Capacity of the supervisor command channel. Commands are small; a modest
 /// buffer absorbs a burst of watch/unwatch ops plus monitor exit reports without
@@ -102,18 +104,21 @@ pub enum ResolveError {
     Invalid(String),
 }
 
-/// The `serve` resolver until a real adapter binary ships (cards 09/10).
+/// A resolver for which no kind has an adapter — every kind resolves to
+/// [`ResolveError::NoAdapter`], so `watch` records intent and the supervisor
+/// leaves the watch `Desired` without spawning anything.
 ///
-/// Every kind resolves to [`ResolveError::NoAdapter`], so `watch` records intent
-/// and the supervisor leaves the watch `Desired` without spawning anything —
-/// preserving the card-06 behaviour in production while the supervision machinery
-/// itself is fully real and tested with a fixture adapter. Card 10 replaces this
-/// with a resolver that points `github-pr` at the real poller.
+/// This was the `serve` default before card 09; `serve` now injects
+/// [`crate::resolver::StubResolver`] (which spawns the reference adapter for
+/// `stub` watches). `UnavailableResolver` is retained for the `watch` unit tests
+/// that exercise the record-intent-only path without spawning a child.
 pub struct UnavailableResolver;
 
 impl AdapterResolver for UnavailableResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
-        Err(ResolveError::NoAdapter { kind: watch.kind })
+        Err(ResolveError::NoAdapter {
+            kind: watch.target.kind(),
+        })
     }
 }
 
@@ -289,9 +294,9 @@ pub async fn reconcile_startup(storage: &Storage) -> Result<(), StorageError> {
         if let WatchState::Running { pid } = watch.state {
             warn!(
                 watch = watch.id.get(),
-                kind = watch.kind.as_str(),
-                repo = %watch.repo,
-                pr = watch.pr,
+                kind = watch.target.kind().as_str(),
+                repo = %watch.target.repo_column(),
+                pr = watch.target.pr_column(),
                 pid = pid.get(),
                 "did not resume previously-running watch on startup (no session-liveness probe); marking stopped"
             );
@@ -307,13 +312,12 @@ pub async fn reconcile_startup(storage: &Storage) -> Result<(), StorageError> {
 /// and by adapter resolvers building config. `None` if the stored repo is not a
 /// well-formed `owner/repo`.
 pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
-    match watch.kind {
-        WatchKind::GithubPr => {
-            let (owner, repo) = watch.repo.split_once('/')?;
-            GithubPr::new(owner, repo, watch.pr)
-                .ok()
-                .map(|pr| pr.topic())
+    match &watch.target {
+        WatchTarget::GithubPr { repo, pr } => {
+            let (owner, repo) = repo.split_once('/')?;
+            GithubPr::new(owner, repo, *pr).ok().map(|pr| pr.topic())
         }
+        WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
     }
 }
 
@@ -480,9 +484,9 @@ impl Actor {
                     .await?;
                 info!(
                     watch = watch_id.get(),
-                    kind = watch.kind.as_str(),
-                    repo = %watch.repo,
-                    pr = watch.pr,
+                    kind = watch.target.kind().as_str(),
+                    repo = %watch.target.repo_column(),
+                    pr = watch.target.pr_column(),
                     "not starting adapter (no remaining interest); marked stopped"
                 );
             }
@@ -493,7 +497,7 @@ impl Actor {
             Err(err) => {
                 info!(
                     watch = watch_id.get(),
-                    kind = watch.kind.as_str(),
+                    kind = watch.target.kind().as_str(),
                     reason = %err,
                     "did not start adapter; no program resolved for this watch kind"
                 );
@@ -506,9 +510,9 @@ impl Actor {
             Err(err) => {
                 warn!(
                     watch = watch_id.get(),
-                    kind = watch.kind.as_str(),
-                    repo = %watch.repo,
-                    pr = watch.pr,
+                    kind = watch.target.kind().as_str(),
+                    repo = %watch.target.repo_column(),
+                    pr = watch.target.pr_column(),
                     error = %err,
                     "adapter failed to start"
                 );
@@ -558,9 +562,9 @@ impl Actor {
                 pid,
                 generation,
                 spawned_at: Instant::now(),
-                kind: watch.kind,
-                repo: watch.repo.clone(),
-                pr: watch.pr,
+                kind: watch.target.kind(),
+                repo: watch.target.repo_column().to_string(),
+                pr: watch.target.pr_column(),
                 stop_tx,
                 monitor,
             },
@@ -570,9 +574,9 @@ impl Actor {
             .await?;
         info!(
             watch = watch_id.get(),
-            kind = watch.kind.as_str(),
-            repo = %watch.repo,
-            pr = watch.pr,
+            kind = watch.target.kind().as_str(),
+            repo = %watch.target.repo_column(),
+            pr = watch.target.pr_column(),
             pid,
             generation,
             "spawned adapter for entity (one per external entity)"
@@ -617,6 +621,30 @@ impl Actor {
                 pid,
                 ?exit,
                 "adapter exited with no remaining interest; marked stopped"
+            );
+            return Ok(());
+        }
+
+        // A clean exit 0 is a NATURAL COMPLETION, not a crash — a finite adapter
+        // (e.g. a `stub --count N`) that published its batch and returned. Even
+        // with interest still held, restarting it would republish the batch
+        // forever (or, for short runs, exhaust the budget and falsely mark a
+        // healthy adapter Failed with a bogus give-up event). So a clean exit is
+        // TERMINAL: mark the watch Stopped and do not restart. Only a crash — a
+        // non-zero code or a signal — takes the backoff-restart path below.
+        if matches!(exit, AdapterExit::Exited { code: 0 }) {
+            self.failures.remove(&watch_id);
+            self.storage
+                .set_watch_state(watch_id, WatchState::Stopped)
+                .await?;
+            info!(
+                watch = watch_id.get(),
+                kind = kind.as_str(),
+                repo = %repo,
+                pr,
+                pid,
+                interest,
+                "adapter completed cleanly (exit 0) with interest still held; marked stopped (no restart)"
             );
             return Ok(());
         }
@@ -728,9 +756,9 @@ impl Actor {
         let Some(topic) = topic_for_watch(&watch) else {
             error!(
                 watch = watch_id.get(),
-                kind = watch.kind.as_str(),
-                repo = %watch.repo,
-                pr = watch.pr,
+                kind = watch.target.kind().as_str(),
+                repo = %watch.target.repo_column(),
+                pr = watch.target.pr_column(),
                 "could not derive topic for give-up event; watch marked failed with NO event surfaced"
             );
             return;
@@ -738,8 +766,8 @@ impl Actor {
         let body = json!({
             "source": "mailbox-supervisor",
             "event": "adapter_gave_up",
-            "repo": watch.repo,
-            "pr": watch.pr,
+            "repo": watch.target.repo_column(),
+            "pr": watch.target.pr_column(),
             "consecutive_failures": failures,
         });
         match self

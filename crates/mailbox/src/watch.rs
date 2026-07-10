@@ -19,10 +19,11 @@
 //! [`Supervisor::ensure_running`], which (given a resolvable adapter) spawns the
 //! poller and marks the watch [`WatchState::Running`] with its child pid; and
 //! [`drop_interest`] calls [`Supervisor::stop_watch`] on the last removal so the
-//! adapter is torn down. In production the `serve` daemon injects an
-//! [`crate::supervisor::UnavailableResolver`] until the real poller ships (card
-//! 10), so a `github-pr` watch still sits `Desired` there — but the supervision
-//! wiring is real and the pid is populated as soon as an adapter resolves.
+//! adapter is torn down. In production the `serve` daemon injects the
+//! [`crate::resolver::StubResolver`] (card 09): a `stub` watch spawns the real
+//! reference adapter, while a `github-pr` watch still sits `Desired` until its
+//! poller ships (card 10) — the supervision wiring is real and the pid is
+//! populated as soon as an adapter resolves.
 //!
 //! Layering stays one-way: `watch` → `supervisor` → {`host`, `bus`, `storage`},
 //! plus `watch` → `bus`/`storage` directly for the watch/interest tables. It
@@ -31,19 +32,20 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{GithubPr, Topic};
+use mailbox_protocol::{GithubPr, Topic, TopicError, stub_topic};
 use tracing::info;
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
     SessionId, Storage, StorageError, SubscribeOutcome, WatchKind, WatchSpec, WatchState,
+    WatchTarget,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
 /// A failure recording or dropping a watch. A dedicated sum type so the CLI edge
-/// sees one error surface and the three causes — a durable storage step, a bus
-/// step, or driving the supervisor — stay distinguishable.
+/// sees one error surface and the causes — a durable storage step, a bus step,
+/// driving the supervisor, or an invalid stub label — stay distinguishable.
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
     #[error(transparent)]
@@ -52,6 +54,9 @@ pub enum WatchError {
     Bus(#[from] BusError),
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
+    /// The stub label did not form a valid `stub.<label>` topic.
+    #[error("invalid stub label: {0}")]
+    Topic(#[from] TopicError),
 }
 
 /// The outcome of recording a watch: the PR topic, this session's interest
@@ -96,9 +101,8 @@ pub struct StatusView {
 /// [`WatchState::Running`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchEntry {
-    pub kind: WatchKind,
-    pub repo: String,
-    pub pr: u64,
+    /// The entity this watch is for (kind + its per-kind fields).
+    pub target: WatchTarget,
     pub interval: Duration,
     pub state: WatchState,
     pub interest: u64,
@@ -120,14 +124,55 @@ pub async fn record(
     interval: Duration,
     session: SessionId,
 ) -> Result<WatchRecorded, WatchError> {
-    let topic = pr.topic();
     let spec = WatchSpec {
-        kind: WatchKind::GithubPr,
-        repo: repo_of(pr),
-        pr: pr.number(),
+        target: WatchTarget::GithubPr {
+            repo: repo_of(pr),
+            pr: pr.number(),
+        },
         interval,
     };
+    record_watch(bus, storage, supervisor, spec, pr.topic(), session).await
+}
 
+/// Record (or reuse) the `stub` watch labelled `label`, attach `session`'s
+/// interest, and subscribe it to the `stub.<label>` topic. The stub analogue of
+/// [`record`], keyed by `(kind=stub, label, pr=0)` so the same interest /
+/// supervision machinery runs the reference adapter. Fails with
+/// [`WatchError::Topic`] if `label` does not form a valid topic.
+pub async fn record_stub(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    label: &str,
+    interval: Duration,
+    count: u64,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    // Validate the label into its topic up front (parse, don't validate), so a
+    // bad label is rejected before any row is written.
+    let topic = stub_topic(label)?;
+    let spec = WatchSpec {
+        target: WatchTarget::Stub {
+            label: label.to_string(),
+            count,
+        },
+        interval,
+    };
+    record_watch(bus, storage, supervisor, spec, topic, session).await
+}
+
+/// Shared body of [`record`]/[`record_stub`]: upsert the watch, attach interest,
+/// align the subscription, and ask the supervisor to run the adapter. Kind-
+/// agnostic — it speaks only in the already-built [`WatchSpec`] and topic — so
+/// both watch kinds reuse one interest/subscription/supervision path.
+async fn record_watch(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    spec: WatchSpec,
+    topic: Topic,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
     let watch_id = storage.upsert_watch(spec).await?;
     // Stamp the interest's last-seen now so the TTL sweeper (card 08) has a fresh
     // liveness baseline; a re-watch refreshes it.
@@ -135,16 +180,14 @@ pub async fn record(
         .add_interest(watch_id, session.clone(), now_millis())
         .await?;
     info!(
-        repo = %repo_of(pr),
-        pr = pr.number(),
-        interest,
-        "attached session interest to watch"
+        topic = topic.as_str(),
+        interest, "attached session interest to watch"
     );
     let subscribe = subscribe_one(bus, session, &topic).await?;
 
     // Now that interest is attached, ask the supervisor to run the adapter. It is
     // idempotent (one adapter per entity), so a second session watching the same
-    // PR reuses the running poller rather than spawning another.
+    // entity reuses the running adapter rather than spawning another.
     supervisor.ensure_running(watch_id).await?;
 
     Ok(WatchRecorded {
@@ -169,21 +212,67 @@ pub async fn drop_interest(
     pr: &GithubPr,
     session: SessionId,
 ) -> Result<WatchDropped, WatchError> {
-    let topic = pr.topic();
-    let repo = repo_of(pr);
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::GithubPr,
+        &repo_of(pr),
+        pr.number(),
+        pr.topic(),
+        session,
+    )
+    .await
+}
 
-    let existing = storage
-        .list_watches()
-        .await?
-        .into_iter()
-        .find(|w| w.kind == WatchKind::GithubPr && w.repo == repo && w.pr == pr.number());
+/// Drop `session`'s interest in the `stub` watch labelled `label` and unsubscribe
+/// it from `stub.<label>`. The stub analogue of [`drop_interest`].
+pub async fn drop_interest_stub(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    label: &str,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    let topic = stub_topic(label)?;
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::Stub,
+        label,
+        0,
+        topic,
+        session,
+    )
+    .await
+}
+
+/// Shared body of [`drop_interest`]/[`drop_interest_stub`]: find the watch by its
+/// `(kind, repo, pr)` identity, remove interest (stopping the adapter on the last
+/// leaver), and unsubscribe the session regardless. Kind-agnostic so both watch
+/// kinds reuse one teardown path.
+#[allow(clippy::too_many_arguments)]
+async fn drop_interest_for(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    kind: WatchKind,
+    repo: &str,
+    pr: u64,
+    topic: Topic,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    let existing = storage.list_watches().await?.into_iter().find(|w| {
+        w.target.kind() == kind && w.target.repo_column() == repo && w.target.pr_column() == pr
+    });
 
     let outcome = match existing {
         Some(watch) => {
             let remaining_interest = storage.remove_interest(watch.id, session.clone()).await?;
             info!(
                 repo = %repo,
-                pr = pr.number(),
+                pr,
                 interest = remaining_interest,
                 "dropped session interest from watch"
             );
@@ -210,9 +299,7 @@ pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView,
     for watch in storage.list_watches().await? {
         let interest = storage.interest_count(watch.id).await?;
         watches.push(WatchEntry {
-            kind: watch.kind,
-            repo: watch.repo,
-            pr: watch.pr,
+            target: watch.target,
             interval: watch.interval,
             state: watch.state,
             interest,
@@ -376,9 +463,13 @@ mod tests {
         let view = status(&storage, SessionId::new("s1")).await.unwrap();
         assert_eq!(view.watches.len(), 1);
         let entry = &view.watches[0];
-        assert_eq!(entry.kind, WatchKind::GithubPr);
-        assert_eq!(entry.repo, "octocat/hello-world");
-        assert_eq!(entry.pr, 1);
+        assert_eq!(
+            entry.target,
+            WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 1
+            }
+        );
         assert_eq!(entry.interest, 1);
         assert_eq!(
             entry.state,
