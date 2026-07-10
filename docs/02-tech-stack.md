@@ -46,19 +46,31 @@ enough to test wake, cursors, and multi-subscriber fan-out.
 
 ### Abstraction boundary
 
-Transport is behind a trait (name TBD), e.g. conceptually:
+Transport is behind the `AdapterHost` trait (settled in card 07,
+`crates/mailbox/src/host/`):
 
 ```text
 AdapterHost
-  ├─ SubprocessTransport   ← v0
+  ├─ SubprocessTransport   ← v0 (implemented)
   └─ WasiTransport         ← later
 ```
 
 Everything above that boundary sees only:
 
 - start / stop adapter instance
-- deliver config
-- receive `Publish` (and later acks / health)
+- deliver config (an opaque JSON value the host never interprets)
+- receive `Publish` (forwarded onto the bus inside the transport; later: acks /
+  health — `AdapterHealth` already exists)
+
+The trait's error is an associated `type Error`, so no transport's internals
+(e.g. `nix` errno) leak across the boundary. It is deliberately **not**
+`dyn`-compatible (RPITIT futures + `self`-by-value); heterogeneous supervision
+(card 08) uses enum dispatch or generics, not `Box<dyn AdapterHost>`.
+
+`SubprocessTransport` spawns each adapter as its own **process-group leader** and
+signals the whole group (SIGTERM → grace → SIGKILL), so an adapter that spawns a
+grandchild (a helper, a `gh` poller) is torn down whole — no orphans, upholding
+the "no zombie pollers" invariant.
 
 Adapters never import bridge storage or wake logic. Swapping subprocess → WASI
 should not change topics, cursors, or harness integrators.
