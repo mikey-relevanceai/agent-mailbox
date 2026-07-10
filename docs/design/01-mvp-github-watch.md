@@ -149,8 +149,17 @@ No `ipc-arm.sh` step.
 
 ## Open questions
 
-- Exact CLI surface (`watch` vs `adapter start`).
-- How Claude session identity is named for interest rows (session_id from hooks).
+- ~~Exact CLI surface (`watch` vs `adapter start`).~~ **Settled (card 06,
+  [ADR-0004](../adr/0004-cli-serve-daemon-and-socket.md)):** `mailbox watch
+  github-pr <owner>/<repo>#<n> [--interval <secs>]` / `mailbox unwatch …`.
+  `watch` records the watch (`upsert_watch`) + this session's interest
+  (`add_interest`) and subscribes the session to the PR topic; `unwatch` reverses
+  it. **Adapter process supervision (spawning the poller, populating child pids,
+  refcount-driven start/stop) is card 08**, not card 06 — until then a watch sits
+  `Desired` with no child pid.
+- ~~How Claude session identity is named for interest rows.~~ **Settled (card
+  06):** the `SessionId` comes from `--session <id>`, falling back to the
+  `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).
 - Whether peer agent→agent messages are in the same MVP slice or immediately
   after GitHub watch.
 - How finely to model CI edges (whole-PR rollup vs per-check) for the first cut.

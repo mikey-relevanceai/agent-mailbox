@@ -146,6 +146,17 @@ pub(crate) enum Command {
         watch: WatchId,
         reply: oneshot::Sender<Result<u64, StorageError>>,
     },
+    /// Enumerate all watches (card-06 `status` / `unwatch`). A read routed through
+    /// the writer channel like every other op.
+    ListWatches {
+        reply: oneshot::Sender<Result<Vec<Watch>, StorageError>>,
+    },
+    /// Per-topic unread counts for a session (card-06 `status`). A non-advancing
+    /// read: it reports what a read *would* deliver without consuming it.
+    UnreadCounts {
+        session: SessionId,
+        reply: oneshot::Sender<Result<Vec<(Topic, u64)>, StorageError>>,
+    },
     GetBaseline {
         watch: WatchId,
         reply: oneshot::Sender<Result<Option<Value>, StorageError>>,
@@ -358,6 +369,18 @@ fn handle(conn: &mut Connection, cmd: Command) {
             let result = do_interest_count(conn, watch);
             log_on_err(&result, "interest_count", || {
                 format!("watch={}", watch.get())
+            });
+            let _ = reply.send(result);
+        }
+        Command::ListWatches { reply } => {
+            let result = do_list_watches(conn);
+            log_on_err(&result, "list_watches", String::new);
+            let _ = reply.send(result);
+        }
+        Command::UnreadCounts { session, reply } => {
+            let result = do_unread_counts(conn, &session);
+            log_on_err(&result, "unread_counts", || {
+                format!("session={}", session.as_str())
             });
             let _ = reply.send(result);
         }
@@ -851,6 +874,64 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
         return Ok(None);
     };
 
+    Ok(Some(build_watch(
+        id,
+        kind,
+        repo,
+        pr,
+        interval_secs,
+        &state,
+        child_pid,
+    )?))
+}
+
+/// Enumerate all watches in stable id order (card-06 `status` / `unwatch`).
+///
+/// Reuses [`build_watch`] so the same corrupt-row guards that protect
+/// [`do_get_watch`] apply to every listed row.
+fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, repo, pr, interval_secs, state, child_pid FROM watch ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let repo: String = row.get(2)?;
+        let pr: i64 = row.get(3)?;
+        let interval_secs: i64 = row.get(4)?;
+        let state: String = row.get(5)?;
+        let child_pid: Option<i64> = row.get(6)?;
+        Ok((id, kind, repo, pr, interval_secs, state, child_pid))
+    })?;
+
+    let mut watches = Vec::new();
+    for row in rows {
+        let (id, kind, repo, pr, interval_secs, state, child_pid) = row?;
+        watches.push(build_watch(
+            WatchId::new(id),
+            kind,
+            repo,
+            pr,
+            interval_secs,
+            &state,
+            child_pid,
+        )?);
+    }
+    Ok(watches)
+}
+
+/// Reconstruct a [`Watch`] read model from its stored columns, rejecting any
+/// value this store could not legitimately have written as [`StorageError::Corrupt`].
+/// Shared by [`do_get_watch`] and [`do_list_watches`] so the guards stay in one place.
+fn build_watch(
+    id: WatchId,
+    kind: String,
+    repo: String,
+    pr: i64,
+    interval_secs: i64,
+    state: &str,
+    child_pid: Option<i64>,
+) -> Result<Watch, StorageError> {
     let kind = WatchKind::parse(&kind).ok_or_else(|| StorageError::Corrupt {
         detail: format!("unknown watch kind {kind:?} for watch {}", id.get()),
     })?;
@@ -862,16 +943,58 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
     let interval_secs = u64::try_from(interval_secs).map_err(|_| StorageError::Corrupt {
         detail: format!("negative interval {interval_secs} for watch {}", id.get()),
     })?;
-    let state = reconstruct_state(&state, child_pid, id)?;
+    let state = reconstruct_state(state, child_pid, id)?;
 
-    Ok(Some(Watch {
+    Ok(Watch {
         id,
         kind,
         repo,
         pr,
         interval: std::time::Duration::from_secs(interval_secs),
         state,
-    }))
+    })
+}
+
+/// Per-topic count of a session's unread events (card-06 `status`).
+///
+/// Mirrors the unread predicate in `read_topic_unread` / `ReadOnlyStore` — an
+/// event is unread when its offset is strictly beyond the session's delivery
+/// cursor on that topic (cursor treated as `-1` when no row exists yet). Only
+/// topics with a positive count are returned, in ascending topic order for a
+/// deterministic status view. This is a pure read: no cursor is advanced.
+fn do_unread_counts(
+    conn: &Connection,
+    session: &SessionId,
+) -> Result<Vec<(Topic, u64)>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.topic, COUNT(e.offset)
+         FROM subscription s
+         JOIN event e ON e.topic = s.topic
+            AND e.offset > COALESCE(
+                (SELECT dc.offset FROM delivery_cursor dc
+                 WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
+                -1)
+         WHERE s.session_id = ?1
+         GROUP BY s.topic
+         ORDER BY s.topic ASC",
+    )?;
+    let rows = stmt.query_map(params![session.as_str()], |row| {
+        let topic: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((topic, count))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (topic_str, count) = row?;
+        // A subscription row can only hold a topic the bridge accepted, so a value
+        // that fails the grammar now is corrupt storage, not user input.
+        let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
+            detail: format!("invalid topic {topic_str:?} stored in subscription"),
+        })?;
+        out.push((topic, count.max(0) as u64));
+    }
+    Ok(out)
 }
 
 /// Rebuild the [`WatchState`] enum from its stored `(state, child_pid)` pair.

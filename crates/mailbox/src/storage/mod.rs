@@ -64,6 +64,17 @@ const DEFAULT_FILE: &str = "mailbox.db";
 /// `AGENT_MAILBOX_HOME`, or a test's explicit path) and can never drift from the
 /// database they signal about.
 const WAITERS_SUBDIR: &str = "waiters";
+/// File name (beside the database file) of the user-scoped Unix socket the
+/// `serve` daemon binds. Derived from the resolved DB path for the same reason as
+/// [`WAITERS_SUBDIR`]: the CLI clients and the daemon must agree on one path
+/// under every storage override, with no separate env to keep in sync (card 06,
+/// ADR-0004).
+const SOCKET_FILE: &str = "mailbox.sock";
+/// File name (beside the database file) of the daemon's exclusive lockfile. The
+/// `serve` daemon holds an advisory `flock` on this for its whole life BEFORE it
+/// opens the writer, so two `serve` processes on one DB cannot both become
+/// writers (the real cross-process single-writer guard — ADR-0003/0004).
+const LOCK_FILE: &str = "mailbox.lock";
 
 /// Capacity of the writer command channel.
 ///
@@ -124,6 +135,43 @@ impl StorageConfig {
         match self.path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.join(WAITERS_SUBDIR),
             _ => PathBuf::from(WAITERS_SUBDIR),
+        }
+    }
+
+    /// The user-scoped Unix socket the `serve` daemon binds and CLI clients
+    /// connect to (`<db-parent>/mailbox.sock`). Derived from the resolved DB path
+    /// exactly like [`waiters_dir`](Self::waiters_dir) so daemon and clients agree
+    /// on one location under every storage override without a separate env var
+    /// (card 06 / ADR-0004). Falls back to a bare relative name only if the DB
+    /// path has no parent, matching how [`Storage::open`] treats an empty parent.
+    pub fn socket_path(&self) -> PathBuf {
+        self.sibling(SOCKET_FILE)
+    }
+
+    /// The daemon's exclusive lockfile (`<db-parent>/mailbox.lock`). Derived from
+    /// the resolved DB path like the socket so the lock, the socket, and the
+    /// database always live together under any override (see [`LOCK_FILE`]).
+    pub fn lock_path(&self) -> PathBuf {
+        self.sibling(LOCK_FILE)
+    }
+
+    /// The directory that holds the database, socket, lockfile, and waiters. The
+    /// daemon creates it `0700` so every user-scoped resource beneath it is
+    /// owner-only from creation.
+    pub fn dir(&self) -> PathBuf {
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
+    /// A file beside the database. Falls back to a bare relative name only if the
+    /// DB path has no parent (a bare filename), matching how [`Storage::open`]
+    /// treats an empty parent.
+    fn sibling(&self, name: &str) -> PathBuf {
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => PathBuf::from(name),
         }
     }
 }
@@ -372,6 +420,34 @@ impl Storage {
     /// The number of sessions currently interested in `watch`.
     pub async fn interest_count(&self, watch: WatchId) -> Result<u64, StorageError> {
         self.call(|reply| Command::InterestCount { watch, reply })
+            .await
+    }
+
+    /// Every watch the bridge knows about, in stable id order.
+    ///
+    /// Added for the card-06 `status` command and `unwatch` resolution: the CLI
+    /// needs to enumerate watches (there is no other way to discover a watch id
+    /// from its `(kind, repo, pr)` identity). A read routed through the single
+    /// writer channel like [`sessions_subscribed`](Self::sessions_subscribed), so
+    /// it never opens a second connection (ADR-0003).
+    pub async fn list_watches(&self) -> Result<Vec<Watch>, StorageError> {
+        self.call(|reply| Command::ListWatches { reply }).await
+    }
+
+    /// Per-topic count of `session`'s currently unread events, for every
+    /// subscribed topic that has at least one, in ascending topic order.
+    ///
+    /// Added for the card-06 `status` command. "Unread" is exactly the bus
+    /// definition (offset strictly beyond the session's delivery cursor, cursor
+    /// treated as `-1` when absent) — the counting twin of
+    /// [`ReadOnlyStore::topics_with_unread`](crate::storage::ReadOnlyStore). It is
+    /// a pure `SELECT` and, unlike [`read_unread`](Self::read_unread), does **not**
+    /// advance any cursor — `status` observes without consuming.
+    pub async fn unread_counts(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<(Topic, u64)>, StorageError> {
+        self.call(|reply| Command::UnreadCounts { session, reply })
             .await
     }
 

@@ -10,6 +10,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0001](0001-rust-bridge-subprocess-adapters.md) | Rust bridge, subprocess adapters, local-only v0 | Accepted |
 | [0002](0002-mvp-crate-stack.md) | MVP crate stack (serde, tracing, clap, rusqlite bundled, …) | Accepted |
 | [0003](0003-single-writer-sqlite.md) | Single-writer SQLite; others queue via the bridge | Accepted |
+| [0004](0004-cli-serve-daemon-and-socket.md) | `serve` daemon + Unix-socket CLI clients (fail loud when down) | Accepted |
 
 ## When to write one
 

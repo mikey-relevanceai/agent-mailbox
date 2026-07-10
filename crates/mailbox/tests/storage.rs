@@ -627,3 +627,73 @@ fn ac3_real_crash_recovery_survives_sigkill() {
         );
     });
 }
+
+// ---- card-06 read additions: list_watches + unread_counts --------------------
+
+/// `list_watches` enumerates every watch (there is no other way to discover a
+/// watch id from its `(kind, repo, pr)` identity — the CLI `status`/`unwatch`
+/// path depends on this).
+#[tokio::test]
+async fn list_watches_enumerates_all_watches() {
+    let (storage, _dir) = fresh_store().await;
+    assert!(storage.list_watches().await.unwrap().is_empty());
+
+    let spec1 = WatchSpec {
+        kind: WatchKind::GithubPr,
+        repo: "octocat/hello-world".to_string(),
+        pr: 1,
+        interval: Duration::from_secs(30),
+    };
+    let spec2 = WatchSpec {
+        kind: WatchKind::GithubPr,
+        repo: "octocat/hello-world".to_string(),
+        pr: 2,
+        interval: Duration::from_secs(60),
+    };
+    storage.upsert_watch(spec1).await.unwrap();
+    storage.upsert_watch(spec2).await.unwrap();
+
+    let watches = storage.list_watches().await.unwrap();
+    assert_eq!(watches.len(), 2);
+    // A fresh watch is Desired with no child pid (card 06 never runs one).
+    assert!(watches.iter().all(|w| w.state == WatchState::Desired));
+    let prs: Vec<u64> = watches.iter().map(|w| w.pr).collect();
+    assert_eq!(prs, vec![1, 2], "stable id order");
+}
+
+/// `unread_counts` reports per-topic unread counts for a session without
+/// advancing any cursor (status observes, never consumes).
+#[tokio::test]
+async fn unread_counts_reports_per_topic_and_does_not_consume() {
+    let (storage, _dir) = fresh_store().await;
+    let bus = mailbox::bus::Bus::new(storage.clone());
+    let session = SessionId::new("s-status");
+    let t1 = pr_topic(1);
+    let t2 = pr_topic(2);
+    bus.subscribe(session.clone(), &[t1.clone(), t2.clone()])
+        .await
+        .unwrap();
+
+    // Two events on t1, one on t2 — all published after subscribe, so all unread.
+    bus.publish(t1.clone(), adapter(), Timestamp(0), json!({"i": 0}))
+        .await
+        .unwrap();
+    bus.publish(t1.clone(), adapter(), Timestamp(1), json!({"i": 1}))
+        .await
+        .unwrap();
+    bus.publish(t2.clone(), adapter(), Timestamp(2), json!({"i": 2}))
+        .await
+        .unwrap();
+
+    let counts = storage.unread_counts(session.clone()).await.unwrap();
+    assert_eq!(
+        counts,
+        vec![(t1.clone(), 2), (t2.clone(), 1)],
+        "per-topic unread counts, in topic order"
+    );
+
+    // Counting did NOT advance the cursor: a real read still returns all three.
+    assert_eq!(bus.read(session.clone(), None).await.unwrap().len(), 3);
+    // After reading, nothing is unread.
+    assert!(storage.unread_counts(session).await.unwrap().is_empty());
+}

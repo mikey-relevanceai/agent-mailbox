@@ -16,7 +16,7 @@ service.
 | Serde | `serde` + `serde_json` | Wire/protocol and NDJSON-friendly CLI I/O |
 | Async runtime | `tokio` | Waiters, process supervision, later local socket/HTTP |
 | Logging | `tracing` + `tracing-subscriber` | `EnvFilter`; structured later if needed |
-| CLI | `clap` (derive) | `mailbox` binary |
+| CLI | `clap` (features `derive`, `env`) | `mailbox` binary; `env` backs `--session`'s `MAILBOX_SESSION_ID` fallback (card 06) |
 | Library errors | `thiserror` | Typed errors in crates |
 | Binary edge errors | `anyhow` | `main` / CLI only |
 | SQLite | `rusqlite` with `features = ["bundled"]` | See [ADR-0003](0003-single-writer-sqlite.md) |

@@ -28,8 +28,9 @@ Full detail: [docs/03-working-agreements.md](docs/03-working-agreements.md).
 - **Adapters never import bridge internals.** They speak the protocol only (CLI / socket today; WASI later). Live under `adapters/`.
 - **Protocol vs transport.** Wire/domain types live in `mailbox-protocol`. How an adapter is hosted (`SubprocessTransport` now, `WasiTransport` later) is a replaceable host boundary — do not leak transport into protocol or storage.
 - **Payload-free wake.** Kicks carry no model-visible body; events are read from the durable log. Wake is ingress, not authority.
-- **Single-writer SQLite.** Only the bridge mutates the DB; others speak the protocol ([ADR-0003](docs/adr/0003-single-writer-sqlite.md)).
-- **Supervised adapters.** Long-running pollers are owned by the bridge (start/stop/idempotent); agents must not leave naked background `gh` loops ([design/01](docs/design/01-mvp-github-watch.md)).
+- **Single-writer SQLite.** Only the `mailbox serve` daemon mutates the DB; other commands are Unix-socket clients ([ADR-0003](docs/adr/0003-single-writer-sqlite.md), [ADR-0004](docs/adr/0004-cli-serve-daemon-and-socket.md)). The daemon holds an exclusive `flock` (`<db-dir>/mailbox.lock`) for its whole life, so a second `serve` on the same DB fails loudly rather than becoming a second writer. `wait` is the sole read-only exception.
+- **Bridge down fails loud.** Socket clients never auto-spawn the daemon and never open the DB directly; if `serve` is down they exit non-zero with "start it with `mailbox serve`" ([ADR-0004](docs/adr/0004-cli-serve-daemon-and-socket.md)).
+- **Supervised adapters.** Long-running pollers are owned by the bridge (start/stop/idempotent); agents must not leave naked background `gh` loops ([design/01](docs/design/01-mvp-github-watch.md)). Adapter *process* supervision is card 08; card 06 `watch` only records intent + interest.
 - **v0 network:** no TCP listen. CLI and/or user-scoped Unix socket only.
 - **Language:** Rust for the bridge. Do not introduce Go.
 
@@ -54,10 +55,33 @@ cargo fmt --all --check                                    # CI gate; drop --che
 cargo clippy --workspace --all-targets -- -D warnings      # CI gate
 cargo check --workspace                                    # CI gate
 cargo test --workspace                                     # CI gate
-cargo run -p mailbox
+cargo run -p mailbox -- --help                             # see the CLI surface
 ```
 
 Add crates with `cargo new` under `crates/` (or `adapters/` for adapter binaries) and register them in the workspace `Cargo.toml`. Add dependencies with `cargo add`, not by hand-editing version pins from memory.
+
+### `mailbox` CLI surface (settled in card 06 / [ADR-0004](docs/adr/0004-cli-serve-daemon-and-socket.md))
+
+The `mailbox` binary is the single entry point. `serve` is the daemon; every
+other command (except `wait`) is a one-shot Unix-socket client of it.
+
+| Command | What it does |
+|---|---|
+| `mailbox serve` | Long-lived daemon: owns the single writer + waker, binds `<db-dir>/mailbox.sock` (0600). |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event (daemon stamps the timestamp). |
+| `mailbox subscribe <topic> --session <id>` | Subscribe this session (baseline-on-subscribe). |
+| `mailbox unsubscribe <topic> --session <id>` | Unsubscribe this session. |
+| `mailbox read --session <id> [--limit <n>]` | Return unread events, advancing the cursor. |
+| `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>] --session <id>` | Record watch + this session's interest, and subscribe to the PR topic. Does **not** spawn the poller (card 08). |
+| `mailbox unwatch github-pr <owner>/<repo>#<n> --session <id>` | Drop this session's interest and unsubscribe. |
+| `mailbox status --session <id>` | Watches (interest counts, child pids — always none until card 08) + this session's unread counts. |
+| `mailbox wait --session <id>` | Block until this session has mail, exit 2 (the `asyncRewake` contract). Direct read-only client — never uses the socket. |
+
+Conventions: `--session <id>` wins over the `MAILBOX_SESSION_ID` env fallback
+(set by harness hooks, card 11). `--json` (global) makes any command emit
+machine-readable JSON on stdout; logs always go to stderr so JSON stays clean.
+When the daemon is down, socket clients fail loudly (non-zero, "start it with
+`mailbox serve`") rather than auto-spawning or opening the DB.
 
 ## Coding conventions
 

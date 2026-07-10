@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use mailbox_protocol::{Cursor, Event, Offset};
 
 /// Identity of a Claude/Codex session that expresses interest in a topic or
@@ -20,7 +22,14 @@ use mailbox_protocol::{Cursor, Event, Offset};
 /// The inner string is private and minted only through [`SessionId::new`] — the
 /// same "opaque, constructed at the edge" story as [`WatchId`] — so a call site
 /// cannot reach in and treat it as a bare `String`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `#[serde(transparent)]` so on the wire a session id is just its bare string —
+/// no envelope for a non-Rust peer to produce — while in Rust it stays branded
+/// (a `SessionId` cannot be passed where a `Topic` or bare `String` is meant).
+/// Deserialization goes straight through [`SessionId::new`]'s representation, so
+/// any string decoded off the socket is a valid session id (there is no
+/// additional grammar to violate — the harness owns the label).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SessionId(String);
 
 impl SessionId {
