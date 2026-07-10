@@ -12,22 +12,47 @@
 //! maintains, so it will call `record`/`drop_interest` here rather than
 //! re-deriving the logic.
 //!
-//! # card-06 ↔ card-08 boundary
+//! # card-06 ↔ card-08 boundary (now closed)
 //!
-//! This module records intent only. It does **not** spawn the `github-pr` poller
-//! subprocess or populate a child pid — a fresh watch stays [`WatchState::Desired`]
-//! with no child. Refcount-driven start/stop of the adapter is card 08.
+//! Card 06 recorded intent only. **Card 08** makes [`record`] drive the
+//! [`Supervisor`]: after attaching interest it calls
+//! [`Supervisor::ensure_running`], which (given a resolvable adapter) spawns the
+//! poller and marks the watch [`WatchState::Running`] with its child pid; and
+//! [`drop_interest`] calls [`Supervisor::stop_watch`] on the last removal so the
+//! adapter is torn down. In production the `serve` daemon injects an
+//! [`crate::supervisor::UnavailableResolver`] until the real poller ships (card
+//! 10), so a `github-pr` watch still sits `Desired` there — but the supervision
+//! wiring is real and the pid is populated as soon as an adapter resolves.
 //!
-//! Layering stays one-way: `watch` → `bus` → `storage` (and `watch` → `storage`
-//! directly for the watch/interest tables). It speaks in domain types
-//! ([`WatchEntry`], [`UnwatchOutcome`], …); the wire mapping lives in the binary.
+//! Layering stays one-way: `watch` → `supervisor` → {`host`, `bus`, `storage`},
+//! plus `watch` → `bus`/`storage` directly for the watch/interest tables. It
+//! speaks in domain types ([`WatchEntry`], [`UnwatchOutcome`], …); the wire
+//! mapping lives in the binary.
 
 use std::time::Duration;
 
 use mailbox_protocol::{GithubPr, Topic};
+use tracing::info;
 
 use crate::bus::{Bus, BusError};
-use crate::storage::{SessionId, Storage, SubscribeOutcome, WatchKind, WatchSpec, WatchState};
+use crate::clock::now_millis;
+use crate::storage::{
+    SessionId, Storage, StorageError, SubscribeOutcome, WatchKind, WatchSpec, WatchState,
+};
+use crate::supervisor::{Supervisor, SupervisorError};
+
+/// A failure recording or dropping a watch. A dedicated sum type so the CLI edge
+/// sees one error surface and the three causes — a durable storage step, a bus
+/// step, or driving the supervisor — stay distinguishable.
+#[derive(Debug, thiserror::Error)]
+pub enum WatchError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Bus(#[from] BusError),
+    #[error(transparent)]
+    Supervisor(#[from] SupervisorError),
+}
 
 /// The outcome of recording a watch: the PR topic, this session's interest
 /// refcount after attaching, and how the (aligned) subscription resolved.
@@ -90,10 +115,11 @@ pub struct WatchEntry {
 pub async fn record(
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     pr: &GithubPr,
     interval: Duration,
     session: SessionId,
-) -> Result<WatchRecorded, BusError> {
+) -> Result<WatchRecorded, WatchError> {
     let topic = pr.topic();
     let spec = WatchSpec {
         kind: WatchKind::GithubPr,
@@ -103,8 +129,23 @@ pub async fn record(
     };
 
     let watch_id = storage.upsert_watch(spec).await?;
-    let interest = storage.add_interest(watch_id, session.clone()).await?;
+    // Stamp the interest's last-seen now so the TTL sweeper (card 08) has a fresh
+    // liveness baseline; a re-watch refreshes it.
+    let interest = storage
+        .add_interest(watch_id, session.clone(), now_millis())
+        .await?;
+    info!(
+        repo = %repo_of(pr),
+        pr = pr.number(),
+        interest,
+        "attached session interest to watch"
+    );
     let subscribe = subscribe_one(bus, session, &topic).await?;
+
+    // Now that interest is attached, ask the supervisor to run the adapter. It is
+    // idempotent (one adapter per entity), so a second session watching the same
+    // PR reuses the running poller rather than spawning another.
+    supervisor.ensure_running(watch_id).await?;
 
     Ok(WatchRecorded {
         topic,
@@ -124,9 +165,10 @@ pub async fn record(
 pub async fn drop_interest(
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     pr: &GithubPr,
     session: SessionId,
-) -> Result<WatchDropped, BusError> {
+) -> Result<WatchDropped, WatchError> {
     let topic = pr.topic();
     let repo = repo_of(pr);
 
@@ -139,6 +181,17 @@ pub async fn drop_interest(
     let outcome = match existing {
         Some(watch) => {
             let remaining_interest = storage.remove_interest(watch.id, session.clone()).await?;
+            info!(
+                repo = %repo,
+                pr = pr.number(),
+                interest = remaining_interest,
+                "dropped session interest from watch"
+            );
+            // The last interested session leaving is what authorizes teardown
+            // (design/01 rule 5): stop the adapter and mark the watch stopped.
+            if remaining_interest == 0 {
+                supervisor.stop_watch(watch.id).await?;
+            }
             UnwatchOutcome::Dropped { remaining_interest }
         }
         None => UnwatchOutcome::NoSuchWatch,
@@ -195,15 +248,27 @@ async fn subscribe_one(
 mod tests {
     use super::*;
     use crate::storage::StorageConfig;
+    use crate::supervisor::{RestartPolicy, UnavailableResolver};
     use mailbox_protocol::{AdapterId, Timestamp};
+    use std::sync::Arc;
 
-    async fn fresh() -> (Bus, Storage, tempfile::TempDir) {
+    // These unit tests use the `UnavailableResolver`, so `record` records intent
+    // and drives the supervisor but no adapter is spawned (the watch stays
+    // `Desired`). The full spawn/stop lifecycle with a real fixture adapter is
+    // exercised in `tests/supervision.rs`.
+    async fn fresh() -> (Bus, Storage, Supervisor, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = Storage::open(StorageConfig::at(dir.path().join("mailbox.db")))
             .await
             .unwrap();
         let bus = Bus::new(storage.clone());
-        (bus, storage, dir)
+        let supervisor = Supervisor::spawn(
+            storage.clone(),
+            bus.clone(),
+            Arc::new(UnavailableResolver),
+            RestartPolicy::default(),
+        );
+        (bus, storage, supervisor, dir)
     }
 
     fn pr(n: u64) -> GithubPr {
@@ -212,12 +277,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_is_idempotent_and_refcounts_interest() {
-        let (bus, storage, _dir) = fresh().await;
+        let (bus, storage, supervisor, _dir) = fresh().await;
         let pr = pr(1);
 
         let first = record(
             &bus,
             &storage,
+            &supervisor,
             &pr,
             Duration::from_secs(30),
             SessionId::new("s1"),
@@ -230,6 +296,7 @@ mod tests {
         let second = record(
             &bus,
             &storage,
+            &supervisor,
             &pr,
             Duration::from_secs(30),
             SessionId::new("s2"),
@@ -246,11 +313,12 @@ mod tests {
 
     #[tokio::test]
     async fn drop_interest_reports_remaining_and_no_such_watch() {
-        let (bus, storage, _dir) = fresh().await;
+        let (bus, storage, supervisor, _dir) = fresh().await;
         let watched = pr(1);
         record(
             &bus,
             &storage,
+            &supervisor,
             &watched,
             Duration::from_secs(30),
             SessionId::new("s1"),
@@ -258,7 +326,7 @@ mod tests {
         .await
         .unwrap();
 
-        let dropped = drop_interest(&bus, &storage, &watched, SessionId::new("s1"))
+        let dropped = drop_interest(&bus, &storage, &supervisor, &watched, SessionId::new("s1"))
             .await
             .unwrap();
         assert_eq!(
@@ -269,7 +337,7 @@ mod tests {
         );
 
         // Unwatching a PR nobody watches is NoSuchWatch — and creates no row.
-        let none = drop_interest(&bus, &storage, &pr(2), SessionId::new("s1"))
+        let none = drop_interest(&bus, &storage, &supervisor, &pr(2), SessionId::new("s1"))
             .await
             .unwrap();
         assert_eq!(none.outcome, UnwatchOutcome::NoSuchWatch);
@@ -282,11 +350,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_watches_interest_and_unread() {
-        let (bus, storage, _dir) = fresh().await;
+        let (bus, storage, supervisor, _dir) = fresh().await;
         let pr = pr(1);
         let recorded = record(
             &bus,
             &storage,
+            &supervisor,
             &pr,
             Duration::from_secs(45),
             SessionId::new("s1"),
@@ -311,7 +380,11 @@ mod tests {
         assert_eq!(entry.repo, "octocat/hello-world");
         assert_eq!(entry.pr, 1);
         assert_eq!(entry.interest, 1);
-        assert_eq!(entry.state, WatchState::Desired, "no adapter in card 06");
+        assert_eq!(
+            entry.state,
+            WatchState::Desired,
+            "the UnavailableResolver spawns no adapter, so the watch stays desired"
+        );
         assert_eq!(view.unread, vec![(recorded.topic, 1)]);
     }
 }

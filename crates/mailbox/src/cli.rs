@@ -454,13 +454,10 @@ fn render_status(report: &StatusReport) {
         println!("watches:");
         for watch in &report.watches {
             let (state, child) = match watch.state {
-                // child pid is absent until card 08 wires adapter supervision.
-                WatchStateWire::Desired => (
-                    "desired",
-                    "not running (adapter supervision: card 08)".to_string(),
-                ),
+                WatchStateWire::Desired => ("desired", "not running".to_string()),
                 WatchStateWire::Running { pid } => ("running", format!("pid {pid}")),
                 WatchStateWire::Stopped => ("stopped", "stopped".to_string()),
+                WatchStateWire::Failed => ("failed", "gave up after repeated crashes".to_string()),
             };
             println!(
                 "  {} {}#{}  state={} interest={} interval={}s child={}",

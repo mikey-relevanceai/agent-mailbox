@@ -27,6 +27,10 @@
 //! - `spawn_grandchild` — re-exec self as `--grandchild <marker>`, then either
 //!   `then: "exit"` (exit 0, grandchild keeps stdout open) or `then: "sleep"`.
 //! - `sleep` — block forever, default SIGTERM disposition (graceful stop path).
+//! - `interval` — publish an incrementing counter every `interval_ms` (default
+//!   50) forever, default SIGTERM disposition. The long-running supervised poller
+//!   the card-08 supervision tests drive (both sessions receive events; a kill
+//!   triggers a restart; last-interest/stop tears it down).
 //! - `ignore_sigterm` — install a SIGTERM handler and ignore it (forceful path).
 //!
 //! Every `Publish` self-reports a bogus adapter id, so a test can prove the host
@@ -127,6 +131,21 @@ fn main() {
             }
         }
         "sleep" => sleep_forever_respecting_sigterm(),
+        "interval" => {
+            // A long-running poller: publish forever on a fixed cadence, dying on
+            // the default SIGTERM disposition (no handler installed) so the host's
+            // graceful stop terminates it.
+            let period = config
+                .get("interval_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(50);
+            let mut i = 0u64;
+            loop {
+                emit_publish(&topic, i);
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(period));
+            }
+        }
         "ignore_sigterm" => sleep_forever_ignoring_sigterm(&topic),
         other => {
             eprintln!("test_adapter: unknown mode {other:?}");

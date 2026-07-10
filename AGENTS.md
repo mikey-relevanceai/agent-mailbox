@@ -30,7 +30,7 @@ Full detail: [docs/03-working-agreements.md](docs/03-working-agreements.md).
 - **Payload-free wake.** Kicks carry no model-visible body; events are read from the durable log. Wake is ingress, not authority.
 - **Single-writer SQLite.** Only the `mailbox serve` daemon mutates the DB; other commands are Unix-socket clients ([ADR-0003](docs/adr/0003-single-writer-sqlite.md), [ADR-0004](docs/adr/0004-cli-serve-daemon-and-socket.md)). The daemon holds an exclusive `flock` (`<db-dir>/mailbox.lock`) for its whole life, so a second `serve` on the same DB fails loudly rather than becoming a second writer. `wait` is the sole read-only exception.
 - **Bridge down fails loud.** Socket clients never auto-spawn the daemon and never open the DB directly; if `serve` is down they exit non-zero with "start it with `mailbox serve`" ([ADR-0004](docs/adr/0004-cli-serve-daemon-and-socket.md)).
-- **Supervised adapters.** Long-running pollers are owned by the bridge (start/stop/idempotent); agents must not leave naked background `gh` loops ([design/01](docs/design/01-mvp-github-watch.md)). Adapter *process* supervision is card 08; card 06 `watch` only records intent + interest.
+- **Supervised adapters.** Long-running pollers are owned by the bridge (start/stop/idempotent, one per external entity, refcounted interest); agents must not leave naked background `gh` loops ([design/01](docs/design/01-mvp-github-watch.md)). Adapter *process* supervision is implemented (card 08): the `serve` daemon owns a `Supervisor` that starts an adapter when a watch gains interest and stops it on the last removal, backoff-restarts crashes, and does not resume orphan watches on restart. The concrete adapter program is injected via a resolver; **no real adapter ships until cards 09/10**, so in production the default `UnavailableResolver` means `watch` records intent + interest but resolves no poller yet (the watch stays `desired`). The full lifecycle is exercised with a fixture adapter.
 - **v0 network:** no TCP listen. CLI and/or user-scoped Unix socket only.
 - **Language:** Rust for the bridge. Do not introduce Go.
 
@@ -72,9 +72,9 @@ other command (except `wait`) is a one-shot Unix-socket client of it.
 | `mailbox subscribe <topic> --session <id>` | Subscribe this session (baseline-on-subscribe). |
 | `mailbox unsubscribe <topic> --session <id>` | Unsubscribe this session. |
 | `mailbox read --session <id> [--limit <n>]` | Return unread events, advancing the cursor. |
-| `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>] --session <id>` | Record watch + this session's interest, and subscribe to the PR topic. Does **not** spawn the poller (card 08). |
+| `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>] --session <id>` | Record watch + this session's interest, subscribe to the PR topic, and ask the supervisor to run the poller (card 08). No real adapter ships until cards 09/10, so today it resolves none and the watch stays `desired`. |
 | `mailbox unwatch github-pr <owner>/<repo>#<n> --session <id>` | Drop this session's interest and unsubscribe. |
-| `mailbox status --session <id>` | Watches (interest counts, child pids — always none until card 08) + this session's unread counts. |
+| `mailbox status --session <id>` | Watches (interest counts, lifecycle state + child pid when the supervisor is running one) + this session's unread counts. In production no real adapter resolves yet (cards 09/10), so watches read `desired` with no pid. |
 | `mailbox wait --session <id>` | Block until this session has mail, exit 2 (the `asyncRewake` contract). Direct read-only client — never uses the socket. |
 
 Conventions: `--session <id>` wins over the `MAILBOX_SESSION_ID` env fallback

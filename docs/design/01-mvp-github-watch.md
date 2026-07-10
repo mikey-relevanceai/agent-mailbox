@@ -56,6 +56,18 @@ Parity with `agent-ipc-github`, plus CI:
 
 ## Adapter lifecycle (no zombies)
 
+> **Status (card 08): implemented.** The `serve` daemon owns a `Supervisor`
+> (`crates/mailbox/src/supervisor.rs`) that realises the rules and state machine
+> below: one adapter per `(kind, repo, pr)`, refcounted interest driving
+> start/stop, backoff-restart with give-up, a TTL sweeper for hard-died sessions,
+> and — via `reconcile_startup` — the rule-6 **no-resume-on-restart** fail-safe.
+> The concrete adapter program is injected through a resolver, so the machinery
+> is decoupled from any adapter. **Staged rollout:** card 08 ships no real
+> adapter, so production uses an `UnavailableResolver` (every kind resolves to
+> "none") — `watch` records intent + interest but no poller spawns yet; the real
+> `github-pr` poller and its resolver arrive with cards 09/10. The full lifecycle
+> is proven with a fixture adapter (`tests/supervision.rs`).
+
 The failure mode in the old skill: `gh-watch.sh` is started with
 `run_in_background` and **never exits**; if the session dies or the agent
 forgets to kill it, pollers pile up.
@@ -155,8 +167,9 @@ No `ipc-arm.sh` step.
   `watch` records the watch (`upsert_watch`) + this session's interest
   (`add_interest`) and subscribes the session to the PR topic; `unwatch` reverses
   it. **Adapter process supervision (spawning the poller, populating child pids,
-  refcount-driven start/stop) is card 08**, not card 06 — until then a watch sits
-  `Desired` with no child pid.
+  refcount-driven start/stop) is implemented in card 08** via the `Supervisor`.
+  With no real adapter yet (cards 09/10), the production `UnavailableResolver`
+  resolves no poller, so a watch still sits `Desired` with no child pid until then.
 - ~~How Claude session identity is named for interest rows.~~ **Settled (card
   06):** the `SessionId` comes from `--session <id>`, falling back to the
   `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).

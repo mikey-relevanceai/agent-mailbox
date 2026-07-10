@@ -135,7 +135,24 @@ pub(crate) enum Command {
     AddInterest {
         watch: WatchId,
         session: SessionId,
+        /// Unix-millis last-seen stamp for the TTL sweeper (card 08).
+        last_seen: i64,
         reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    /// Refresh an existing interest's `last_seen` (the heartbeat/touch path, card
+    /// 08/11). A no-op if the interest row does not exist.
+    TouchInterest {
+        watch: WatchId,
+        session: SessionId,
+        last_seen: i64,
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Drop every interest whose `last_seen` is strictly older than `cutoff`,
+    /// returning the watches whose interest thereby reached zero (the sweeper
+    /// stops those adapters).
+    SweepStaleInterests {
+        cutoff: i64,
+        reply: oneshot::Sender<Result<Vec<WatchId>, StorageError>>,
     },
     RemoveInterest {
         watch: WatchId,
@@ -346,11 +363,31 @@ fn handle(conn: &mut Connection, cmd: Command) {
         Command::AddInterest {
             watch,
             session,
+            last_seen,
             reply,
         } => {
-            let result = do_add_interest(conn, watch, &session);
+            let result = do_add_interest(conn, watch, &session, last_seen);
             log_on_err(&result, "add_interest", || {
                 format!("watch={} session={}", watch.get(), session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::TouchInterest {
+            watch,
+            session,
+            last_seen,
+            reply,
+        } => {
+            let result = do_touch_interest(conn, watch, &session, last_seen);
+            log_on_err(&result, "touch_interest", || {
+                format!("watch={} session={}", watch.get(), session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::SweepStaleInterests { cutoff, reply } => {
+            let result = do_sweep_stale_interests(conn, cutoff);
+            log_on_err(&result, "sweep_stale_interests", || {
+                format!("cutoff={cutoff}")
             });
             let _ = reply.send(result);
         }
@@ -842,8 +879,9 @@ fn do_set_watch_state(
     // enum keeps DB and model in lockstep (no "running with NULL pid").
     let (state_str, pid): (&str, Option<i64>) = match state {
         WatchState::Desired => ("desired", None),
-        WatchState::Running { pid } => ("running", Some(i64::from(pid.0))),
+        WatchState::Running { pid } => ("running", Some(i64::from(pid.get()))),
         WatchState::Stopped => ("stopped", None),
+        WatchState::Failed => ("failed", None),
     };
     conn.execute(
         "UPDATE watch SET state = ?1, child_pid = ?2 WHERE id = ?3",
@@ -1012,12 +1050,13 @@ fn reconstruct_state(
     match state {
         "desired" => no_pid(WatchState::Desired, child_pid, state, id),
         "stopped" => no_pid(WatchState::Stopped, child_pid, state, id),
+        "failed" => no_pid(WatchState::Failed, child_pid, state, id),
         "running" => match child_pid {
             Some(pid) => {
-                let pid = i32::try_from(pid).map_err(|_| StorageError::Corrupt {
-                    detail: format!("watch {} child pid {pid} does not fit i32", id.get()),
+                let pid = u32::try_from(pid).map_err(|_| StorageError::Corrupt {
+                    detail: format!("watch {} child pid {pid} is not a valid u32", id.get()),
                 })?;
-                Ok(WatchState::Running { pid: Pid(pid) })
+                Ok(WatchState::Running { pid: Pid::new(pid) })
             }
             None => Err(StorageError::Corrupt {
                 detail: format!("watch {} is running with no child pid", id.get()),
@@ -1052,10 +1091,15 @@ fn do_add_interest(
     conn: &Connection,
     watch: WatchId,
     session: &SessionId,
+    last_seen: i64,
 ) -> Result<u64, StorageError> {
+    // Idempotent per session: re-watching the same PR must not double-count. It
+    // DOES refresh `last_seen` (a re-watch is a fresh liveness signal), so a
+    // session that re-declares interest resets its sweep clock.
     conn.execute(
-        "INSERT OR IGNORE INTO watch_interest (watch_id, session_id) VALUES (?1, ?2)",
-        params![watch.get(), session.as_str()],
+        "INSERT INTO watch_interest (watch_id, session_id, last_seen) VALUES (?1, ?2, ?3)
+         ON CONFLICT(watch_id, session_id) DO UPDATE SET last_seen = excluded.last_seen",
+        params![watch.get(), session.as_str(), last_seen],
     )?;
     let count = interest_count(conn, watch)?;
     info!(
@@ -1064,6 +1108,67 @@ fn do_add_interest(
         "attached session interest"
     );
     Ok(count)
+}
+
+/// Refresh an existing interest's `last_seen`. A no-op (zero rows) if the session
+/// is not interested — the heartbeat must not resurrect a dropped interest.
+fn do_touch_interest(
+    conn: &Connection,
+    watch: WatchId,
+    session: &SessionId,
+    last_seen: i64,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "UPDATE watch_interest SET last_seen = ?3 WHERE watch_id = ?1 AND session_id = ?2",
+        params![watch.get(), session.as_str(), last_seen],
+    )?;
+    Ok(())
+}
+
+/// Drop every interest older than `cutoff`, returning the watches whose interest
+/// thereby fell to zero. One transaction so the "who reached zero" answer is
+/// consistent with the deletion that caused it.
+fn do_sweep_stale_interests(
+    conn: &mut Connection,
+    cutoff: i64,
+) -> Result<Vec<WatchId>, StorageError> {
+    let tx = conn.transaction()?;
+
+    // The watches that had at least one stale interest — only these can have
+    // reached zero, so we recount just them rather than every watch.
+    let affected: Vec<i64> = {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT watch_id FROM watch_interest WHERE last_seen < ?1")?;
+        let rows = stmt.query_map(params![cutoff], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let removed = tx.execute(
+        "DELETE FROM watch_interest WHERE last_seen < ?1",
+        params![cutoff],
+    )?;
+
+    let mut emptied = Vec::new();
+    for watch_id in affected {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM watch_interest WHERE watch_id = ?1",
+            params![watch_id],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            emptied.push(WatchId::new(watch_id));
+        }
+    }
+    tx.commit()?;
+
+    if removed > 0 {
+        info!(
+            removed,
+            emptied = emptied.len(),
+            "swept stale watch interests"
+        );
+    }
+    Ok(emptied)
 }
 
 fn do_remove_interest(

@@ -54,7 +54,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -68,6 +68,7 @@ use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::storage::{SessionId, Storage, StorageConfig};
+use mailbox::supervisor::{RestartPolicy, Supervisor, UnavailableResolver, reconcile_startup};
 use mailbox::wake::Waker;
 
 use crate::control::{GithubPrTarget, Request, Response, StatusReport, decode_frame, encode_frame};
@@ -95,6 +96,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// How long shutdown waits for in-flight connection tasks to finish (so a
 /// committed publish gets its ack out) before dropping the runtime.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often the TTL sweeper runs, dropping interests whose session hard-died
+/// without a `SessionEnd`/`unwatch` (design/01 reconcile row).
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Interests older than this are swept. Generous by default: a live session
+/// refreshes its last-seen on `watch` and (card 11) via the harness heartbeat, so
+/// an interest only ages out once a session has genuinely gone away without
+/// saying so. Missing a slow cleanup beats dropping a live session's watch.
+const DEFAULT_INTEREST_TTL: Duration = Duration::from_secs(3600);
 
 /// Runtime-tunable daemon limits. Defaults are the constants above; each may be
 /// overridden by an env var, which keeps the safety property (a limit exists)
@@ -145,7 +156,24 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     let waker = Waker::new(config.waiters_dir());
     let bus = Bus::with_waker(storage.clone(), waker);
 
-    // 4. We hold the lock, so any leftover socket node is provably stale.
+    // 4. Fail-safe on restart: mark previously-running watches stopped and clear
+    //    their pids. We do NOT resume them — until a session-liveness probe
+    //    exists, a resumed poller could outlive every session that wanted it
+    //    (design/01 rule 6). A live session must re-`watch` to restart a poller.
+    reconcile_startup(&storage).await?;
+
+    // 5. Build the watch supervisor. Card 08 ships no real adapter, so the
+    //    resolver reports "unavailable" for every kind — `watch` records intent
+    //    and the poller stays unspawned until card 10 plugs in the real
+    //    `github-pr` adapter here. The supervision machinery itself is fully live.
+    let supervisor = Supervisor::spawn(
+        storage.clone(),
+        bus.clone(),
+        Arc::new(UnavailableResolver),
+        RestartPolicy::default(),
+    );
+
+    // 6. We hold the lock, so any leftover socket node is provably stale.
     let socket_path = config.socket_path();
     remove_stale_socket(&socket_path)?;
     let listener = bind_socket_owner_only(&socket_path)?;
@@ -155,15 +183,24 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         socket = %socket_path.display(),
         db = %config.path().display(),
         max_connections = limits.max_connections,
-        "bridge serving (single writer + waker); Ctrl-C or SIGTERM to stop"
+        "bridge serving (single writer + waker + supervisor); Ctrl-C or SIGTERM to stop"
     );
 
-    // 5. Serve until a shutdown signal, capping concurrent handlers.
-    let connections = Arc::new(Semaphore::new(limits.max_connections));
-    let result = accept_loop(&listener, &bus, &storage, &connections, limits).await;
+    // 7. Periodically sweep stale interests so a hard-killed session's watch is
+    //    reconciled and its adapter stopped when its interest hits zero.
+    let sweeper = spawn_sweeper(supervisor.clone());
 
-    // 6. Drain in-flight tasks (bounded), then clean up the socket. The lock
+    // 8. Serve until a shutdown signal, capping concurrent handlers.
+    let connections = Arc::new(Semaphore::new(limits.max_connections));
+    let result = accept_loop(&listener, &bus, &storage, &supervisor, &connections, limits).await;
+
+    // 9. Stop the sweeper and tear down every adapter so none outlives the bridge,
+    //    then drain in-flight tasks (bounded) and clean up the socket. The lock
     //    releases on drop.
+    sweeper.abort();
+    if let Err(err) = supervisor.shutdown().await {
+        warn!(error = %err, "supervisor shutdown reported an error");
+    }
     drain_connections(&connections, limits.max_connections).await;
     if let Err(err) = std::fs::remove_file(&socket_path)
         && err.kind() != io::ErrorKind::NotFound
@@ -174,12 +211,40 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     result
 }
 
+/// Spawn the periodic TTL sweeper. Env overrides (`MAILBOX_SWEEP_INTERVAL_MS`,
+/// `MAILBOX_INTEREST_TTL_MS`) let tests drive it fast; production uses the
+/// generous defaults so a live session's watch is never swept out from under it.
+fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
+    let interval = env_var("MAILBOX_SWEEP_INTERVAL_MS")
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SWEEP_INTERVAL);
+    let ttl = env_var("MAILBOX_INTEREST_TTL_MS")
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_INTEREST_TTL);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match supervisor.sweep(ttl).await {
+                Ok(swept) if !swept.is_empty() => {
+                    info!(
+                        count = swept.len(),
+                        "TTL sweep stopped watches with no live interest"
+                    )
+                }
+                Ok(_) => {}
+                Err(err) => warn!(error = %err, "TTL sweep failed"),
+            }
+        }
+    })
+}
+
 /// Accept connections until a shutdown signal. Each connection is served on its
 /// own task guarded by a semaphore permit; accept errors back off.
 async fn accept_loop(
     listener: &UnixListener,
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     connections: &Arc<Semaphore>,
     limits: Limits,
 ) -> anyhow::Result<()> {
@@ -198,7 +263,7 @@ async fn accept_loop(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => spawn_handler(stream, bus, storage, connections, limits),
+                    Ok((stream, _addr)) => spawn_handler(stream, bus, storage, supervisor, connections, limits),
                     Err(err) => {
                         // EMFILE and friends: back off so we cannot tight-loop.
                         warn!(error = %err, backoff = ?ACCEPT_BACKOFF, "accept failed; backing off");
@@ -216,6 +281,7 @@ fn spawn_handler(
     stream: UnixStream,
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     connections: &Arc<Semaphore>,
     limits: Limits,
 ) {
@@ -223,11 +289,13 @@ fn spawn_handler(
         Ok(permit) => {
             let bus = bus.clone();
             let storage = storage.clone();
+            let supervisor = supervisor.clone();
             tokio::spawn(async move {
                 // Hold the permit for the task's life; dropping it frees a slot
                 // and lets shutdown drain see this task complete.
                 let _permit = permit;
-                if let Err(err) = handle_connection(stream, bus, storage, limits).await {
+                if let Err(err) = handle_connection(stream, bus, storage, supervisor, limits).await
+                {
                     warn!(error = %err, "connection handler failed");
                 }
             });
@@ -272,6 +340,7 @@ async fn handle_connection(
     stream: UnixStream,
     bus: Bus,
     storage: Storage,
+    supervisor: Supervisor,
     limits: Limits,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -292,7 +361,7 @@ async fn handle_connection(
     let session = request_session(&request).map(|s| s.as_str().to_string());
     let topic = request_topic(&request).map(|t| t.as_str().to_string());
 
-    let response = dispatch(&bus, &storage, request).await;
+    let response = dispatch(&bus, &storage, &supervisor, request).await;
 
     let outcome = match &response {
         Response::Error { .. } => "error",
@@ -424,7 +493,12 @@ fn response_detail(response: &Response) -> &str {
 /// Map a request onto bus/watch operations, converting any business error into a
 /// [`Response::Error`] the client can surface. Never returns `Err`: transport
 /// failures are the caller's concern, business failures travel as a value.
-async fn dispatch(bus: &Bus, storage: &Storage, request: Request) -> Response {
+async fn dispatch(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    request: Request,
+) -> Response {
     match request {
         Request::Publish {
             topic,
@@ -438,8 +512,10 @@ async fn dispatch(bus: &Bus, storage: &Storage, request: Request) -> Response {
             session,
             target,
             interval_secs,
-        } => watch(bus, storage, session, target, interval_secs).await,
-        Request::Unwatch { session, target } => unwatch(bus, storage, session, target).await,
+        } => watch(bus, storage, supervisor, session, target, interval_secs).await,
+        Request::Unwatch { session, target } => {
+            unwatch(bus, storage, supervisor, session, target).await
+        }
         Request::Status { session } => status(storage, session).await,
     }
 }
@@ -447,7 +523,12 @@ async fn dispatch(bus: &Bus, storage: &Storage, request: Request) -> Response {
 async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
     match bus
-        .publish(topic, adapter, Timestamp(now_millis()), body)
+        .publish(
+            topic,
+            adapter,
+            Timestamp(mailbox::clock::now_millis()),
+            body,
+        )
         .await
     {
         Ok(event) => Response::Published {
@@ -492,6 +573,7 @@ async fn read(bus: &Bus, session: SessionId, limit: Option<u32>) -> Response {
 async fn watch(
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     session: SessionId,
     target: GithubPrTarget,
     interval_secs: u64,
@@ -503,6 +585,7 @@ async fn watch(
     match mailbox::watch::record(
         bus,
         storage,
+        supervisor,
         &pr,
         Duration::from_secs(interval_secs),
         session,
@@ -522,6 +605,7 @@ async fn watch(
 async fn unwatch(
     bus: &Bus,
     storage: &Storage,
+    supervisor: &Supervisor,
     session: SessionId,
     target: GithubPrTarget,
 ) -> Response {
@@ -529,7 +613,7 @@ async fn unwatch(
         Ok(pr) => pr,
         Err(message) => return Response::error(message),
     };
-    match mailbox::watch::drop_interest(bus, storage, &pr, session).await {
+    match mailbox::watch::drop_interest(bus, storage, supervisor, &pr, session).await {
         Ok(dropped) => Response::Unwatched {
             topic: dropped.topic,
             outcome: dropped.outcome.into(),
@@ -551,16 +635,6 @@ async fn status(storage: &Storage, session: SessionId) -> Response {
 fn github_pr(target: &GithubPrTarget) -> Result<GithubPr, String> {
     GithubPr::new(&target.owner, &target.repo, target.number)
         .map_err(|err| format!("invalid github-pr target: {err}"))
-}
-
-/// Now, in Unix milliseconds UTC. A clock before the epoch is impossible on a
-/// sane host; if it happens we stamp 0 rather than panic (timestamps are
-/// provenance, not authority).
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 /// Create the daemon directory `0700`, fatal on failure (B4: refuse to serve

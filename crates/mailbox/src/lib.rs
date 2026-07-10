@@ -9,7 +9,9 @@
 //! layer on top of it — publish, subscribe, and cursor-based read semantics.
 
 pub mod bus;
+pub mod clock;
 pub mod host;
 pub mod storage;
+pub mod supervisor;
 pub mod wake;
 pub mod watch;

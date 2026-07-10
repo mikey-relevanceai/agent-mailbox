@@ -71,10 +71,23 @@ impl WatchId {
 
 /// Operating-system process id of a supervised adapter child.
 ///
-/// Newtype rather than a bare `i32` so it reads as a pid at call sites and
-/// cannot be confused with a `WatchId` or an offset.
+/// Wraps a `u32` (the tokio/OS pid width) behind a private field so a pid can be
+/// constructed only through [`Pid::new`] and cannot be confused with a `WatchId`
+/// or an offset, nor silently narrowed to a signed value at a call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Pid(pub i32);
+pub struct Pid(u32);
+
+impl Pid {
+    /// Wrap an OS pid.
+    pub fn new(pid: u32) -> Self {
+        Self(pid)
+    }
+
+    /// The underlying pid value.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// What kind of external entity a watch polls.
 ///
@@ -117,8 +130,14 @@ pub enum WatchState {
     Desired,
     /// Adapter child is running under this pid.
     Running { pid: Pid },
-    /// Torn down (last interest gone, or crashed and given up).
+    /// Torn down (last interest gone). A clean stop, distinct from [`Failed`].
     Stopped,
+    /// The adapter crashed repeatedly and the supervisor gave up restarting it
+    /// (card 08): it exceeded the restart policy's consecutive-failure budget, so
+    /// an error event was surfaced on the entity's topic and no more restarts are
+    /// attempted. Distinct from [`Stopped`] so `status` can tell "torn down
+    /// because nobody wanted it" from "torn down because it kept dying".
+    Failed,
 }
 
 /// What to persist when creating or reusing a watch.

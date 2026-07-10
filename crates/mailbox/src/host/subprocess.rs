@@ -527,6 +527,49 @@ impl SubprocessTransport {
     }
 }
 
+impl SubprocessTransport {
+    /// A lightweight, owned handle that can signal this adapter's whole process
+    /// group without owning the transport.
+    ///
+    /// # Why this exists (the supervisor's crash-watch, card 08)
+    ///
+    /// [`AdapterHost::stop`] and [`AdapterHost::wait`] both consume `self`, so a
+    /// task that owns the transport via `wait()` to detect a crash cannot also
+    /// call `stop()` to tear it down on command. Capturing a [`Terminator`]
+    /// *before* moving the transport into a `wait()` future gives that task a way
+    /// to drive a graceful group SIGTERM→SIGKILL while the same `wait()` future it
+    /// is holding reaps the child and drains the pipes. The terminator only knows
+    /// the pgid, so it cannot touch anything but this adapter's own group.
+    pub fn terminator(&self) -> Terminator {
+        Terminator {
+            pid: self.process.pid(),
+        }
+    }
+}
+
+/// Signals an adapter's process group on behalf of a supervisor that owns the
+/// transport elsewhere (via a pending `wait()`), keeping the "signal the whole
+/// group, never the bare pid" no-orphan discipline inside this module. See
+/// [`SubprocessTransport::terminator`].
+#[derive(Debug, Clone, Copy)]
+pub struct Terminator {
+    /// The adapter's pid, which (because it was spawned `process_group(0)`) is
+    /// also its pgid — so `kill(-pid, …)` reaches the whole group.
+    pid: u32,
+}
+
+impl Terminator {
+    /// SIGTERM the whole group (graceful request to shut down).
+    pub fn terminate(&self) -> Result<(), HostError> {
+        checked_group_signal(self.pid, Signal::SIGTERM)
+    }
+
+    /// SIGKILL the whole group (forceful, after a grace period).
+    pub fn kill(&self) -> Result<(), HostError> {
+        checked_group_signal(self.pid, Signal::SIGKILL)
+    }
+}
+
 impl AdapterHost for SubprocessTransport {
     type Error = HostError;
 
@@ -777,7 +820,7 @@ async fn handle_line(
                 .publish(
                     publish.topic,
                     adapter_id.clone(),
-                    Timestamp(now_millis()),
+                    Timestamp(crate::clock::now_millis()),
                     publish.body,
                 )
                 .await
@@ -998,17 +1041,6 @@ fn strip_cr(mut buf: Vec<u8>) -> Vec<u8> {
         buf.pop();
     }
     buf
-}
-
-/// Now, in Unix milliseconds UTC. Stamped by the host at forward time so events
-/// carry one clock (the same choice the daemon makes). A pre-epoch clock is
-/// impossible on a sane host; if it happens we stamp 0 rather than panic.
-fn now_millis() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

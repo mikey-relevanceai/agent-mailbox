@@ -41,7 +41,7 @@ use mailbox_protocol::{
     AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, Topic, check_version,
 };
 
-use mailbox::storage::{Pid, SessionId, SubscribeOutcome, WatchKind, WatchState};
+use mailbox::storage::{SessionId, SubscribeOutcome, WatchKind, WatchState};
 use mailbox::watch::{StatusView, UnwatchOutcome, WatchEntry};
 
 /// A one-shot request from a CLI client to the `serve` daemon.
@@ -240,20 +240,23 @@ impl From<WatchKind> for WatchKindWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WatchStateWire {
-    /// Wanted by ≥1 session; adapter not spawned. **Always this in card 06.**
+    /// Wanted by ≥1 session; adapter not spawned (or no adapter resolved yet).
     Desired,
     /// Adapter child running under this pid (card 08 sets it).
-    Running { pid: i32 },
-    /// Torn down (last interest gone, or crashed and given up).
+    Running { pid: u32 },
+    /// Torn down cleanly (last interest gone).
     Stopped,
+    /// The adapter crashed repeatedly and the supervisor gave up (card 08).
+    Failed,
 }
 
 impl From<WatchState> for WatchStateWire {
     fn from(state: WatchState) -> Self {
         match state {
             WatchState::Desired => WatchStateWire::Desired,
-            WatchState::Running { pid: Pid(pid) } => WatchStateWire::Running { pid },
+            WatchState::Running { pid } => WatchStateWire::Running { pid: pid.get() },
             WatchState::Stopped => WatchStateWire::Stopped,
+            WatchState::Failed => WatchStateWire::Failed,
         }
     }
 }

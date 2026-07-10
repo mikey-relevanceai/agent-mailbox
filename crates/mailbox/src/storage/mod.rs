@@ -37,9 +37,12 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use mailbox_protocol::{AdapterId, Cursor, Event, Offset, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, Event, Offset, Timestamp, Topic};
 
 pub use error::StorageError;
+// Re-exported so callers of the public read API (e.g. `read_events`) can name
+// the cursor type without reaching into `mailbox-protocol` directly.
+pub use mailbox_protocol::Cursor;
 pub use model::{
     Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
 };
@@ -388,18 +391,49 @@ impl Storage {
     }
 
     /// Add `session`'s interest in `watch`, returning the new refcount
-    /// (idempotent per session).
+    /// (idempotent per session). `last_seen` (Unix millis) stamps the interest
+    /// for the TTL sweeper; a re-watch refreshes it.
     pub async fn add_interest(
         &self,
         watch: WatchId,
         session: SessionId,
+        last_seen: i64,
     ) -> Result<u64, StorageError> {
         self.call(|reply| Command::AddInterest {
             watch,
             session,
+            last_seen,
             reply,
         })
         .await
+    }
+
+    /// Refresh an existing interest's `last_seen` (the heartbeat/touch path for
+    /// card 08's TTL sweeper; card 11 wires the harness heartbeat). A no-op if
+    /// `session` is not interested in `watch` — the heartbeat must not resurrect a
+    /// dropped interest.
+    pub async fn touch_interest(
+        &self,
+        watch: WatchId,
+        session: SessionId,
+        last_seen: i64,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| Command::TouchInterest {
+            watch,
+            session,
+            last_seen,
+            reply,
+        })
+        .await
+    }
+
+    /// Drop every interest whose `last_seen` is strictly older than `cutoff`
+    /// (Unix millis), returning the watches whose interest thereby reached zero —
+    /// the ones whose adapter the caller should now stop (design/01 reconcile /
+    /// TTL sweep).
+    pub async fn sweep_stale_interests(&self, cutoff: i64) -> Result<Vec<WatchId>, StorageError> {
+        self.call(|reply| Command::SweepStaleInterests { cutoff, reply })
+            .await
     }
 
     /// Remove `session`'s interest in `watch`, returning the remaining refcount.

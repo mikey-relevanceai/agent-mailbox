@@ -12,7 +12,10 @@ use tracing::{debug, info};
 use super::error::StorageError;
 
 /// The schema version this build creates and understands.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (card 08) adds `watch_interest.last_seen` for the TTL sweeper — see
+/// [`SCHEMA_V2`].
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// Version 1 of the schema.
 ///
@@ -88,6 +91,20 @@ CREATE TABLE adapter_baseline (
 );
 "#;
 
+/// Version 2 of the schema (card 08): interests carry a `last_seen` timestamp
+/// (Unix millis) so a periodic TTL sweeper can drop the interest of a session
+/// that hard-died without an explicit `SessionEnd`/`unwatch` (design/01
+/// reconcile row). `watch` and the heartbeat (card 11) refresh it; when a
+/// watch's interest hits zero — explicitly or by sweep — the adapter is stopped.
+///
+/// `DEFAULT 0` (the epoch) for any interest row migrated from v1 is deliberate:
+/// a pre-upgrade interest is treated as immediately stale until something
+/// refreshes it, which is the fail-safe direction — a stale interest whose
+/// liveness we cannot vouch for should not pin a poller forever.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE watch_interest ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -107,18 +124,25 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
         return Ok(());
     }
 
-    // current < SCHEMA_VERSION: apply the gap. For the MVP there is only the
-    // v0 -> v1 step. Wrap in a transaction so a partial schema never persists.
+    // current < SCHEMA_VERSION: apply the missing steps in order, all inside one
+    // transaction so a partial schema never persists. A fresh DB (v0) runs every
+    // step; a v1 DB runs only the v1->v2 step.
+    let mut sql = String::from("BEGIN;\n");
     if current < 1 {
-        conn.execute_batch(&format!(
-            "BEGIN;\n{SCHEMA_V1}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
-        ))?;
-        info!(
-            from = current,
-            to = SCHEMA_VERSION,
-            "applied schema migration"
-        );
+        sql.push_str(SCHEMA_V1);
     }
+    if current < 2 {
+        sql.push_str(SCHEMA_V2);
+    }
+    sql.push_str(&format!(
+        "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
+    ));
+    conn.execute_batch(&sql)?;
+    info!(
+        from = current,
+        to = SCHEMA_VERSION,
+        "applied schema migration"
+    );
 
     Ok(())
 }

@@ -359,7 +359,7 @@ async fn watch_upsert_is_idempotent_by_entity() {
         .set_watch_state(
             id1,
             WatchState::Running {
-                pid: mailbox::storage::Pid(1234),
+                pid: mailbox::storage::Pid::new(1234),
             },
         )
         .await
@@ -375,7 +375,7 @@ async fn watch_upsert_is_idempotent_by_entity() {
     assert_eq!(
         watch.state,
         WatchState::Running {
-            pid: mailbox::storage::Pid(1234)
+            pid: mailbox::storage::Pid::new(1234)
         }
     );
 
@@ -393,10 +393,19 @@ async fn interest_refcount_add_remove() {
     let s1 = SessionId::new("s1".to_string());
     let s2 = SessionId::new("s2".to_string());
 
-    assert_eq!(storage.add_interest(watch, s1.clone()).await.unwrap(), 1);
+    assert_eq!(
+        storage.add_interest(watch, s1.clone(), 1000).await.unwrap(),
+        1
+    );
     // Idempotent: re-adding the same session does not double-count.
-    assert_eq!(storage.add_interest(watch, s1.clone()).await.unwrap(), 1);
-    assert_eq!(storage.add_interest(watch, s2.clone()).await.unwrap(), 2);
+    assert_eq!(
+        storage.add_interest(watch, s1.clone(), 2000).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        storage.add_interest(watch, s2.clone(), 3000).await.unwrap(),
+        2
+    );
     assert_eq!(storage.interest_count(watch).await.unwrap(), 2);
 
     // First session leaving does NOT drop to zero — the watcher must survive.
@@ -696,4 +705,128 @@ async fn unread_counts_reports_per_topic_and_does_not_consume() {
     assert_eq!(bus.read(session.clone(), None).await.unwrap().len(), 3);
     // After reading, nothing is unread.
     assert!(storage.unread_counts(session).await.unwrap().is_empty());
+}
+
+// ---- card-08 additions: interest last-seen, touch, TTL sweep, v1->v2 ----------
+
+/// `touch_interest` refreshes an existing interest but must NOT create or
+/// resurrect a row for a session that is not interested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn touch_interest_is_a_no_op_without_a_row() {
+    let (storage, _dir) = fresh_store().await;
+    let watch = storage.upsert_watch(watch_spec(11)).await.unwrap();
+    let s1 = SessionId::new("s1");
+
+    // No interest yet: touching creates nothing.
+    storage
+        .touch_interest(watch, s1.clone(), 5_000)
+        .await
+        .unwrap();
+    assert_eq!(storage.interest_count(watch).await.unwrap(), 0);
+
+    // Once interested, touching updates last_seen (observable via the sweeper).
+    storage
+        .add_interest(watch, s1.clone(), 1_000)
+        .await
+        .unwrap();
+    storage.touch_interest(watch, s1, 9_000).await.unwrap();
+    // A cutoff between the two stamps: with last_seen refreshed to 9000, a 5000
+    // cutoff does not sweep it.
+    assert!(
+        storage
+            .sweep_stale_interests(5_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The TTL sweep drops interests older than the cutoff and reports the watches
+/// whose interest thereby reached zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_stale_interests_reports_emptied_watches() {
+    let (storage, _dir) = fresh_store().await;
+    let watch = storage.upsert_watch(watch_spec(12)).await.unwrap();
+    let fresh_session = SessionId::new("fresh");
+    let stale_session = SessionId::new("stale");
+
+    storage
+        .add_interest(watch, fresh_session, 10_000)
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch, stale_session, 1_000)
+        .await
+        .unwrap();
+
+    // Cutoff 5000: only the stale (1000) interest is dropped; the watch still has
+    // the fresh one, so it is NOT reported as emptied.
+    assert!(
+        storage
+            .sweep_stale_interests(5_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(storage.interest_count(watch).await.unwrap(), 1);
+
+    // A later cutoff sweeps the last interest → watch reported emptied.
+    let emptied = storage.sweep_stale_interests(50_000).await.unwrap();
+    assert_eq!(emptied, vec![watch]);
+    assert_eq!(storage.interest_count(watch).await.unwrap(), 0);
+}
+
+/// A populated v1 database migrates to v2: existing rows survive, `last_seen`
+/// defaults to 0 (the epoch), and such a pre-upgrade interest is immediately
+/// TTL-sweep-eligible until refreshed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn populated_v1_db_migrates_to_v2() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mailbox.db");
+
+    // Build a real v1 DB by hand: the v1 DDL (no last_seen column), user_version=1,
+    // and populated watch + watch_interest rows.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE watch (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind          TEXT    NOT NULL,
+                repo          TEXT    NOT NULL,
+                pr            INTEGER NOT NULL,
+                interval_secs INTEGER NOT NULL,
+                state         TEXT    NOT NULL,
+                child_pid     INTEGER,
+                UNIQUE(kind, repo, pr)
+            );
+            CREATE TABLE watch_interest (
+                watch_id   INTEGER NOT NULL REFERENCES watch(id) ON DELETE CASCADE,
+                session_id TEXT    NOT NULL,
+                PRIMARY KEY (watch_id, session_id)
+            );
+            INSERT INTO watch (id, kind, repo, pr, interval_secs, state, child_pid)
+                VALUES (1, 'github-pr', 'octocat/hello-world', 42, 60, 'desired', NULL);
+            INSERT INTO watch_interest (watch_id, session_id) VALUES (1, 's1');
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+    }
+
+    // Open through the real Storage: this runs the v1->v2 migration.
+    let storage = Storage::open(StorageConfig::at(&path)).await.unwrap();
+
+    // The watch and its interest survived the migration.
+    let watches = storage.list_watches().await.unwrap();
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].pr, 42);
+    let watch = watches[0].id;
+    assert_eq!(storage.interest_count(watch).await.unwrap(), 1);
+
+    // The migrated interest has last_seen = 0 (the epoch), so any positive cutoff
+    // sweeps it — a pre-upgrade interest is sweep-eligible until refreshed.
+    let emptied = storage.sweep_stale_interests(1).await.unwrap();
+    assert_eq!(emptied, vec![watch]);
+    assert_eq!(storage.interest_count(watch).await.unwrap(), 0);
 }
