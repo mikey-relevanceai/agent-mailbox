@@ -67,7 +67,7 @@ use tracing::{info, warn};
 use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
-use mailbox::resolver::StubResolver;
+use mailbox::resolver::DefaultResolver;
 use mailbox::storage::{SessionId, Storage, StorageConfig};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
@@ -163,14 +163,15 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    (design/01 rule 6). A live session must re-`watch` to restart a poller.
     reconcile_startup(&storage).await?;
 
-    // 5. Build the watch supervisor with the stub resolver (card 09): a `stub`
-    //    watch spawns the reference adapter, while `github-pr` still resolves to
-    //    "no adapter" and stays `Desired` until card 10 plugs in the real poller.
-    //    The supervision machinery itself is fully live for both.
+    // 5. Build the watch supervisor with the default resolver: a `stub` watch
+    //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the
+    //    real PR poller (card 10). The supervisor injects each watch's persisted
+    //    baseline into the adapter's spawn config and relays the adapter's
+    //    `Baseline` lines back to storage (baseline-via-protocol).
     let supervisor = Supervisor::spawn(
         storage.clone(),
         bus.clone(),
-        Arc::new(StubResolver),
+        Arc::new(DefaultResolver::default()),
         RestartPolicy::default(),
     );
 

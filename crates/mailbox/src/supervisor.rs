@@ -48,21 +48,23 @@
 //! `github-pr` poller.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic, stub_topic};
 
 use crate::bus::Bus;
 use crate::clock::now_millis;
 use crate::host::subprocess::{AdapterSpec, SubprocessTransport};
-use crate::host::{AdapterConfig, AdapterExit, AdapterHost};
+use crate::host::{AdapterConfig, AdapterExit, AdapterHost, BaselineSink};
 use crate::storage::{
     Pid, Storage, StorageError, Watch, WatchId, WatchKind, WatchState, WatchTarget,
 };
@@ -321,6 +323,50 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
     }
 }
 
+/// Merge the persisted baseline into an adapter's spawn config under a
+/// `"baseline"` key (design/01 / card 10). `None` (never baselined) injects JSON
+/// `null`, so an adapter always sees the key and treats null as "first poll —
+/// baseline, publish nothing". A non-object config (e.g. `null`) is passed
+/// through unchanged, since there is nowhere to insert the key.
+fn inject_baseline(config: AdapterConfig, baseline: Option<Value>) -> AdapterConfig {
+    let mut value = config.value().clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("baseline".to_string(), baseline.unwrap_or(Value::Null));
+    }
+    AdapterConfig::new(value)
+}
+
+/// The persist side of baseline-via-protocol: a [`BaselineSink`] bound to one
+/// watch's `(storage, watch_id)`. The transport calls it for every `Baseline`
+/// line the adapter emits; it upserts the opaque snapshot into that watch's
+/// `adapter_baseline` row. Best-effort — a persist failure is logged, not
+/// propagated (a lost baseline degrades to at most one re-fired edge on the next
+/// restart, never a crash).
+struct StorageBaselineSink {
+    storage: Storage,
+    watch_id: WatchId,
+}
+
+impl BaselineSink for StorageBaselineSink {
+    fn persist(&self, value: Value) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let storage = self.storage.clone();
+        let watch_id = self.watch_id;
+        Box::pin(async move {
+            match storage.set_baseline(watch_id, value).await {
+                Ok(()) => debug!(
+                    watch = watch_id.get(),
+                    "persisted adapter baseline via protocol"
+                ),
+                Err(err) => warn!(
+                    watch = watch_id.get(),
+                    error = %err,
+                    "failed to persist adapter baseline; a restart may re-fire the last edge"
+                ),
+            }
+        })
+    }
+}
+
 /// A command posted to the actor. External requests carry a reply; internal
 /// events (a monitor reporting an exit, a scheduled restart) do not.
 enum Command {
@@ -505,7 +551,44 @@ impl Actor {
             }
         };
 
-        match SubprocessTransport::start(resolved.spec, resolved.config, self.bus.clone()).await {
+        // Baseline-via-protocol (design/01 / card 10): read the persisted baseline
+        // and inject it into the adapter's spawn config, so an edge-triggered
+        // adapter resumes from its last snapshot and does not re-fire already-
+        // baselined edges on restart. Read here (not in the resolver) so the
+        // resolver stays storage-free. Harmless for adapters that ignore it (the
+        // stub drops the extra field).
+        let baseline = self.storage.get_baseline(watch_id).await?;
+        let config = inject_baseline(resolved.config, baseline);
+        // The persist side of the round trip: relay each `Baseline` line the
+        // adapter emits to `set_baseline` for THIS watch, bound behind a sink so
+        // the transport stays decoupled from storage (mirrors Publish→bus).
+        let sink: Arc<dyn BaselineSink> = Arc::new(StorageBaselineSink {
+            storage: self.storage.clone(),
+            watch_id,
+        });
+        // Provenance (review item C): bind the transport to this entity's topic so
+        // the adapter can publish ONLY on it — a Publish to any other topic is
+        // rejected by the host. A watch whose stored repo is not a well-formed
+        // entity topic cannot be provenance-bound, so we refuse to start it
+        // unconstrained (counts as a failed start).
+        let Some(entity_topic) = topic_for_watch(&watch) else {
+            warn!(
+                watch = watch_id.get(),
+                kind = watch.target.kind().as_str(),
+                repo = %watch.target.repo_column(),
+                "cannot derive an entity topic to bind the adapter's publishes; not starting"
+            );
+            return self.handle_failure(watch_id, None).await;
+        };
+        match SubprocessTransport::start_with_baseline(
+            resolved.spec,
+            config,
+            self.bus.clone(),
+            sink,
+            entity_topic,
+        )
+        .await
+        {
             Ok(transport) => self.install_running(watch_id, &watch, transport).await,
             Err(err) => {
                 warn!(
@@ -840,10 +923,22 @@ impl Actor {
         Ok(emptied)
     }
 
-    /// Tear down every running adapter on shutdown. Aborting each monitor drops
-    /// its pending `wait()` future, which triggers the card-07 process-group
-    /// teardown (group SIGKILL + child reap) — fast and unconditional, so daemon
-    /// shutdown is not prolonged by a per-adapter graceful grace.
+    /// Tear down every running adapter on shutdown — GRACEFULLY (review item D).
+    ///
+    /// Each monitor is signalled to stop (SIGTERM → bounded grace → SIGKILL) rather
+    /// than aborted-into-an-immediate-SIGKILL. The graceful path gives an edge-
+    /// triggered adapter (the github-pr poller) the window to finish its in-flight
+    /// poll and flush its final `Baseline` line, and the monitor's `wait()` drains
+    /// stdout so that baseline is relayed to storage BEFORE the process is reaped.
+    /// This shrinks the at-least-once window on the COMMON (graceful) shutdown path
+    /// so a routine restart does not re-fire the last edge.
+    ///
+    /// Delivery remains at-least-once across an UNGRACEFUL termination (SIGKILL /
+    /// OOM / power loss): if the adapter dies between publishing an edge and
+    /// emitting its baseline, resuming from the older baseline re-fires that edge.
+    /// That is consistent with the card-06 publish-at-least-once stance and is
+    /// tolerable for a wake bus — a duplicate wake makes the agent re-check and
+    /// find the same state (see ADR-0005).
     async fn shutdown_all(&mut self) {
         let entities: Vec<(WatchId, RunningEntity)> = self.running.drain().collect();
         if entities.is_empty() {
@@ -851,15 +946,18 @@ impl Actor {
         }
         info!(
             count = entities.len(),
-            "supervisor shutting down; tearing down all adapters"
+            "supervisor shutting down; gracefully stopping all adapters (flush final baseline)"
         );
+        // Signal every adapter to stop FIRST, so they tear down concurrently rather
+        // than one graceful grace after another.
         let mut monitors = Vec::with_capacity(entities.len());
         for (watch_id, entity) in entities {
-            entity.monitor.abort();
+            let _ = entity.stop_tx.send(());
             monitors.push((watch_id, entity.monitor));
         }
         for (watch_id, monitor) in monitors {
-            // Await the aborted task so its Drop (the group kill) has run.
+            // Await the graceful teardown (SIGTERM→drain→reap) so the final
+            // baseline has been relayed before we mark the watch stopped.
             let _ = monitor.await;
             let _ = self
                 .storage
@@ -931,5 +1029,38 @@ async fn monitor_adapter(
             }
             info!(watch = watch_id.get(), pid, "tore down adapter on stop signal");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_baseline_adds_persisted_snapshot() {
+        let config = AdapterConfig::new(json!({ "topic": "github.pr.o/r#1" }));
+        let injected = inject_baseline(config, Some(json!({ "mergeable": "conflicting" })));
+        assert_eq!(
+            injected.value()["baseline"],
+            json!({ "mergeable": "conflicting" }),
+            "the persisted baseline is merged under the baseline key"
+        );
+        assert_eq!(injected.value()["topic"], "github.pr.o/r#1");
+    }
+
+    #[test]
+    fn inject_baseline_uses_null_when_unset() {
+        // A never-baselined watch injects JSON null, so the adapter still sees the
+        // key and treats it as "first poll".
+        let config = AdapterConfig::new(json!({ "topic": "t" }));
+        let injected = inject_baseline(config, None);
+        assert_eq!(injected.value()["baseline"], Value::Null);
+    }
+
+    #[test]
+    fn inject_baseline_passes_through_non_object_config() {
+        // Nowhere to insert the key, so a non-object config is unchanged.
+        let injected = inject_baseline(AdapterConfig::new(Value::Null), Some(json!({ "x": 1 })));
+        assert_eq!(*injected.value(), Value::Null);
     }
 }

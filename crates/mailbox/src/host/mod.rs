@@ -45,6 +45,7 @@
 pub mod subprocess;
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
@@ -109,6 +110,30 @@ pub trait AdapterHost {
     /// publishes its events and returns — forwarding publishes until it does,
     /// then reap and report the exit.
     fn wait(self) -> impl Future<Output = Result<AdapterExit, Self::Error>> + Send;
+}
+
+/// A sink for the opaque baseline snapshots an edge-triggered adapter emits
+/// (design/01 / card 10: baseline-via-protocol).
+///
+/// When a hosted adapter emits a [`mailbox_protocol::Baseline`] line, the
+/// transport relays its opaque snapshot here rather than persisting it inline —
+/// keeping the transport decoupled from storage, exactly as a `Publish` is
+/// forwarded to the [`Bus`](crate::bus::Bus) instead of being written to SQLite
+/// by the transport. The supervisor binds an implementation to `(storage,
+/// watch_id)` so the snapshot lands in the `adapter_baseline` row for the right
+/// watch; on the next spawn it injects that snapshot back into the adapter's
+/// config, so a restart does not re-fire already-baselined edges.
+///
+/// `persist` returns a boxed `'static` future (rather than an `async fn`) so the
+/// trait stays `dyn`-compatible — the transport holds one behind an `Arc<dyn
+/// BaselineSink>` and awaits it inline on the stdout-forwarding task. A bound
+/// implementation clones the cheap `(storage, watch_id)` it needs, so the future
+/// borrows nothing.
+pub trait BaselineSink: Send + Sync + 'static {
+    /// Persist one opaque baseline snapshot. Best-effort: an implementation logs
+    /// its own failure and never propagates (a lost baseline degrades to at most
+    /// a re-fired edge on the next restart, never a crash).
+    fn persist(&self, value: Value) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
 
 /// Opaque adapter configuration, handed to the adapter at start.

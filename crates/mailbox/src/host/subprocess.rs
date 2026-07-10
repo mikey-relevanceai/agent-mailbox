@@ -38,6 +38,13 @@
 //! durable and both fire the card-05 wake kick. We reuse that path rather than
 //! reimplement durability or wake.
 //!
+//! An edge-triggered adapter may also emit a [`mailbox_protocol::Baseline`] line
+//! (design/01 / card 10: baseline-via-protocol). The transport relays its opaque
+//! snapshot to an optional [`BaselineSink`] the supervisor binds to `(storage,
+//! watch_id)` — the same decoupling as `Publish`→bus, keeping the transport
+//! storage-free. With no sink bound (a hand-run, a happy-path test) a baseline
+//! line is a harmless no-op.
+//!
 //! # Adapter identity comes from the spawn
 //!
 //! Every forwarded event is stamped with the [`AdapterId`] the *host* was given
@@ -97,11 +104,11 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use mailbox_protocol::{AdapterId, LineError, Message, Timestamp, decode_line};
+use mailbox_protocol::{AdapterId, LineError, Message, Timestamp, Topic, decode_line};
 
 use crate::bus::Bus;
 
-use super::{AdapterConfig, AdapterExit, AdapterHealth, AdapterHost, HealthCounters};
+use super::{AdapterConfig, AdapterExit, AdapterHealth, AdapterHost, BaselineSink, HealthCounters};
 
 /// Default per-line cap on the child's stdout. A single `Publish` line is a
 /// topic + an opaque body; 1 MiB is generous head room for a real event while
@@ -415,7 +422,7 @@ impl SubprocessTransport {
         config: AdapterConfig,
         bus: Bus,
     ) -> Result<Self, HostError> {
-        Self::start_with_limits(spec, config, bus, HostLimits::from_env()).await
+        Self::start_inner(spec, config, bus, HostLimits::from_env(), None, None).await
     }
 
     /// Like [`start`](Self::start), but with explicit [`HostLimits`] rather than
@@ -426,6 +433,51 @@ impl SubprocessTransport {
         config: AdapterConfig,
         bus: Bus,
         limits: HostLimits,
+    ) -> Result<Self, HostError> {
+        Self::start_inner(spec, config, bus, limits, None, None).await
+    }
+
+    /// Like [`start`](Self::start), but also relays the adapter's
+    /// [`mailbox_protocol::Baseline`] lines to `baseline_sink` (design/01 / card
+    /// 10: baseline-via-protocol) and CONSTRAINS the adapter to publish only on
+    /// `expected_topic` — a `Publish` to any other topic is rejected, not
+    /// forwarded (provenance: an adapter must not inject events onto another
+    /// entity's topic — review item C). The supervisor passes the watch's own
+    /// topic here; `start`/`start_with_limits` pass no sink and no topic, so a
+    /// hand-run or a happy-path test is unconstrained.
+    pub async fn start_with_baseline(
+        spec: AdapterSpec,
+        config: AdapterConfig,
+        bus: Bus,
+        baseline_sink: Arc<dyn BaselineSink>,
+        expected_topic: Topic,
+    ) -> Result<Self, HostError> {
+        Self::start_inner(
+            spec,
+            config,
+            bus,
+            HostLimits::from_env(),
+            Some(baseline_sink),
+            Some(expected_topic),
+        )
+        .await
+    }
+
+    /// The shared start path behind [`start`](Self::start),
+    /// [`start_with_limits`](Self::start_with_limits), and
+    /// [`start_with_baseline`](Self::start_with_baseline). The optional
+    /// `baseline_sink` is threaded into the stdout-forwarding task so a `Baseline`
+    /// line is relayed to storage the same way a `Publish` line is relayed to the
+    /// bus — the transport itself stays storage-free. `expected_topic`, when set,
+    /// binds the adapter to a single entity topic (see
+    /// [`start_with_baseline`](Self::start_with_baseline)).
+    async fn start_inner(
+        spec: AdapterSpec,
+        config: AdapterConfig,
+        bus: Bus,
+        limits: HostLimits,
+        baseline_sink: Option<Arc<dyn BaselineSink>>,
+        expected_topic: Option<Topic>,
     ) -> Result<Self, HostError> {
         // Serialize the opaque config to ONE line before we spawn, so a bad
         // config value fails fast without leaving a child running.
@@ -491,6 +543,8 @@ impl SubprocessTransport {
             spec.adapter_id.clone(),
             max_line,
             Arc::clone(&health),
+            baseline_sink,
+            expected_topic,
         ));
         let stderr_task = tokio::spawn(log_stderr(stderr, spec.adapter_id.clone(), pid, max_line));
 
@@ -744,6 +798,8 @@ async fn forward_stdout(
     adapter_id: AdapterId,
     max_line: usize,
     health: Arc<HealthCounters>,
+    baseline_sink: Option<Arc<dyn BaselineSink>>,
+    expected_topic: Option<Topic>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line_number = 0usize;
@@ -763,7 +819,16 @@ async fn forward_stdout(
             }
             Ok(Frame::Line(bytes)) => {
                 line_number += 1;
-                handle_line(&bytes, line_number, &bus, &adapter_id, &health).await;
+                handle_line(
+                    &bytes,
+                    line_number,
+                    &bus,
+                    &adapter_id,
+                    &health,
+                    baseline_sink.as_ref(),
+                    expected_topic.as_ref(),
+                )
+                .await;
             }
             Err(err) => {
                 // A read error on the pipe ends forwarding; the child is likely
@@ -795,6 +860,8 @@ async fn handle_line(
     bus: &Bus,
     adapter_id: &AdapterId,
     health: &HealthCounters,
+    baseline_sink: Option<&Arc<dyn BaselineSink>>,
+    expected_topic: Option<&Topic>,
 ) {
     // A blank line is legal NDJSON padding — skip it silently, uncounted.
     let text = match std::str::from_utf8(bytes) {
@@ -813,6 +880,23 @@ async fn handle_line(
 
     match decode_line(text) {
         Ok(Message::Publish(publish)) => {
+            // Provenance (review item C): a transport bound to one entity topic
+            // rejects a Publish to any OTHER topic — an adapter must not inject
+            // events onto another entity's topic. Host-enforced, exactly like the
+            // adapter_id is host-stamped rather than adapter-asserted.
+            if let Some(expected) = expected_topic
+                && &publish.topic != expected
+            {
+                health.record_rejected();
+                warn!(
+                    adapter = adapter_id.0.as_str(),
+                    line = line_number,
+                    expected = expected.as_str(),
+                    got = publish.topic.as_str(),
+                    "rejected adapter publish to a foreign topic; skipping"
+                );
+                return;
+            }
             let topic = publish.topic.clone();
             // Stamp OUR identity (provenance), ignoring publish.adapter. Stamp the
             // timestamp here, like the durable bridge does (one clock).
@@ -847,14 +931,37 @@ async fn handle_line(
                 }
             }
         }
+        Ok(Message::Baseline(baseline)) => {
+            // Baseline-via-protocol (design/01 / card 10): relay the opaque
+            // snapshot to the bound sink (storage) rather than the bus, mirroring
+            // how a Publish is forwarded. Without a sink (a hand-run or a
+            // happy-path test) the line is a harmless no-op. Awaited inline so the
+            // persist ordering matches the stdout line order.
+            match baseline_sink {
+                Some(sink) => {
+                    sink.persist(baseline.value).await;
+                    debug!(
+                        adapter = adapter_id.0.as_str(),
+                        line = line_number,
+                        "relayed adapter baseline snapshot to the persist sink"
+                    );
+                }
+                None => debug!(
+                    adapter = adapter_id.0.as_str(),
+                    line = line_number,
+                    "adapter emitted a baseline but no persist sink is bound; ignoring"
+                ),
+            }
+        }
         Ok(_other) => {
-            // A valid protocol message, but not a Publish. Adapters publish; a
-            // subscribe/read/etc. from a child is misuse. Skip and count.
+            // A valid protocol message, but not a Publish or Baseline. Adapters
+            // publish (and, if edge-triggered, emit baselines); a subscribe/read/
+            // etc. from a child is misuse. Skip and count.
             health.record_rejected();
             warn!(
                 adapter = adapter_id.0.as_str(),
                 line = line_number,
-                "adapter sent a non-publish protocol message; skipping"
+                "adapter sent an unexpected protocol message; skipping"
             );
         }
         Err(source) => {
@@ -1191,7 +1298,7 @@ mod tests {
         let health = HealthCounters::default();
         let adapter = AdapterId("t".to_string());
 
-        handle_line(&[0xff, 0xfe, 0x00], 1, &bus, &adapter, &health).await;
+        handle_line(&[0xff, 0xfe, 0x00], 1, &bus, &adapter, &health, None, None).await;
 
         let snap = health.snapshot();
         assert_eq!(snap.rejected, 1);
@@ -1208,10 +1315,83 @@ mod tests {
         let adapter = AdapterId("t".to_string());
 
         let line = encode_line(&Message::Subscribe(Subscribe { topic: gh_topic() })).unwrap();
-        handle_line(line.as_bytes(), 1, &bus, &adapter, &health).await;
+        handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
 
         let snap = health.snapshot();
         assert_eq!(snap.rejected, 1);
+        assert_eq!(snap.forwarded, 0);
+    }
+
+    /// A `Baseline` line is relayed to the bound sink (not the bus) and is not
+    /// counted as a reject — an edge-triggered adapter's baseline is expected
+    /// output, not misuse.
+    #[tokio::test]
+    async fn handle_line_relays_baseline_to_sink() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingSink {
+            seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+        impl BaselineSink for RecordingSink {
+            fn persist(
+                &self,
+                value: serde_json::Value,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+            {
+                let seen = Arc::clone(&self.seen);
+                Box::pin(async move { seen.lock().unwrap().push(value) })
+            }
+        }
+
+        let (bus, _path, _dir) = healthy_bus().await;
+        let health = HealthCounters::default();
+        let adapter = AdapterId("t".to_string());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<dyn BaselineSink> = Arc::new(RecordingSink {
+            seen: Arc::clone(&seen),
+        });
+
+        let line = encode_line(&Message::Baseline(mailbox_protocol::Baseline {
+            value: json!({ "mergeable": "conflicting" }),
+        }))
+        .unwrap();
+        handle_line(
+            line.as_bytes(),
+            1,
+            &bus,
+            &adapter,
+            &health,
+            Some(&sink),
+            None,
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap.rejected, 0, "a baseline is not a reject");
+        assert_eq!(snap.forwarded, 0, "a baseline is not a bus publish");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![json!({ "mergeable": "conflicting" })],
+            "the baseline snapshot was relayed to the sink verbatim"
+        );
+    }
+
+    /// A `Baseline` with no sink bound is a harmless no-op — not a reject.
+    #[tokio::test]
+    async fn handle_line_ignores_baseline_without_sink() {
+        let (bus, _path, _dir) = healthy_bus().await;
+        let health = HealthCounters::default();
+        let adapter = AdapterId("t".to_string());
+
+        let line = encode_line(&Message::Baseline(mailbox_protocol::Baseline {
+            value: json!({ "x": 1 }),
+        }))
+        .unwrap();
+        handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap.rejected, 0);
         assert_eq!(snap.forwarded, 0);
     }
 
@@ -1228,7 +1408,7 @@ mod tests {
             body: json!({ "hello": "world" }),
         }))
         .unwrap();
-        handle_line(line.as_bytes(), 1, &bus, &adapter, &health).await;
+        handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
 
         let snap = health.snapshot();
         assert_eq!(snap.forwarded, 1);
@@ -1252,11 +1432,77 @@ mod tests {
             body: json!({}),
         }))
         .unwrap();
-        handle_line(line.as_bytes(), 1, &bus, &adapter, &health).await;
+        handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
 
         let snap = health.snapshot();
         assert_eq!(snap.publish_failures, 1, "the bus append failed");
         assert_eq!(snap.forwarded, 0);
         assert_eq!(snap.rejected, 0, "a bus failure is not an adapter reject");
+    }
+
+    /// Review item C: when the transport is bound to an entity topic, a `Publish`
+    /// to a DIFFERENT topic is rejected (counted, not forwarded) — an adapter must
+    /// not inject events onto another entity's topic.
+    #[tokio::test]
+    async fn handle_line_rejects_a_foreign_topic_publish() {
+        let (bus, _path, _dir) = healthy_bus().await;
+        let health = HealthCounters::default();
+        let adapter = AdapterId("host-id".to_string());
+        let expected = gh_topic();
+        let foreign = GithubPr::new("victim", "repo", 99).unwrap().topic();
+
+        let line = encode_line(&Message::Publish(Publish {
+            topic: foreign,
+            adapter: AdapterId("self-reported".to_string()),
+            body: json!({ "edge": "mergeable_conflicting" }),
+        }))
+        .unwrap();
+        handle_line(
+            line.as_bytes(),
+            1,
+            &bus,
+            &adapter,
+            &health,
+            None,
+            Some(&expected),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap.rejected, 1, "a foreign-topic publish is rejected");
+        assert_eq!(snap.forwarded, 0, "it is never appended to the other topic");
+    }
+
+    /// A `Publish` to the BOUND entity topic is forwarded as normal.
+    #[tokio::test]
+    async fn handle_line_forwards_a_publish_on_the_bound_topic() {
+        let (bus, _path, _dir) = healthy_bus().await;
+        let health = HealthCounters::default();
+        let adapter = AdapterId("host-id".to_string());
+        let expected = gh_topic();
+
+        let line = encode_line(&Message::Publish(Publish {
+            topic: expected.clone(),
+            adapter: AdapterId("self-reported".to_string()),
+            body: json!({ "edge": "new_reviews" }),
+        }))
+        .unwrap();
+        handle_line(
+            line.as_bytes(),
+            1,
+            &bus,
+            &adapter,
+            &health,
+            None,
+            Some(&expected),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(
+            snap.forwarded, 1,
+            "a publish on the bound topic is forwarded"
+        );
+        assert_eq!(snap.rejected, 0);
     }
 }

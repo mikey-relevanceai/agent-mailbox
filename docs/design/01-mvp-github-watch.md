@@ -11,10 +11,27 @@
 > **reference implementation** of this design: a trivial adapter (`stub.<label>`,
 > `mailbox-stub-adapter`) that publishes a synthetic edge on an interval, driving
 > the full supervised path (watch → interest → spawn → publish → wake → read) end
-> to end. It is distinct from the still-pending **`github-pr` poller** (card 10),
-> which will implement the actual GitHub polling / baseline / edge-detection
-> described below. `serve`'s resolver now spawns the stub for `stub` watches and
-> still returns "no adapter" for `github-pr` until that poller ships.
+> to end.
+>
+> **Card 10 status note — IMPLEMENTED.** The real `github-pr` poller
+> (`mailbox-github-pr-adapter`) now ships and `serve`'s `DefaultResolver` spawns it
+> for `github-pr` watches. It polls a PR via `gh` (injectable via `MAILBOX_GH_BIN`
+> for tests) and is **edge-triggered**: it baselines on the first poll and fires
+> only on transitions — mergeable → `CONFLICTING` (ignoring transient `UNKNOWN`),
+> new reviews / review threads / PR comments (diffed by highest-seen **id**, not a
+> bare count, so an add is never missed when a concurrent delete cancels the
+> count), and whole-PR **CI rollup** transitions **into failure** (event body lists
+> the newly-failed check names). The baseline
+> **persists through the bridge via the protocol** (never adapter-side SQLite —
+> ADR-0001): the supervisor injects the last persisted baseline into the adapter's
+> spawn config and relays the adapter's new `Baseline` protocol messages to the
+> `adapter_baseline` table, so a restart does not re-fire. Delivery is
+> **at-least-once across an ungraceful termination** (SIGKILL/OOM/power-loss in the
+> window between publishing an edge and persisting the baseline) — a re-fired edge
+> is a duplicate wake, tolerable for a wake bus; graceful shutdown flushes the
+> baseline first. See the acceptance tests
+> in `adapters/github-pr-adapter/tests/adapter_e2e.rs` (ac-10-1…4) and the
+> round-trip-through-the-bridge test in `crates/mailbox/tests/github_pr_e2e.rs`.
 
 ## Goal
 
@@ -131,8 +148,16 @@ stateDiagram-v2
 | `subscription` | session ↔ topics (may align with `watch_interest`) |
 | `delivery_cursor` | per subscriber; advanced by harness/bridge on surface |
 
-Adapter baseline can live in SQLite (preferred) instead of
-`~/.claude/agent-ipc/watchers/*.state` so restart/idempotency is centralized.
+Adapter baseline lives in SQLite (`adapter_baseline`, centralized) instead of
+`~/.claude/agent-ipc/watchers/*.state`. **The adapter never writes it directly**
+(ADR-0001): it round-trips via the protocol (card 10). At spawn the supervisor
+reads `storage.get_baseline(watch_id)` and injects it into the adapter's config
+(`{ "baseline": … }`); after each poll that changes it the adapter emits a
+`mailbox_protocol::Baseline` line, which the card-07 host relays to
+`storage.set_baseline(watch_id, …)`. One-way both directions (storage → config →
+adapter at startup; adapter → `Baseline` stdout → host → storage for updates), so
+there is no request/response channel and a restart resumes from the persisted
+snapshot without re-firing.
 
 ## Agent-facing loop (MVP)
 
@@ -184,4 +209,9 @@ No `ipc-arm.sh` step.
   `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).
 - Whether peer agent→agent messages are in the same MVP slice or immediately
   after GitHub watch.
-- How finely to model CI edges (whole-PR rollup vs per-check) for the first cut.
+- ~~How finely to model CI edges (whole-PR rollup vs per-check) for the first
+  cut.~~ **Settled (card 10):** whole-PR **rollup** (pending/success/failure); the
+  event fires on a transition **into failure** (or the failed-check set gaining
+  names while already failing) and carries the newly-failed check *names* in its
+  body — not one event per check, and not on success/pending transitions (which
+  would storm on a flapping check).

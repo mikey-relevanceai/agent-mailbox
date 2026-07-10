@@ -9,9 +9,9 @@
 //!
 //! # Message set
 //!
-//! Everything on the wire is a [`Message`]: [`Publish`], [`Subscribe`],
-//! [`Unsubscribe`], [`ReadRequest`], [`Event`], [`ReadResponse`], [`Ack`], and
-//! [`ProtocolError`]. See [`message`] for the shape of each.
+//! Everything on the wire is a [`Message`]: [`Publish`], [`Baseline`],
+//! [`Subscribe`], [`Unsubscribe`], [`ReadRequest`], [`Event`], [`ReadResponse`],
+//! [`Ack`], and [`ProtocolError`]. See [`message`] for the shape of each.
 //!
 //! # Untrusted bodies
 //!
@@ -49,7 +49,7 @@ pub use error::{FramingError, IncompatibleVersion, LineError, TopicError, check_
 pub use framing::{decode_line, encode_line, read_lines, write_line};
 pub use ids::{AdapterId, Cursor, EventId, Offset, Timestamp};
 pub use message::{
-    Ack, ErrorCode, Event, Message, ProtocolError, Publish, ReadRequest, ReadResponse, Subscribe,
-    Unsubscribe,
+    Ack, Baseline, ErrorCode, Event, Message, ProtocolError, Publish, ReadRequest, ReadResponse,
+    Subscribe, Unsubscribe,
 };
 pub use topic::{GithubPr, Topic, stub_topic};

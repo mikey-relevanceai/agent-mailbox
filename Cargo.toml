@@ -5,6 +5,7 @@ members = [
     "crates/mailbox-protocol",
     "crates/mailbox-harness",
     "adapters/stub-adapter",
+    "adapters/github-pr-adapter",
 ]
 
 [workspace.package]

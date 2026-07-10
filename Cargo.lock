@@ -314,6 +314,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailbox-github-pr-adapter"
+version = "0.1.0"
+dependencies = [
+ "mailbox-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mailbox-harness"
 version = "0.1.0"
 dependencies = [

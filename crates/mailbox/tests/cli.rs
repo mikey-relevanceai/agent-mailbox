@@ -28,6 +28,31 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox")
 }
 
+/// The reference stub adapter binary, beside the `mailbox` bin (built if missing).
+///
+/// These CLI tests exercise the watch/status *surface*, not adapter behaviour, so
+/// a `github-pr` watch points its adapter at the harmless stub (via
+/// `MAILBOX_GH_ADAPTER_BIN`) rather than the real poller — the stub ignores the
+/// github config's extra fields, publishes on the topic, and stays `running`, so
+/// the watch lifecycle is deterministic with no `gh` / network involved. Real
+/// github-pr adapter behaviour is covered in `github_pr_e2e.rs`.
+fn stub_bin() -> String {
+    let dir = Path::new(bin())
+        .parent()
+        .expect("mailbox bin has a parent dir")
+        .to_path_buf();
+    let stub = dir.join("mailbox-stub-adapter");
+    if !stub.exists() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "mailbox-stub-adapter"])
+            .status()
+            .expect("build mailbox-stub-adapter");
+        assert!(status.success(), "failed to build mailbox-stub-adapter");
+    }
+    stub.to_str().expect("stub bin path is utf8").to_string()
+}
+
 /// The socket path the daemon derives from a DB path (`<db-parent>/mailbox.sock`).
 fn socket_for(db_path: &Path) -> PathBuf {
     db_path.parent().unwrap().join("mailbox.sock")
@@ -125,6 +150,20 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // Graceful teardown: SIGTERM lets `serve` run its shutdown, which tears
+        // down and reaps any supervised adapter it spawned (e.g. a `github-pr`
+        // watch's poller) — so nothing is orphaned. Fall back to SIGKILL if it
+        // does not exit promptly. `serve` with no adapters exits in a few ms, so
+        // this does not slow the common case.
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+        for _ in 0..150 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -282,7 +321,9 @@ fn bridge_down_json_mode_emits_error_object() {
 
 #[test]
 fn ac3_status_shows_watch_with_interest_count() {
-    let daemon = Daemon::start();
+    // github-pr now resolves to a real adapter (card 10), so point it at the
+    // harmless stub for a deterministic lifecycle without `gh`.
+    let daemon = Daemon::start_with_env(&[("MAILBOX_GH_ADAPTER_BIN", &stub_bin())]);
     let session = "sess-watch";
 
     assert_ok(
@@ -310,16 +351,23 @@ fn ac3_status_shows_watch_with_interest_count() {
     assert_eq!(w["pr"], 42);
     assert_eq!(w["interval_ms"], 30_000);
     assert_eq!(w["interest"], 1, "one interested session");
-    assert_eq!(w["state"], "desired");
-    // The pid lives inside the running state; a desired watch has no pid key at
-    // all (card 08 sets it, not card 06). Invalid "stopped+pid" is unrepresentable.
-    assert!(w.get("pid").is_none(), "a desired watch carries no pid");
+    // The supervisor spawns the adapter as part of `watch` (card 08/10), so by the
+    // time it returns the watch is `running` with a child pid.
+    assert_eq!(w["state"], "running");
+    assert!(
+        w.get("pid").and_then(|p| p.as_u64()).is_some(),
+        "a running watch carries its child pid"
+    );
+    // The daemon's graceful Drop (SIGTERM → supervisor shutdown) reaps the adapter,
+    // so no poller is orphaned when the test ends.
 }
 
 /// Two sessions share one refcounted watch; unwatch reports the sum-typed outcome.
 #[test]
 fn two_sessions_share_one_watch_refcounted() {
-    let daemon = Daemon::start();
+    // Point github-pr at the stub so the shared adapter runs deterministically
+    // without `gh` (this test is about the refcount, not adapter behaviour).
+    let daemon = Daemon::start_with_env(&[("MAILBOX_GH_ADAPTER_BIN", &stub_bin())]);
     let pr = "octocat/hello-world#7";
 
     assert_ok(
@@ -345,6 +393,7 @@ fn two_sessions_share_one_watch_refcounted() {
     // Sum-typed outcome: "dropped" carries the remaining count.
     assert_eq!(uv["outcome"]["unwatch"], "dropped");
     assert_eq!(uv["outcome"]["remaining_interest"], 1);
+    // s2's interest remains; the daemon's graceful Drop reaps the shared adapter.
 }
 
 // ==== A1: an oversized / unterminated frame is rejected, not buffered ==========

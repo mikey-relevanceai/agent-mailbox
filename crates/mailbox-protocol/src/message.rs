@@ -29,6 +29,26 @@ pub struct Publish {
     pub body: Value,
 }
 
+/// Persist an edge-triggered adapter's baseline snapshot (adapter → bridge).
+///
+/// design/01 / card 10: an edge-triggered adapter (the `github-pr` poller) keeps
+/// a baseline of the watched entity's last-seen state so a restart does not
+/// re-fire edges it has already published. The baseline must live in the bridge,
+/// not adapter-side storage (ADR-0001: adapters never touch SQLite), so the
+/// adapter emits it on stdout as this message after each poll that changed it;
+/// the host relays the opaque snapshot to the bridge's `adapter_baseline` row for
+/// that watch. On the next spawn the supervisor injects the persisted snapshot
+/// back into the adapter's config, so the adapter resumes edge-detection from
+/// where it left off (baseline-via-protocol — a one-way flow, no request/reply).
+///
+/// Like [`Publish::body`], [`value`](Self::value) is opaque `serde_json::Value`
+/// this crate never interprets — the adapter owns its baseline schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Baseline {
+    /// The opaque baseline snapshot, shaped entirely by the emitting adapter.
+    pub value: Value,
+}
+
 /// Register interest in a topic (subscriber → bridge).
 ///
 /// Subscribing governs *pushed* [`Event`]s only; durable catch-up is a separate
@@ -131,6 +151,8 @@ pub struct ProtocolError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Publish(Publish),
+    /// An adapter's baseline snapshot to persist (see [`Baseline`]).
+    Baseline(Baseline),
     Subscribe(Subscribe),
     Unsubscribe(Unsubscribe),
     Read(ReadRequest),
@@ -172,6 +194,22 @@ mod tests {
             topic: sample_topic(),
             adapter: AdapterId("github-watch".to_string()),
             body: serde_json::json!({ "hello": "world" }),
+        }));
+    }
+
+    #[test]
+    fn baseline_round_trips() {
+        assert_round_trips(Message::Baseline(Baseline {
+            value: serde_json::json!({
+                "mergeable": "conflicting",
+                "reviews": 3,
+                "ci": "failure",
+                "failed_checks": ["build", "test"],
+            }),
+        }));
+        // A null snapshot (the "no baseline yet" injection) round-trips too.
+        assert_round_trips(Message::Baseline(Baseline {
+            value: serde_json::Value::Null,
         }));
     }
 
