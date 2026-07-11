@@ -193,6 +193,21 @@ No `ipc-arm.sh` step.
 5. Kill adapter process → one restart while interest > 0; stop when interest is 0.
 6. Bridge restart with no live interested sessions → watch not resumed (no zombie).
 
+> **Card 12 status note — AUTOMATED.** All six scenarios above are now encoded as
+> the cross-component suite `crates/mailbox/tests/e2e.rs` (`scenario_1…6_*`),
+> driven end to end through the real `mailbox serve` daemon + `mailbox` CLI + a
+> real supervised adapter (the `github-pr` poller against a recorded fake `gh`, and
+> the reference stub) + the fake harness driver (hook JSON fed to `mailbox harness
+> arm`/`cleanup`). The wake path (waiter wake, coalescing, mid-turn surfacing) is
+> covered by the same suite's `wake_*` tests. The headline **no-zombie-pollers**
+> guarantee is ENFORCED by a `LeakGuard` (`tests/common/mod.rs`): it fails the test
+> if any adapter / waiter / serve process scoped to that test's daemon subtree +
+> waiters dir survives teardown, and a dedicated test
+> (`leak_guard_detects_a_surviving_process_and_clears_when_reaped`) proves the guard
+> actually catches a leak. Runs in `cargo test --workspace` / CI with no network or
+> real GitHub. Unit-level proofs still live in their own suites
+> (`tests/supervision.rs`, `tests/wake.rs`, `adapters/github-pr-adapter/tests/adapter_e2e.rs`).
+
 ## Open questions
 
 - ~~Exact CLI surface (`watch` vs `adapter start`).~~ **Settled (card 06,
