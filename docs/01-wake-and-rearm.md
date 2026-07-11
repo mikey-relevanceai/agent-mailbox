@@ -41,6 +41,98 @@ Caveats:
 - Wake payload should be a short reminder (“mail on topic X”), not a re-run of a
   slash command. Body stays in the durable log (payload-free wake).
 
+### Implemented: `mailbox harness` (card 11)
+
+The loop above is real. The `mailbox` binary carries three hook targets (logic in
+the `mailbox-harness` crate; the binary is a thin dispatcher that owns the socket
+client):
+
+| Hook | Command | What it does |
+|---|---|---|
+| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` ~10m) | Reads `session_id` from the hook stdin JSON, asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
+| `SessionEnd` | `mailbox harness cleanup` | Reaps the waiter (`SIGTERM` the pidfile PID, remove the pidfile) and calls the bridge to drop this session's subscriptions **and** interests, stopping any adapter whose last interest it held (feeds the card-08 refcount — no zombie poller outlives the session). |
+| install | `mailbox harness install-hooks [--settings <path>]` | Prints the `settings.json` hooks snippet (and merges it into a file *atomically*, preserving unrelated settings). |
+
+**Session identity (settled).** Claude Code passes the hook payload as JSON on
+stdin, including `session_id`. `arm`/`cleanup` parse that into a branded
+`SessionId` (shared with the bridge in `mailbox-protocol`); `arm` execs `mailbox
+wait --session <id>` (the CLI also honours the `MAILBOX_SESSION_ID` env fallback).
+That closes the previously-open "how does a session name itself" question — the
+answer is *the hook tells us*.
+
+**Coordination: the lock is the source of truth (ADR-0006).** Exactly one waiter
+may be live per session, guarded by an advisory lock. The **waiter — not `arm` —
+owns the pidfile**, written only *after* it takes that lock; a waiter that loses
+the lock exits without touching it. So the pidfile always names the one live
+lock-holding waiter, and `cleanup` reaps that stable PID. (Previously `arm` wrote
+the pidfile pre-lock, so a doomed second arm could overwrite it with its own dead
+pid and orphan the real waiter — HIGH#1.) The pidfile, FIFO, and lock share one
+filename stem via a single `SessionId::encode_filename` encoder, so they key a
+session identically.
+
+**Arm-iff-subscribed, enforced twice.** A wake is only meaningful if the session
+subscribes to something. `arm` probes `status` over the socket (empty list, error
+reply, or unreachable bridge all → a typed *skip*, never a wake). The **waiter
+re-checks** `has_subscription` after taking the lock and self-exits cleanly (exit
+0, pidfile removed) if there is none — catching an `arm` whose probe passed but
+whose `SessionEnd`/unsubscribe then landed, so no orphan waiter survives (HIGH#2).
+
+**Payload-free wake.** The waiter's stderr on exit 2 is only `mail on topic X`
+(topic names, never a body); the body stays in the durable log and is read by the
+agent's later `read`. To keep that wire clean regardless of `RUST_LOG`, `wait` and
+`harness arm` route their `tracing` to `<db-dir>/harness.log`, never stderr.
+
+### Timeout survival: self-respawn by re-exec
+
+Claude Code kills a `command` hook after its `timeout` (default 10 minutes). A
+truly idle session gets no further `Stop`, so if the waiter were simply killed the
+session would silently go un-armed. The waiter therefore **self-respawns**:
+
+- `arm` execs `mailbox wait --max-block-ms <N>` with `N` shorter than the hook
+  `timeout` (defaults: `N = 540 000` ms vs `timeout = 600` s).
+- `mailbox wait` blocks on the kick for at most `N`. On mail → exit 2 (wake). On
+  reaching `N` with no mail → it **re-execs itself** (`execv`, same argv).
+- `execv` replaces the process image but **preserves the PID**, so the harness's
+  pidfile keeps identifying the live waiter across every respawn, and `cleanup`
+  reaps that one stable PID.
+- Each fresh waiter repeats the card-05 **open → check-then-block** ordering, so a
+  publish that lands during the re-exec gap is caught by the next waiter's unread
+  check rather than missed.
+
+Why re-exec (a fresh process image) rather than an internal loop: the goal is to
+present the harness with a *new* process before its per-hook timeout lands on a
+live wait. Whether Claude Code measures the async-hook timeout per PID or per
+process-image across `execv` is **not documented** (we could not confirm it either
+way). We therefore keep `max_block` well under `timeout` so the re-exec always
+precedes the kill deadline, and expose both as install-time knobs
+(`--max-block-ms`, `--timeout-secs`): if `execv` resets the timer, an arbitrarily
+long idle stays armed; if it does not, the waiter still survives to the configured
+`timeout`, after which the next `Stop` re-arms — and an operator can raise
+`--timeout-secs` for a longer guaranteed idle. This uncertainty is the one open
+empirical question; everything else is exercised without a live Claude Code
+(`crates/mailbox/tests/harness.rs`).
+
+### install-hooks
+
+`mailbox harness install-hooks` emits (JSON) the snippet below; `--settings <file>`
+also merges it in (idempotent, preserving unrelated settings). The `arm` command
+carries `--max-block-ms` so the self-respawn bound travels with the hook.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 540000",
+      "asyncRewake": true, "timeout": 600 }] }],
+    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 540000",
+      "asyncRewake": true, "timeout": 600 }] }],
+    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
+      "command": "/abs/path/to/mailbox harness cleanup" }] }]
+  }
+}
+```
+
 ## Codex CLI: no equivalent yet
 
 Codex has lifecycle hooks (`SessionStart`, `Stop`, …) but **not** an

@@ -33,7 +33,7 @@
 use std::time::Duration;
 
 use mailbox_protocol::{GithubPr, Topic, TopicError, stub_topic};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
@@ -89,11 +89,25 @@ pub enum UnwatchOutcome {
     NoSuchWatch,
 }
 
-/// A status snapshot: every known watch plus one session's per-topic unread.
+/// A status snapshot: every known watch plus one session's subscriptions and
+/// per-topic unread.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusView {
     pub watches: Vec<WatchEntry>,
+    /// The topics this session is subscribed to (card 11): the read behind
+    /// "arm-iff-subscribed", surfaced in `status` so it is observable by hand too.
+    pub subscriptions: Vec<Topic>,
     pub unread: Vec<(Topic, u64)>,
+}
+
+/// The outcome of ending a session (card 11): what was torn down. Counts only —
+/// never a body — so it is safe to log verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionEnded {
+    pub subscriptions_dropped: u64,
+    pub interests_dropped: u64,
+    /// Adapters stopped because this session's departure took their last interest.
+    pub adapters_stopped: u64,
 }
 
 /// One watch as `status` sees it, including its interest refcount and lifecycle
@@ -305,8 +319,69 @@ pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView,
             interest,
         });
     }
+    let subscriptions = storage.session_subscriptions(session.clone()).await?;
     let unread = storage.unread_counts(session).await?;
-    Ok(StatusView { watches, unread })
+    Ok(StatusView {
+        watches,
+        subscriptions,
+        unread,
+    })
+}
+
+/// End `session`: drop all its subscriptions and interests, and stop the adapter
+/// for every watch whose interest thereby reached zero (design/01 rule 5, feeding
+/// the card-08 supervisor). The durable teardown is one atomic storage step; the
+/// adapter stops are driven from its result. This is the bridge half of the
+/// harness `SessionEnd` hook (card 11): no zombie poller outlives the session.
+pub async fn end_session(
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Result<SessionEnded, WatchError> {
+    let outcome = storage.end_session(session.clone()).await?;
+
+    // The durable rows are already committed, so one adapter's stop failing must
+    // NOT abort the others — an early return here would leak the later emptied
+    // watches' pollers (a zombie). Try to stop EVERY emptied watch, collect any
+    // errors, and only then decide what to surface.
+    let mut stopped = 0u64;
+    let mut first_err: Option<SupervisorError> = None;
+    for watch_id in &outcome.emptied_watches {
+        // The last interested session leaving authorizes teardown; stop the adapter
+        // and mark the watch stopped (idempotent — a no-op if nothing is running).
+        match supervisor.stop_watch(*watch_id).await {
+            Ok(()) => stopped += 1,
+            Err(err) => {
+                warn!(
+                    session = session.as_str(),
+                    watch = watch_id.get(),
+                    error = %err,
+                    "could not stop an orphaned adapter during session end; continuing with the rest"
+                );
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+
+    info!(
+        session = session.as_str(),
+        subscriptions_dropped = outcome.subscriptions_removed,
+        interests_dropped = outcome.interests_removed,
+        adapters_stopped = stopped,
+        adapters_failed = outcome.emptied_watches.len() as u64 - stopped,
+        "ended session and stopped its now-orphaned adapters"
+    );
+
+    // The session's rows are gone regardless; only surface an error once every
+    // watch has been attempted, so no orphan is skipped by a fail-fast.
+    if let Some(err) = first_err {
+        return Err(WatchError::Supervisor(err));
+    }
+    Ok(SessionEnded {
+        subscriptions_dropped: outcome.subscriptions_removed,
+        interests_dropped: outcome.interests_removed,
+        adapters_stopped: stopped,
+    })
 }
 
 /// `owner/repo`, the watch identity's repo segment.
@@ -476,6 +551,53 @@ mod tests {
             WatchState::Desired,
             "the UnavailableResolver spawns no adapter, so the watch stays desired"
         );
+        assert_eq!(view.subscriptions, vec![recorded.topic.clone()]);
         assert_eq!(view.unread, vec![(recorded.topic, 1)]);
+    }
+
+    #[tokio::test]
+    async fn end_session_drops_the_departing_session_and_leaves_others() {
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let watched = pr(1);
+        // Two sessions watch the same PR; only one leaves.
+        record(
+            &bus,
+            &storage,
+            &supervisor,
+            &watched,
+            Duration::from_secs(30),
+            SessionId::new("leaver"),
+        )
+        .await
+        .unwrap();
+        record(
+            &bus,
+            &storage,
+            &supervisor,
+            &watched,
+            Duration::from_secs(30),
+            SessionId::new("stayer"),
+        )
+        .await
+        .unwrap();
+
+        let ended = end_session(&storage, &supervisor, SessionId::new("leaver"))
+            .await
+            .unwrap();
+        assert_eq!(ended.subscriptions_dropped, 1);
+        assert_eq!(ended.interests_dropped, 1);
+        // The other session still cares, so no adapter was orphaned/stopped.
+        assert_eq!(ended.adapters_stopped, 0);
+
+        // The leaver is gone from status; the shared watch's interest is now 1.
+        let view = status(&storage, SessionId::new("leaver")).await.unwrap();
+        assert!(view.subscriptions.is_empty());
+        assert_eq!(view.watches[0].interest, 1);
+
+        // The last session leaving empties the watch (drives supervisor teardown).
+        let ended = end_session(&storage, &supervisor, SessionId::new("stayer"))
+            .await
+            .unwrap();
+        assert_eq!(ended.adapters_stopped, 1);
     }
 }

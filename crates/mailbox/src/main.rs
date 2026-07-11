@@ -27,24 +27,25 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, HarnessCommand};
 
 fn main() -> ExitCode {
-    // Route library `tracing` events to STDERR, filtered by RUST_LOG. Keeping
-    // logs off stdout is what lets `--json` output stay clean and parseable; the
-    // default filter is quiet (error only) so ordinary CLI use is silent unless
-    // an operator opts in with `RUST_LOG=mailbox=debug`.
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
-
     // clap handles --help/--version and prints usage errors itself (exit 2).
     let cli = Cli::parse();
 
+    // Route `tracing` events. For `wait` and `harness arm`, the process stderr is
+    // a WIRE channel: on exit 2 Claude Code surfaces it to the agent as the "mail
+    // on topic X" reminder (payload-free wake). A `RUST_LOG=info` tracing line on
+    // that stderr would pollute the reminder, so those two commands send tracing to
+    // a log file under the mailbox dir (or suppress it) — the reminder is written
+    // with a bare `eprintln!`, keeping the wire clean regardless of `RUST_LOG`.
+    // Every other command keeps logs on stderr (stdout stays clean for `--json`).
+    init_tracing(&cli.command);
+
     match cli.command {
         // `wait` runs synchronously (no runtime) and owns its own exit codes:
-        // 2 = mail (wake the session), 1 = waiter error.
+        // 2 = mail (wake the session), 1 = waiter error. On its self-respawn
+        // boundary it re-execs itself, so it never returns to `main` in that case.
         Command::Wait(args) => cli::run_wait(&args),
         // Everything else is async (socket client, or the serve daemon).
         command => {
@@ -66,4 +67,63 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Whether this command's stderr is a wake wire channel (`wait` and `harness
+/// arm`), so its tracing must be kept OFF stderr.
+fn is_wire_stderr(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Wait(_)
+            | Command::Harness(cli::HarnessArgs {
+                command: HarnessCommand::Arm(_)
+            })
+    )
+}
+
+/// Initialise the `tracing` subscriber. Wire-stderr commands (`wait`, `harness
+/// arm`) log to `<db-dir>/harness.log` (append) so their stderr stays a clean wake
+/// channel; if that file cannot be opened, or for any other command, tracing goes
+/// to stderr as usual. Filtered by `RUST_LOG` (quiet — error only — by default).
+fn init_tracing(command: &Command) {
+    let filter = || EnvFilter::from_default_env();
+    if is_wire_stderr(command)
+        && let Some(file) = wire_log_file()
+    {
+        // `with_writer` takes a MakeWriter; a closure returning a fresh handle each
+        // time satisfies it, and appends interleave safely on our targets.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(move || file.try_clone().unwrap_or_else(|_| open_null()))
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+}
+
+/// Open (append) the harness log file beside the database, if the storage path
+/// resolves. `None` falls back to stderr for that run — losing a few log lines is
+/// preferable to failing the hook.
+fn wire_log_file() -> Option<std::fs::File> {
+    let config = mailbox::storage::StorageConfig::from_env().ok()?;
+    let dir = config.dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("harness.log"))
+        .ok()
+}
+
+/// `/dev/null` as a last-resort writer (a failed `try_clone`); dropping logs is
+/// fine here — never polluting the wake wire is the priority.
+fn open_null() -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null")
 }

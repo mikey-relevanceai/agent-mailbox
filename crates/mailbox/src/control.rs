@@ -91,8 +91,13 @@ pub enum Request {
     },
     /// Drop `session`'s interest in a `stub` watch and unsubscribe it.
     UnwatchStub { session: SessionId, label: String },
-    /// Report watches (interest + child pid) and this session's unread counts.
+    /// Report watches (interest + child pid), this session's subscriptions, and
+    /// its unread counts.
     Status { session: SessionId },
+    /// End a session (the harness `SessionEnd` hook, card 11): drop all its
+    /// subscriptions and interests, stopping any adapter whose last interest it
+    /// held. No topic here — it tears down everything for the session at once.
+    EndSession { session: SessionId },
 }
 
 /// Identity of a GitHub PR to watch/unwatch. Only `github-pr` exists for the MVP;
@@ -142,6 +147,12 @@ pub enum Response {
     },
     /// A status snapshot.
     Status(StatusReport),
+    /// A session was ended (card 11): counts of what its teardown removed.
+    SessionEnded {
+        subscriptions_dropped: u64,
+        interests_dropped: u64,
+        adapters_stopped: u64,
+    },
     /// The command was well-formed but could not be serviced (bad topic, storage
     /// error, …). Human-readable detail only; not machine-dispatched on.
     Error { message: String },
@@ -207,6 +218,9 @@ pub struct StatusReport {
     pub session: SessionId,
     /// Every watch the bridge knows about, with interest counts + lifecycle.
     pub watches: Vec<WatchStatus>,
+    /// The topics `session` is subscribed to (card 11): the read behind
+    /// "arm-iff-subscribed", also handy by hand.
+    pub subscriptions: Vec<Topic>,
     /// Per-topic unread counts for `session` (topics with zero are omitted).
     pub unread: Vec<TopicUnread>,
 }
@@ -217,6 +231,7 @@ impl StatusReport {
         StatusReport {
             session,
             watches: view.watches.into_iter().map(WatchStatus::from).collect(),
+            subscriptions: view.subscriptions,
             unread: view
                 .unread
                 .into_iter()

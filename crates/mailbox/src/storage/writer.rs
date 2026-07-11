@@ -27,8 +27,8 @@ use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Top
 
 use super::error::StorageError;
 use super::model::{
-    Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
-    WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 
 /// Default page size when a reader does not specify a limit. Bounds memory for
@@ -119,6 +119,19 @@ pub(crate) enum Command {
     SessionsSubscribed {
         topic: Topic,
         reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
+    },
+    /// List the topics a session subscribes to (the "arm-iff-subscribed" read,
+    /// card 11). A read routed through the writer channel like every other op.
+    SessionSubscriptions {
+        session: SessionId,
+        reply: oneshot::Sender<Result<Vec<Topic>, StorageError>>,
+    },
+    /// Drop all of a session's subscriptions AND interests in one transaction,
+    /// returning what was removed and which watches reached zero interest (the
+    /// SessionEnd teardown, card 11).
+    EndSession {
+        session: SessionId,
+        reply: oneshot::Sender<Result<EndSessionOutcome, StorageError>>,
     },
     UpsertWatch {
         spec: WatchSpec,
@@ -314,6 +327,20 @@ fn handle(conn: &mut Connection, cmd: Command) {
             let result = do_sessions_subscribed(conn, &topic);
             log_on_err(&result, "sessions_subscribed", || {
                 format!("topic={}", topic.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::SessionSubscriptions { session, reply } => {
+            let result = do_session_subscriptions(conn, &session);
+            log_on_err(&result, "session_subscriptions", || {
+                format!("session={}", session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::EndSession { session, reply } => {
+            let result = do_end_session(conn, &session);
+            log_on_err(&result, "end_session", || {
+                format!("session={}", session.as_str())
             });
             let _ = reply.send(result);
         }
@@ -609,6 +636,86 @@ fn do_sessions_subscribed(
         sessions.push(SessionId::new(row?));
     }
     Ok(sessions)
+}
+
+/// The topics `session` subscribes to, ascending (deterministic for the arm
+/// decision + logs). A subscription row can only hold a topic the bridge
+/// accepted, so a value that now fails the grammar is corrupt storage, not user
+/// input (mirrors `do_unread_counts`).
+fn do_session_subscriptions(
+    conn: &Connection,
+    session: &SessionId,
+) -> Result<Vec<Topic>, StorageError> {
+    let mut stmt =
+        conn.prepare("SELECT topic FROM subscription WHERE session_id = ?1 ORDER BY topic ASC")?;
+    let rows = stmt.query_map(params![session.as_str()], |row| row.get::<_, String>(0))?;
+    let mut topics = Vec::new();
+    for row in rows {
+        let topic_str = row?;
+        let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
+            detail: format!("invalid topic {topic_str:?} stored in subscription"),
+        })?;
+        topics.push(topic);
+    }
+    Ok(topics)
+}
+
+/// Drop every subscription and every watch interest held by `session`, and report
+/// which watches thereby reached zero interest — all in ONE transaction so the
+/// "who reached zero" answer is consistent with the deletion that caused it
+/// (mirrors [`do_sweep_stale_interests`], but keyed by session rather than age).
+///
+/// The delivery cursors are intentionally left untouched: they are harmless
+/// orphans once the subscriptions are gone (nothing reads them), and preserving
+/// them means a session id that is ever reused does not silently replay history.
+fn do_end_session(
+    conn: &mut Connection,
+    session: &SessionId,
+) -> Result<EndSessionOutcome, StorageError> {
+    let tx = conn.transaction()?;
+
+    // The watches this session had an interest in — only these can have reached
+    // zero, so we recount just them after the delete rather than every watch.
+    let affected: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT watch_id FROM watch_interest WHERE session_id = ?1")?;
+        let rows = stmt.query_map(params![session.as_str()], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let interests_removed = tx.execute(
+        "DELETE FROM watch_interest WHERE session_id = ?1",
+        params![session.as_str()],
+    )? as u64;
+    let subscriptions_removed = tx.execute(
+        "DELETE FROM subscription WHERE session_id = ?1",
+        params![session.as_str()],
+    )? as u64;
+
+    let mut emptied_watches = Vec::new();
+    for watch_id in affected {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM watch_interest WHERE watch_id = ?1",
+            params![watch_id],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            emptied_watches.push(WatchId::new(watch_id));
+        }
+    }
+    tx.commit()?;
+
+    info!(
+        session = session.as_str(),
+        subscriptions_removed,
+        interests_removed,
+        emptied = emptied_watches.len(),
+        "ended session (dropped its subscriptions and interests)"
+    );
+    Ok(EndSessionOutcome {
+        subscriptions_removed,
+        interests_removed,
+        emptied_watches,
+    })
 }
 
 fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, StorageError> {
@@ -1445,6 +1552,90 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["alice", "bob"]);
+    }
+
+    #[test]
+    fn session_subscriptions_lists_topics_in_order() {
+        let mut conn = migrated();
+        let session = SessionId::new("s");
+        assert!(
+            do_session_subscriptions(&conn, &session)
+                .unwrap()
+                .is_empty()
+        );
+        do_subscribe_and_baseline(&mut conn, &session, &Topic::parse("t.b").unwrap()).unwrap();
+        do_subscribe_and_baseline(&mut conn, &session, &Topic::parse("t.a").unwrap()).unwrap();
+        // Another session's subscription must not leak into this one's list.
+        do_subscribe_and_baseline(
+            &mut conn,
+            &SessionId::new("other"),
+            &Topic::parse("t.z").unwrap(),
+        )
+        .unwrap();
+        let topics: Vec<String> = do_session_subscriptions(&conn, &session)
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect();
+        assert_eq!(topics, ["t.a", "t.b"]);
+    }
+
+    #[test]
+    fn end_session_drops_subscriptions_and_interests_and_reports_emptied() {
+        let mut conn = migrated();
+        let session = SessionId::new("leaver");
+        let other = SessionId::new("stayer");
+
+        // Two watches: one only `leaver` cares about, one both care about.
+        let solo = do_upsert_watch(
+            &conn,
+            &WatchSpec {
+                target: WatchTarget::Stub {
+                    label: "solo".to_string(),
+                    count: 0,
+                },
+                interval: std::time::Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let shared = do_upsert_watch(
+            &conn,
+            &WatchSpec {
+                target: WatchTarget::Stub {
+                    label: "shared".to_string(),
+                    count: 0,
+                },
+                interval: std::time::Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        do_add_interest(&conn, solo, &session, 0).unwrap();
+        do_add_interest(&conn, shared, &session, 0).unwrap();
+        do_add_interest(&conn, shared, &other, 0).unwrap();
+        do_subscribe_and_baseline(&mut conn, &session, &Topic::parse("t.x").unwrap()).unwrap();
+        do_subscribe_and_baseline(&mut conn, &session, &Topic::parse("t.y").unwrap()).unwrap();
+
+        let outcome = do_end_session(&mut conn, &session).unwrap();
+        assert_eq!(outcome.subscriptions_removed, 2);
+        assert_eq!(outcome.interests_removed, 2);
+        // Only the solo watch reached zero interest; the shared one still has `other`.
+        assert_eq!(outcome.emptied_watches, vec![solo]);
+
+        // The session is fully gone; the other session's interest is untouched.
+        assert!(
+            do_session_subscriptions(&conn, &session)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(do_interest_count(&conn, shared).unwrap(), 1);
+        assert_eq!(do_interest_count(&conn, solo).unwrap(), 0);
+    }
+
+    #[test]
+    fn end_session_on_unknown_session_is_a_clean_noop() {
+        let mut conn = migrated();
+        let outcome = do_end_session(&mut conn, &SessionId::new("ghost")).unwrap();
+        assert_eq!(outcome, EndSessionOutcome::default());
     }
 
     #[test]

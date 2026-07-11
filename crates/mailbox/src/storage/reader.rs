@@ -76,6 +76,23 @@ impl ReadOnlyStore {
     pub fn topics_with_unread(&self, session: &SessionId) -> Result<Vec<Topic>, StorageError> {
         query_topics_with_unread(&self.conn, session.as_str())
     }
+
+    /// Whether `session` currently has at least one subscription.
+    ///
+    /// The waiter-side "arm-iff-subscribed" re-check (card 11): distinct from
+    /// [`topics_with_unread`](Self::topics_with_unread), which is empty both when
+    /// the session has NO subscription AND when it is subscribed but caught up.
+    /// This asks the narrower question — "is there anything to be woken about at
+    /// all?" — so a waiter that raced a `SessionEnd`/unsubscribe (interest already
+    /// dropped) can self-exit instead of blocking forever as an orphan.
+    pub fn has_subscription(&self, session: &SessionId) -> Result<bool, StorageError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM subscription WHERE session_id = ?1)",
+            [session.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
 }
 
 /// The unread-topics query, factored out so it can run against any

@@ -39,6 +39,7 @@ mod error;
 mod framing;
 mod ids;
 mod message;
+mod session;
 mod topic;
 
 /// Protocol schema version carried on every framed line so peers reject frames
@@ -52,4 +53,5 @@ pub use message::{
     Ack, Baseline, ErrorCode, Event, Message, ProtocolError, Publish, ReadRequest, ReadResponse,
     Subscribe, Unsubscribe,
 };
+pub use session::SessionId;
 pub use topic::{GithubPr, Topic, stub_topic};

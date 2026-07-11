@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use mailbox::bus::{Bus, SessionId};
 use mailbox::storage::{Storage, StorageConfig};
-use mailbox::wake::{KickOutcome, WAKE_BYTE, Waiter, WakeError, WakeReason, Waker};
+use mailbox::wake::{KickOutcome, WAKE_BYTE, WaitOutcome, Waiter, WakeError, WakeReason, Waker};
 use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 use serde_json::json;
 use tempfile::TempDir;
@@ -158,12 +158,18 @@ fn let_waiter_block() {
 
 type WaitResult = Result<mailbox::wake::WakeOutcome, WakeError>;
 
-/// Run `waiter.wait()` on a background thread, returning the result channel and
-/// the join handle. The result is sent when `wait` returns.
+/// Run `waiter.wait(None)` (unbounded) on a background thread, returning the
+/// result channel and the join handle. These tests all subscribe first and drive
+/// a real publish, so the wait always resolves to `Woken`; any other outcome is a
+/// test-setup bug and panics the sender thread.
 fn spawn_wait_thread(waiter: Waiter) -> (mpsc::Receiver<WaitResult>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let _ = tx.send(waiter.wait());
+        let mapped = waiter.wait(None).map(|outcome| match outcome {
+            WaitOutcome::Woken(woken) => woken,
+            other => panic!("unbounded subscribed wait resolved unexpectedly: {other:?}"),
+        });
+        let _ = tx.send(mapped);
     });
     (rx, handle)
 }
@@ -425,11 +431,20 @@ async fn second_waiter_for_same_session_refuses() {
     // FIFO existing implies the lock was already acquired (lock precedes FIFO).
     wait_for_path(&fifo, Duration::from_secs(3));
 
-    // Waiter 2 (same session) must refuse fast rather than attach to the FIFO.
-    let result2 = h.waiter("sess-dup").wait();
+    // Waiter 2 (same session) must refuse fast rather than attach to the FIFO —
+    // and, crucially, must NOT touch the pidfile (a lock loser leaves the live
+    // waiter's pidfile intact; card 11 HIGH#1).
+    let waiter2 = h.waiter("sess-dup");
+    let pidfile_before = std::fs::read(waiter2.pidfile_path()).ok();
+    let result2 = waiter2.wait(None);
     assert!(
         matches!(result2, Err(WakeError::AlreadyWaiting { .. })),
         "expected AlreadyWaiting, got {result2:?}"
+    );
+    assert_eq!(
+        std::fs::read(waiter2.pidfile_path()).ok(),
+        pidfile_before,
+        "the lock loser must not overwrite the live waiter's pidfile"
     );
 
     // Reap waiter 1: give it mail so it returns (either wake path is fine here —
@@ -618,4 +633,68 @@ async fn missed_kick_boundary_stress() {
         let exit = await_exit(child, Duration::from_secs(5));
         assert_eq!(exit.code, Some(2), "trial {i} stderr: {}", exit.stderr);
     }
+}
+
+// ==== bounded wait: the self-respawn boundary at the Waiter level (card 11) ======
+
+/// A bounded wait with nothing unread must give up (so the caller re-execs a
+/// fresh waiter) rather than block forever; and a *fresh* bounded waiter's
+/// check-then-block still wakes on mail that landed while no waiter was live —
+/// the exact "publish during the re-exec gap is not missed" property.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_bounded_times_out_then_a_fresh_waiter_still_wakes() {
+    let h = harness().await;
+    let t = topic(40);
+    h.subscribe("sess-bounded", &t).await;
+
+    let waiter = h.waiter("sess-bounded");
+    let timed_out =
+        tokio::task::spawn_blocking(move || waiter.wait(Some(Duration::from_millis(200))))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        matches!(timed_out, WaitOutcome::TimedOut { .. }),
+        "a bounded wait with no mail must yield for re-arm, got {timed_out:?}"
+    );
+
+    // Mail lands while no waiter is live (the re-exec gap).
+    h.publish(&t, 0, json!({ "i": 0 })).await;
+
+    let waiter = h.waiter("sess-bounded");
+    let woken = tokio::task::spawn_blocking(move || waiter.wait(Some(Duration::from_millis(200))))
+        .await
+        .unwrap()
+        .unwrap();
+    match woken {
+        WaitOutcome::Woken(outcome) => assert_eq!(outcome.topics(), std::slice::from_ref(&t)),
+        other => panic!("a fresh bounded waiter must catch the pending mail, got {other:?}"),
+    }
+}
+
+// ==== waiter-side arm-iff-subscribed: no subscription => Unsubscribed, no orphan =
+
+/// A waiter for a session with NO subscription must self-exit `Unsubscribed`
+/// (removing its pidfile) rather than block as an orphan. This is the waiter-side
+/// half of arm-iff-subscribed: it catches an `arm` that raced a `SessionEnd` /
+/// unsubscribe after the pre-exec probe already passed (card 11 HIGH#2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_on_unsubscribed_session_exits_without_orphaning() {
+    let h = harness().await;
+    // Deliberately do NOT subscribe.
+    let waiter = h.waiter("sess-unsub");
+    let pidfile = waiter.pidfile_path().to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || waiter.wait(Some(Duration::from_secs(5))))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        WaitOutcome::Unsubscribed,
+        "a waiter with no subscription must self-exit, not block as an orphan"
+    );
+    assert!(
+        !pidfile.exists(),
+        "the Unsubscribed exit must remove the pidfile"
+    );
 }

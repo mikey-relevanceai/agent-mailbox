@@ -44,8 +44,8 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind, WatchSpec, WatchState,
-    WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -483,6 +483,36 @@ impl Storage {
         session: SessionId,
     ) -> Result<Vec<(Topic, u64)>, StorageError> {
         self.call(|reply| Command::UnreadCounts { session, reply })
+            .await
+    }
+
+    /// The topics `session` is currently subscribed to, in ascending topic order.
+    ///
+    /// The read behind "arm-iff-subscribed" (card 11): the harness `arm` hook asks
+    /// this to decide whether an idle session has anything to be woken about before
+    /// it launches a waiter. A pure read routed through the single writer channel
+    /// like [`list_watches`](Self::list_watches), so it never opens a second
+    /// connection (ADR-0003).
+    pub async fn session_subscriptions(
+        &self,
+        session: SessionId,
+    ) -> Result<Vec<Topic>, StorageError> {
+        self.call(|reply| Command::SessionSubscriptions { session, reply })
+            .await
+    }
+
+    /// Drop every subscription AND every watch interest held by `session`, in one
+    /// transaction, returning what was removed plus the watches whose interest
+    /// thereby reached zero.
+    ///
+    /// The durable half of the SessionEnd teardown (card 11): a departing session
+    /// must leave no subscription (so a late publish wakes nobody) and no interest
+    /// (so the card-08 supervisor can stop adapters nobody else wants). The caller
+    /// stops each [`EndSessionOutcome::emptied_watches`] adapter — the same signal
+    /// the TTL sweeper uses, but triggered promptly by an explicit session end
+    /// rather than by ageing out.
+    pub async fn end_session(&self, session: SessionId) -> Result<EndSessionOutcome, StorageError> {
+        self.call(|reply| Command::EndSession { session, reply })
             .await
     }
 

@@ -458,6 +458,7 @@ fn request_op(request: &Request) -> &'static str {
         Request::WatchStub { .. } => "watch_stub",
         Request::UnwatchStub { .. } => "unwatch_stub",
         Request::Status { .. } => "status",
+        Request::EndSession { .. } => "end_session",
     }
 }
 
@@ -473,7 +474,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::Unwatch { session, .. }
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
-        | Request::Status { session } => Some(session),
+        | Request::Status { session }
+        | Request::EndSession { session } => Some(session),
     }
 }
 
@@ -532,6 +534,7 @@ async fn dispatch(
             unwatch_stub(bus, storage, supervisor, session, label).await
         }
         Request::Status { session } => status(storage, session).await,
+        Request::EndSession { session } => end_session(storage, supervisor, session).await,
     }
 }
 
@@ -690,6 +693,20 @@ async fn unwatch_stub(
 async fn status(storage: &Storage, session: SessionId) -> Response {
     match mailbox::watch::status(storage, session.clone()).await {
         Ok(view) => Response::Status(StatusReport::from_view(session, view)),
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::end_session`] (the harness `SessionEnd`
+/// teardown, card 11): drop the session's subscriptions + interests and stop any
+/// now-orphaned adapters.
+async fn end_session(storage: &Storage, supervisor: &Supervisor, session: SessionId) -> Response {
+    match mailbox::watch::end_session(storage, supervisor, session).await {
+        Ok(ended) => Response::SessionEnded {
+            subscriptions_dropped: ended.subscriptions_dropped,
+            interests_dropped: ended.interests_dropped,
+            adapters_stopped: ended.adapters_stopped,
+        },
         Err(err) => Response::error(err.to_string()),
     }
 }

@@ -77,10 +77,16 @@ other command (except `wait`) is a one-shot Unix-socket client of it.
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>] --session <id>` | Record a `stub` watch + interest, subscribe to `stub.<label>`, and spawn the reference stub adapter (card 09), which publishes a synthetic event every `--interval-ms` (default 1000), `--count` times (`0`/default = forever). The one watch kind that spawns a real adapter today. |
 | `mailbox unwatch stub <label> --session <id>` | Drop this session's interest in the stub watch and unsubscribe. |
 | `mailbox status --session <id>` | Watches (interest counts, lifecycle state + child pid when the supervisor is running one) + this session's unread counts. Both `stub` and `github-pr` watches read `running` with a pid once their adapter is spawned. |
-| `mailbox wait --session <id>` | Block until this session has mail, exit 2 (the `asyncRewake` contract). Direct read-only client — never uses the socket. |
+| `mailbox wait --session <id> [--max-block-ms <n>]` | Block until this session has mail, exit 2 (the `asyncRewake` contract). Direct read-only client — never uses the socket. With `--max-block-ms`, a block that elapses with no mail **re-execs a fresh waiter** (same PID) instead of returning — the self-respawn that keeps a long idle armed (card 11). |
+| `mailbox harness arm [--max-block-ms <n>]` | The `SessionStart`/`Stop` hook target (`asyncRewake: true`). Reads `session_id` from the hook stdin JSON and launches the waiter **iff the session has subscriptions** — bridge-down/erroring or not-subscribed exit 0 without waking (fail-safe). It does NOT write the pidfile; the waiter does, after taking the single-waiter lock ([ADR-0006](docs/adr/0006-harness-self-respawn.md)). Logic lives in `mailbox-harness` (card 11). |
+| `mailbox harness cleanup` | The `SessionEnd` hook target. Reaps the session's waiter (pidfile + `SIGTERM`) and drops its subscriptions + interests on the bridge, stopping any now-orphaned adapter (feeds the card-08 refcount — no zombie poller outlives the session). Retries a transient bridge failure, then defers to the card-08 TTL sweeper. |
+| `mailbox harness install-hooks [--settings <path>] [--timeout-secs <n>] [--max-block-ms <n>] [--mailbox-bin <path>]` | Print (and, with `--settings`, merge into a file) the Claude Code `settings.json` hooks snippet wiring `arm` (SessionStart/Stop) + `cleanup` (SessionEnd). |
 
-Conventions: `--session <id>` wins over the `MAILBOX_SESSION_ID` env fallback
-(set by harness hooks, card 11). `--json` (global) makes any command emit
+Conventions: `--session <id>` wins over the `MAILBOX_SESSION_ID` env fallback.
+Session identity is settled (card 11): it comes from the Claude Code hook stdin
+JSON (`session_id`), which `mailbox harness arm`/`cleanup` read; `arm` then execs
+`mailbox wait --session <id>` (which self-respawns carrying the same flag).
+`--json` (global) makes any command emit
 machine-readable JSON on stdout; logs always go to stderr so JSON stays clean.
 When the daemon is down, socket clients fail loudly (non-zero, "start it with
 `mailbox serve`") rather than auto-spawning or opening the DB.

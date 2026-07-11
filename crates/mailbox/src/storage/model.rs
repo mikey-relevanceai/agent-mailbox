@@ -10,40 +10,11 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use mailbox_protocol::{Cursor, Event, Offset};
-
-/// Identity of a Claude/Codex session that expresses interest in a topic or
-/// watch. Sourced from the harness (hook `session_id`); the bridge treats it as
-/// an opaque label. Branded so it cannot be swapped with a `Topic` or any other
-/// string at a call site.
-///
-/// The inner string is private and minted only through [`SessionId::new`] — the
-/// same "opaque, constructed at the edge" story as [`WatchId`] — so a call site
-/// cannot reach in and treat it as a bare `String`.
-/// `#[serde(transparent)]` so on the wire a session id is just its bare string —
-/// no envelope for a non-Rust peer to produce — while in Rust it stays branded
-/// (a `SessionId` cannot be passed where a `Topic` or bare `String` is meant).
-/// Deserialization goes straight through [`SessionId::new`]'s representation, so
-/// any string decoded off the socket is a valid session id (there is no
-/// additional grammar to violate — the harness owns the label).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(String);
-
-impl SessionId {
-    /// Wrap a session label coming from the harness. Accepts anything
-    /// string-like so call sites need not pre-convert.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    /// Borrow as a string slice (for binding into SQL).
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+// The session identity is shared with the harness, so it lives in the protocol
+// crate (see `mailbox_protocol::session`). Re-exported here so the many existing
+// `mailbox::storage::SessionId` call sites keep working unchanged.
+pub use mailbox_protocol::SessionId;
 
 /// Stable identifier for a watch row, assigned by the store on insert.
 ///
@@ -222,6 +193,26 @@ pub struct Watch {
     pub target: WatchTarget,
     pub interval: Duration,
     pub state: WatchState,
+}
+
+/// What ending a session removed (the SessionEnd teardown, card 11).
+///
+/// A session's departure drops both halves of its state in one transaction: its
+/// `subscription` rows (so it is woken about nothing more) and its
+/// `watch_interest` rows (so the card-08 refcount can stop adapters nobody else
+/// wants). `emptied_watches` are exactly the watches whose interest thereby fell
+/// to zero — the ones whose adapter the caller must now stop, mirroring
+/// [`crate::storage::Storage::sweep_stale_interests`]'s return. The counts are
+/// kept for an honest, body-free teardown log.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EndSessionOutcome {
+    /// How many `subscription` rows were removed for the session.
+    pub subscriptions_removed: u64,
+    /// How many `watch_interest` rows were removed for the session.
+    pub interests_removed: u64,
+    /// Watches whose interest reached zero because this session left — the
+    /// caller stops each one's adapter (design/01 rule 5).
+    pub emptied_watches: Vec<WatchId>,
 }
 
 /// A page of events plus the cursor to continue from.

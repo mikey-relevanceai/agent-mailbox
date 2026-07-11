@@ -54,6 +54,7 @@ use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{debug, info, trace, warn};
 
@@ -137,6 +138,15 @@ pub enum WakeError {
         source: io::Error,
     },
 
+    /// The waiter pidfile could not be written (the waiter cannot make itself
+    /// reap-able by `cleanup`, so this is a real error rather than best-effort).
+    #[error("could not write waiter pidfile {path}: {source}")]
+    Pidfile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// The read-only unread check against the durable store failed.
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -191,6 +201,39 @@ enum Pass {
     AfterKick,
 }
 
+/// Why one `poll` on the FIFO returned: a kick byte arrived (drain + re-check),
+/// or the bounded block elapsed with no kick (the self-respawn boundary, card 11).
+/// A named enum, not a `bool`, so the branch reads plainly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// The FIFO became readable — a kick arrived and was drained.
+    Kicked,
+    /// The `max_block` budget elapsed before any kick (bounded waits only).
+    TimedOut,
+}
+
+/// The result of a [`Waiter::wait`]: how a blocking wait ended.
+///
+/// A three-way outcome, so the harness's arm-iff-subscribed and self-respawn
+/// coordination are both representable and exhaustively handled at the call site
+/// (no `unreachable!`): see docs/01-wake-and-rearm.md and ADR-0006.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The session has unread mail; exit 2 and surface the reminder.
+    Woken(WakeOutcome),
+    /// No mail within `budget`; the caller should re-exec a fresh waiter. Only
+    /// ever returned when a `max_block` was supplied (an unbounded wait blocks
+    /// forever). `budget` is carried so the caller re-arms with the same bound
+    /// without re-reading it from elsewhere.
+    TimedOut { budget: Duration },
+    /// The session has NO subscriptions, so there is nothing to be woken about —
+    /// exit cleanly WITHOUT waking. This is the waiter-side half of
+    /// arm-iff-subscribed: an `arm` that raced a `SessionEnd`/unsubscribe (interest
+    /// already dropped) starts a waiter that finds nothing and self-exits, so no
+    /// orphan waiter survives (card 11 HIGH#2 fix).
+    Unsubscribed,
+}
+
 /// The result of a completed [`Waiter::wait`]: the session has mail and should
 /// be woken.
 ///
@@ -230,41 +273,26 @@ impl WakeOutcome {
 }
 
 /// The path of a session's FIFO under `waiters_dir`.
+///
+/// The filename stem is [`SessionId::encode_filename`] — the ONE shared encoder
+/// (in `mailbox-protocol`), so the FIFO, the lock, and the harness's pidfile all
+/// key a session identically (card 11 coordination).
 fn fifo_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
-    waiters_dir.join(format!("{}.fifo", encode_session(session)))
+    waiters_dir.join(format!("{}.fifo", session.encode_filename()))
 }
 
 /// The path of a session's advisory lockfile under `waiters_dir`.
 fn lock_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
-    waiters_dir.join(format!("{}.lock", encode_session(session)))
+    waiters_dir.join(format!("{}.lock", session.encode_filename()))
 }
 
-/// Encode a session id into a filesystem-safe, collision-free file stem.
+/// The path of a session's waiter pidfile under `waiters_dir`.
 ///
-/// The session id is an opaque label from the harness and may contain bytes that
-/// are unsafe in a filename (`/`, control chars). We percent-encode anything
-/// outside a conservative safe set.
-///
-/// Crucially the safe set excludes UPPERCASE ASCII letters: macOS's default
-/// APFS is case-INSENSITIVE, so `aB` and `Ab` would otherwise map to the same
-/// file. Encoding every non-lowercase letter as `%XX` (uppercase hex, whose only
-/// letters are `A`–`F` and never fold onto a lowercase safe char) keeps the map
-/// injective on BOTH case-sensitive and case-insensitive filesystems. The escape
-/// char `%` is itself encoded, so distinct inputs can never collide.
-fn encode_session(session: &SessionId) -> String {
-    let mut out = String::with_capacity(session.as_str().len());
-    for &byte in session.as_str().as_bytes() {
-        // Safe set: lowercase letters, digits, and `. _ -`. Everything else —
-        // including uppercase letters — is percent-encoded.
-        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{byte:02X}"));
-        }
-    }
-    out
+/// The waiter (not `arm`) owns this: it is written only AFTER the single-waiter
+/// lock is acquired, so the pidfile always names the one live lock-holding waiter
+/// — the source of truth `cleanup` reaps (card 11, ADR-0006).
+pub fn pidfile_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
+    waiters_dir.join(format!("{}.waiter.pid", session.encode_filename()))
 }
 
 /// The kick side of wake, held by whoever publishes (the bridge / bus).
@@ -391,12 +419,13 @@ pub struct Waiter {
     session: SessionId,
     fifo_path: PathBuf,
     lock_path: PathBuf,
+    pidfile_path: PathBuf,
     db_path: PathBuf,
 }
 
 impl Waiter {
-    /// Build a waiter for `session`, using FIFOs/locks under `waiters_dir` and
-    /// the read-only store at `db_path`.
+    /// Build a waiter for `session`, using FIFOs/locks/pidfiles under
+    /// `waiters_dir` and the read-only store at `db_path`.
     pub fn new(
         waiters_dir: impl AsRef<Path>,
         db_path: impl Into<PathBuf>,
@@ -405,10 +434,12 @@ impl Waiter {
         let waiters_dir = waiters_dir.as_ref();
         let fifo_path = fifo_path(waiters_dir, &session);
         let lock_path = lock_path(waiters_dir, &session);
+        let pidfile_path = pidfile_path(waiters_dir, &session);
         Self {
             session,
             fifo_path,
             lock_path,
+            pidfile_path,
             db_path: db_path.into(),
         }
     }
@@ -418,31 +449,52 @@ impl Waiter {
         &self.fifo_path
     }
 
+    /// The resolved waiter pidfile path (exposed for tests and diagnostics).
+    pub fn pidfile_path(&self) -> &Path {
+        &self.pidfile_path
+    }
+
     /// Block until this session has unread mail, then return the outcome.
     ///
-    /// The ordering is load-bearing (see the module docs). Concretely:
+    /// The ordering is load-bearing (see the module docs and ADR-0006):
     ///
     /// 0. Acquire the per-session exclusive lock (single-waiter-per-session); a
-    ///    second waiter fails fast with [`WakeError::AlreadyWaiting`].
-    /// 1. Ensure the FIFO node exists (and really is a FIFO), then **open it**
-    ///    (`O_RDWR | O_NONBLOCK`) — from here on any kick is either buffered in
-    ///    this pipe or already reflected in the durable log.
-    /// 2. Open the read-only store.
-    /// 3. Loop: check unread. If there is mail, return (first pass ⇒
-    ///    `ExistingUnread`, later passes ⇒ `Kicked`). Otherwise `poll` until a
-    ///    kick byte arrives, drain every buffered byte, then re-check.
+    ///    second waiter fails fast with [`WakeError::AlreadyWaiting`] and — never
+    ///    having reached the pidfile step — leaves the pidfile untouched, so it
+    ///    keeps naming the LIVE lock-holding waiter (card 11 HIGH#1 fix).
+    /// 1. Write the pidfile (our pid) — the waiter, not `arm`, owns it, written
+    ///    only AFTER the lock so the pidfile is always the one live waiter's.
+    /// 2. Ensure + open the FIFO (`O_RDWR | O_NONBLOCK`) — from here any kick is
+    ///    either buffered in this pipe or already reflected in the durable log.
+    /// 3. Open the read-only store and **re-check the session still has a
+    ///    subscription** — an `arm` that raced `SessionEnd` finds none and exits
+    ///    [`WaitOutcome::Unsubscribed`] (no orphan; card 11 HIGH#2 fix).
+    /// 4. Loop: check unread. If there is mail, return `Woken`. Otherwise `poll`
+    ///    until a kick (drain + re-check) or, with a `max_block`, the budget
+    ///    elapses → `TimedOut` (the caller re-execs a fresh waiter).
     ///
-    /// The drain + re-check after a wake makes coalescing and spurious kicks
-    /// free: ten rapid kicks wake the poll once, every byte is drained, the check
-    /// sees the (now durable) mail, and the waiter returns exactly once; a stray
-    /// kick with nothing actually unread simply loops back and blocks again
-    /// rather than waking the session for nothing.
-    pub fn wait(&self) -> Result<WakeOutcome, WakeError> {
+    /// `max_block = None` blocks indefinitely (the original card-05 contract, so a
+    /// bare `mailbox wait` never times out). `Some(budget)` is a per-block bound:
+    /// the self-respawn primitive that keeps a long idle armed without the
+    /// harness's per-hook timeout ever landing on a live wait (see
+    /// docs/01-wake-and-rearm.md). The same open→check→block ordering runs on every
+    /// fresh waiter, so a publish during a re-exec gap is caught, not missed.
+    ///
+    /// The pidfile is removed only on the `Unsubscribed` exit (while the lock is
+    /// still held, so no concurrent waiter can have written a fresh one). On
+    /// `Woken` and `TimedOut` it is deliberately LEFT in place: on `TimedOut` the
+    /// same-pid re-exec re-writes it (and a `cleanup` racing the exec gap can still
+    /// reap our live pid); on `Woken` the process is exiting and the next `arm`'s
+    /// waiter overwrites it under lock.
+    pub fn wait(&self, max_block: Option<Duration>) -> Result<WaitOutcome, WakeError> {
         // Step 0: single-waiter lock. Held for the whole call; released on drop
         // (any return path). `_lock` must stay bound so it is not dropped early.
         let _lock = self.acquire_lock()?;
 
-        // Step 1: open the FIFO FIRST. O_RDWR|O_NONBLOCK keeps the open and the
+        // Step 1: record ourselves as the live waiter, now that we hold the lock.
+        self.write_pidfile()?;
+
+        // Step 2: open the FIFO FIRST. O_RDWR|O_NONBLOCK keeps the open and the
         // reads non-blocking; we block explicitly with poll below.
         self.ensure_fifo()?;
         let mut fifo = std::fs::OpenOptions::new()
@@ -455,10 +507,20 @@ impl Waiter {
                 source,
             })?;
 
-        // Step 2: read-only view of the durable store for the unread check.
+        // Step 3: read-only view of the durable store, and the arm-iff-subscribed
+        // re-check. If the session unsubscribed (or a SessionEnd raced us), there
+        // is nothing to wake about: drop the pidfile (under lock) and self-exit.
         let store = ReadOnlyStore::open(&self.db_path)?;
+        if !store.has_subscription(&self.session)? {
+            self.remove_pidfile();
+            info!(
+                session = self.session.as_str(),
+                "waiter found no subscriptions; exiting without waking"
+            );
+            return Ok(WaitOutcome::Unsubscribed);
+        }
 
-        // Step 3: check-then-block loop.
+        // Step 4: check-then-block loop.
         let mut pass = Pass::FirstCheck;
         loop {
             let topics = store.topics_with_unread(&self.session)?;
@@ -476,35 +538,102 @@ impl Waiter {
                     topics = names.join(","),
                     "waiter woke; session has unread mail (exiting 2)"
                 );
-                return Ok(WakeOutcome { topics, reason });
+                return Ok(WaitOutcome::Woken(WakeOutcome { topics, reason }));
             }
             pass = Pass::AfterKick;
 
-            // No unread yet: block until a kick byte arrives, then drain and
-            // re-check.
-            self.block_for_kick(&mut fifo)?;
+            // No unread yet: block until a kick byte arrives (or the budget
+            // elapses), then drain and re-check.
+            match self.block_for_kick(&mut fifo, max_block)? {
+                Blocked::Kicked => continue,
+                Blocked::TimedOut => {
+                    // Re-check once before giving up: a publish may have landed
+                    // during this block without a delivered kick (the same durable
+                    // safety the first-pass check relies on). If still nothing, the
+                    // caller re-arms a fresh waiter.
+                    if !store.topics_with_unread(&self.session)?.is_empty() {
+                        continue;
+                    }
+                    // `budget` is the max_block that produced this timeout; a
+                    // `None` (unbounded) wait never reaches here (its poll blocks
+                    // forever), so this is only ever the bounded case.
+                    let budget = max_block.unwrap_or_default();
+                    info!(
+                        session = self.session.as_str(),
+                        max_block_ms = budget.as_millis(),
+                        "waiter reached its max-block with no mail; yielding for re-arm"
+                    );
+                    return Ok(WaitOutcome::TimedOut { budget });
+                }
+            }
         }
     }
 
-    /// Block (via `poll`) until the FIFO is readable, then drain every buffered
-    /// byte with non-blocking reads.
+    /// Record our own pid in the pidfile (called after the lock is acquired).
+    /// Creates the waiters dir if needed; a write failure is a real error (the
+    /// waiter cannot make itself reap-able) so it surfaces rather than being
+    /// swallowed.
+    fn write_pidfile(&self) -> Result<(), WakeError> {
+        self.ensure_dir()?;
+        std::fs::write(&self.pidfile_path, std::process::id().to_string()).map_err(|source| {
+            WakeError::Pidfile {
+                path: self.pidfile_path.clone(),
+                source,
+            }
+        })
+    }
+
+    /// Remove the pidfile, ignoring a missing file. Best-effort: only called on
+    /// the clean `Unsubscribed` exit while still holding the lock.
+    fn remove_pidfile(&self) {
+        if let Err(err) = std::fs::remove_file(&self.pidfile_path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            warn!(
+                session = self.session.as_str(),
+                path = %self.pidfile_path.display(),
+                error = %err,
+                "could not remove waiter pidfile on clean exit"
+            );
+        }
+    }
+
+    /// Block (via `poll`) until the FIFO is readable or `max_block` elapses, then
+    /// drain every buffered byte with non-blocking reads.
     ///
     /// Draining fully means coalesced kicks leave nothing behind for a later
     /// iteration to misread. A read of `Ok(0)` is EOF — impossible for a live
     /// FIFO we hold `O_RDWR` on, so it means the node is not (or no longer) a
     /// working FIFO — and is surfaced as an error rather than looped on, which is
     /// the second guard against the hot-spin failure mode.
-    fn block_for_kick(&self, fifo: &mut std::fs::File) -> Result<(), WakeError> {
+    ///
+    /// With `max_block = None` the poll blocks indefinitely (card-05 behaviour);
+    /// with `Some(budget)` it returns [`Blocked::TimedOut`] when the budget
+    /// elapses before any kick — the self-respawn boundary (card 11).
+    fn block_for_kick(
+        &self,
+        fifo: &mut std::fs::File,
+        max_block: Option<Duration>,
+    ) -> Result<Blocked, WakeError> {
         // Scope the poll so the BorrowedFd it holds is released before the drain
         // loop needs `fifo` mutably.
-        {
+        let ready = {
             let mut poll_fds = [PollFd::new(fifo.as_fd(), PollFlags::POLLIN)];
-            // PollTimeout::NONE = block indefinitely; a kick or existing buffered
-            // byte makes the fd readable.
-            poll(&mut poll_fds, PollTimeout::NONE).map_err(|errno| WakeError::ReadFifo {
+            // NONE = block indefinitely; a bounded timeout returns 0 ready fds when
+            // it elapses. A kick or existing buffered byte makes the fd readable.
+            let timeout = match max_block {
+                None => PollTimeout::NONE,
+                Some(budget) => PollTimeout::try_from(budget).unwrap_or(PollTimeout::MAX),
+            };
+            poll(&mut poll_fds, timeout).map_err(|errno| WakeError::ReadFifo {
                 path: self.fifo_path.clone(),
                 source: io::Error::from_raw_os_error(errno as i32),
-            })?;
+            })?
+        };
+
+        // `poll` returned 0 ready fds => the timeout elapsed with no kick.
+        if ready == 0 {
+            return Ok(Blocked::TimedOut);
         }
 
         // Drain all currently-available bytes; their count and value are
@@ -528,7 +657,7 @@ impl Waiter {
             }
         }
         trace!(session = self.session.as_str(), "waiter drained a kick");
-        Ok(())
+        Ok(Blocked::Kicked)
     }
 
     /// Acquire the per-session exclusive advisory lock. Non-blocking: if another
@@ -615,49 +744,30 @@ impl Waiter {
 mod tests {
     use super::*;
 
+    // The session-id filename encoding is now shared and authoritatively tested in
+    // `mailbox_protocol::session`; here we only assert the per-session file paths
+    // are built from it and sit under the waiters dir.
     #[test]
-    fn encodes_lowercase_safe_session_ids_unchanged() {
-        // A lowercase-only id with the allowed punctuation passes through verbatim.
-        let s = SessionId::new("abc-123_def.456");
-        assert_eq!(encode_session(&s), "abc-123_def.456");
-    }
-
-    #[test]
-    fn encodes_uppercase_letters_for_case_insensitive_filesystems() {
-        // Uppercase letters MUST be encoded: on case-insensitive APFS `aB` and
-        // `Ab` would otherwise share one FIFO and steal each other's kicks.
-        let ab_upper = SessionId::new("aB");
-        let ab_lower = SessionId::new("Ab");
-        assert_eq!(encode_session(&ab_upper), "a%42");
-        assert_eq!(encode_session(&ab_lower), "%41b");
-        // Distinct even under ASCII case-folding (the only uppercase chars in the
-        // output are hex digits A–F, which never fold onto a lowercase safe char).
-        assert_ne!(
-            encode_session(&ab_upper).to_ascii_lowercase(),
-            encode_session(&ab_lower).to_ascii_lowercase()
-        );
-    }
-
-    #[test]
-    fn encodes_unsafe_bytes_and_stays_collision_free() {
-        // A slash cannot be allowed to create a subdirectory, and the escape char
-        // itself must be encoded so distinct inputs never collide.
-        let slash = SessionId::new("a/b");
-        assert_eq!(encode_session(&slash), "a%2Fb");
-        let literal = SessionId::new("a%2Fb");
-        // The literal string "a%2Fb" must NOT encode to the same thing as "a/b":
-        // `%`→`%25`, and the uppercase `F` is itself encoded (`%46`) for the
-        // case-insensitive-filesystem guarantee.
-        assert_eq!(encode_session(&literal), "a%252%46b");
-        assert_ne!(encode_session(&slash), encode_session(&literal));
-    }
-
-    #[test]
-    fn fifo_and_lock_paths_are_under_waiters_dir() {
+    fn per_session_paths_share_one_encoded_stem_under_waiters_dir() {
         let dir = Path::new("/tmp/mb/waiters");
         let s = SessionId::new("s1");
         assert_eq!(fifo_path(dir, &s), PathBuf::from("/tmp/mb/waiters/s1.fifo"));
         assert_eq!(lock_path(dir, &s), PathBuf::from("/tmp/mb/waiters/s1.lock"));
+        assert_eq!(
+            pidfile_path(dir, &s),
+            PathBuf::from("/tmp/mb/waiters/s1.waiter.pid")
+        );
+        // An unsafe id keys all three files identically (the FIFO/lock/pidfile
+        // coordination the wake loop relies on).
+        let unsafe_id = SessionId::new("a/b");
+        assert_eq!(
+            fifo_path(dir, &unsafe_id)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "a%2Fb"
+        );
     }
 
     #[test]

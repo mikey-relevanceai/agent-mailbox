@@ -11,9 +11,12 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use tracing::{error, info, warn};
 
 use mailbox::storage::{SessionId, StorageConfig};
-use mailbox::wake::{Waiter, WakeOutcome};
+use mailbox::wake::{WaitOutcome, Waiter, WakeOutcome};
+use mailbox_harness::arm::{ArmDecision, SubscriptionProbe};
+use mailbox_harness::hook::HookInput;
 use mailbox_protocol::{AdapterId, GithubPr, Topic, stub_topic};
 
 use crate::client;
@@ -90,7 +93,10 @@ pub enum Command {
     /// Show watches (interest + child pid) and this session's unread counts.
     Status(SessionOpt),
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
-    Wait(SessionOpt),
+    Wait(WaitArgs),
+    /// Claude Code hook handlers (arm / cleanup / install-hooks). The harness owns
+    /// the wake loop so the agent never re-arms (card 11).
+    Harness(HarnessArgs),
 }
 
 /// The session identity every session-scoped command needs. Parsed ONCE here at
@@ -107,6 +113,74 @@ pub struct SessionOpt {
 /// the label's grammar — but expressed as a `value_parser` so clap brands it.
 fn parse_session(raw: &str) -> Result<SessionId, Infallible> {
     Ok(SessionId::new(raw))
+}
+
+/// Default waiter max-block before self-respawn (9 minutes). Kept below Claude
+/// Code's default async-hook `timeout` (10 min) so the waiter re-execs a fresh
+/// image before the harness would kill it (card 11, docs/01-wake-and-rearm.md).
+const DEFAULT_ARM_MAX_BLOCK_MS: u64 = 540_000;
+
+/// Default async-hook `timeout` the install snippet writes, in **seconds** (10
+/// minutes — Claude Code's documented default for command hooks).
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
+
+/// Arguments to `wait`: the session plus an optional self-respawn bound.
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    #[command(flatten)]
+    pub session: SessionOpt,
+    /// If set, block at most this long before re-execing a fresh waiter (the
+    /// self-respawn that keeps a long idle armed, card 11). Absent = block forever
+    /// (the card-05 default). The harness passes this; a bare `mailbox wait` does
+    /// not, preserving the original blocking contract.
+    #[arg(long)]
+    pub max_block_ms: Option<u64>,
+}
+
+/// The `harness` command group: Claude Code hook targets.
+#[derive(Args, Debug)]
+pub struct HarnessArgs {
+    #[command(subcommand)]
+    pub command: HarnessCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HarnessCommand {
+    /// SessionStart / Stop hook: launch a waiter IFF the session is subscribed.
+    Arm(ArmArgs),
+    /// SessionEnd hook: reap the waiter and drop this session's interests/subs.
+    Cleanup,
+    /// Print (and optionally merge) the settings.json hooks snippet.
+    InstallHooks(InstallHooksArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ArmArgs {
+    /// Max block the armed waiter uses before self-respawn (see [`WaitArgs`]).
+    ///
+    /// `arm` always reads the session id from the hook's stdin JSON — the
+    /// self-respawn re-execs `mailbox wait` directly (carrying `--session`), never
+    /// `harness arm`, so `arm` needs no `--session` flag.
+    #[arg(long, default_value_t = DEFAULT_ARM_MAX_BLOCK_MS)]
+    pub max_block_ms: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct InstallHooksArgs {
+    /// Path to a settings.json to merge the snippet into (instead of only printing
+    /// it). Created if missing; unrelated settings are preserved.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
+    /// Absolute path to the `mailbox` binary the hooks invoke. Defaults to this
+    /// executable's resolved path.
+    #[arg(long)]
+    pub mailbox_bin: Option<std::path::PathBuf>,
+    /// Claude Code async-hook timeout to write, in seconds.
+    #[arg(long, default_value_t = DEFAULT_HOOK_TIMEOUT_SECS)]
+    pub timeout_secs: u64,
+    /// Waiter max-block to write into the arm command, in milliseconds.
+    #[arg(long, default_value_t = DEFAULT_ARM_MAX_BLOCK_MS)]
+    pub max_block_ms: u64,
 }
 
 #[derive(Args, Debug)]
@@ -222,6 +296,7 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<()> {
         Command::Status(args) => run_status(format, args).await,
         // `wait` is dispatched synchronously by `main` and never reaches here.
         Command::Wait(_) => unreachable!("wait is handled synchronously in main"),
+        Command::Harness(args) => run_harness(format, args).await,
     }
 }
 
@@ -405,6 +480,7 @@ fn request_context(request: &Request) -> String {
             format!("unwatching stub {label} for {}", session.as_str())
         }
         Request::Status { session } => format!("status for {}", session.as_str()),
+        Request::EndSession { session } => format!("ending session {}", session.as_str()),
     }
 }
 
@@ -468,6 +544,13 @@ fn render_human(response: &Response) {
             }
         },
         Response::Status(report) => render_status(report),
+        Response::SessionEnded {
+            subscriptions_dropped,
+            interests_dropped,
+            adapters_stopped,
+        } => println!(
+            "ended session (subscriptions dropped={subscriptions_dropped}, interests dropped={interests_dropped}, adapters stopped={adapters_stopped})"
+        ),
         // Error is handled before rendering; nothing to print here.
         Response::Error { message } => eprintln!("error: {message}"),
     }
@@ -513,6 +596,14 @@ fn render_status(report: &StatusReport) {
                 format_interval(watch.interval_ms),
                 child
             );
+        }
+    }
+    if report.subscriptions.is_empty() {
+        println!("subscriptions: none");
+    } else {
+        println!("subscriptions:");
+        for topic in &report.subscriptions {
+            println!("  {}", topic.as_str());
         }
     }
     if report.unread.is_empty() {
@@ -580,13 +671,250 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     Ok(label.to_string())
 }
 
+/// Dispatch a `harness` subcommand. `arm`/`cleanup` are socket clients; only
+/// `install-hooks` touches no bridge.
+async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<()> {
+    match args.command {
+        HarnessCommand::Arm(args) => run_harness_arm(args).await,
+        HarnessCommand::Cleanup => run_harness_cleanup().await,
+        HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
+    }
+}
+
+/// The `SessionStart` / `Stop` hook: launch a waiter IFF the session is
+/// subscribed. Session identity comes from the hook's stdin JSON (settled
+/// decision, card 11). Fail-safe: a down/erroring bridge or a session with no
+/// subscriptions all skip arming (no wake).
+///
+/// On the `Arm` path this **execs** `mailbox wait` (it does NOT write the
+/// pidfile — the waiter writes it after taking the single-waiter lock, so a
+/// doomed second arm can never overwrite the live waiter's pidfile; card 11
+/// HIGH#1). A failure to exec exits **2** (a wake → the harness re-runs Stop and
+/// re-arms) rather than exit 1 (a silent un-arm), first clearing any stale
+/// pidfile (item E / ADR-0006).
+async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
+    let config = StorageConfig::from_env().context("resolving storage path for harness arm")?;
+    let session = HookInput::from_reader(std::io::stdin().lock())
+        .context("reading the SessionStart/Stop hook payload from stdin")?
+        .session_id;
+
+    let probe = probe_subscription(&config, &session).await;
+    match mailbox_harness::arm::decide(probe) {
+        ArmDecision::Arm => {
+            info!(
+                session = %session.as_str(),
+                max_block_ms = args.max_block_ms,
+                "armed session (subscribed); exec-ing the waiter"
+            );
+            let exe = std::env::current_exe()
+                .context("resolving the mailbox binary path to exec the waiter")?;
+            // Never returns on success — the image becomes `mailbox wait`, which
+            // writes the pidfile itself after acquiring the single-waiter lock.
+            let err = mailbox_harness::arm::exec_waiter(&exe, session.as_str(), args.max_block_ms);
+            error!(
+                session = %session.as_str(),
+                error = %err,
+                "could not exec the waiter; waking to force a re-arm rather than silently un-arming"
+            );
+            let _ =
+                std::fs::remove_file(mailbox::wake::pidfile_path(&config.waiters_dir(), &session));
+            // Exit 2 (wake) so the harness re-runs Stop; std::process::exit skips
+            // the anyhow→exit-1 mapping this async path would otherwise apply.
+            std::process::exit(i32::from(mailbox::wake::WakeOutcome::EXIT_CODE));
+        }
+        ArmDecision::Skip(reason) => {
+            info!(
+                session = %session.as_str(),
+                reason = reason.as_str(),
+                "did not arm a waiter"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Probe whether `session` has any subscriptions, over the socket. A clean
+/// `Status` with subscriptions → `Subscribed`; a clean `Status` with none →
+/// `NotSubscribed`; a serviced error/unexpected reply → `BridgeError`; an
+/// unreachable bridge → `BridgeUnreachable`. The two failure cases are logged
+/// distinctly (honest diagnostics) but both keep arming fail-safe (no wake).
+async fn probe_subscription(config: &StorageConfig, session: &SessionId) -> SubscriptionProbe {
+    let request = Request::Status {
+        session: session.clone(),
+    };
+    match client::send(&config.socket_path(), &request).await {
+        Ok(Response::Status(report)) if !report.subscriptions.is_empty() => {
+            SubscriptionProbe::Subscribed
+        }
+        Ok(Response::Status(_)) => SubscriptionProbe::NotSubscribed,
+        Ok(Response::Error { message }) => {
+            warn!(session = %session.as_str(), error = %message, "bridge errored on the subscription probe; not arming");
+            SubscriptionProbe::BridgeError
+        }
+        Ok(other) => {
+            warn!(session = %session.as_str(), reply = ?other, "unexpected bridge reply to the subscription probe; not arming");
+            SubscriptionProbe::BridgeError
+        }
+        Err(err) => {
+            warn!(session = %session.as_str(), error = %err, "bridge unreachable on the subscription probe; not arming");
+            SubscriptionProbe::BridgeUnreachable
+        }
+    }
+}
+
+/// The `SessionEnd` hook: reap the waiter (process half) and drop the session's
+/// subscriptions + interests on the bridge (durable half, which stops any adapter
+/// whose last interest this session held). Best-effort: a down bridge must not
+/// fail the hook, and the waiter is reaped regardless.
+///
+/// A transient bridge failure is RETRIED a few times (brief backoff) so a
+/// momentary blip does not leak the session's interest. If every attempt fails,
+/// the card-08 TTL sweeper is the ultimate backstop: an un-torn-down interest
+/// ages out via its `last_seen` (exactly the hard-died-session case it exists for)
+/// — so we log and exit 0 rather than build a durable pending-end queue for MVP.
+async fn run_harness_cleanup() -> anyhow::Result<()> {
+    let config = StorageConfig::from_env().context("resolving storage path for harness cleanup")?;
+    let session = HookInput::from_reader(std::io::stdin().lock())
+        .context("reading the SessionEnd hook payload from stdin")?
+        .session_id;
+
+    let reap = mailbox_harness::cleanup::reap_waiter(&config.waiters_dir(), &session);
+    info!(session = %session.as_str(), outcome = reap.as_str(), "reaped session waiter");
+
+    end_session_with_retry(&config, &session).await;
+    Ok(())
+}
+
+/// Number of `EndSession` attempts before deferring to the TTL sweeper.
+const CLEANUP_END_SESSION_ATTEMPTS: u32 = 4;
+/// Base backoff between `EndSession` retries (doubles each attempt).
+const CLEANUP_END_SESSION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Ask the bridge to end the session, retrying transient failures with backoff.
+/// A serviced `Error` reply is NOT retried (it is deterministic); only an
+/// unreachable/transport failure is. Never returns an error — cleanup is
+/// best-effort, backstopped by the TTL sweeper.
+async fn end_session_with_retry(config: &StorageConfig, session: &SessionId) {
+    let request = Request::EndSession {
+        session: session.clone(),
+    };
+    let mut backoff = CLEANUP_END_SESSION_BACKOFF;
+    for attempt in 1..=CLEANUP_END_SESSION_ATTEMPTS {
+        match client::send(&config.socket_path(), &request).await {
+            Ok(Response::SessionEnded {
+                subscriptions_dropped,
+                interests_dropped,
+                adapters_stopped,
+            }) => {
+                info!(
+                    session = %session.as_str(),
+                    attempt,
+                    subscriptions_dropped,
+                    interests_dropped,
+                    adapters_stopped,
+                    "ended session on the bridge (dropped interests/subscriptions)"
+                );
+                return;
+            }
+            Ok(Response::Error { message }) => {
+                // Deterministic business failure — retrying will not help.
+                warn!(session = %session.as_str(), error = %message, "bridge could not end session cleanly; TTL sweeper will reconcile");
+                return;
+            }
+            Ok(_) => {
+                warn!(session = %session.as_str(), "unexpected bridge reply to end-session; TTL sweeper will reconcile");
+                return;
+            }
+            Err(err) if attempt < CLEANUP_END_SESSION_ATTEMPTS => {
+                warn!(session = %session.as_str(), attempt, error = %err, backoff_ms = backoff.as_millis(), "bridge unreachable during cleanup; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(err) => {
+                warn!(session = %session.as_str(), attempts = CLEANUP_END_SESSION_ATTEMPTS, error = %err, "bridge unreachable during cleanup; leaving interest for the TTL sweeper (waiter already reaped)");
+                return;
+            }
+        }
+    }
+}
+
+/// `install-hooks`: validate the timing, print the settings.json snippet (always)
+/// and, with `--settings <path>`, merge it into that file (atomically, preserving
+/// unrelated settings).
+fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::Result<()> {
+    let mailbox_bin = match args.mailbox_bin {
+        Some(path) => mailbox_harness::install::abs_bin(&path),
+        None => mailbox_harness::install::default_mailbox_bin(std::env::current_exe()),
+    };
+    let spec = mailbox_harness::install::HookInstallSpec {
+        mailbox_bin,
+        timeout_secs: args.timeout_secs,
+        max_block_ms: args.max_block_ms,
+    };
+    // Reject a max-block that would let Claude Code kill the waiter before it can
+    // self-respawn (the load-bearing invariant, ADR-0006).
+    spec.validate().context("invalid hook timing")?;
+    let snippet = mailbox_harness::install::hooks_snippet(&spec);
+
+    if let Some(path) = &args.settings {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+                .with_context(|| format!("parsing existing settings {}", path.display()))?,
+            _ => serde_json::json!({}),
+        };
+        let merged = mailbox_harness::install::merge_into_settings(existing, &snippet);
+        let pretty = serde_json::to_string_pretty(&merged)?;
+        write_atomic(path, &format!("{pretty}\n"))
+            .with_context(|| format!("writing merged settings {}", path.display()))?;
+        eprintln!("merged agent-mailbox hooks into {}", path.display());
+    }
+
+    // Always emit the snippet so it can be installed by hand.
+    if format.is_json() {
+        println!("{}", serde_json::to_string(&snippet)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&snippet)?);
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` atomically: write a sibling temp file then rename
+/// over the target. An interrupted write corrupts only the throwaway temp, never
+/// the user's real settings.json (item C). `rename` within a directory is atomic
+/// on our targets.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // A pid-suffixed temp name so concurrent installs do not clobber each other.
+    let tmp = dir.join(format!(
+        ".{}.mailbox-tmp-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, contents)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
 /// Run `wait` synchronously (no tokio runtime): open the read-only store and
 /// block on the FIFO. Finalizes the card-05 PROVISIONAL command into its real
 /// shape — `mailbox wait --session <id>` — with the same exit-code contract.
 ///
 /// Exit codes: `2` = the session has mail (wake it; reminder on stderr);
 /// `1` = a waiter error. Usage errors (missing `--session`) are handled by clap.
-pub fn run_wait(args: &SessionOpt) -> ExitCode {
+///
+/// With `--max-block-ms`, a block that elapses with no mail re-execs a FRESH
+/// waiter (same PID) rather than returning — the self-respawn that keeps a long
+/// idle armed without Claude Code's per-hook timeout ever killing a live wait
+/// (card 11). Without it, `wait` blocks indefinitely (the card-05 contract).
+pub fn run_wait(args: &WaitArgs) -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -595,14 +923,16 @@ pub fn run_wait(args: &SessionOpt) -> ExitCode {
         }
     };
 
+    let session = &args.session.session;
     let waiter = Waiter::new(
         config.waiters_dir(),
         config.path().to_path_buf(),
-        args.session.clone(),
+        session.clone(),
     );
+    let max_block = args.max_block_ms.map(std::time::Duration::from_millis);
 
-    match waiter.wait() {
-        Ok(outcome) => {
+    match waiter.wait(max_block) {
+        Ok(WaitOutcome::Woken(outcome)) => {
             // Payload-free reminder — topic names only — is what the harness
             // surfaces as a system reminder (docs/01-wake-and-rearm.md).
             eprintln!("{}", outcome.reminder());
@@ -611,11 +941,47 @@ pub fn run_wait(args: &SessionOpt) -> ExitCode {
             }
             ExitCode::from(WakeOutcome::EXIT_CODE)
         }
+        // The session unsubscribed (or a SessionEnd raced this arm): nothing to
+        // wake about. The waiter already dropped its pidfile; exit 0, no wake.
+        Ok(WaitOutcome::Unsubscribed) => ExitCode::SUCCESS,
+        Ok(WaitOutcome::TimedOut { budget }) => {
+            // Re-exec a fresh waiter. exec preserves the PID (so the pidfile stays
+            // valid) and gives the harness a fresh process to reset its async-hook
+            // timeout against; the fresh waiter's check-then-block catches any
+            // publish that landed during the exec gap. `budget` carries the same
+            // max-block forward.
+            let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+            reexec_or_wake(&waiter, session, ms)
+        }
         Err(err) => {
+            error!(session = %session.as_str(), error = %err, "waiter failed");
             eprintln!("mailbox wait: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Re-exec a fresh waiter (self-respawn). On a re-exec FAILURE we exit **2**, not
+/// 1: exit 2 is a wake, so the harness re-runs `Stop` and re-arms — a silent
+/// un-arm (exit 1, no wake) would be worse than a spurious wake. Any stale pidfile
+/// is removed first so a later arm/cleanup does not chase a dead pid (card 11,
+/// item E / ADR-0006).
+fn reexec_or_wake(waiter: &Waiter, session: &SessionId, max_block_ms: u64) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            error!(session = %session.as_str(), error = %err, "could not resolve binary to re-exec");
+            let _ = std::fs::remove_file(waiter.pidfile_path());
+            eprintln!("mailbox wait: could not resolve binary to re-exec: {err}");
+            return ExitCode::from(WakeOutcome::EXIT_CODE);
+        }
+    };
+    // exec only returns on failure.
+    let err = mailbox_harness::arm::exec_waiter(&exe, session.as_str(), max_block_ms);
+    error!(session = %session.as_str(), error = %err, "could not re-exec waiter; waking instead of silently un-arming");
+    let _ = std::fs::remove_file(waiter.pidfile_path());
+    eprintln!("mailbox wait: could not re-exec waiter: {err}");
+    ExitCode::from(WakeOutcome::EXIT_CODE)
 }
 
 fn wait_debug_enabled() -> bool {

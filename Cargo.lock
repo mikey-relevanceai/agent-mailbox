@@ -332,6 +332,12 @@ name = "mailbox-harness"
 version = "0.1.0"
 dependencies = [
  "mailbox-protocol",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
