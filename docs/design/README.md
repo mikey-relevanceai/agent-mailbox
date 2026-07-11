@@ -10,7 +10,7 @@ ADRs ([`../adr/`](../adr/)) record the durable *choice*. Designs record the
 
 | Design | Status | Notes |
 |---|---|---|
-| [01-mvp-github-watch](01-mvp-github-watch.md) | Draft | GitHub PR watch (conflicts, reviews, CI); refcounted multi-session interest; no zombie pollers |
+| [01-mvp-github-watch](01-mvp-github-watch.md) | Implemented | GitHub PR watch (conflicts, reviews, CI); refcounted multi-session interest; no zombie pollers |
 
 Likely next designs:
 
@@ -30,7 +30,7 @@ with no code path.
 ```markdown
 # Design: <name>
 
-- Status: Draft | Active | Superseded
+- Status: Draft | Active | Implemented | Superseded
 - Related ADRs: …
 
 ## Goal

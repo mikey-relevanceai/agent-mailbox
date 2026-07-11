@@ -1,6 +1,18 @@
 # Agent Mailbox docs
 
-Design notes for the experiment. Read in order if you're new; otherwise jump by topic.
+Notes for the project. **New here and want to *use* it?** Start with
+[04-usage](04-usage.md) and the [demo](demo.md). Reading to understand the
+*design*? Go in number order.
+
+**Get it running:**
+
+| Doc | What it covers |
+|---|---|
+| [04-usage](04-usage.md) | **Start here.** Install, hooks, the four-verb agent loop, `mailbox status` |
+| [demo](demo.md) | Runnable end-to-end demo (`scripts/demo.sh`) + captured output; real-PR steps |
+| [migration-from-agent-ipc](migration-from-agent-ipc.md) | Retire the old `agent-ipc` / `agent-ipc-github` skills; drop-in replacement skill |
+
+**Design notes:**
 
 | # | Doc | What it covers |
 |---|---|---|
@@ -15,7 +27,7 @@ Also:
 |---|---|
 | [adr/](adr/README.md) | Architecture Decision Records |
 | [design/](design/README.md) | Major system / subsystem designs |
-| [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md) | MVP: GitHub PR watch lifecycle |
+| [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md) | MVP: GitHub PR watch lifecycle (**Implemented**) |
 
 ## Mental model
 

@@ -106,9 +106,12 @@ Follow the mikey-in-a-box skills when they apply (architecture, type-driven desi
 | Doc | Use when |
 |---|---|
 | [docs/00-index.md](docs/00-index.md) | Starting point / repo map |
+| [docs/04-usage.md](docs/04-usage.md) | Install, hooks, the four-verb loop, `mailbox status` (getting started) |
+| [docs/demo.md](docs/demo.md) | Runnable demo (`scripts/demo.sh`) + captured output; real-PR steps |
+| [docs/migration-from-agent-ipc.md](docs/migration-from-agent-ipc.md) | Retiring the old `agent-ipc` skills; the replacement `skills/agent-mailbox` |
 | [docs/01-wake-and-rearm.md](docs/01-wake-and-rearm.md) | Wake loop, delivery cursors, Claude vs Codex |
 | [docs/02-tech-stack.md](docs/02-tech-stack.md) | Rust, subprocess→WASI, security process split |
 | [docs/03-working-agreements.md](docs/03-working-agreements.md) | ADRs, designs, PRs, mikey-in-a-box install |
 | [docs/adr/](docs/adr/README.md) | Decision log |
 | [docs/design/](docs/design/README.md) | Subsystem designs |
-| [docs/design/01-mvp-github-watch.md](docs/design/01-mvp-github-watch.md) | MVP GitHub watch / no zombie pollers |
+| [docs/design/01-mvp-github-watch.md](docs/design/01-mvp-github-watch.md) | MVP GitHub watch / no zombie pollers (Implemented) |

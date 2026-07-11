@@ -86,7 +86,8 @@ pub enum Command {
     Unsubscribe(TopicArgs),
     /// Read this session's unread events, advancing its cursor.
     Read(ReadArgs),
-    /// Declare interest in a watch (records intent; adapter start is card 08).
+    /// Watch an entity: record interest, subscribe to its topic, and (via the
+    /// daemon) spawn the shared supervised poller.
     Watch(WatchArgs),
     /// Drop interest in a watch.
     Unwatch(UnwatchArgs),
@@ -231,7 +232,7 @@ pub enum WatchTargetCmd {
 pub struct GithubPrWatchArgs {
     /// PR reference: `owner/repo#number`.
     pub spec: String,
-    /// Desired poll interval in seconds (adapter poll cadence; used by card 08).
+    /// Poll interval in seconds (the supervised adapter's poll cadence).
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
     #[command(flatten)]

@@ -1,20 +1,79 @@
 # Agent Mailbox
 
-Agent mailbox is a system designed to allow agents to be woken up via asynchronous actions. It integrates directly with Claude code, which is the most popular harness in use here, and allows you to have a number of background tasks trigger Claude to react to them. Examples of things that might be interesting to trigger would be:
+Agent mailbox lets agents be **woken by asynchronous, real-world events** instead
+of polling for them. It integrates with Claude Code (the harness we target
+first): an agent subscribes to the things it cares about, goes idle, and gets
+woken when one of them changes. Things worth waking on:
 
-- changes in pull request state
+- changes in pull-request state (merge conflicts, reviews, CI)
 - the deployment of your changes
 - monitoring of those changes in production
+- a peer agent handing off work
+
+The key idea: **the agent never polls and never re-arms.** Claude Code *hooks*
+keep a waiter armed; a local *bridge daemon* supervises the pollers. The whole
+agent-facing contract is four verbs — **subscribe → read → react →
+unsubscribe** — and that's it.
+
+```text
+Adapters (detect world changes)
+        ↓ publish
+Bridge (durable events + subscriptions + wake kicks)
+        ↓ harness wake
+Agent sessions (react, never poll)
+```
+
+## Quickstart
+
+```bash
+# 1. Build the bridge + adapters
+cargo build --release
+
+# 2. See it work end to end, with no network and no Claude Code:
+scripts/demo.sh
+```
+
+The demo starts a private daemon in a tempdir and walks the whole loop —
+subscribe/read, an idle wake, a supervised poller, and teardown — asserting the
+idle waiter wakes. Captured output is in [docs/demo.md](docs/demo.md).
+
+To actually use it:
+
+```bash
+# Install mailbox + the two adapters co-located on PATH
+install -m755 target/release/mailbox \
+              target/release/mailbox-stub-adapter \
+              target/release/mailbox-github-pr-adapter ~/.local/bin/
+
+mailbox serve &                                            # the bridge daemon
+mailbox harness install-hooks --settings ~/.claude/settings.json   # wire wake hooks
+```
+
+Then, from an agent session:
+
+```bash
+mailbox watch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID"  # subscribe + start the poller
+# ... go idle; the hooks keep you armed ...
+mailbox read --session "$MAILBOX_SESSION_ID"                           # on wake
+mailbox unwatch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID" # when done
+```
+
+Full walkthrough (install, hooks, the four-verb loop, `mailbox status`):
+**[docs/04-usage.md](docs/04-usage.md)**.
 
 ## Layout
 
 ```text
 crates/
-  mailbox/            # bridge CLI binary
+  mailbox/            # bridge CLI + daemon binary
   mailbox-protocol/   # shared publish/subscribe types
-  mailbox-harness/    # harness wake helpers (Claude Code first)
-adapters/             # subprocess adapters (protocol only; no bridge imports)
+  mailbox-harness/    # Claude Code hook wake helpers (arm / cleanup / install)
+adapters/
+  stub-adapter/       # reference adapter (synthetic edges; demo/tests)
+  github-pr-adapter/  # the real GitHub PR poller (via `gh`)
 docs/
+scripts/demo.sh       # self-contained end-to-end demo
+skills/agent-mailbox/ # drop-in Claude Code skill (replaces agent-ipc)
 ```
 
 ## Develop
@@ -24,12 +83,21 @@ Requires a stable Rust toolchain (`rustup`). From the repo root:
 ```bash
 cargo check --workspace
 cargo test --workspace
-cargo run -p mailbox
+cargo run -p mailbox -- --help    # the CLI surface
 ```
 
 ## Docs
 
-See [docs/00-index.md](docs/00-index.md) for the full list. Agent-oriented repo guidance lives in [AGENTS.md](AGENTS.md).
+See [docs/00-index.md](docs/00-index.md) for the full list. Agent-oriented repo
+guidance lives in [AGENTS.md](AGENTS.md).
+
+**Start here:**
+
+- [Usage: install → hooks → the four-verb loop](docs/04-usage.md)
+- [Demo](docs/demo.md) — runnable + captured output
+- [Migrating from the agent-ipc skills](docs/migration-from-agent-ipc.md)
+
+**Design:**
 
 - [Wake and re-arm](docs/01-wake-and-rearm.md)
 - [Tech stack](docs/02-tech-stack.md)

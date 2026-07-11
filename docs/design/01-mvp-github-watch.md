@@ -1,6 +1,9 @@
 # Design: MVP — GitHub PR watch (agent-ipc parity)
 
-- Status: Draft
+- Status: **Implemented** (MVP shipped, cards 06–13). Every open question below
+  is resolved (see § Open questions); the loop is usable per
+  [04-usage](../04-usage.md) and [demo](../demo.md), and the old skill loop is
+  retired via [migration-from-agent-ipc](../migration-from-agent-ipc.md).
 - Related ADRs: [0001](../adr/0001-rust-bridge-subprocess-adapters.md),
   [0002](../adr/0002-mvp-crate-stack.md),
   [0003](../adr/0003-single-writer-sqlite.md)
@@ -88,11 +91,14 @@ Parity with `agent-ipc-github`, plus CI:
 > start/stop, backoff-restart with give-up, a TTL sweeper for hard-died sessions,
 > and — via `reconcile_startup` — the rule-6 **no-resume-on-restart** fail-safe.
 > The concrete adapter program is injected through a resolver, so the machinery
-> is decoupled from any adapter. **Staged rollout:** card 08 ships no real
-> adapter, so production uses an `UnavailableResolver` (every kind resolves to
-> "none") — `watch` records intent + interest but no poller spawns yet; the real
-> `github-pr` poller and its resolver arrive with cards 09/10. The full lifecycle
-> is proven with a fixture adapter (`tests/supervision.rs`).
+> is decoupled from any adapter. **Staged rollout (now complete):** card 08
+> shipped the supervisor with no real adapter (production briefly used an
+> `UnavailableResolver` — every kind resolves to "none" — so `watch` recorded
+> intent + interest but spawned no poller). Cards 09/10 then landed the reference
+> `stub` and the real `github-pr` poller, and `serve` now injects the
+> `DefaultResolver` (`crates/mailbox/src/resolver.rs`), so **both kinds spawn a
+> real supervised adapter**. The full lifecycle is proven with a fixture adapter
+> (`tests/supervision.rs`) and end to end in `tests/e2e.rs`.
 
 The failure mode in the old skill: `gh-watch.sh` is started with
 `run_in_background` and **never exits**; if the session dies or the agent
@@ -101,8 +107,9 @@ forgets to kill it, pollers pile up.
 MVP rules:
 
 1. **Bridge-supervised adapters.** Starting a watch is
-   `mailbox watch github-pr …` (name TBD), not “agent spawns a naked bash loop.”
-   The bridge records the watch in SQLite and owns the child process.
+   `mailbox watch github-pr …` (CLI settled in card 06), not “agent spawns a
+   naked bash loop.” The bridge records the watch in SQLite and owns the child
+   process.
 2. **One adapter per external entity.** Keyed by `(kind, repo, pr)` (not by
    session). Many sessions may care about the same PR; they share one poller.
 3. **Interest is refcounted.** `watch` / subscribe adds this session as an
@@ -216,14 +223,18 @@ No `ipc-arm.sh` step.
   `watch` records the watch (`upsert_watch`) + this session's interest
   (`add_interest`) and subscribes the session to the PR topic; `unwatch` reverses
   it. **Adapter process supervision (spawning the poller, populating child pids,
-  refcount-driven start/stop) is implemented in card 08** via the `Supervisor`.
-  With no real adapter yet (cards 09/10), the production `UnavailableResolver`
-  resolves no poller, so a watch still sits `Desired` with no child pid until then.
+  refcount-driven start/stop) is implemented in card 08** via the `Supervisor`,
+  and cards 09/10 landed the real adapters — `serve`'s `DefaultResolver` now
+  spawns the `stub` and `github-pr` pollers, so a live watch reads `running` with
+  a child pid.
 - ~~How Claude session identity is named for interest rows.~~ **Settled (card
   06):** the `SessionId` comes from `--session <id>`, falling back to the
   `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).
-- Whether peer agent→agent messages are in the same MVP slice or immediately
-  after GitHub watch.
+- **Deferred (post-MVP):** whether peer agent→agent messaging ships in the same
+  slice as GitHub watch. The MVP demo is GitHub PR watching; peer messaging is
+  already expressible as plain publish/subscribe on a shared topic (the bus does
+  not privilege GitHub), so no new mechanism is blocked — a dedicated peer-chat
+  UX is simply out of MVP scope, not an unresolved design question.
 - ~~How finely to model CI edges (whole-PR rollup vs per-check) for the first
   cut.~~ **Settled (card 10):** whole-PR **rollup** (pending/success/failure); the
   event fires on a transition **into failure** (or the failed-check set gaining
