@@ -215,6 +215,25 @@ pub struct EndSessionOutcome {
     pub emptied_watches: Vec<WatchId>,
 }
 
+/// One topic as discovery (`mailbox topics`) sees it: what it is, who listens,
+/// and how much traffic it has carried.
+///
+/// A pure projection of the durable tables — there is no `topic` table, a topic
+/// exists precisely because something subscribed to it or published to it — so
+/// this is a read model with no creation twin. `last_event` is `None` exactly
+/// when `events` is 0 (a topic that only has subscribers), which is why it is an
+/// `Option` rather than a sentinel timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicSummary {
+    pub topic: mailbox_protocol::Topic,
+    /// Sessions currently subscribed (the fan-out width).
+    pub subscribers: u64,
+    /// Events durably retained on the topic.
+    pub events: u64,
+    /// Timestamp of the newest event, or `None` on a topic with no events.
+    pub last_event: Option<mailbox_protocol::Timestamp>,
+}
+
 /// A page of events plus the cursor to continue from.
 ///
 /// Carrying `next` explicitly means a caller never derives paging state from

@@ -49,7 +49,7 @@ client):
 
 | Hook | Command | What it does |
 |---|---|---|
-| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` ~10m) | Reads `session_id` from the hook stdin JSON, asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
+| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` ~10m) | Reads `session_id` from the hook stdin JSON, **registers the session's agent inbox** (`agent.<session-id>`, always-on — ADR-0007), asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the waiter (`SIGTERM` the pidfile PID, remove the pidfile) and calls the bridge to drop this session's subscriptions **and** interests, stopping any adapter whose last interest it held (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` — `--settings <path>`, else `~/.claude/settings.json` when it exists — *atomically*, preserving unrelated settings; prints only (with the reason) when there is no such file. |
 
@@ -76,6 +76,20 @@ reply, or unreachable bridge all → a typed *skip*, never a wake). The **waiter
 re-checks** `has_subscription` after taking the lock and self-exits cleanly (exit
 0, pidfile removed) if there is none — catching an `arm` whose probe passed but
 whose `SessionEnd`/unsubscribe then landed, so no orphan waiter survives (HIGH#2).
+
+**Always-on agent inbox (card 16 / ADR-0007).** Before it probes, `arm` subscribes
+the session to its own inbox topic `agent.<session-id>` — every session, every
+`SessionStart` and `Stop`, idempotently. That is what makes an agent addressable by
+its peers (`mailbox send <session-id>`) with nothing for the agent to do.
+
+The rule above is unchanged; what changed is that **a live session's subscription
+list is now never empty**, so a live session always arms a waiter while the bridge
+is up. That is intended: the cost is one blocked `mailbox wait` per live session
+(blocked in `poll`, no CPU), and the benefit is that any agent can be woken by any
+other. Every fail-safe still holds: registration is best-effort (it never fails the
+hook), a down/erroring bridge still means exit 0 and no wake, and the waiter's
+post-lock `has_subscription` re-check is untouched — a session whose `SessionEnd`
+raced the arm still self-exits rather than orphaning a waiter.
 
 **Payload-free wake.** The waiter's stderr on exit 2 is only `mail on topic X`
 (topic names, never a body); the body stays in the durable log and is read by the

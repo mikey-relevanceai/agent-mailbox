@@ -54,4 +54,4 @@ pub use message::{
     Subscribe, Unsubscribe,
 };
 pub use session::SessionId;
-pub use topic::{GithubPr, Topic, stub_topic};
+pub use topic::{GithubPr, Topic, inbox_topic, stub_topic};

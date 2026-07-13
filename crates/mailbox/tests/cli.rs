@@ -800,20 +800,72 @@ fn human_publish_output_is_readable() {
     );
 }
 
+/// With no `--session` and neither session env var set, a session-scoped command
+/// fails with an actionable error (exit 1) that names every place the id could
+/// have come from. Card 16 moved this off clap's `env =` (which supports only one
+/// variable) into an explicit three-way resolution, so it is a runtime error
+/// rather than a clap usage error — and deliberately NOT exit 2, which is
+/// reserved for the waiter's wake signal.
 #[test]
-fn missing_session_is_a_usage_error() {
+fn missing_session_everywhere_is_an_actionable_error() {
     let output = Command::new(bin())
         .args(["read"])
         .env_remove("MAILBOX_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .output()
         .expect("run read without session");
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "clap usage error should exit 2; stderr: {}",
+        Some(1),
+        "a missing session should fail (and never with the wake code 2); stderr: {}",
         stderr(&output)
     );
+    let stderr = stderr(&output);
+    assert!(stderr.contains("--session"), "stderr: {stderr}");
+    assert!(stderr.contains("MAILBOX_SESSION_ID"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("CLAUDE_CODE_SESSION_ID"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `CLAUDE_CODE_SESSION_ID` is the LAST fallback: Claude Code exports it into
+/// every tool call, so an agent can address itself with nothing installed but the
+/// binary. `MAILBOX_SESSION_ID` (which the harness hooks set) still wins over it.
+#[test]
+fn claude_code_session_env_is_the_last_fallback() {
+    // `whoami` is a local command (identity does not depend on the bridge), so no
+    // daemon is needed to exercise the resolution order end to end.
+    let out = Command::new(bin())
+        .args(["--json", "whoami"])
+        .env_remove("MAILBOX_SESSION_ID")
+        .env("CLAUDE_CODE_SESSION_ID", "s-claude")
+        .output()
+        .expect("run whoami");
+    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
+    assert_eq!(value["session"], "s-claude");
+    assert_eq!(value["inbox_topic"], "agent.s-claude");
+
+    // MAILBOX_SESSION_ID wins over it...
+    let out = Command::new(bin())
+        .args(["--json", "whoami"])
+        .env("MAILBOX_SESSION_ID", "s-mailbox")
+        .env("CLAUDE_CODE_SESSION_ID", "s-claude")
+        .output()
+        .expect("run whoami");
+    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
+    assert_eq!(value["session"], "s-mailbox");
+
+    // ...and the explicit flag wins over both.
+    let out = Command::new(bin())
+        .args(["--json", "whoami", "--session", "s-flag"])
+        .env("MAILBOX_SESSION_ID", "s-mailbox")
+        .env("CLAUDE_CODE_SESSION_ID", "s-claude")
+        .output()
+        .expect("run whoami");
+    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
+    assert_eq!(value["session"], "s-flag");
 }
 
 #[test]

@@ -9,7 +9,9 @@
 //!
 //! Covered (the four acceptance criteria):
 //! - **AC1**: an idle *subscribed* session wakes (exit 2) on a publish, with no
-//!   agent-run arm. A *not-subscribed* session's arm exits 0 and starts no waiter.
+//!   agent-run arm. (Card 16 replaced the "not-subscribed arms nothing" half: arm
+//!   now registers the session's agent inbox first, so a live session always has a
+//!   subscription and always arms — the fail-safes are unchanged.)
 //! - **AC2**: a publish that lands while no waiter is armed surfaces on the NEXT
 //!   arm (the delivery cursor keeps it unread until read).
 //! - **AC3**: `cleanup` reaps the waiter (pid gone, process dead) AND drops the
@@ -345,21 +347,119 @@ fn ac1_subscribed_session_wakes_on_publish_via_hook_only() {
     );
 }
 
-// ==== arm-iff-subscribed: a NOT-subscribed session arms nothing =================
+// ==== always-on inbox (card 16 / ADR-0007): arm registers, then arms ============
 
+/// A session with NO prior subscription still ends up armed, because `arm` now
+/// registers its agent inbox first (always-on, ADR-0007). This replaces card 11's
+/// "an unsubscribed arm exits 0 and starts no waiter": the arm-iff-subscribed rule
+/// is unchanged — it is the *set of subscriptions* that is now never empty for a
+/// live session, which is what makes every agent addressable by its peers.
 #[test]
-fn arm_without_subscription_exits_zero_and_starts_no_waiter() {
+fn arm_registers_the_agent_inbox_and_then_arms_a_waiter() {
     let daemon = Daemon::start();
     let session = "s-none";
 
-    // No subscription: arm must decide NotSubscribed and exit 0 promptly.
     let mut arm = daemon.spawn_arm(session, &[]);
-    let status = wait_within(&mut arm, Duration::from_secs(10)).expect("arm should exit");
-    assert_eq!(status.code(), Some(0), "an unsubscribed arm exits 0");
-    assert!(
-        !daemon.pidfile(session).exists(),
-        "no waiter pidfile should be written when not subscribed"
+    // The waiter is armed (the pidfile appears once it holds the single-waiter
+    // lock), and the session is now subscribed to its own inbox topic.
+    poll_until("waiter pidfile appears", Duration::from_secs(10), || {
+        daemon.pidfile(session).exists().then_some(())
+    });
+    assert_eq!(
+        subscriptions(&daemon, session),
+        vec![format!("agent.{session}")],
+        "arm must have registered the session's inbox, and nothing else"
     );
+
+    // It is a REAL waiter: a peer's message to that inbox wakes it (exit 2) with
+    // the payload-free reminder.
+    assert_ok(
+        &daemon.run(&["send", session, "--text", "hi", "--session", "s-peer"]),
+        "send",
+    );
+    let status = wait_within(&mut arm, Duration::from_secs(10)).expect("waiter should wake");
+    assert_eq!(status.code(), Some(2), "mail in the inbox wakes the waiter");
+    let reminder = drain_stderr(&mut arm);
+    assert!(
+        reminder.contains(&format!("mail on topic agent.{session}")),
+        "stderr carries the payload-free reminder: {reminder:?}"
+    );
+}
+
+/// `arm` runs on every `Stop`, so registration must be idempotent: repeated arms
+/// leave exactly ONE inbox subscription (and, because `subscribe` never rebaselines
+/// an existing subscription, they cannot skip mail the agent has not read).
+#[test]
+fn repeated_arms_do_not_duplicate_the_inbox_subscription() {
+    let daemon = Daemon::start();
+    let session = "s-rearm";
+
+    for attempt in 1..=3 {
+        // Arm (registering the inbox and exec-ing the waiter), then drop the child
+        // — `ArmChild`'s Drop kills and reaps the waiter, releasing the
+        // single-waiter lock so the next arm is not a lock loser. The SUBSCRIPTION
+        // survives (only SessionEnd drops it), which is exactly the state a re-arm
+        // must be idempotent against.
+        {
+            let _arm = daemon.spawn_arm(session, &[]);
+            poll_until("the inbox is registered", Duration::from_secs(10), || {
+                (!subscriptions(&daemon, session).is_empty()).then_some(())
+            });
+        }
+        assert_eq!(
+            subscriptions(&daemon, session),
+            vec![format!("agent.{session}")],
+            "arm #{attempt} must leave exactly one inbox subscription"
+        );
+    }
+}
+
+/// SessionEnd deregisters the inbox: the session's subscriptions are dropped, so
+/// it disappears from `mailbox agents` and is no longer addressable.
+#[test]
+fn cleanup_deregisters_the_agent_inbox() {
+    let daemon = Daemon::start();
+    let session = "s-bye";
+
+    let mut arm = daemon.spawn_arm(session, &[]);
+    poll_until("waiter pidfile appears", Duration::from_secs(10), || {
+        daemon.pidfile(session).exists().then_some(())
+    });
+    assert!(agent_sessions(&daemon).contains(&session.to_string()));
+
+    assert_ok(&daemon.cleanup(session), "cleanup");
+    let _ = wait_within(&mut arm, Duration::from_secs(10));
+
+    assert!(
+        subscriptions(&daemon, session).is_empty(),
+        "SessionEnd drops the inbox subscription"
+    );
+    assert!(
+        !agent_sessions(&daemon).contains(&session.to_string()),
+        "a departed session is no longer listed as an addressable agent"
+    );
+    // And it is no longer addressable: a send to it now fails loudly.
+    let out = daemon.run(&["send", session, "--text", "hi", "--session", "s-peer"]);
+    assert!(
+        !out.status.success(),
+        "sending to a departed agent must fail, not vanish into a void"
+    );
+}
+
+/// The session ids `mailbox agents` reports.
+fn agent_sessions(daemon: &Daemon) -> Vec<String> {
+    let out = daemon.run(&["--json", "agents", "--session", "s-observer"]);
+    assert_ok(&out, "agents");
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("agents json");
+    value["agents"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|a| a["session"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ==== bridge-down fail-safe: arm does NOT wake when the bridge is unreachable ====

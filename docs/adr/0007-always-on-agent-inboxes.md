@@ -1,0 +1,107 @@
+# ADR-0007: Always-on agent inboxes (inter-agent messaging)
+
+- Status: Accepted
+- Date: 2026-07-13
+
+## Context
+
+Until card 16 the mailbox could only wake an agent about the *world* (a watched
+PR, a stub publisher, a topic someone happened to share). Agents could not
+address each other: there was no name to send to. The concrete want is a reviewer
+agent telling a builder agent "your review is done" — and the builder, idle in a
+different session, waking up — **with no human in the loop and nobody switching
+sessions to arrange it beforehand**.
+
+Everything needed already exists. Topics are arbitrary validated strings; the bus
+already does multi-subscriber fan-out with independent per-subscriber cursors and
+exactly-once delivery; a publish already kicks every subscribed session's waiter.
+The only missing piece is an *address*: a well-known topic per session, and
+something that registers it.
+
+Two forces shape the decision:
+
+1. **Opt-in registration cannot work.** If an agent had to subscribe to its own
+   inbox before peers could reach it, then reaching an agent that had not thought
+   to do so would require entering its session and asking it to — which is exactly
+   the human-in-the-loop step this feature exists to remove.
+2. **Baseline-on-subscribe.** A fresh subscription starts at the topic head
+   (docs/01), so events published before a session subscribed are never delivered.
+   A message sent to an unregistered agent is therefore *guaranteed* undeliverable,
+   not merely "delivered late".
+
+## Decision
+
+**1. A per-session inbox topic: `agent.<session-id>`.** Minted and parsed in one
+place (`mailbox_protocol::inbox_topic` / `Topic::as_agent_inbox`), alongside the
+`github.pr.*` and `stub.*` schemes — parse, don't validate, so producer and
+consumer cannot drift. It is fallible, not total: a `SessionId` is an opaque
+harness label whose grammar is *not* a subset of the topic grammar (whitespace,
+control characters, `/`, `#`), so a pathological id is refused rather than mangled.
+
+**2. Registration is ALWAYS-ON, done by the harness.** `mailbox harness arm`
+subscribes the session to its own inbox before it probes and arms — on every
+`SessionStart` *and* every `Stop`, idempotently (subscribe is a no-op when already
+subscribed and leaves the delivery cursor untouched, so a re-arm can never skip
+unread mail). `harness cleanup` (SessionEnd) already drops every subscription, so
+the inbox deregisters when the session ends. An agent does nothing to be
+addressable.
+
+**3. `send` to an unregistered agent is a hard error.** Because of
+baseline-on-subscribe, publishing to a session with no inbox subscription would
+durably store a message that can never be read, while telling the sender it
+worked. `mailbox send` therefore fails loudly (non-zero exit, naming the unknown
+target) and publishes nothing. There is deliberately **no `--force`**: the only
+thing a forced publish could produce is a message that is silently lost.
+
+**4. Discovery is a read over existing tables.** `mailbox agents` lists the
+sessions subscribed to their *own* inbox topic; `mailbox topics` lists known
+topics with subscriber/event counts. No schema migration: a topic exists precisely
+because something subscribed or published to it.
+
+**5. Liveness is a live-waiter probe, not a heartbeat.** `agents` reports whether
+a session's waiter pidfile names a live PID. Post-ADR-0006 that pidfile is written
+by the waiter itself, only after it takes the single-waiter lock, so it reliably
+names the one blocked waiter — meaning "this agent is idle and a send wakes it
+now". It does **not** mean the agent is healthy, and `false` does not mean the
+message will be lost (it lands durably and surfaces on the agent's next read). We
+did not invent a heartbeat we do not have, and the CLI says exactly this.
+
+## Consequences
+
+- **Every live session now arms a waiter.** Registration means a live session
+  always has ≥1 subscription, so the arm-iff-subscribed rule (ADR-0006) now always
+  says "arm" while the bridge is up. The cost is one blocked `mailbox wait` process
+  per live session — a few hundred KB of RSS, blocked in `poll`, costing no CPU.
+  This is accepted, and is the price of agents being addressable by default.
+- **Every fail-safe is unchanged.** A bridge that is down or erroring still means
+  exit 0 and no wake (registration fails the same way the probe does, and is
+  best-effort — it never fails the hook). The waiter still re-checks
+  `has_subscription` after taking its lock and self-exits if a `SessionEnd` raced
+  it. A session id that cannot form a topic simply gets no inbox, logged.
+- **Trust model: any local same-user process can publish to any inbox.** This is
+  the accepted boundary — one user, one machine, no TCP (ADR-0001/0004), and every
+  peer agent is already running with that user's full authority. Message bodies
+  remain **untrusted data, never authority** (ADR-0001): a body may inform an
+  agent, never instruct it. The `from` stamp (which the bridge writes, overwriting
+  any caller-supplied value) is *provenance* — good enough to route a reply, not to
+  authorize an action.
+- **The wake stays payload-free.** A peer message wakes the recipient with
+  `mail on topic agent.<id>` and nothing more; the body is read afterwards through
+  `mailbox read`, exactly like every other event.
+
+## Alternatives considered
+
+- **Opt-in registration (`mailbox register`).** Rejected: an agent nobody can reach
+  until it opts in is unreachable exactly when you need it, and arranging the opt-in
+  requires the human step this feature removes.
+- **A dedicated `inbox`/`message` table + delivery machinery.** Rejected: the bus
+  already gives durable fan-out, exactly-once, cursors, and wake. A second delivery
+  path would be a second set of bugs.
+- **Publish to an unregistered agent and let it "catch up" on registration.**
+  Rejected: baseline-on-subscribe means it never catches up. Changing baselining to
+  replay history would break the property every other subscriber depends on (a new
+  subscriber must not be flooded with a backlog).
+- **A real heartbeat / presence protocol.** Deferred. It would need an agent-side
+  periodic action, which is exactly what "agents never run background loops"
+  forbids. The live-waiter probe answers the one question discovery actually needs
+  ("will a send wake it right now?") using state the wake loop already maintains.

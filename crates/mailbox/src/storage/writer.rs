@@ -23,12 +23,12 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
-use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Topic, inbox_topic};
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind,
-    WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, TopicSummary, Watch, WatchId,
+    WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// Default page size when a reader does not specify a limit. Bounds memory for
@@ -187,6 +187,16 @@ pub(crate) enum Command {
     UnreadCounts {
         session: SessionId,
         reply: oneshot::Sender<Result<Vec<(Topic, u64)>, StorageError>>,
+    },
+    /// The sessions with a registered agent inbox (card-16 `agents`). A read
+    /// routed through the writer channel like every other op.
+    ListAgentInboxes {
+        reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
+    },
+    /// Every known topic with its subscriber/event counts (card-16 `topics`).
+    ListTopics {
+        prefix: Option<String>,
+        reply: oneshot::Sender<Result<Vec<TopicSummary>, StorageError>>,
     },
     GetBaseline {
         watch: WatchId,
@@ -446,6 +456,18 @@ fn handle(conn: &mut Connection, cmd: Command) {
             let result = do_unread_counts(conn, &session);
             log_on_err(&result, "unread_counts", || {
                 format!("session={}", session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::ListAgentInboxes { reply } => {
+            let result = do_list_agent_inboxes(conn);
+            log_on_err(&result, "list_agent_inboxes", String::new);
+            let _ = reply.send(result);
+        }
+        Command::ListTopics { prefix, reply } => {
+            let result = do_list_topics(conn, prefix.as_deref());
+            log_on_err(&result, "list_topics", || {
+                format!("prefix={}", prefix.as_deref().unwrap_or("-"))
             });
             let _ = reply.send(result);
         }
@@ -1181,6 +1203,99 @@ fn do_unread_counts(
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
         out.push((topic, count.max(0) as u64));
+    }
+    Ok(out)
+}
+
+/// The sessions that have REGISTERED an agent inbox (card-16 `agents`).
+///
+/// A session is registered exactly when it is subscribed to *its own* inbox topic
+/// — the thing `harness arm` guarantees on every SessionStart/Stop (ADR-0007).
+/// That "its own" test is what makes this an agent list rather than a list of
+/// everyone who happens to be listening to an `agent.*` topic: a session may
+/// legitimately subscribe to a PEER's inbox (nothing forbids it), and such a
+/// subscriber is not itself addressable.
+///
+/// The ownership test is done in Rust through the one canonical
+/// [`inbox_topic`] constructor rather than as SQL string concatenation, so the
+/// topic grammar lives in exactly one place and cannot drift into a query. The
+/// scan is over all subscription rows, which is bounded by (live sessions ×
+/// topics they watch) — tens of rows on a local dev bus, so the simplicity is
+/// worth more than an index-friendly `LIKE`.
+fn do_list_agent_inboxes(conn: &Connection) -> Result<Vec<SessionId>, StorageError> {
+    let mut stmt =
+        conn.prepare("SELECT session_id, topic FROM subscription ORDER BY session_id ASC")?;
+    let rows = stmt.query_map([], |row| {
+        let session: String = row.get(0)?;
+        let topic: String = row.get(1)?;
+        Ok((session, topic))
+    })?;
+
+    let mut agents = Vec::new();
+    for row in rows {
+        let (session, topic) = row?;
+        let session = SessionId::new(session);
+        // A session id that cannot form an inbox topic simply has no inbox; it is
+        // not corrupt storage (the id is an opaque harness label), so skip it.
+        if let Ok(inbox) = inbox_topic(&session)
+            && inbox.as_str() == topic
+        {
+            agents.push(session);
+        }
+    }
+    Ok(agents)
+}
+
+/// Every topic the bridge knows about, with its subscriber count, event count,
+/// and newest-event timestamp (card-16 `topics`).
+///
+/// A topic is not a table: it exists because something subscribed to it or
+/// published to it. So the row set is the UNION of both tables' topics — a topic
+/// with subscribers but no traffic yet (the common case for a fresh inbox) is
+/// listed just as honestly as one with events and no listeners.
+///
+/// `prefix` filters in Rust rather than with SQL `LIKE`, which would need escaping
+/// for `%`/`_` in a user-supplied prefix; the distinct-topic count is small, so the
+/// unescapable, obviously-correct filter wins.
+fn do_list_topics(
+    conn: &Connection,
+    prefix: Option<&str>,
+) -> Result<Vec<TopicSummary>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT t.topic,
+                (SELECT COUNT(*) FROM subscription s WHERE s.topic = t.topic),
+                (SELECT COUNT(*) FROM event e WHERE e.topic = t.topic),
+                (SELECT MAX(e.timestamp) FROM event e WHERE e.topic = t.topic)
+         FROM (SELECT topic FROM event UNION SELECT topic FROM subscription) t
+         ORDER BY t.topic ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let topic: String = row.get(0)?;
+        let subscribers: i64 = row.get(1)?;
+        let events: i64 = row.get(2)?;
+        let last_event: Option<i64> = row.get(3)?;
+        Ok((topic, subscribers, events, last_event))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (topic_str, subscribers, events, last_event) = row?;
+        if let Some(prefix) = prefix
+            && !topic_str.starts_with(prefix)
+        {
+            continue;
+        }
+        // Both tables can only hold a topic this bridge accepted, so a value that
+        // fails the grammar now is corrupt storage, not user input.
+        let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
+            detail: format!("invalid topic {topic_str:?} stored"),
+        })?;
+        out.push(TopicSummary {
+            topic,
+            subscribers: subscribers.max(0) as u64,
+            events: events.max(0) as u64,
+            last_event: last_event.map(Timestamp),
+        });
     }
     Ok(out)
 }

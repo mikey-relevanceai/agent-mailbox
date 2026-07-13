@@ -8,7 +8,7 @@ Notes for the project. **New here and want to *use* it?** Start with
 
 | Doc | What it covers |
 |---|---|
-| [04-usage](04-usage.md) | **Start here.** Install, hooks, the four-verb agent loop, `mailbox status` |
+| [04-usage](04-usage.md) | **Start here.** Install, hooks, the four-verb agent loop, agent-to-agent messaging, `mailbox status` |
 | [demo](demo.md) | Runnable end-to-end demo (`scripts/demo.sh`) + captured output; real-PR steps |
 | [migration-from-agent-ipc](migration-from-agent-ipc.md) | Retire the old `agent-ipc` / `agent-ipc-github` skills; drop-in replacement skill |
 
@@ -32,14 +32,14 @@ Also:
 ## Mental model
 
 ```text
-Adapters (detect world changes)
-        ↓ publish
+Adapters (detect world changes)          Peer agents (mailbox send)
+        ↓ publish                                ↓ publish to agent.<session-id>
 Bridge (durable events + subscriptions + wake kicks)
         ↓ harness wake
 Agent sessions (react, never poll)
 ```
 
-Adapters never know how wake works. The bridge owns topics and per-subscriber cursors. Harness integrators own arm/re-arm so the agent does not.
+Adapters never know how wake works. The bridge owns topics and per-subscriber cursors. Harness integrators own arm/re-arm so the agent does not. Every live session is automatically subscribed to its own inbox topic (`agent.<session-id>`), so agents can wake each other with no human in the loop (ADR-0007).
 
 ## Repo map
 

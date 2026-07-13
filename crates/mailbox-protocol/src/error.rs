@@ -28,12 +28,15 @@ pub enum TopicError {
     #[error("not a GitHub PR topic: expected `github.pr.<owner>/<repo>#<n>`")]
     NotGithubPr,
 
+    #[error("not an agent inbox topic: expected `agent.<session-id>`")]
+    NotAgentInbox,
+
     // The embedded `value` echoes adapter-authored topic data (owner/repo/PR
-    // number) so the diagnostic points at the exact bad input. This is a
-    // DELIBERATE, size-bounded echo of a topic segment — do NOT copy this
-    // pattern for `Publish`/`Event` bodies, which are untrusted, potentially
+    // number, or a session id) so the diagnostic points at the exact bad input.
+    // This is a DELIBERATE, size-bounded echo of a topic segment — do NOT copy
+    // this pattern for `Publish`/`Event` bodies, which are untrusted, potentially
     // large content that must never be echoed (ADR-0001).
-    #[error("GitHub PR topic {field} segment is invalid: {value:?}")]
+    #[error("topic {field} segment is invalid: {value:?}")]
     InvalidSegment { field: &'static str, value: String },
 
     #[error("GitHub PR number is invalid: {value:?} (must be a positive integer)")]

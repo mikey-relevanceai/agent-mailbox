@@ -39,9 +39,10 @@ use serde_json::Value;
 
 use mailbox_protocol::{
     AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, Topic, check_version,
+    inbox_topic,
 };
 
-use mailbox::storage::{SessionId, SubscribeOutcome, WatchKind, WatchState};
+use mailbox::storage::{SessionId, SubscribeOutcome, TopicSummary, WatchKind, WatchState};
 use mailbox::watch::{StatusView, UnwatchOutcome, WatchEntry};
 
 /// A one-shot request from a CLI client to the `serve` daemon.
@@ -94,6 +95,25 @@ pub enum Request {
     /// Report watches (interest + child pid), this session's subscriptions, and
     /// its unread counts.
     Status { session: SessionId },
+    /// Message a peer agent: publish `body` to the target's inbox topic, stamped
+    /// with the sender's id (card 16). `to` is a [`SessionId`], not a `Topic`: the
+    /// daemon mints the inbox topic through the one canonical constructor, so a
+    /// caller cannot address a *non*-inbox topic through this op.
+    ///
+    /// The body is a JSON **object** on the wire (a `Map`, not a `Value`), so
+    /// "there is somewhere to stamp `from`" is a type-level guarantee rather than
+    /// a runtime check. It stays opaque to the bus either way (ADR-0001).
+    Send {
+        from: SessionId,
+        to: SessionId,
+        body: serde_json::Map<String, Value>,
+    },
+    /// List the sessions with a registered agent inbox (card-16 discovery).
+    /// `session` is the *caller*, so the reply can mark which agent is itself.
+    Agents { session: SessionId },
+    /// List known topics with subscriber/event counts, optionally filtered to a
+    /// prefix (card-16 discovery).
+    Topics { prefix: Option<String> },
     /// End a session (the harness `SessionEnd` hook, card 11): drop all its
     /// subscriptions and interests, stopping any adapter whose last interest it
     /// held. No topic here — it tears down everything for the session at once.
@@ -147,6 +167,19 @@ pub enum Response {
     },
     /// A status snapshot.
     Status(StatusReport),
+    /// A message was published to a peer's inbox. Carries the durable coordinates
+    /// (like `Published`) plus the resolved target, so the sender can log exactly
+    /// where its message landed.
+    Sent {
+        to: SessionId,
+        topic: Topic,
+        id: EventId,
+        offset: Offset,
+    },
+    /// The registered agent inboxes (card-16 discovery).
+    Agents { agents: Vec<AgentSummary> },
+    /// The known topics (card-16 discovery).
+    Topics { topics: Vec<TopicStatus> },
     /// A session was ended (card 11): counts of what its teardown removed.
     SessionEnded {
         subscriptions_dropped: u64,
@@ -211,11 +244,56 @@ impl From<UnwatchOutcome> for UnwatchResultWire {
     }
 }
 
+/// One registered agent inbox as `mailbox agents` reports it (card 16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    /// The agent's session id — what you pass to `mailbox send`.
+    pub session: SessionId,
+    /// Its inbox topic (`agent.<session-id>`), carried explicitly so a consumer
+    /// never has to re-derive the grammar.
+    pub inbox: Topic,
+    /// Whether a waiter is blocked for this session right now — i.e. the agent is
+    /// idle and a `send` will wake it immediately. `false` means it is busy
+    /// (mid-turn) or never armed; a message still lands durably in its inbox and
+    /// surfaces on its next read. This is NOT a heartbeat (see
+    /// [`mailbox::wake::waiter_alive`]).
+    pub live_waiter: bool,
+    /// Whether this row is the caller itself.
+    pub is_self: bool,
+}
+
+/// One topic as `mailbox topics` reports it. Wire twin of [`TopicSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicStatus {
+    pub topic: Topic,
+    pub subscribers: u64,
+    pub events: u64,
+    /// Unix millis of the newest event; absent on a topic with no events.
+    pub last_event_ms: Option<i64>,
+}
+
+impl From<TopicSummary> for TopicStatus {
+    fn from(summary: TopicSummary) -> Self {
+        TopicStatus {
+            topic: summary.topic,
+            subscribers: summary.subscribers,
+            events: summary.events,
+            last_event_ms: summary.last_event.map(|t| t.0),
+        }
+    }
+}
+
 /// What `status` reports (card 06).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusReport {
     /// The session this snapshot is for (whose unread counts are shown).
     pub session: SessionId,
+    /// This session's inbox topic (card 16), so an agent can see its own address
+    /// without re-deriving it. `None` only if the session id cannot form a topic
+    /// (see `mailbox_protocol::inbox_topic`) — a session that is then not
+    /// addressable at all, which `status` should say plainly rather than hide.
+    /// Whether it is REGISTERED is visible in `subscriptions`.
+    pub inbox: Option<Topic>,
     /// Every watch the bridge knows about, with interest counts + lifecycle.
     pub watches: Vec<WatchStatus>,
     /// The topics `session` is subscribed to (card 11): the read behind
@@ -229,6 +307,7 @@ impl StatusReport {
     /// Assemble the wire report from the domain [`StatusView`] and its session.
     pub fn from_view(session: SessionId, view: StatusView) -> Self {
         StatusReport {
+            inbox: inbox_topic(&session).ok(),
             session,
             watches: view.watches.into_iter().map(WatchStatus::from).collect(),
             subscriptions: view.subscriptions,

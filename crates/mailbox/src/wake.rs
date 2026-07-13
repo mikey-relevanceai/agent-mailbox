@@ -295,6 +295,37 @@ pub fn pidfile_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
     waiters_dir.join(format!("{}.waiter.pid", session.encode_filename()))
 }
 
+/// Whether a session currently has a LIVE waiter blocked on its FIFO.
+///
+/// The honest definition, because `mailbox agents` reports it and must not
+/// overclaim: this reads the session's pidfile and probes that PID with
+/// `kill(pid, 0)`. Post-ADR-0006 the pidfile is written by the waiter itself,
+/// only after it takes the single-waiter lock, so it reliably names the one
+/// lock-holding waiter for the session. A live PID therefore means "this agent is
+/// idle and listening — a publish to its topics will wake it now".
+///
+/// What it is NOT: a heartbeat, or proof the *agent* is healthy. `false` only
+/// means no waiter is blocked at this instant — typically because the session is
+/// mid-turn (busy), or because it never armed. A message published to a
+/// subscribed session with no live waiter is still durably delivered; it surfaces
+/// on that session's next read/arm. There is no liveness signal beyond this, and
+/// we deliberately do not invent one.
+pub fn waiter_alive(waiters_dir: &Path, session: &SessionId) -> bool {
+    let Ok(text) = std::fs::read_to_string(pidfile_path(waiters_dir, session)) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<i32>() else {
+        // A half-written or garbage pidfile names no waiter (same tolerance as
+        // `mailbox_harness::arm::read_pidfile`).
+        return false;
+    };
+    // Signal 0 probes liveness without delivering anything: Ok => alive, ESRCH => gone.
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Ok(())
+    )
+}
+
 /// The kick side of wake, held by whoever publishes (the bridge / bus).
 ///
 /// Cheap to clone; it holds only the waiters directory path. It never opens the

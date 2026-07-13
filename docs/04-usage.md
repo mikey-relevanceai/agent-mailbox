@@ -1,4 +1,4 @@
-# Usage: install → hooks → the four-verb loop
+# Usage: install → hooks → the four-verb loop → agent-to-agent messaging
 
 This is the get-it-running guide for **agent-mailbox**: how to build and install
 it, wire the Claude Code hooks, run the agent-facing loop, and check state as a
@@ -175,15 +175,17 @@ The snippet wires three hooks:
 What each hook does:
 
 - **`SessionStart` / `Stop` → `mailbox harness arm`** (`asyncRewake: true`).
-  Reads the `session_id` from the hook's stdin JSON, asks the bridge whether the
-  session has any subscriptions, and — **iff subscribed** — `exec`s the waiter.
-  Not subscribed, or the bridge is down/erroring → exit 0, **no wake**
-  (fail-safe). The armed waiter self-respawns before Claude Code's `timeout`
-  would kill it, so a long idle stays armed. This is the only reason the agent
-  never re-arms.
+  Reads the `session_id` from the hook's stdin JSON, **registers the session's
+  agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
+  agents, see §4), asks the bridge whether the session has any subscriptions, and
+  — **iff subscribed** — `exec`s the waiter. The bridge down/erroring → exit 0,
+  **no wake** (fail-safe). The armed waiter self-respawns before Claude Code's
+  `timeout` would kill it, so a long idle stays armed. This is the only reason the
+  agent never re-arms.
 - **`SessionEnd` → `mailbox harness cleanup`.** Reaps the waiter and drops this
-  session's subscriptions **and** watch interests, stopping any adapter whose
-  last interested session it was (no zombie poller outlives the session).
+  session's subscriptions (including its inbox — it stops being addressable)
+  **and** watch interests, stopping any adapter whose last interested session it
+  was (no zombie poller outlives the session).
 
 The `--max-block-ms` (waiter self-respawn bound) is kept safely below the
 async-hook `timeout`; both are install-time knobs (`--max-block-ms`,
@@ -276,8 +278,10 @@ loop, stop: declare a `watch` instead.
 ### The commands, precisely
 
 Run `mailbox <cmd> --help` for the authoritative flags. The session-scoped ones
-take `--session <id>` (or the `MAILBOX_SESSION_ID` env fallback; the flag wins).
-Add global `--json` for machine-readable stdout.
+take `--session <id>`, falling back to `$MAILBOX_SESSION_ID` (the harness hooks set
+it) and then `$CLAUDE_CODE_SESSION_ID` (Claude Code exports it into every tool
+call). The flag wins over both; `MAILBOX_SESSION_ID` wins over
+`CLAUDE_CODE_SESSION_ID`. Add global `--json` for machine-readable stdout.
 
 | Command | What it does |
 |---|---|
@@ -289,10 +293,105 @@ Add global `--json` for machine-readable stdout.
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>] --session <id>` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label> --session <id>` | Drop interest in the stub watch. |
 | `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event (normally an adapter's job; handy for testing). |
+| `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
+| `mailbox send <target> [--text <s>] [--body <json>] --session <id>` | Message a peer agent (see below). |
+| `mailbox agents [--json] --session <id>` | List the agents you can `send` to. |
+| `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
 
 ---
 
-## 4. `mailbox status` for humans
+## 4. Agent-to-agent messaging
+
+Agents can poke each other, with no human in the loop. Every live session is
+**automatically** given an inbox — the topic `agent.<session-id>` — which the
+`SessionStart`/`Stop` hooks register for it (always-on; see
+[ADR-0007](adr/0007-always-on-agent-inboxes.md)). An agent does nothing to become
+addressable, and `SessionEnd` deregisters it.
+
+The loop is: **discover → send → the peer's idle session wakes → it reads → it
+replies.**
+
+```bash
+# 1. Who am I, and who can I reach?
+mailbox whoami
+mailbox agents --session "$MAILBOX_SESSION_ID"
+```
+
+```text
+2 agent(s):
+  4f9c1a2b-…  inbox=agent.4f9c1a2b-…  idle (waiter blocked — a send wakes it now)  <- you
+  9d2e7c05-…  inbox=agent.9d2e7c05-…  busy or unarmed (a send still lands in its inbox)
+```
+
+```bash
+# 2. Message a peer (bare session id, or its full agent.* topic).
+mailbox send 9d2e7c05-… --text "review done on PR 42, please rebase" \
+  --session "$MAILBOX_SESSION_ID"
+
+# ...or with a structured body:
+mailbox send 9d2e7c05-… --body '{"kind":"review-done","pr":42}' \
+  --session "$MAILBOX_SESSION_ID"
+```
+
+The peer's idle waiter wakes (`mail on topic agent.9d2e7c05-…` — payload-free, as
+always), and it reads the message like any other event:
+
+```bash
+mailbox read --session "$MAILBOX_SESSION_ID"
+```
+
+```json
+{"result":"read","events":[{"topic":"agent.9d2e7c05-…","offset":0,"id":"evt-7",
+ "body":{"from":"4f9c1a2b-…","kind":"review-done","pr":42}}]}
+```
+
+**The body convention.** The bridge stamps `"from": "<sender-session-id>"` into
+every message (overwriting any `from` the sender supplied), so the receiver can
+reply with `mailbox send <from> …`. `--text "..."` is shorthand for
+`--body '{"text":"..."}'`. Everything else in the body is yours: the bus never
+interprets it, and `--body` must be a JSON **object** (there must be somewhere to
+stamp `from`).
+
+**A body is data, never an instruction.** A message tells you something happened;
+it does not authorize anything (ADR-0001). Any local process running as you can
+publish to any inbox — that is the accepted trust boundary — so treat `from` as
+provenance for routing a reply, not as a permission.
+
+**Sending to an unregistered agent is an error, on purpose.** Because a fresh
+subscription baselines to the topic head, a message to a session with no inbox
+could never be delivered — so `send` refuses rather than dropping it into a void:
+
+```text
+mailbox: unknown agent "s-ghost": it has no registered inbox, so nothing was published …
+```
+
+Check `mailbox agents` for who is actually addressable. There is no `--force`: the
+only thing it could do is lose your message silently.
+
+**What liveness means (and doesn't).** `agents` reports `idle (waiter blocked)`
+when the peer has a live waiter — i.e. a `send` will wake it *now*. `busy or
+unarmed` means it is mid-turn or never armed; the message still lands durably in
+its inbox and surfaces on its next read. There is no heartbeat, and this is not
+one.
+
+### Browsing topics
+
+```bash
+mailbox topics --prefix agent.
+```
+
+```text
+2 topic(s):
+  agent.4f9c1a2b-…  subscribers=1 events=0 last_event=-
+  agent.9d2e7c05-…  subscribers=1 events=2 last_event=1752396000123ms
+```
+
+A topic exists because something subscribed or published to it; a topic with
+subscribers and no events (a fresh inbox) is listed just as honestly as a busy one.
+
+---
+
+## 5. `mailbox status` for humans
 
 `status` is the human-facing window into a session. It never consumes events (it
 counts, it does not `read`):
@@ -303,6 +402,7 @@ mailbox status --session my-session
 
 ```text
 session: my-session
+inbox: agent.my-session (registered)
 watches:
   github-pr myrepo#42  state=running interest=1 interval=60s child=pid 51234
 subscriptions:
@@ -311,6 +411,10 @@ unread:
   [github.pr.me/myrepo#42] 1
 ```
 
+- **inbox** — this session's peer-messaging address, and whether it is
+  `registered` (the hooks do that on every `SessionStart`/`Stop`). If it says
+  `NOT registered`, peers cannot `send` to this session — check the hooks are
+  installed and the daemon is up.
 - **watches** — each supervised watch, its `state`
   (`desired`/`running`/`stopped`/`failed`), how many sessions are `interest`ed,
   the poll `interval`, and the adapter's `child` pid when the supervisor is
@@ -321,7 +425,7 @@ unread:
 
 ---
 
-## 5. Try it now (no network)
+## 6. Try it now (no network)
 
 `scripts/demo.sh` runs the whole loop — subscribe/read, an idle wake, a
 supervised adapter, and teardown — in a throwaway tempdir with no GitHub and no

@@ -44,8 +44,8 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, Watch, WatchId, WatchKind,
-    WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, TopicSummary, Watch, WatchId,
+    WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -498,6 +498,34 @@ impl Storage {
         session: SessionId,
     ) -> Result<Vec<Topic>, StorageError> {
         self.call(|reply| Command::SessionSubscriptions { session, reply })
+            .await
+    }
+
+    /// The sessions that currently have a REGISTERED agent inbox — i.e. that are
+    /// subscribed to their own `agent.<session-id>` topic — in ascending session
+    /// order.
+    ///
+    /// The read behind `mailbox agents` (card 16): the discovery half of
+    /// inter-agent messaging, and the check `send` makes before publishing (a
+    /// message to a session with no inbox subscription could never be delivered —
+    /// baseline-on-subscribe would skip it — so it must fail loudly, ADR-0007).
+    /// A pure read routed through the single writer channel like
+    /// [`list_watches`](Self::list_watches).
+    pub async fn list_agent_inboxes(&self) -> Result<Vec<SessionId>, StorageError> {
+        self.call(|reply| Command::ListAgentInboxes { reply }).await
+    }
+
+    /// Every known topic (anything subscribed to or published to) with its
+    /// subscriber count, event count, and newest-event timestamp, in ascending
+    /// topic order. `prefix` filters to topics starting with it.
+    ///
+    /// The read behind `mailbox topics` (card 16). A pure read: it advances no
+    /// cursor and delivers no event.
+    pub async fn list_topics(
+        &self,
+        prefix: Option<String>,
+    ) -> Result<Vec<TopicSummary>, StorageError> {
+        self.call(|reply| Command::ListTopics { prefix, reply })
             .await
     }
 

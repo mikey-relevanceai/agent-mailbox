@@ -13,6 +13,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0004](0004-cli-serve-daemon-and-socket.md) | `serve` daemon + Unix-socket CLI clients (fail loud when down) | Accepted |
 | [0005](0005-baseline-via-protocol.md) | Edge-triggered adapter baseline persists via the protocol (config in, `Baseline` out) | Accepted |
 | [0006](0006-harness-self-respawn.md) | Harness wake loop: self-respawn via execv, waiter-owned pidfile after the lock, arm-iff-subscribed | Accepted |
+| [0007](0007-always-on-agent-inboxes.md) | Always-on agent inboxes (`agent.<session-id>`), discovery, and why `send` to an unregistered agent is an error | Accepted |
 
 ## When to write one
 

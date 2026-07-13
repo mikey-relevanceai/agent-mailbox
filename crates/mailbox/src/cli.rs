@@ -17,12 +17,12 @@ use mailbox::storage::{SessionId, StorageConfig};
 use mailbox::wake::{WaitOutcome, Waiter, WakeOutcome};
 use mailbox_harness::arm::{ArmDecision, SubscriptionProbe};
 use mailbox_harness::hook::HookInput;
-use mailbox_protocol::{AdapterId, GithubPr, Topic, stub_topic};
+use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
 
 use crate::client;
 use crate::control::{
-    GithubPrTarget, Request, Response, StatusReport, SubscribeState, UnwatchResultWire,
-    WatchKindWire, WatchStateWire,
+    AgentSummary, GithubPrTarget, Request, Response, StatusReport, SubscribeState, TopicStatus,
+    UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
 
@@ -93,6 +93,14 @@ pub enum Command {
     Unwatch(UnwatchArgs),
     /// Show watches (interest + child pid) and this session's unread counts.
     Status(SessionOpt),
+    /// Print this session's own id and inbox topic (card 16). Needs no bridge.
+    Whoami(SessionOpt),
+    /// Message a peer agent: publish to its inbox, stamped with your session id.
+    Send(SendArgs),
+    /// List the agents with a registered inbox (who you can `send` to).
+    Agents(SessionOpt),
+    /// List known topics with their subscriber and event counts.
+    Topics(TopicsArgs),
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
     Wait(WaitArgs),
     /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
@@ -101,14 +109,63 @@ pub enum Command {
     Harness(HarnessArgs),
 }
 
+/// Env var the harness hooks export for a session (card 11).
+const ENV_MAILBOX_SESSION: &str = "MAILBOX_SESSION_ID";
+/// Env var **Claude Code itself** exports into every tool invocation. It carries
+/// the same id the hooks receive on stdin, so it is the fallback that lets an
+/// agent learn its own identity with nothing installed but the binary (card 16).
+const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
+
 /// The session identity every session-scoped command needs. Parsed ONCE here at
-/// the clap edge into a branded [`SessionId`] (parse, don't validate), so the six
-/// handlers never re-mint it from a bare `String`. The `--session` flag wins;
-/// `MAILBOX_SESSION_ID` is the fallback (set by the harness hooks, card 11).
+/// the clap edge into a branded [`SessionId`] (parse, don't validate), so the
+/// handlers never re-mint it from a bare `String`.
+///
+/// Resolution order: `--session` > `MAILBOX_SESSION_ID` > `CLAUDE_CODE_SESSION_ID`
+/// (see [`resolve_session`]). The env fallbacks are read here rather than through
+/// clap's `env =` because clap supports only ONE env var per argument, and the
+/// precedence between the two is a rule we want stated (and tested) explicitly.
 #[derive(Args, Debug)]
 pub struct SessionOpt {
-    #[arg(long, env = "MAILBOX_SESSION_ID", value_parser = parse_session)]
-    pub session: SessionId,
+    /// This session's id. Defaults to `$MAILBOX_SESSION_ID`, else
+    /// `$CLAUDE_CODE_SESSION_ID` (which Claude Code exports into every tool call).
+    #[arg(long, value_parser = parse_session)]
+    pub session: Option<SessionId>,
+}
+
+impl SessionOpt {
+    /// Resolve the session from the flag and the environment, or fail with an
+    /// actionable message naming every place we looked.
+    pub fn resolve(&self) -> anyhow::Result<SessionId> {
+        resolve_session(
+            self.session.clone(),
+            env_session(ENV_MAILBOX_SESSION),
+            env_session(ENV_CLAUDE_SESSION),
+        )
+    }
+}
+
+/// A non-empty environment variable, trimmed of surrounding whitespace. An empty
+/// or whitespace-only value names no session, so it is treated as absent rather
+/// than resolving to a phantom session id.
+fn env_session(key: &str) -> Option<String> {
+    let value = std::env::var(key).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The session-resolution rule, as a pure function of its three inputs so the
+/// precedence is unit-testable without touching process env.
+fn resolve_session(
+    flag: Option<SessionId>,
+    mailbox_env: Option<String>,
+    claude_env: Option<String>,
+) -> anyhow::Result<SessionId> {
+    flag.or_else(|| mailbox_env.map(SessionId::new))
+        .or_else(|| claude_env.map(SessionId::new))
+        .context(
+            "no session id: pass --session <id>, or set MAILBOX_SESSION_ID \
+             (the harness hooks do) or CLAUDE_CODE_SESSION_ID (Claude Code does)",
+        )
 }
 
 /// Wrap a raw session label into a [`SessionId`]. Infallible — the harness owns
@@ -218,6 +275,33 @@ pub struct TopicArgs {
     pub session: SessionOpt,
 }
 
+/// Arguments to `send`: who to message, and what to say.
+///
+/// `--text` and `--body` are mutually exclusive: `--text` IS the shorthand for
+/// `--body '{"text": "..."}'`, so accepting both would only raise the question of
+/// which wins. Neither is also fine — a bare `send <target>` is a poke, and the
+/// receiver still learns who it came from (the `from` stamp is always present).
+#[derive(Args, Debug)]
+pub struct SendArgs {
+    /// The agent to message: a bare session id, or its full `agent.<id>` topic.
+    pub target: String,
+    /// Message text. Shorthand for `--body '{"text": "<s>"}'`.
+    #[arg(long, conflicts_with = "body")]
+    pub text: Option<String>,
+    /// A JSON **object** body (stored verbatim; the bridge only adds `from`).
+    #[arg(long)]
+    pub body: Option<String>,
+    #[command(flatten)]
+    pub session: SessionOpt,
+}
+
+#[derive(Args, Debug)]
+pub struct TopicsArgs {
+    /// Only list topics starting with this prefix (e.g. `agent.`, `github.pr.`).
+    #[arg(long)]
+    pub prefix: Option<String>,
+}
+
 #[derive(Args, Debug)]
 pub struct ReadArgs {
     /// Maximum events per topic to return (bridge default if omitted).
@@ -309,6 +393,10 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<()> {
         Command::Watch(args) => run_watch(format, args).await,
         Command::Unwatch(args) => run_unwatch(format, args).await,
         Command::Status(args) => run_status(format, args).await,
+        Command::Whoami(args) => run_whoami(format, args),
+        Command::Send(args) => run_send(format, args).await,
+        Command::Agents(args) => run_agents(format, args).await,
+        Command::Topics(args) => run_topics(format, args).await,
         // `wait` is dispatched synchronously by `main` and never reaches here.
         Command::Wait(_) => unreachable!("wait is handled synchronously in main"),
         Command::Harness(args) => run_harness(format, args).await,
@@ -324,7 +412,7 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
     let topic = parse_topic(&args.topic)?;
     let body: serde_json::Value =
         serde_json::from_str(&args.body).context("--body must be valid JSON")?;
-    send(
+    request(
         format,
         Request::Publish {
             topic,
@@ -337,10 +425,10 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
 
 async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<()> {
     let topic = parse_topic(&args.topic)?;
-    send(
+    request(
         format,
         Request::Subscribe {
-            session: args.session.session,
+            session: args.session.resolve()?,
             topic,
         },
     )
@@ -349,10 +437,10 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
 
 async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<()> {
     let topic = parse_topic(&args.topic)?;
-    send(
+    request(
         format,
         Request::Unsubscribe {
-            session: args.session.session,
+            session: args.session.resolve()?,
             topic,
         },
     )
@@ -360,25 +448,128 @@ async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Resul
 }
 
 async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
-    send(
+    request(
         format,
         Request::Read {
-            session: args.session.session,
+            session: args.session.resolve()?,
             limit: args.limit,
         },
     )
     .await
 }
 
+/// `whoami`: this session's id and its inbox topic — the address a peer uses to
+/// `send` to it. Deliberately NOT a socket call: identity does not depend on the
+/// bridge, so an agent can always answer "who am I" even when the daemon is down.
+fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
+    let session = args.resolve()?;
+    let inbox = inbox_topic(&session)
+        .with_context(|| format!("session {:?} cannot form an inbox topic", session.as_str()))?;
+
+    if format.is_json() {
+        println!(
+            "{}",
+            serde_json::json!({ "session": session.as_str(), "inbox_topic": inbox.as_str() })
+        );
+    } else {
+        println!("session: {}", session.as_str());
+        println!("inbox:   {}", inbox.as_str());
+    }
+    Ok(())
+}
+
+/// `send`: message a peer agent. The body the bridge publishes is
+/// `{"from": "<sender>", ...}` — see [`mailbox::agents`] for the convention and
+/// for why an unregistered target is a hard error rather than a silent publish.
+async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<()> {
+    let from = args.session.resolve()?;
+    let to = parse_send_target(&args.target)?;
+    let body = send_body(args.text, args.body)?;
+    request(format, Request::Send { from, to, body }).await
+}
+
+/// Build the message body from the mutually-exclusive `--text` / `--body` flags.
+/// `--body` must be a JSON **object**: the bridge stamps `from` into it, and there
+/// is nowhere to stamp it on a bare scalar or array.
+fn send_body(
+    text: Option<String>,
+    body: Option<String>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    match (text, body) {
+        (Some(text), _) => {
+            let mut map = serde_json::Map::new();
+            map.insert("text".to_string(), serde_json::Value::String(text));
+            Ok(map)
+        }
+        (None, Some(raw)) => {
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).context("--body must be valid JSON")?;
+            match value {
+                serde_json::Value::Object(map) => Ok(map),
+                _ => anyhow::bail!(
+                    "--body must be a JSON object (e.g. '{{\"text\":\"hi\"}}'), so the bridge can \
+                     stamp the sender's id into it"
+                ),
+            }
+        }
+        // A bare poke: the receiver still learns who sent it (the `from` stamp).
+        (None, None) => Ok(serde_json::Map::new()),
+    }
+}
+
+/// Resolve a `send` target — a bare session id, or a full `agent.<id>` topic —
+/// into the [`SessionId`] the request addresses.
+///
+/// The three cases are kept apart rather than guessed at: a topic in the `agent.`
+/// namespace with a bad session segment is an ERROR (the user meant an inbox and
+/// got it wrong), while a string that is not in that namespace at all is treated
+/// as the bare session id it looks like.
+fn parse_send_target(raw: &str) -> anyhow::Result<SessionId> {
+    let topic = Topic::parse(raw).with_context(|| format!("invalid send target {raw:?}"))?;
+    match topic.as_agent_inbox() {
+        Ok(session) => Ok(session),
+        Err(mailbox_protocol::TopicError::NotAgentInbox) => {
+            let session = SessionId::new(raw);
+            // Validate through the same grammar the daemon will use, so a target
+            // that could never form an inbox fails locally with a clear message.
+            inbox_topic(&session)
+                .with_context(|| format!("{raw:?} cannot be used as an agent address"))?;
+            Ok(session)
+        }
+        Err(err) => Err(anyhow::Error::new(err))
+            .with_context(|| format!("invalid agent inbox topic {raw:?}")),
+    }
+}
+
+async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
+    request(
+        format,
+        Request::Agents {
+            session: args.resolve()?,
+        },
+    )
+    .await
+}
+
+async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<()> {
+    request(
+        format,
+        Request::Topics {
+            prefix: args.prefix,
+        },
+    )
+    .await
+}
+
 async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> {
-    let request = match args.target {
+    let req = match args.target {
         WatchTargetCmd::GithubPr(gh) => Request::Watch {
-            session: gh.session.session,
+            session: gh.session.resolve()?,
             target: parse_pr_spec(&gh.spec)?,
             interval_secs: gh.interval,
         },
         WatchTargetCmd::Stub(stub) => Request::WatchStub {
-            session: stub.session.session,
+            session: stub.session.resolve()?,
             // Validate the label at the edge (same as the daemon) so a bad label
             // is a clean local error, not a round-trip.
             label: parse_stub_label(&stub.label)?,
@@ -386,28 +577,28 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> 
             count: stub.count,
         },
     };
-    send(format, request).await
+    request(format, req).await
 }
 
 async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<()> {
-    let request = match args.target {
+    let req = match args.target {
         UnwatchTargetCmd::GithubPr(gh) => Request::Unwatch {
-            session: gh.session.session,
+            session: gh.session.resolve()?,
             target: parse_pr_spec(&gh.spec)?,
         },
         UnwatchTargetCmd::Stub(stub) => Request::UnwatchStub {
-            session: stub.session.session,
+            session: stub.session.resolve()?,
             label: parse_stub_label(&stub.label)?,
         },
     };
-    send(format, request).await
+    request(format, req).await
 }
 
 async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
-    send(
+    request(
         format,
         Request::Status {
-            session: args.session,
+            session: args.resolve()?,
         },
     )
     .await
@@ -421,7 +612,7 @@ async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()
 /// - the bridge is down / unreachable ([`client::ClientError`]) → the actionable
 ///   "start it with `mailbox serve`" error, tagged with the op/session it was
 ///   trying to run (F13). Both failure paths exit non-zero.
-async fn send(format: OutputFormat, request: Request) -> anyhow::Result<()> {
+async fn request(format: OutputFormat, request: Request) -> anyhow::Result<()> {
     let config = StorageConfig::from_env().context("resolving storage path")?;
     let socket = config.socket_path();
 
@@ -495,6 +686,14 @@ fn request_context(request: &Request) -> String {
             format!("unwatching stub {label} for {}", session.as_str())
         }
         Request::Status { session } => format!("status for {}", session.as_str()),
+        Request::Send { from, to, .. } => {
+            format!("sending from {} to {}", from.as_str(), to.as_str())
+        }
+        Request::Agents { .. } => "listing agents".to_string(),
+        Request::Topics { prefix } => match prefix {
+            Some(prefix) => format!("listing topics under {prefix:?}"),
+            None => "listing topics".to_string(),
+        },
         Request::EndSession { session } => format!("ending session {}", session.as_str()),
     }
 }
@@ -559,6 +758,20 @@ fn render_human(response: &Response) {
             }
         },
         Response::Status(report) => render_status(report),
+        Response::Sent {
+            to,
+            topic,
+            id,
+            offset,
+        } => println!(
+            "sent to {} on {} (event {} at offset {})",
+            to.as_str(),
+            topic.as_str(),
+            id.0,
+            offset.0
+        ),
+        Response::Agents { agents } => render_agents(agents),
+        Response::Topics { topics } => render_topics(topics),
         Response::SessionEnded {
             subscriptions_dropped,
             interests_dropped,
@@ -583,8 +796,75 @@ fn describe_sub(state: &SubscribeState) -> String {
     }
 }
 
+/// Render the registered agent inboxes.
+///
+/// The liveness column is stated in full rather than as a bare `live`/`idle`
+/// flag, because it is easy to over-read: it means "a waiter is blocked for this
+/// session right now", not "this agent is healthy". A `send` to an agent with no
+/// live waiter still lands durably — so the footer says so instead of leaving the
+/// reader to guess (there is no heartbeat here, and we do not pretend otherwise).
+fn render_agents(agents: &[AgentSummary]) {
+    if agents.is_empty() {
+        println!("no agents registered (nobody is addressable yet)");
+        return;
+    }
+    println!("{} agent(s):", agents.len());
+    for agent in agents {
+        let waiter = if agent.live_waiter {
+            "idle (waiter blocked — a send wakes it now)"
+        } else {
+            "busy or unarmed (a send still lands in its inbox)"
+        };
+        let me = if agent.is_self { "  <- you" } else { "" };
+        println!(
+            "  {}  inbox={}  {}{}",
+            agent.session.as_str(),
+            agent.inbox.as_str(),
+            waiter,
+            me
+        );
+    }
+}
+
+fn render_topics(topics: &[TopicStatus]) {
+    if topics.is_empty() {
+        println!("no topics");
+        return;
+    }
+    println!("{} topic(s):", topics.len());
+    for topic in topics {
+        // A topic with no events has no last-event time; say "-" rather than
+        // inventing an epoch timestamp.
+        let last = match topic.last_event_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "-".to_string(),
+        };
+        println!(
+            "  {}  subscribers={} events={} last_event={}",
+            topic.topic.as_str(),
+            topic.subscribers,
+            topic.events,
+            last
+        );
+    }
+}
+
 fn render_status(report: &StatusReport) {
     println!("session: {}", report.session.as_str());
+    // The inbox line answers "can peers reach me?" — the topic AND whether the
+    // session is actually subscribed to it (registration is what makes a `send`
+    // deliverable; see ADR-0007).
+    match &report.inbox {
+        Some(inbox) => {
+            let registered = if report.subscriptions.contains(inbox) {
+                "registered"
+            } else {
+                "NOT registered — peers cannot send to this session"
+            };
+            println!("inbox: {} ({registered})", inbox.as_str());
+        }
+        None => println!("inbox: none (this session id cannot form an inbox topic)"),
+    }
     if report.watches.is_empty() {
         println!("watches: none");
     } else {
@@ -697,10 +977,18 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
     }
 }
 
-/// The `SessionStart` / `Stop` hook: launch a waiter IFF the session is
-/// subscribed. Session identity comes from the hook's stdin JSON (settled
-/// decision, card 11). Fail-safe: a down/erroring bridge or a session with no
-/// subscriptions all skip arming (no wake).
+/// The `SessionStart` / `Stop` hook: register this session's agent inbox, then
+/// launch a waiter IFF the session is subscribed. Session identity comes from the
+/// hook's stdin JSON (settled decision, card 11). Fail-safe: a down/erroring
+/// bridge or a session with no subscriptions all skip arming (no wake).
+///
+/// **Always-on inbox (card 16 / ADR-0007).** Registration happens here, before the
+/// probe, on every arm — so a session is addressable by its peers from its first
+/// `SessionStart` with nothing for the agent to do. The consequence is intended:
+/// every live session now has ≥1 subscription, so every live session arms a waiter
+/// while the bridge is up. Every fail-safe is untouched: a bridge that is down or
+/// erroring still skips arming (registration fails the same way the probe does),
+/// and the waiter still re-checks `has_subscription` after taking its lock.
 ///
 /// On the `Arm` path this **execs** `mailbox wait` (it does NOT write the
 /// pidfile — the waiter writes it after taking the single-waiter lock, so a
@@ -714,6 +1002,7 @@ async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
         .context("reading the SessionStart/Stop hook payload from stdin")?
         .session_id;
 
+    register_inbox(&config, &session).await;
     let probe = probe_subscription(&config, &session).await;
     match mailbox_harness::arm::decide(probe) {
         ArmDecision::Arm => {
@@ -746,6 +1035,59 @@ async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// Ensure `session` is subscribed to its own inbox topic, over the socket
+/// (always-on agent inboxes, ADR-0007).
+///
+/// Idempotent by construction: `arm` runs on every `Stop`, and `subscribe` is an
+/// idempotent no-op that leaves an existing delivery cursor untouched — so a
+/// re-arm can neither duplicate the subscription nor skip mail the agent has not
+/// read yet. Baseline-on-subscribe applies on the FIRST registration, which is
+/// exactly right: an agent is not shown messages sent before it existed.
+///
+/// Best-effort and silent on failure by design: this must never fail the hook. If
+/// the bridge is down or errors, the probe that follows sees the same thing and
+/// takes the fail-safe path (skip arming, no wake).
+async fn register_inbox(config: &StorageConfig, session: &SessionId) {
+    let topic = match inbox_topic(session) {
+        Ok(topic) => topic,
+        Err(err) => {
+            warn!(
+                session = %session.as_str(),
+                error = %err,
+                "session id cannot form an inbox topic; not registering an inbox (peers cannot address this session)"
+            );
+            return;
+        }
+    };
+    let request = Request::Subscribe {
+        session: session.clone(),
+        topic: topic.clone(),
+    };
+    match client::send(&config.socket_path(), &request).await {
+        Ok(Response::Subscribed { outcome, .. }) => info!(
+            session = %session.as_str(),
+            topic = %topic.as_str(),
+            outcome = %describe_sub(&outcome),
+            "registered the session's agent inbox"
+        ),
+        Ok(Response::Error { message }) => warn!(
+            session = %session.as_str(),
+            error = %message,
+            "bridge could not register the agent inbox; continuing (arming stays fail-safe)"
+        ),
+        Ok(other) => warn!(
+            session = %session.as_str(),
+            reply = ?other,
+            "unexpected bridge reply while registering the agent inbox; continuing"
+        ),
+        Err(err) => warn!(
+            session = %session.as_str(),
+            error = %err,
+            "bridge unreachable while registering the agent inbox; continuing (arming stays fail-safe)"
+        ),
     }
 }
 
@@ -1067,7 +1409,8 @@ fn render_skill_report(
 /// shape — `mailbox wait --session <id>` — with the same exit-code contract.
 ///
 /// Exit codes: `2` = the session has mail (wake it; reminder on stderr);
-/// `1` = a waiter error. Usage errors (missing `--session`) are handled by clap.
+/// `1` = a waiter error, including an unresolvable session (no `--session` and no
+/// session env var — a waiter with no identity has nothing to wait on).
 ///
 /// With `--max-block-ms`, a block that elapses with no mail re-execs a FRESH
 /// waiter (same PID) rather than returning — the self-respawn that keeps a long
@@ -1082,7 +1425,14 @@ pub fn run_wait(args: &WaitArgs) -> ExitCode {
         }
     };
 
-    let session = &args.session.session;
+    let session = match args.session.resolve() {
+        Ok(session) => session,
+        Err(err) => {
+            eprintln!("mailbox wait: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let session = &session;
     let waiter = Waiter::new(
         config.waiters_dir(),
         config.path().to_path_buf(),
@@ -1150,4 +1500,97 @@ fn wait_debug_enabled() -> bool {
 /// Convenience for `main`: turn the `--json` flag into an [`OutputFormat`].
 pub fn output_format(json: bool) -> OutputFormat {
     OutputFormat::from_json_flag(json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_flag_beats_both_env_vars() {
+        let resolved = resolve_session(
+            Some(SessionId::new("from-flag")),
+            Some("from-mailbox-env".to_string()),
+            Some("from-claude-env".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved, SessionId::new("from-flag"));
+    }
+
+    #[test]
+    fn mailbox_env_beats_claude_env() {
+        // The harness hooks set MAILBOX_SESSION_ID deliberately; Claude Code's own
+        // CLAUDE_CODE_SESSION_ID is the LAST resort, so it must not win.
+        let resolved = resolve_session(
+            None,
+            Some("from-mailbox-env".to_string()),
+            Some("from-claude-env".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved, SessionId::new("from-mailbox-env"));
+    }
+
+    #[test]
+    fn claude_env_is_the_last_fallback() {
+        let resolved = resolve_session(None, None, Some("from-claude-env".to_string())).unwrap();
+        assert_eq!(resolved, SessionId::new("from-claude-env"));
+    }
+
+    #[test]
+    fn no_session_anywhere_is_an_actionable_error() {
+        let err = resolve_session(None, None, None).unwrap_err();
+        let message = format!("{err}");
+        // The error must name every place we looked, or the agent cannot fix it.
+        assert!(message.contains("--session"), "{message}");
+        assert!(message.contains("MAILBOX_SESSION_ID"), "{message}");
+        assert!(message.contains("CLAUDE_CODE_SESSION_ID"), "{message}");
+    }
+
+    #[test]
+    fn send_target_accepts_a_bare_session_or_a_full_inbox_topic() {
+        assert_eq!(parse_send_target("s-b").unwrap(), SessionId::new("s-b"));
+        assert_eq!(
+            parse_send_target("agent.s-b").unwrap(),
+            SessionId::new("s-b")
+        );
+        // A dotted session id survives both spellings identically.
+        assert_eq!(parse_send_target("a.b").unwrap(), SessionId::new("a.b"));
+        assert_eq!(
+            parse_send_target("agent.a.b").unwrap(),
+            SessionId::new("a.b")
+        );
+    }
+
+    #[test]
+    fn send_target_rejects_an_unaddressable_target() {
+        // A malformed inbox topic is an error, not a session id literally named
+        // "agent." — the user clearly meant an inbox.
+        assert!(parse_send_target("agent.").is_err());
+        // A session id that cannot form a topic at all.
+        assert!(parse_send_target("has space").is_err());
+        assert!(parse_send_target("a/b").is_err());
+    }
+
+    #[test]
+    fn send_body_builds_from_text_or_a_json_object() {
+        let from_text = send_body(Some("hello".to_string()), None).unwrap();
+        assert_eq!(from_text["text"], serde_json::json!("hello"));
+
+        let from_body = send_body(None, Some(r#"{"kind":"review-done"}"#.to_string())).unwrap();
+        assert_eq!(from_body["kind"], serde_json::json!("review-done"));
+
+        // A bare poke is allowed: the `from` stamp the bridge adds is enough.
+        assert!(send_body(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_body_rejects_a_non_object_body() {
+        // There would be nowhere to stamp `from` on a scalar or an array.
+        for bad in ["[1,2]", "\"just a string\"", "7", "not json at all"] {
+            assert!(
+                send_body(None, Some(bad.to_string())).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
 }

@@ -18,12 +18,24 @@
 //! convention: constructing a topic and parsing one back go through one place,
 //! so the format cannot drift between producers and consumers (parse, don't
 //! validate).
+//!
+//! The second structured topic is an **agent inbox** — the per-session address
+//! every live session registers so peers can message it (card 16, ADR-0007):
+//!
+//! ```text
+//! agent.<session-id>
+//! e.g.  agent.4f9c1a2b-…
+//! ```
+//!
+//! Same discipline: [`inbox_topic`] mints one and [`Topic::as_agent_inbox`]
+//! parses it back to a [`SessionId`], so the two directions can never drift.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::TopicError;
+use crate::session::SessionId;
 
 /// Upper bound on topic length. Generous for `owner/repo#n` style ids while
 /// still bounding memory for anything that reaches us over the wire.
@@ -34,6 +46,9 @@ const GITHUB_PR_PREFIX: &str = "github.pr.";
 
 /// Prefix shared by every stub-adapter topic (`stub.<label>`).
 const STUB_PREFIX: &str = "stub.";
+
+/// Prefix shared by every agent-inbox topic (`agent.<session-id>`).
+const AGENT_INBOX_PREFIX: &str = "agent.";
 
 /// A validated topic identifier.
 ///
@@ -72,6 +87,63 @@ impl Topic {
     pub fn as_github_pr(&self) -> Result<GithubPr, TopicError> {
         GithubPr::parse_topic(self)
     }
+
+    /// Parse this topic as an agent inbox (`agent.<session-id>`), recovering the
+    /// [`SessionId`] it addresses. The reverse of [`inbox_topic`], and the map
+    /// discovery (`mailbox agents`) uses to turn a registered inbox topic back
+    /// into the agent that owns it.
+    ///
+    /// Three distinguishable outcomes, deliberately: [`TopicError::NotAgentInbox`]
+    /// when the topic is simply not in the `agent.` namespace (a caller may then
+    /// treat the string as something else), and [`TopicError::InvalidSegment`]
+    /// when it IS in that namespace but the session segment is malformed (an
+    /// error, not a fall-through).
+    pub fn as_agent_inbox(&self) -> Result<SessionId, TopicError> {
+        let rest = self
+            .0
+            .strip_prefix(AGENT_INBOX_PREFIX)
+            .ok_or(TopicError::NotAgentInbox)?;
+        check_inbox_segment(rest)?;
+        Ok(SessionId::new(rest))
+    }
+}
+
+/// The canonical inbox topic for `session`: `agent.<session-id>`.
+///
+/// Every live session registers this on `arm` (always-on, ADR-0007), which is
+/// what makes an agent addressable by its peers. Minted here — never formatted at
+/// a call site — so the producer (`send`), the registrar (`harness arm`), and the
+/// reverse map ([`Topic::as_agent_inbox`]) can never disagree.
+///
+/// This is fallible rather than total on purpose: [`SessionId`] is an opaque
+/// label from the harness with no grammar of its own, so it is NOT a subset of
+/// the topic grammar (a session id containing whitespace, a control character, or
+/// the `/`/`#` delimiters used by the other topic schemes cannot form an
+/// unambiguous inbox topic). Real harness session ids are UUID-like and always
+/// pass; a pathological one is refused loudly instead of silently mangled.
+pub fn inbox_topic(session: &SessionId) -> Result<Topic, TopicError> {
+    check_inbox_segment(session.as_str())?;
+    // Route the assembled string through `Topic::parse` too, so the length bound
+    // and the full grammar apply to the whole topic, not just the segment.
+    Topic::parse(format!("{AGENT_INBOX_PREFIX}{}", session.as_str()))
+}
+
+/// The session segment's rule, shared by [`inbox_topic`] (construction) and
+/// [`Topic::as_agent_inbox`] (parsing) so the round trip is lossless by
+/// construction. A `.` is allowed (session ids may contain one, and the prefix is
+/// stripped exactly once), so `agent.a.b` addresses the session `a.b`.
+fn check_inbox_segment(session: &str) -> Result<(), TopicError> {
+    let invalid = session.is_empty()
+        || session
+            .chars()
+            .any(|c| matches!(c, '/' | '#') || c.is_control() || c.is_whitespace());
+    if invalid {
+        return Err(TopicError::InvalidSegment {
+            field: "session",
+            value: session.to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl fmt::Display for Topic {
@@ -314,6 +386,73 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn inbox_topic_round_trips_to_its_session() {
+        let session = SessionId::new("4f9c1a2b-7d3e-4c5f-8a1b-2c3d4e5f6a7b");
+        let topic = inbox_topic(&session).unwrap();
+        assert_eq!(topic.as_str(), "agent.4f9c1a2b-7d3e-4c5f-8a1b-2c3d4e5f6a7b");
+        assert_eq!(topic.as_agent_inbox().unwrap(), session);
+    }
+
+    #[test]
+    fn inbox_topic_keeps_a_dotted_session_id_whole() {
+        // The prefix is stripped exactly once, so a `.` in the session id survives
+        // the round trip rather than splitting the address.
+        let session = SessionId::new("a.b");
+        let topic = inbox_topic(&session).unwrap();
+        assert_eq!(topic.as_str(), "agent.a.b");
+        assert_eq!(topic.as_agent_inbox().unwrap(), session);
+    }
+
+    #[test]
+    fn inbox_topic_rejects_session_ids_that_cannot_be_addressed() {
+        for bad in ["", "has space", "with/slash", "with#hash", "tab\tid"] {
+            assert!(
+                matches!(
+                    inbox_topic(&SessionId::new(bad)),
+                    Err(TopicError::InvalidSegment {
+                        field: "session",
+                        ..
+                    })
+                ),
+                "expected session {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn as_agent_inbox_separates_wrong_namespace_from_malformed_address() {
+        // Not in the namespace at all: the caller may legitimately treat the
+        // string as something else.
+        assert_eq!(
+            Topic::parse("stub.demo").unwrap().as_agent_inbox(),
+            Err(TopicError::NotAgentInbox)
+        );
+        // In the namespace but with an empty session segment: a real error.
+        assert!(matches!(
+            Topic::parse("agent.").unwrap().as_agent_inbox(),
+            Err(TopicError::InvalidSegment {
+                field: "session",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inbox_topic_length_boundary() {
+        // The whole assembled topic is bounded, not just the segment.
+        let ok = "a".repeat(MAX_TOPIC_LEN - AGENT_INBOX_PREFIX.len());
+        assert_eq!(
+            inbox_topic(&SessionId::new(ok)).unwrap().as_str().len(),
+            MAX_TOPIC_LEN
+        );
+        let over = "a".repeat(MAX_TOPIC_LEN - AGENT_INBOX_PREFIX.len() + 1);
+        assert!(matches!(
+            inbox_topic(&SessionId::new(over)),
+            Err(TopicError::TooLong { .. })
+        ));
     }
 
     #[test]

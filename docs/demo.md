@@ -75,6 +75,7 @@ $ mailbox watch stub demo --interval-ms 500 --session demo-session
 watching stub.demo (interest=1, subscription: new, empty topic (no baseline))
 $ mailbox status --session demo-session
 session: demo-session
+inbox: agent.demo-session (NOT registered — peers cannot send to this session)
 watches:
   stub demo  state=running interest=1 interval=500ms child=pid 23407
 subscriptions:
@@ -92,6 +93,7 @@ $ mailbox unwatch stub demo --session demo-session
 unwatched stub.demo (remaining interest=0)
 $ mailbox status --session demo-session
 session: demo-session
+inbox: agent.demo-session (NOT registered — peers cannot send to this session)
 watches:
   stub demo  state=stopped interest=0 interval=500ms child=stopped
 subscriptions:
@@ -100,6 +102,12 @@ unread: none
 
 OK — subscribe/read, idle-wake, supervised watch, and teardown all worked.
 ```
+
+(The `inbox: … (NOT registered)` line is expected here: the demo drives the CLI
+by hand with no Claude Code hooks, and it is `mailbox harness arm` — the
+`SessionStart`/`Stop` hook — that registers a session's inbox. In a real session
+with the hooks installed it reads `inbox: agent.<id> (registered)`, and peers can
+`mailbox send` to it; see [04-usage §4](04-usage.md#4-agent-to-agent-messaging).)
 
 (The `wake reason: kicked` line is a diagnostic the script opts into via
 `MAILBOX_WAIT_DEBUG=1`; a real wake surfaces only the payload-free

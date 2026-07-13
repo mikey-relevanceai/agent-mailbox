@@ -52,7 +52,7 @@
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,7 +72,10 @@ use mailbox::storage::{SessionId, Storage, StorageConfig};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
-use crate::control::{GithubPrTarget, Request, Response, StatusReport, decode_frame, encode_frame};
+use crate::control::{
+    AgentSummary, GithubPrTarget, Request, Response, StatusReport, TopicStatus, decode_frame,
+    encode_frame,
+};
 
 /// Hard cap on a single control frame (request line). Sized for the largest
 /// legitimate frame — a `publish` carrying an event body — with generous head
@@ -141,6 +144,20 @@ fn env_var(key: &str) -> Option<u64> {
     std::env::var(key).ok()?.parse().ok()
 }
 
+/// Everything a request handler needs, bundled so it travels as ONE value from
+/// `accept_loop` down to `dispatch` (rather than five positional arguments that
+/// grow with every card). Cheap to clone: the bus/storage/supervisor handles are
+/// channels, and the waiters path is shared behind an `Arc`.
+#[derive(Clone)]
+struct Ctx {
+    bus: Bus,
+    storage: Storage,
+    supervisor: Supervisor,
+    /// The per-session waiter FIFOs/pidfiles directory — the source of the
+    /// live-waiter liveness `agents` reports (card 16).
+    waiters_dir: Arc<PathBuf>,
+}
+
 /// Run the daemon until a termination signal (SIGINT/SIGTERM) arrives.
 pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     // 1. Create the owner-only directory FIRST (0700), fatal on failure — every
@@ -193,8 +210,14 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     let sweeper = spawn_sweeper(supervisor.clone());
 
     // 8. Serve until a shutdown signal, capping concurrent handlers.
+    let ctx = Ctx {
+        bus,
+        storage,
+        supervisor: supervisor.clone(),
+        waiters_dir: Arc::new(config.waiters_dir()),
+    };
     let connections = Arc::new(Semaphore::new(limits.max_connections));
-    let result = accept_loop(&listener, &bus, &storage, &supervisor, &connections, limits).await;
+    let result = accept_loop(&listener, &ctx, &connections, limits).await;
 
     // 9. Stop the sweeper and tear down every adapter so none outlives the bridge,
     //    then drain in-flight tasks (bounded) and clean up the socket. The lock
@@ -244,9 +267,7 @@ fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
 /// own task guarded by a semaphore permit; accept errors back off.
 async fn accept_loop(
     listener: &UnixListener,
-    bus: &Bus,
-    storage: &Storage,
-    supervisor: &Supervisor,
+    ctx: &Ctx,
     connections: &Arc<Semaphore>,
     limits: Limits,
 ) -> anyhow::Result<()> {
@@ -265,7 +286,7 @@ async fn accept_loop(
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => spawn_handler(stream, bus, storage, supervisor, connections, limits),
+                    Ok((stream, _addr)) => spawn_handler(stream, ctx, connections, limits),
                     Err(err) => {
                         // EMFILE and friends: back off so we cannot tight-loop.
                         warn!(error = %err, backoff = ?ACCEPT_BACKOFF, "accept failed; backing off");
@@ -279,25 +300,15 @@ async fn accept_loop(
 
 /// Spawn a handler for `stream` iff a connection permit is available; otherwise
 /// drop the connection (the client can retry — the daemon stays healthy).
-fn spawn_handler(
-    stream: UnixStream,
-    bus: &Bus,
-    storage: &Storage,
-    supervisor: &Supervisor,
-    connections: &Arc<Semaphore>,
-    limits: Limits,
-) {
+fn spawn_handler(stream: UnixStream, ctx: &Ctx, connections: &Arc<Semaphore>, limits: Limits) {
     match connections.clone().try_acquire_owned() {
         Ok(permit) => {
-            let bus = bus.clone();
-            let storage = storage.clone();
-            let supervisor = supervisor.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
                 // Hold the permit for the task's life; dropping it frees a slot
                 // and lets shutdown drain see this task complete.
                 let _permit = permit;
-                if let Err(err) = handle_connection(stream, bus, storage, supervisor, limits).await
-                {
+                if let Err(err) = handle_connection(stream, ctx, limits).await {
                     warn!(error = %err, "connection handler failed");
                 }
             });
@@ -338,13 +349,7 @@ fn signal_stream() -> anyhow::Result<tokio::signal::unix::Signal> {
 /// Serve exactly one request on `stream`: read one bounded frame, dispatch, reply
 /// one line. Logs the command AFTER servicing it (past tense, structured, with
 /// session + topic, never the body).
-async fn handle_connection(
-    stream: UnixStream,
-    bus: Bus,
-    storage: Storage,
-    supervisor: Supervisor,
-    limits: Limits,
-) -> anyhow::Result<()> {
+async fn handle_connection(stream: UnixStream, ctx: Ctx, limits: Limits) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
 
     let request = match read_incoming(read_half, limits).await {
@@ -363,7 +368,7 @@ async fn handle_connection(
     let session = request_session(&request).map(|s| s.as_str().to_string());
     let topic = request_topic(&request).map(|t| t.as_str().to_string());
 
-    let response = dispatch(&bus, &storage, &supervisor, request).await;
+    let response = dispatch(&ctx, request).await;
 
     let outcome = match &response {
         Response::Error { .. } => "error",
@@ -458,6 +463,9 @@ fn request_op(request: &Request) -> &'static str {
         Request::WatchStub { .. } => "watch_stub",
         Request::UnwatchStub { .. } => "unwatch_stub",
         Request::Status { .. } => "status",
+        Request::Send { .. } => "send",
+        Request::Agents { .. } => "agents",
+        Request::Topics { .. } => "topics",
         Request::EndSession { .. } => "end_session",
     }
 }
@@ -466,7 +474,9 @@ fn request_op(request: &Request) -> &'static str {
 /// is the adapter id).
 fn request_session(request: &Request) -> Option<&SessionId> {
     match request {
-        Request::Publish { .. } => None,
+        // Publish carries no session (its provenance is the adapter id), and
+        // `topics` is a global read with no session at all.
+        Request::Publish { .. } | Request::Topics { .. } => None,
         Request::Subscribe { session, .. }
         | Request::Unsubscribe { session, .. }
         | Request::Read { session, .. }
@@ -475,7 +485,11 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
         | Request::Status { session }
+        | Request::Agents { session }
         | Request::EndSession { session } => Some(session),
+        // For a send, the session that acted is the SENDER (the recipient is
+        // logged by the agents module with both ends).
+        Request::Send { from, .. } => Some(from),
     }
 }
 
@@ -501,12 +515,13 @@ fn response_detail(response: &Response) -> &str {
 /// Map a request onto bus/watch operations, converting any business error into a
 /// [`Response::Error`] the client can surface. Never returns `Err`: transport
 /// failures are the caller's concern, business failures travel as a value.
-async fn dispatch(
-    bus: &Bus,
-    storage: &Storage,
-    supervisor: &Supervisor,
-    request: Request,
-) -> Response {
+async fn dispatch(ctx: &Ctx, request: Request) -> Response {
+    let Ctx {
+        bus,
+        storage,
+        supervisor,
+        waiters_dir,
+    } = ctx;
     match request {
         Request::Publish {
             topic,
@@ -534,7 +549,58 @@ async fn dispatch(
             unwatch_stub(bus, storage, supervisor, session, label).await
         }
         Request::Status { session } => status(storage, session).await,
+        Request::Send { from, to, body } => send(bus, storage, from, to, body).await,
+        Request::Agents { session } => agents(storage, waiters_dir, session).await,
+        Request::Topics { prefix } => topics(storage, prefix).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
+    }
+}
+
+/// Thin translation over [`mailbox::agents::send`] (card 16): publish to the
+/// target's inbox, refusing loudly if that agent has no registered inbox.
+async fn send(
+    bus: &Bus,
+    storage: &Storage,
+    from: SessionId,
+    to: SessionId,
+    body: serde_json::Map<String, serde_json::Value>,
+) -> Response {
+    match mailbox::agents::send(bus, storage, from, to, body).await {
+        Ok(sent) => Response::Sent {
+            to: sent.to,
+            topic: sent.topic,
+            id: sent.event.id,
+            offset: sent.event.offset,
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::agents::list`] (card-16 discovery).
+async fn agents(storage: &Storage, waiters_dir: &Path, caller: SessionId) -> Response {
+    match mailbox::agents::list(storage, waiters_dir, &caller).await {
+        Ok(agents) => Response::Agents {
+            agents: agents
+                .into_iter()
+                .map(|agent| AgentSummary {
+                    session: agent.session,
+                    inbox: agent.inbox,
+                    live_waiter: agent.live_waiter,
+                    is_self: agent.is_self,
+                })
+                .collect(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Topic discovery: every known topic with its subscriber/event counts.
+async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
+    match storage.list_topics(prefix).await {
+        Ok(topics) => Response::Topics {
+            topics: topics.into_iter().map(TopicStatus::from).collect(),
+        },
+        Err(err) => Response::error(err.to_string()),
     }
 }
 
