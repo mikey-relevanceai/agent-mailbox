@@ -14,6 +14,10 @@
 //!   poller outlives the session).
 //! - [`install`](install) emits the `settings.json` snippet that wires all three.
 //!
+//! The other half of setup is [`skills`](skills), which installs the embedded
+//! `agent-mailbox` skill into the user's Claude Code skills dir. The hooks make
+//! wake infrastructure; the skill teaches the agent the loop it wakes into.
+//!
 //! # Why this crate holds the logic (and shells out for the bridge)
 //!
 //! Business logic lives here so it is unit-testable in isolation; the `mailbox`
@@ -32,9 +36,11 @@
 //! a session name itself" question.
 
 pub mod arm;
+pub mod atomic;
 pub mod cleanup;
 pub mod hook;
 pub mod install;
+pub mod skills;
 
 use mailbox_protocol::PROTOCOL_VERSION;
 

@@ -733,3 +733,66 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
     assert!(merged["hooks"]["Stop"].is_array(), "hooks merged in");
 }
+
+// ==== install-skills writes the embedded skill, idempotently ====================
+
+/// Drive the REAL binary's `install-skills` against a tempdir (never the user's
+/// `~/.claude`): a fresh dir is `created`, a re-run is `unchanged`, and the file
+/// on disk is the skill this binary embedded.
+#[test]
+fn install_skills_installs_the_embedded_skill_and_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let skills_dir = dir.path().join("skills");
+
+    let install = |args: &[&str]| -> Output {
+        Command::new(mailbox_bin())
+            .args(["--json", "harness", "install-skills", "--skills-dir"])
+            .arg(&skills_dir)
+            .args(args)
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("run install-skills")
+    };
+
+    // First run: the skills dir does not exist yet, so the skill is created.
+    let first = install(&[]);
+    assert_ok(&first, "install-skills");
+    let report = parse_json(&stdout(&first));
+    assert_eq!(report["skills"][0]["name"], "agent-mailbox");
+    assert_eq!(report["skills"][0]["outcome"], "created");
+
+    let installed = skills_dir.join("agent-mailbox").join("SKILL.md");
+    assert!(
+        installed.is_file(),
+        "the skill lands at <dir>/<name>/SKILL.md"
+    );
+    let written = std::fs::read_to_string(&installed).unwrap();
+    assert!(
+        written.contains("name: agent-mailbox"),
+        "the installed file is the real skill (with frontmatter)"
+    );
+
+    // Second run: byte-identical content already there → a visible no-op.
+    let second = install(&[]);
+    assert_ok(&second, "install-skills re-run");
+    assert_eq!(
+        parse_json(&stdout(&second))["skills"][0]["outcome"],
+        "unchanged",
+        "re-running install-skills must be idempotent"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&installed).unwrap(),
+        written,
+        "the re-run must not alter the installed content"
+    );
+
+    // A locally-edited (stale) skill is refreshed back to the shipped content.
+    std::fs::write(&installed, "stale\n").unwrap();
+    let third = install(&[]);
+    assert_ok(&third, "install-skills refresh");
+    assert_eq!(
+        parse_json(&stdout(&third))["skills"][0]["outcome"],
+        "updated"
+    );
+    assert_eq!(std::fs::read_to_string(&installed).unwrap(), written);
+}

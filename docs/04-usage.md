@@ -82,9 +82,26 @@ fails loudly (the lock is held for the daemon's whole life).
 
 ---
 
-## 2. Wire the Claude Code hooks
+## 2. Set up Claude Code (two commands)
 
-The hooks are what make wake **infrastructure**, not something the agent does.
+Setting up a machine is two idempotent commands, and they are complementary:
+
+```bash
+mailbox harness install-hooks --settings ~/.claude/settings.json  # wake hooks
+mailbox harness install-skills                                    # the agent-mailbox skill
+```
+
+- **`install-hooks`** makes wake **infrastructure** — the harness arms the waiter,
+  so the agent never has to.
+- **`install-skills`** installs the skill that teaches the agent the loop it wakes
+  into (subscribe / read / react / unsubscribe — no background pollers, no
+  self-arming).
+
+Both are safe to re-run: after upgrading `mailbox`, run them again to refresh the
+hooks and the skill.
+
+### 2a. Wire the Claude Code hooks
+
 `mailbox harness install-hooks` prints the `settings.json` snippet and — with
 `--settings <path>` — merges it into a file (atomically, preserving unrelated
 settings, idempotent):
@@ -135,6 +152,57 @@ The `--max-block-ms` (waiter self-respawn bound) is kept safely below the
 async-hook `timeout`; both are install-time knobs (`--max-block-ms`,
 `--timeout-secs`). See [01-wake-and-rearm](01-wake-and-rearm.md) § "Timeout
 survival" for the reasoning.
+
+### 2b. Install the skill
+
+`mailbox harness install-skills` installs the `agent-mailbox` Claude Code skill —
+the one that teaches agents the four-verb loop and explicitly forbids background
+pollers and self-arming:
+
+```bash
+# Install into ~/.claude/skills (the default):
+mailbox harness install-skills
+
+# ...or somewhere else:
+mailbox harness install-skills --skills-dir /path/to/skills
+```
+
+Each skill lands at `<skills-dir>/<name>/SKILL.md` — for example
+`~/.claude/skills/agent-mailbox/SKILL.md`. Nothing else under `~/.claude` is
+touched.
+
+The skill body is **embedded in the `mailbox` binary** (`include_str!`), so the
+command works on a machine with no checkout of this repo — and the skill you get
+is always the one that shipped with the binary you ran. The write is atomic
+(temp file + rename), so an interrupted install can never leave a truncated
+`SKILL.md`.
+
+It is idempotent, and says what it did per skill:
+
+```text
+created agent-mailbox -> /Users/me/.claude/skills/agent-mailbox/SKILL.md
+installed 1 skill(s) into /Users/me/.claude/skills
+next: run `mailbox harness install-hooks` to wire the wake hooks
+```
+
+Re-running reports `unchanged` (byte-identical — not rewritten at all); if the
+installed file has drifted from the shipped content, it is refreshed and reported
+as `updated`. Two more outcomes are worth knowing:
+
+- It is **self-healing**: a `SKILL.md` that is corrupt, non-UTF-8, unreadable, or
+  even a directory is replaced rather than erroring. The command whose job is to
+  reinstall a known-good skill has to work *especially* when the installed one is
+  broken, so there is no `--force` to remember.
+- If your `SKILL.md` is a **symlink** (a live-edit link into a checkout) and its
+  target has drifted, it is replaced by a regular file and reported as
+  `replaced-symlink`, with a warning — so you know the link is gone. A symlink
+  already pointing at matching content is left alone (`unchanged`).
+
+With the global `--json` flag it prints the same report as JSON:
+
+```json
+{"skills_dir":"/Users/me/.claude/skills","skills":[{"name":"agent-mailbox","path":"/Users/me/.claude/skills/agent-mailbox/SKILL.md","outcome":"created"}]}
+```
 
 ---
 

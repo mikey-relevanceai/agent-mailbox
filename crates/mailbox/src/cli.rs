@@ -95,8 +95,9 @@ pub enum Command {
     Status(SessionOpt),
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
     Wait(WaitArgs),
-    /// Claude Code hook handlers (arm / cleanup / install-hooks). The harness owns
-    /// the wake loop so the agent never re-arms (card 11).
+    /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
+    /// install-skills). The harness owns the wake loop so the agent never re-arms
+    /// (card 11).
     Harness(HarnessArgs),
 }
 
@@ -153,6 +154,8 @@ pub enum HarnessCommand {
     Cleanup,
     /// Print (and optionally merge) the settings.json hooks snippet.
     InstallHooks(InstallHooksArgs),
+    /// Install the embedded agent-mailbox skill into the Claude Code skills dir.
+    InstallSkills(InstallSkillsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -182,6 +185,15 @@ pub struct InstallHooksArgs {
     /// Waiter max-block to write into the arm command, in milliseconds.
     #[arg(long, default_value_t = DEFAULT_ARM_MAX_BLOCK_MS)]
     pub max_block_ms: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct InstallSkillsArgs {
+    /// Directory to install the skill(s) into. Defaults to `~/.claude/skills`
+    /// (home from `AGENT_MAILBOX_HOME`, else `HOME`). Each skill lands at
+    /// `<skills-dir>/<name>/SKILL.md`; nothing else is touched.
+    #[arg(long)]
+    pub skills_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -672,13 +684,14 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     Ok(label.to_string())
 }
 
-/// Dispatch a `harness` subcommand. `arm`/`cleanup` are socket clients; only
-/// `install-hooks` touches no bridge.
+/// Dispatch a `harness` subcommand. `arm`/`cleanup` are socket clients; the two
+/// `install-*` setup commands touch no bridge.
 async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<()> {
     match args.command {
         HarnessCommand::Arm(args) => run_harness_arm(args).await,
         HarnessCommand::Cleanup => run_harness_cleanup().await,
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
+        HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
     }
 }
 
@@ -865,43 +878,121 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
         };
         let merged = mailbox_harness::install::merge_into_settings(existing, &snippet);
         let pretty = serde_json::to_string_pretty(&merged)?;
-        write_atomic(path, &format!("{pretty}\n"))
+        // The same atomic write `install-skills` uses — one guarantee, one
+        // implementation (the two used to be separate copies, and had drifted).
+        mailbox_harness::atomic::write_atomic(path, format!("{pretty}\n").as_bytes())
             .with_context(|| format!("writing merged settings {}", path.display()))?;
         eprintln!("merged agent-mailbox hooks into {}", path.display());
     }
 
-    // Always emit the snippet so it can be installed by hand.
+    // Always emit the snippet so it can be installed by hand. In `--json` mode the
+    // snippet IS the stdout contract, so the sibling-command pointer goes to
+    // stderr (never polluting parseable stdout).
     if format.is_json() {
         println!("{}", serde_json::to_string(&snippet)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&snippet)?);
     }
+    eprintln!("next: run `mailbox harness install-skills` to install the agent-mailbox skill");
     Ok(())
 }
 
-/// Write `contents` to `path` atomically: write a sibling temp file then rename
-/// over the target. An interrupted write corrupts only the throwaway temp, never
-/// the user's real settings.json (item C). `rename` within a directory is atomic
-/// on our targets.
-fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    // A pid-suffixed temp name so concurrent installs do not clobber each other.
-    let tmp = dir.join(format!(
-        ".{}.mailbox-tmp-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("settings"),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, contents)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+/// `install-skills`: write every embedded skill to `<skills-dir>/<name>/SKILL.md`
+/// (atomically), reporting per skill whether it was created / updated / unchanged
+/// / replaced-symlink.
+///
+/// The skill body is compiled into this binary, so the command works with no repo
+/// checked out — see `mailbox_harness::skills` for why it is embedded, why an
+/// unreadable existing skill is repaired rather than fatal, and why the write is
+/// atomic.
+///
+/// A failure still renders what DID install before returning non-zero: with more
+/// than one skill, "it failed" without naming what landed is not actionable.
+fn run_harness_install_skills(format: OutputFormat, args: InstallSkillsArgs) -> anyhow::Result<()> {
+    let skills_dir = match args.skills_dir {
+        Some(dir) => dir,
+        None => mailbox_harness::skills::default_skills_dir()
+            .context("resolving the default skills directory")?,
+    };
+
+    match mailbox_harness::skills::install_skills(&skills_dir) {
+        Ok(report) => {
+            render_skill_report(format, &report)?;
+            eprintln!("next: run `mailbox harness install-hooks` to wire the wake hooks");
+            Ok(())
+        }
         Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(err)
+            // Report the skills that DID land before failing, so a partial install
+            // is never invisible (this is empty today, and won't be once a second
+            // skill exists). Each failure is logged with its own cause, because the
+            // error chain only carries the first.
+            render_skill_report(format, &err.installed)?;
+            for failure in &err.failures {
+                error!(
+                    skill = %failure.name,
+                    error = %failure.error,
+                    "could not install skill"
+                );
+            }
+            Err(anyhow::Error::from(err))
+                .with_context(|| format!("installing skills into {}", skills_dir.display()))
         }
     }
+}
+
+/// Render an install report.
+///
+/// In `--json` mode the report IS the stdout contract, so it is always printed
+/// (even when empty) and nothing else goes to stdout. In human mode an empty
+/// report prints nothing — on a failed install the error is the message, and
+/// "installed 0 skill(s)" would just be noise above it.
+///
+/// A replaced symlink is warned about on stderr in both modes: a user who
+/// deliberately symlinked their SKILL.md into a checkout needs to be told it is
+/// now a plain copy.
+fn render_skill_report(
+    format: OutputFormat,
+    report: &mailbox_harness::skills::InstallReport,
+) -> anyhow::Result<()> {
+    use mailbox_harness::skills::SkillOutcome;
+
+    for skill in &report.skills {
+        info!(
+            skill = %skill.name,
+            path = %skill.path.display(),
+            outcome = skill.outcome.as_str(),
+            "installed skill"
+        );
+    }
+
+    if format.is_json() {
+        println!("{}", serde_json::to_string(report)?);
+    } else if !report.skills.is_empty() {
+        for skill in &report.skills {
+            println!(
+                "{} {} -> {}",
+                skill.outcome.as_str(),
+                skill.name,
+                skill.path.display()
+            );
+        }
+        println!(
+            "installed {} skill(s) into {}",
+            report.skills.len(),
+            report.skills_dir.display()
+        );
+    }
+
+    for skill in &report.skills {
+        if skill.outcome == SkillOutcome::ReplacedSymlink {
+            eprintln!(
+                "warning: {} was a symlink and is now a regular file ({}); any live-edit link into a checkout is gone",
+                skill.name,
+                skill.path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Run `wait` synchronously (no tokio runtime): open the read-only store and

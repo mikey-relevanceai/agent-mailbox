@@ -59,13 +59,16 @@ below.
 
 `skills/agent-mailbox/SKILL.md` (in this repo) is a ready-to-use Claude Code
 skill that teaches agents the new loop and explicitly forbids background pollers
-and self-arming. Install it in place of the old two skills:
+and self-arming. It is embedded in the `mailbox` binary, so one command installs
+it in place of the old two skills:
 
 ```bash
-# Copy the replacement skill into your Claude Code skills dir:
-mkdir -p ~/.claude/skills/agent-mailbox
-cp skills/agent-mailbox/SKILL.md ~/.claude/skills/agent-mailbox/SKILL.md
+mailbox harness install-skills
 ```
+
+That writes `~/.claude/skills/agent-mailbox/SKILL.md` (override the location with
+`--skills-dir`). It is atomic and idempotent — re-run it after an upgrade and it
+reports `unchanged`, or refreshes a drifted file to the shipped content.
 
 It is intentionally a single skill covering both peer-agent messaging (old
 `agent-ipc`) and GitHub PR watching (old `agent-ipc-github`), because both are
@@ -81,13 +84,13 @@ now just topics on the same bus.
 > each machine. Do it **after** installing the hooks and the replacement skill,
 > so no session is left without a wake path.
 
-1. **Install the new path first** (hooks + replacement skill):
+1. **Install the new path first** — the two setup commands (hooks + replacement
+   skill):
 
    ```bash
    mailbox harness install-hooks --mailbox-bin ~/.local/bin/mailbox \
      --settings ~/.claude/settings.json
-   mkdir -p ~/.claude/skills/agent-mailbox
-   cp skills/agent-mailbox/SKILL.md ~/.claude/skills/agent-mailbox/SKILL.md
+   mailbox harness install-skills
    ```
 
 2. **Confirm nothing else references the old skills.** Check your

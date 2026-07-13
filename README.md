@@ -45,9 +45,17 @@ install -m755 target/release/mailbox \
               target/release/mailbox-stub-adapter \
               target/release/mailbox-github-pr-adapter ~/.local/bin/
 
-mailbox serve &                                            # the bridge daemon
-mailbox harness install-hooks --settings ~/.claude/settings.json   # wire wake hooks
+mailbox serve &                                                   # the bridge daemon
+
+# The two setup commands: hooks make wake infrastructure, the skill teaches the
+# agent the loop it wakes into.
+mailbox harness install-hooks --settings ~/.claude/settings.json  # wire wake hooks
+mailbox harness install-skills                                    # install the agent-mailbox skill
 ```
+
+Both are idempotent — re-run them after an upgrade to refresh the hooks and the
+skill. `install-skills` defaults to `~/.claude/skills`; pass `--skills-dir` to
+install elsewhere.
 
 Then, from an agent session:
 
@@ -73,7 +81,8 @@ adapters/
   github-pr-adapter/  # the real GitHub PR poller (via `gh`)
 docs/
 scripts/demo.sh       # self-contained end-to-end demo
-skills/agent-mailbox/ # drop-in Claude Code skill (replaces agent-ipc)
+skills/agent-mailbox/ # drop-in Claude Code skill (replaces agent-ipc); embedded in
+                      # the binary and installed by `mailbox harness install-skills`
 ```
 
 ## Develop
