@@ -49,13 +49,18 @@ mailbox serve &                                                   # the bridge d
 
 # The two setup commands: hooks make wake infrastructure, the skill teaches the
 # agent the loop it wakes into.
-mailbox harness install-hooks --settings ~/.claude/settings.json  # wire wake hooks
-mailbox harness install-skills                                    # install the agent-mailbox skill
+mailbox harness install-skills   # skill  -> ~/.claude/skills
+mailbox harness install-hooks    # hooks  -> ~/.claude/settings.json (when it exists)
 ```
 
 Both are idempotent — re-run them after an upgrade to refresh the hooks and the
-skill. `install-skills` defaults to `~/.claude/skills`; pass `--skills-dir` to
-install elsewhere.
+skill. Both default under the same home (`AGENT_MAILBOX_HOME`, else `HOME`), and
+both take an override: `--skills-dir <path>` and `--settings <path>`.
+
+`install-hooks` merges into your existing `~/.claude/settings.json` (preserving
+unrelated settings and foreign hooks). If that file does **not** exist, it prints
+the snippet instead of conjuring a `settings.json` on a machine with no Claude
+Code — pass `--settings <path>` to create one anyway.
 
 Then, from an agent session:
 

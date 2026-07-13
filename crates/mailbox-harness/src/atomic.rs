@@ -24,24 +24,80 @@
 //! - `sync_all` **before** the rename, because a rename can otherwise be durable
 //!   while the data it points at is not — a power loss then leaves a zero-length
 //!   file, exactly the corruption this function exists to prevent.
+//!
+//! # The target's file mode is preserved
+//!
+//! A temp file is created 0600, and `rename` carries the temp's mode onto the
+//! target — so a naive atomic write silently *narrows* the user's `settings.json`
+//! from 0644 to 0600. Narrowing is safe but it is still an unannounced mutation of
+//! metadata on a file we do not own, so an existing target's permissions are copied
+//! onto the temp before the rename. The one thing we force is owner read/write
+//! ([`OWNER_RW`]): a mode-000 file exists precisely so that `install-skills` can
+//! *repair* it, and republishing it unreadable would defeat that.
+//!
+//! # Publishing can be guarded (the lost-update problem)
+//!
+//! Atomicity stops a *torn* write; it does nothing about a *lost* one. Claude Code
+//! rewrites `settings.json` itself (a `/config` model change, an "always allow"
+//! permission grant), so a read-modify-write of that file can silently discard a
+//! concurrent edit. [`write_atomic_guarded`] runs a caller's check in the last
+//! moment before the rename, which is what lets the settings merge compare-and-swap
+//! (see `install::merge_hooks_file`) rather than blindly clobber.
 
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tempfile::NamedTempFile;
+
+/// The owner read/write bits every file we publish must keep, whatever mode the
+/// target we are replacing had. See the module docs.
+const OWNER_RW: u32 = 0o600;
 
 /// Atomically write `contents` to `path`, creating the parent directory if
 /// needed. See the module docs for why each step is what it is.
 ///
 /// On any failure the target is left exactly as it was and no temp file survives.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_guarded(path, contents, || Ok(()))
+}
+
+/// [`write_atomic`], with a `guard` run in the last moment before the rename.
+///
+/// A `guard` that returns `Err` **aborts the publish**: the target is left exactly
+/// as it was, no temp survives, and the error is returned as-is (so a caller can
+/// signal "the file changed underneath me" with a kind it recognises and retry).
+/// This is the only place a caller can wedge a check *after* the new content is
+/// durable but *before* it becomes visible — which is what a compare-and-swap on
+/// the user's `settings.json` needs.
+pub fn write_atomic_guarded(
+    path: &Path,
+    contents: &[u8],
+    guard: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
 
     let mut tmp = NamedTempFile::new_in(dir)?;
     tmp.write_all(contents)?;
+
+    // Inherit the target's mode (a temp is 0600, and the rename would carry that
+    // onto a 0644 settings.json). Owner read/write is forced back on, so repairing
+    // a mode-000 file does not republish it unreadable. `metadata` follows a
+    // symlink, which is right: the caller has already resolved where it is writing.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode() | OWNER_RW;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+
     // Flush the DATA to disk before the rename publishes the name.
     tmp.as_file().sync_all()?;
+
+    // The last look before the content becomes visible (see the module docs). On
+    // Err the temp is dropped — and deleted — without ever touching the target.
+    guard()?;
+
     // `persist` is the rename. Its error carries the temp file back, which we drop
     // — deleting it — so a failed publish leaves no litter either.
     tmp.persist(path).map_err(|err| err.error)?;
@@ -103,6 +159,69 @@ mod tests {
         assert!(target.is_dir(), "the target is left exactly as it was");
         // The directory still holds ONLY the pre-existing target: no orphaned temp.
         assert_eq!(entries(dir.path()), vec!["occupied"]);
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The user's `settings.json` is 0644; publishing our merge over it must not
+    /// silently narrow it to the temp file's 0600.
+    #[test]
+    fn an_existing_targets_mode_is_preserved() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomic(&path, b"{\"a\":1}").expect("write");
+
+        assert_eq!(mode_of(&path), 0o644, "the target's mode must survive");
+    }
+
+    /// ...but a mode-000 file (the one `install-skills` exists to repair) must come
+    /// back readable, or the repair would be invisible to the tool that needs it.
+    #[test]
+    fn a_repaired_file_regains_owner_read_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("SKILL.md");
+        std::fs::write(&path, b"corrupt").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        write_atomic(&path, b"repaired").expect("write");
+
+        assert_eq!(mode_of(&path) & 0o600, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"repaired");
+    }
+
+    #[test]
+    fn a_new_file_is_created_private() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fresh");
+        write_atomic(&path, b"x").expect("write");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// A guard that fails ABORTS the publish: the target keeps its old content and
+    /// no temp survives. This is what makes the settings compare-and-swap safe —
+    /// losing the race must never mean clobbering the winner.
+    #[test]
+    fn a_failing_guard_aborts_the_publish_without_touching_the_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"old").unwrap();
+
+        let err = write_atomic_guarded(&path, b"new", || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "changed underneath me",
+            ))
+        })
+        .expect_err("the guard must veto the rename");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "kind survives");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old", "target untouched");
+        assert_eq!(entries(dir.path()), vec!["f"], "no temp left behind");
     }
 
     /// Concurrent writers must not collide on a temp name (the regression guard for

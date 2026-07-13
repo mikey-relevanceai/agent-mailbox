@@ -51,7 +51,7 @@ client):
 |---|---|---|
 | `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` ~10m) | Reads `session_id` from the hook stdin JSON, asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the waiter (`SIGTERM` the pidfile PID, remove the pidfile) and calls the bridge to drop this session's subscriptions **and** interests, stopping any adapter whose last interest it held (feeds the card-08 refcount — no zombie poller outlives the session). |
-| install | `mailbox harness install-hooks [--settings <path>]` | Prints the `settings.json` hooks snippet (and merges it into a file *atomically*, preserving unrelated settings). |
+| install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` — `--settings <path>`, else `~/.claude/settings.json` when it exists — *atomically*, preserving unrelated settings; prints only (with the reason) when there is no such file. |
 
 **Session identity (settled).** Claude Code passes the hook payload as JSON on
 stdin, including `session_id`. `arm`/`cleanup` parse that into a branded
@@ -114,9 +114,12 @@ empirical question; everything else is exercised without a live Claude Code
 
 ### install-hooks
 
-`mailbox harness install-hooks` emits (JSON) the snippet below; `--settings <file>`
-also merges it in (idempotent, preserving unrelated settings). The `arm` command
-carries `--max-block-ms` so the self-respawn bound travels with the hook.
+`mailbox harness install-hooks` merges the snippet below into the Claude Code
+settings file — `--settings <file>` if given (created if missing), else
+`~/.claude/settings.json` when it exists — idempotently, preserving unrelated
+settings; with no such file it only emits the snippet (JSON) and says why. The
+`arm` command carries `--max-block-ms` so the self-respawn bound travels with the
+hook.
 
 ```json
 {

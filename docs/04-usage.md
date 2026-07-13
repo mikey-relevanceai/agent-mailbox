@@ -87,8 +87,8 @@ fails loudly (the lock is held for the daemon's whole life).
 Setting up a machine is two idempotent commands, and they are complementary:
 
 ```bash
-mailbox harness install-hooks --settings ~/.claude/settings.json  # wake hooks
-mailbox harness install-skills                                    # the agent-mailbox skill
+mailbox harness install-skills   # skill  -> ~/.claude/skills
+mailbox harness install-hooks    # hooks  -> ~/.claude/settings.json (when it exists)
 ```
 
 - **`install-hooks`** makes wake **infrastructure** — the harness arms the waiter,
@@ -97,20 +97,57 @@ mailbox harness install-skills                                    # the agent-ma
   into (subscribe / read / react / unsubscribe — no background pollers, no
   self-arming).
 
-Both are safe to re-run: after upgrading `mailbox`, run them again to refresh the
-hooks and the skill.
+Both resolve their default under the same home — `AGENT_MAILBOX_HOME` if set, else
+`HOME` — and both take an explicit override (`--settings <path>`,
+`--skills-dir <path>`). Both are safe to re-run: after upgrading `mailbox`, run
+them again to refresh the hooks and the skill.
 
 ### 2a. Wire the Claude Code hooks
 
-`mailbox harness install-hooks` prints the `settings.json` snippet and — with
-`--settings <path>` — merges it into a file (atomically, preserving unrelated
-settings, idempotent):
+`mailbox harness install-hooks` merges the hooks into your Claude Code
+`settings.json` — atomically, preserving unrelated settings and foreign hooks, and
+idempotently (a re-run does not duplicate them). It always prints the snippet too,
+so you can review (or hand-install) exactly what it wired.
+
+Where it merges:
+
+| | Behaviour |
+|---|---|
+| `--settings <path>` given | Merge into that file, **creating it if missing**. |
+| No flag, `~/.claude/settings.json` **exists** | Merge into it (the common case). |
+| No flag, no such file (or no home) | **Print only**, and say why — nothing is written. |
+
+That last row is deliberate: a machine with no Claude Code settings file should not
+have one conjured for it. The command tells you what it looked at —
+
+```text
+no Claude Code settings found at /Users/me/.claude/settings.json; printed the
+snippet instead — pass --settings <path> to create one
+```
+
+— so pass `--settings ~/.claude/settings.json` if you want it created.
+
+Because it now edits your real config by default, the merge is deliberately
+conservative:
+
+- It **never overwrites settings it cannot read.** A `settings.json` that is
+  unreadable, non-UTF-8, or invalid JSON is an error — the file is left exactly as
+  it is (the snippet is still printed, so you can install it by hand).
+- It writes **through** a symlinked `settings.json` (dotfiles setups keep their
+  link, and the tracked file is the one that gets the hooks).
+- It keeps a **`settings.json.bak`** of what it replaced, and preserves the file's
+  permissions.
+- It **compare-and-swaps**: if Claude Code rewrites the file while we merge (a
+  `/config` change, an "always allow" click), we re-merge from its new content
+  rather than discarding it.
+- Re-running with a different `--mailbox-bin` or `--max-block-ms` **updates** our
+  hooks in place; it never leaves a stale second copy pointing at an old binary.
 
 ```bash
-# Print the snippet (review it, paste it by hand):
+# Merge into ~/.claude/settings.json (when it exists):
 mailbox harness install-hooks --mailbox-bin ~/.local/bin/mailbox
 
-# ...or merge it straight into your Claude Code user settings:
+# ...or name the file explicitly (created if missing):
 mailbox harness install-hooks \
   --mailbox-bin ~/.local/bin/mailbox \
   --settings ~/.claude/settings.json

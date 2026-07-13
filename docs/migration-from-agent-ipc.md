@@ -29,7 +29,7 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 
 | You used to… | Now run… |
 |---|---|
-| `ipc-arm.sh` (background, re-run after each turn) | *nothing* — install the hooks once (`mailbox harness install-hooks`) |
+| `ipc-arm.sh` (background, re-run after each turn) | *nothing* — install the hooks once (`mailbox harness install-hooks`, which merges into `~/.claude/settings.json`) |
 | Start `gh-watch.sh OWNER/REPO N` in the background | `mailbox watch github-pr OWNER/REPO#N --session <id>` |
 | Read the NDJSON inbox / react to a kick | `mailbox read --session <id>` |
 | `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N --session <id>` (or just end the session) |
@@ -88,10 +88,15 @@ now just topics on the same bus.
    skill):
 
    ```bash
-   mailbox harness install-hooks --mailbox-bin ~/.local/bin/mailbox \
-     --settings ~/.claude/settings.json
-   mailbox harness install-skills
+   mailbox harness install-skills   # skill  -> ~/.claude/skills
+   mailbox harness install-hooks --mailbox-bin ~/.local/bin/mailbox
+                                    # hooks  -> ~/.claude/settings.json
    ```
+
+   `install-hooks` merges into your existing `~/.claude/settings.json` (yours is
+   certain to exist — you are migrating *from* `agent-ipc`, whose hooks live in
+   it). If it somehow does not, the command prints the snippet and says so; pass
+   `--settings ~/.claude/settings.json` to have it created.
 
 2. **Confirm nothing else references the old skills.** Check your
    `~/.claude/settings.json` (and any project `.claude/settings.json`) for hooks

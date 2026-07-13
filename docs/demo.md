@@ -120,8 +120,8 @@ local stack can stand in for.
   **co-located** on `PATH` (see [04-usage.md § Install](04-usage.md#1-install)).
 - `gh` authenticated (`gh auth status` is clean).
 - A pull request you can push to — call it `OWNER/REPO#N`.
-- Claude Code hooks installed
-  (`mailbox harness install-hooks --settings ~/.claude/settings.json`).
+- Claude Code hooks installed (`mailbox harness install-hooks`, which merges into
+  `~/.claude/settings.json` when it exists).
 
 ### Steps
 

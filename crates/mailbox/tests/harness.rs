@@ -21,6 +21,7 @@
 //! bounded deadlines rather than fixed sleeps; reap every child on drop.
 
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -678,7 +679,28 @@ fn ac4_waiter_self_respawns_across_max_block_and_still_wakes() {
     assert!(drain_stderr(&mut arm).contains(&format!("mail on topic {topic}")));
 }
 
-// ==== install-hooks emits a valid, parseable settings.json snippet ==============
+// ==== install-hooks emits a valid snippet, and merges where it should ===========
+
+/// `install-hooks`, ALWAYS with the home redirected at a tempdir.
+///
+/// Every one of these tests must be hermetic: `install-hooks` now merges into the
+/// default `~/.claude/settings.json` when it exists, so a run that inherited the
+/// real `HOME` would edit the developer's own Claude Code settings. Redirecting
+/// `AGENT_MAILBOX_HOME` (which wins over `HOME`) is what makes that impossible.
+fn install_hooks(home: &Path, args: &[&str]) -> Output {
+    Command::new(mailbox_bin())
+        .args(["harness", "install-hooks"])
+        .args(args)
+        .env("AGENT_MAILBOX_HOME", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-hooks")
+}
+
+/// The default settings file under a redirected home.
+fn default_settings(home: &Path) -> PathBuf {
+    home.join(".claude").join("settings.json")
+}
 
 #[test]
 fn install_hooks_emits_valid_settings_snippet() {
@@ -687,6 +709,9 @@ fn install_hooks_emits_valid_settings_snippet() {
     let out = Command::new(mailbox_bin())
         .args(["--json", "harness", "install-hooks"])
         .env("AGENT_MAILBOX_DB", &db_path)
+        // The home has no `.claude/settings.json`, so this prints only — and, more
+        // to the point, it cannot touch the real one.
+        .env("AGENT_MAILBOX_HOME", dir.path())
         .env("RUST_LOG", "error")
         .output()
         .expect("run install-hooks");
@@ -718,20 +743,373 @@ fn install_hooks_emits_valid_settings_snippet() {
             .is_none()
     );
 
-    // --settings merges into a file, preserving unrelated keys.
+    // An explicit --settings merges into that file, preserving unrelated keys.
     let settings = dir.path().join("settings.json");
     std::fs::write(&settings, r#"{"model":"sonnet"}"#).unwrap();
-    let merged_out = Command::new(mailbox_bin())
-        .args(["harness", "install-hooks", "--settings"])
-        .arg(&settings)
-        .env("AGENT_MAILBOX_DB", &db_path)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run install-hooks --settings");
+    let merged_out = install_hooks(dir.path(), &["--settings", settings.to_str().unwrap()]);
     assert_ok(&merged_out, "install-hooks --settings");
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
     assert!(merged["hooks"]["Stop"].is_array(), "hooks merged in");
+}
+
+/// `--settings <path>` is an instruction, so a MISSING file is created — that is
+/// how a settings file gets bootstrapped on purpose (the default path never is).
+#[test]
+fn install_hooks_with_an_explicit_settings_path_creates_a_missing_file() {
+    let dir = TempDir::new().unwrap();
+    let settings = dir.path().join("nested").join("settings.json");
+
+    let out = install_hooks(dir.path(), &["--settings", settings.to_str().unwrap()]);
+
+    assert_ok(&out, "install-hooks --settings (missing file)");
+    let written = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert!(written["hooks"]["SessionStart"].is_array());
+}
+
+/// The change: with a Claude Code `settings.json` present at the default path, a
+/// bare `install-hooks` MERGES into it — symmetric with `install-skills`. Unrelated
+/// keys and foreign hooks survive, and a re-run does not duplicate our hooks.
+#[test]
+fn install_hooks_merges_into_the_default_settings_when_it_exists() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"model":"sonnet","hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"echo other"}]}]}}"#,
+    )
+    .unwrap();
+
+    let out = install_hooks(home.path(), &[]);
+    assert_ok(&out, "install-hooks (default settings)");
+    assert!(
+        stdout(&out).contains(&format!(
+            "merged agent-mailbox hooks into {}",
+            settings.display()
+        )),
+        "human output must name the file it merged into: {}",
+        stdout(&out)
+    );
+
+    let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
+    let stop = merged["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 2, "the foreign Stop hook survives beside ours");
+    assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
+    assert!(
+        stop[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("harness arm")
+    );
+    assert!(merged["hooks"]["SessionEnd"].is_array());
+
+    // Idempotent: a re-run merges the same hooks without duplicating them.
+    assert_ok(&install_hooks(home.path(), &[]), "install-hooks re-run");
+    let again = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(
+        again, merged,
+        "re-running must not change the settings file"
+    );
+}
+
+/// With NO settings file at the default path, `install-hooks` prints the snippet and
+/// writes NOTHING — it must not conjure a `settings.json` on a machine that has no
+/// Claude Code — and it says why, naming the path it looked at.
+#[test]
+fn install_hooks_without_a_default_settings_file_prints_only_and_writes_nothing() {
+    let home = TempDir::new().unwrap();
+
+    let out = install_hooks(home.path(), &[]);
+
+    assert_ok(&out, "install-hooks (no default settings)");
+    let text = stdout(&out);
+    assert!(
+        text.contains("no Claude Code settings found at")
+            && text.contains(&default_settings(home.path()).display().to_string()),
+        "the print-only run must say WHY, naming the path it looked at: {text}"
+    );
+    // The snippet is still printed, so it can be installed by hand.
+    assert!(text.contains("asyncRewake"), "the snippet is still printed");
+
+    // Nothing was created ANYWHERE under the home — not even the `.claude` dir.
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "a print-only run must not create a settings.json (or its directory)"
+    );
+}
+
+/// With no home at all (neither `AGENT_MAILBOX_HOME` nor `HOME`), the command still
+/// succeeds: it prints the snippet and explains — never a panic, and never a guessed
+/// path inside someone's config.
+#[test]
+fn install_hooks_with_no_home_prints_only_without_panicking() {
+    let out = Command::new(mailbox_bin())
+        .args(["harness", "install-hooks"])
+        .env_remove("AGENT_MAILBOX_HOME")
+        .env_remove("HOME")
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-hooks with no home");
+
+    assert_ok(&out, "install-hooks (no home)");
+    let text = stdout(&out);
+    assert!(
+        text.contains("no home to resolve Claude Code settings under"),
+        "a homeless run must explain itself: {text}"
+    );
+    assert!(text.contains("asyncRewake"), "the snippet is still printed");
+}
+
+/// `--json` keeps its machine contract: stdout is EXACTLY the snippet, and the
+/// human note about the merge goes to stderr.
+#[test]
+fn install_hooks_json_keeps_stdout_clean_when_it_merges() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+
+    let out = Command::new(mailbox_bin())
+        .args(["--json", "harness", "install-hooks"])
+        .env("AGENT_MAILBOX_HOME", home.path())
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-hooks --json");
+
+    assert_ok(&out, "install-hooks --json");
+    // Parses whole: no note leaked into the JSON contract.
+    let value = parse_json(&stdout(&out));
+    assert!(value["hooks"]["SessionStart"].is_array());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("merged agent-mailbox hooks into"),
+        "the merge note belongs on stderr in --json mode"
+    );
+    assert!(
+        parse_json(&std::fs::read_to_string(&settings).unwrap())["hooks"]["Stop"].is_array(),
+        "--json still merges"
+    );
+}
+
+// ==== hostile settings files: the user's config is NEVER destroyed ==============
+
+/// A home whose `.claude/settings.json` is whatever the test puts there.
+fn home_with_settings(prepare: impl FnOnce(&Path)) -> TempDir {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    prepare(&settings);
+    home
+}
+
+/// The keys a user actually loses if their settings are replaced — including the
+/// permission DENY rules, i.e. their tool-permission policy.
+const PRECIOUS_SETTINGS: &str = r#"{
+  "model": "opus",
+  "apiKeyHelper": "/usr/local/bin/key",
+  "permissions": {"deny": ["Bash(rm -rf *)"]}
+}
+"#;
+
+/// **The data-loss regression guard.** For every hostile settings file, the outcome
+/// must be *either* intact *or* correctly merged — but NEVER a hooks-only document.
+/// The bug this pins: every read failure (chmod 000, non-UTF-8, a directory) was
+/// treated as "no file", merged from `{}`, and atomically published over the user's
+/// real config — exit 0, reporting "merged".
+#[test]
+fn install_hooks_never_replaces_a_settings_file_it_cannot_read() {
+    // 1. Unreadable (mode 000).
+    let home = home_with_settings(|path| {
+        std::fs::write(path, PRECIOUS_SETTINGS).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let settings = default_settings(home.path());
+    // (Skipped as root, where the read is permitted and the merge simply succeeds.)
+    if std::fs::read(&settings).is_err() {
+        let out = install_hooks(home.path(), &[]);
+        assert!(
+            !out.status.success(),
+            "an unreadable settings.json must FAIL, not be silently replaced"
+        );
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            PRECIOUS_SETTINGS,
+            "the user's settings must survive byte for byte"
+        );
+        // The snippet is STILL printed: hand-installation is now the only route.
+        assert!(stdout(&out).contains("asyncRewake"));
+    }
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // 2. Non-UTF-8 (a corrupt or latin-1 file), on a perfectly writable path.
+    let home = home_with_settings(|path| std::fs::write(path, [b'{', 0xff, 0xfe, b'}']).unwrap());
+    let settings = default_settings(home.path());
+    let out = install_hooks(home.path(), &[]);
+    assert!(!out.status.success(), "non-UTF-8 settings must FAIL");
+    assert_eq!(
+        std::fs::read(&settings).unwrap(),
+        [b'{', 0xff, 0xfe, b'}'],
+        "corrupt-and-kept beats silently-replaced"
+    );
+
+    // 3. Unparseable JSON.
+    let home = home_with_settings(|path| std::fs::write(path, "{ not json").unwrap());
+    let settings = default_settings(home.path());
+    let out = install_hooks(home.path(), &[]);
+    assert!(!out.status.success(), "unparseable settings must FAIL");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{ not json");
+
+    // 4. A DIRECTORY where settings.json belongs.
+    let home = home_with_settings(|path| std::fs::create_dir_all(path).unwrap());
+    let settings = default_settings(home.path());
+    let out = install_hooks(home.path(), &[]);
+    assert!(!out.status.success(), "a directory must FAIL");
+    assert!(settings.is_dir(), "left exactly as it was");
+    assert!(
+        stdout(&out).contains("asyncRewake"),
+        "a failed merge must STILL print the snippet — hand-installing it is now the \
+         user's only option, so the failure must not suppress the fallback"
+    );
+}
+
+/// A symlinked `~/.claude/settings.json` (the dotfiles setup) is written THROUGH:
+/// the tracked file receives the hooks, and the link survives. Replacing the link
+/// with a regular file would leave the tracked file hookless — and the next
+/// `stow -R` / `git checkout` would silently revert the hooks, killing wake.
+#[test]
+fn install_hooks_writes_through_a_symlinked_settings_file() {
+    let home = TempDir::new().unwrap();
+    let tracked = home.path().join("dotfiles").join("settings.json");
+    std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+    std::fs::write(&tracked, PRECIOUS_SETTINGS).unwrap();
+
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&tracked, &settings).unwrap();
+
+    let out = install_hooks(home.path(), &[]);
+
+    assert_ok(&out, "install-hooks (symlinked settings)");
+    assert!(
+        std::fs::symlink_metadata(&settings).unwrap().is_symlink(),
+        "the dotfiles symlink must survive"
+    );
+    let written = parse_json(&std::fs::read_to_string(&tracked).unwrap());
+    assert_eq!(written["model"], "opus", "unrelated settings preserved");
+    assert!(
+        written["hooks"]["Stop"].is_array(),
+        "the TRACKED file is what received the hooks"
+    );
+    assert!(
+        stdout(&out).contains("via the symlink"),
+        "the user must be told their hooks landed in the link's target: {}",
+        stdout(&out)
+    );
+}
+
+/// The default (unconfirmed, no-preview) merge keeps a `.bak` of what it replaced,
+/// and does not narrow the file's 0644 mode to the temp file's 0600.
+#[test]
+fn install_hooks_backs_up_the_original_and_preserves_its_mode() {
+    let home = home_with_settings(|path| {
+        std::fs::write(path, PRECIOUS_SETTINGS).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    });
+    let settings = default_settings(home.path());
+
+    let out = install_hooks(home.path(), &[]);
+
+    assert_ok(&out, "install-hooks (backup)");
+    let backup = settings.with_file_name("settings.json.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        PRECIOUS_SETTINGS,
+        "the pre-image is kept beside the file we edited"
+    );
+    assert!(stdout(&out).contains("previous settings are at"));
+    assert_eq!(
+        std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "merging must not silently narrow the user's file mode"
+    );
+}
+
+/// Re-running after moving the binary (the documented flow: once from `target/`,
+/// again from `~/.local/bin`) must UPDATE our hook group, not append a second one
+/// pointing at a binary that no longer exists.
+#[test]
+fn install_hooks_re_run_with_a_different_binary_updates_rather_than_appends() {
+    let home = home_with_settings(|path| std::fs::write(path, "{}").unwrap());
+    let settings = default_settings(home.path());
+
+    assert_ok(
+        &install_hooks(home.path(), &["--mailbox-bin", mailbox_bin()]),
+        "first install",
+    );
+    let relocated = home.path().join("mailbox");
+    std::fs::copy(mailbox_bin(), &relocated).unwrap();
+    let out = install_hooks(
+        home.path(),
+        &[
+            "--mailbox-bin",
+            relocated.to_str().unwrap(),
+            "--max-block-ms",
+            "120000",
+            "--timeout-secs",
+            "300",
+        ],
+    );
+    assert_ok(&out, "second install from a new path");
+
+    let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    let stop = merged["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(
+        stop.len(),
+        1,
+        "a re-run must leave exactly ONE arm hook, not a stale second one: {stop:?}"
+    );
+    let command = stop[0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        command.contains("--max-block-ms 120000"),
+        "the surviving hook is the NEW one: {command}"
+    );
+    assert_eq!(merged["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
+}
+
+/// A RELATIVE `HOME` must not resolve the default settings path against the CWD —
+/// which would merge into the *project's* committed `.claude/settings.json`.
+#[test]
+fn install_hooks_refuses_a_relative_home() {
+    let cwd = TempDir::new().unwrap();
+    // A project-style `.claude/settings.json` sitting in the CWD, which a relative
+    // home would resolve onto.
+    let project = cwd.path().join(".claude");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("settings.json"), PRECIOUS_SETTINGS).unwrap();
+
+    let out = Command::new(mailbox_bin())
+        .args(["harness", "install-hooks"])
+        .current_dir(cwd.path())
+        .env("AGENT_MAILBOX_HOME", ".")
+        .env_remove("HOME")
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-hooks with a relative home");
+
+    assert_ok(&out, "install-hooks (relative home)");
+    assert!(
+        stdout(&out).contains("no home to resolve Claude Code settings under"),
+        "a relative home must be refused, not resolved: {}",
+        stdout(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("settings.json")).unwrap(),
+        PRECIOUS_SETTINGS,
+        "the project's committed settings must NOT be touched"
+    );
 }
 
 // ==== install-skills writes the embedded skill, idempotently ====================

@@ -152,7 +152,7 @@ pub enum HarnessCommand {
     Arm(ArmArgs),
     /// SessionEnd hook: reap the waiter and drop this session's interests/subs.
     Cleanup,
-    /// Print (and optionally merge) the settings.json hooks snippet.
+    /// Merge the hooks into the Claude Code settings.json (and print the snippet).
     InstallHooks(InstallHooksArgs),
     /// Install the embedded agent-mailbox skill into the Claude Code skills dir.
     InstallSkills(InstallSkillsArgs),
@@ -171,8 +171,10 @@ pub struct ArmArgs {
 
 #[derive(Args, Debug)]
 pub struct InstallHooksArgs {
-    /// Path to a settings.json to merge the snippet into (instead of only printing
-    /// it). Created if missing; unrelated settings are preserved.
+    /// settings.json to merge the snippet into, created if missing. Defaults to
+    /// `~/.claude/settings.json` (home from `AGENT_MAILBOX_HOME`, else `HOME`) IF
+    /// that file exists — if it does not, the snippet is only printed. Unrelated
+    /// settings and foreign hooks are always preserved; a re-run does not duplicate.
     #[arg(long)]
     pub settings: Option<std::path::PathBuf>,
     /// Absolute path to the `mailbox` binary the hooks invoke. Defaults to this
@@ -852,10 +854,18 @@ async fn end_session_with_retry(config: &StorageConfig, session: &SessionId) {
     }
 }
 
-/// `install-hooks`: validate the timing, print the settings.json snippet (always)
-/// and, with `--settings <path>`, merge it into that file (atomically, preserving
-/// unrelated settings).
+/// `install-hooks`: validate the timing, then merge the snippet into the Claude
+/// Code settings file — `--settings <path>` if given, else `~/.claude/settings.json`
+/// **when it exists** — and always print the snippet too.
+///
+/// The three outcomes come from ONE resolved
+/// [`SettingsTarget`](mailbox_harness::install::SettingsTarget), matched
+/// exhaustively below, so a print-only run always arrives with its reason. With no
+/// settings file (and no `--settings`) this writes nothing at all: conjuring a
+/// `settings.json` on a machine with no Claude Code is not ours to do.
 fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::Result<()> {
+    use mailbox_harness::install::{BackupPolicy, SettingsTarget};
+
     let mailbox_bin = match args.mailbox_bin {
         Some(path) => mailbox_harness::install::abs_bin(&path),
         None => mailbox_harness::install::default_mailbox_bin(std::env::current_exe()),
@@ -870,31 +880,88 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
     spec.validate().context("invalid hook timing")?;
     let snippet = mailbox_harness::install::hooks_snippet(&spec);
 
-    if let Some(path) = &args.settings {
-        let existing = match std::fs::read_to_string(path) {
-            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
-                .with_context(|| format!("parsing existing settings {}", path.display()))?,
-            _ => serde_json::json!({}),
-        };
-        let merged = mailbox_harness::install::merge_into_settings(existing, &snippet);
-        let pretty = serde_json::to_string_pretty(&merged)?;
-        // The same atomic write `install-skills` uses — one guarantee, one
-        // implementation (the two used to be separate copies, and had drifted).
-        mailbox_harness::atomic::write_atomic(path, format!("{pretty}\n").as_bytes())
-            .with_context(|| format!("writing merged settings {}", path.display()))?;
-        eprintln!("merged agent-mailbox hooks into {}", path.display());
-    }
+    // Resolve the destination ONCE (env at this edge; the decision itself is pure).
+    let target = mailbox_harness::install::settings_target(args.settings);
 
-    // Always emit the snippet so it can be installed by hand. In `--json` mode the
-    // snippet IS the stdout contract, so the sibling-command pointer goes to
-    // stderr (never polluting parseable stdout).
+    // Emit the snippet BEFORE attempting the merge. It does not depend on the merge,
+    // and a failed merge is precisely when the user needs it: hand-installation is
+    // then their only route, so the fallback must not be suppressed by the failure
+    // it exists for. In `--json` mode the snippet IS the stdout contract, so every
+    // human note goes to stderr and never pollutes parseable stdout.
     if format.is_json() {
         println!("{}", serde_json::to_string(&snippet)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&snippet)?);
     }
+
+    match &target {
+        SettingsTarget::Explicit(path) | SettingsTarget::DefaultFound(path) => {
+            // The default path edits the user's real config with no confirmation, so
+            // it keeps a `.bak`; an explicitly named file does not get littered.
+            let backup = match &target {
+                SettingsTarget::DefaultFound(_) => BackupPolicy::Keep,
+                _ => BackupPolicy::Skip,
+            };
+            let report = mailbox_harness::install::merge_hooks_file(path, &snippet, backup)
+                .with_context(|| {
+                    format!(
+                        "merging the agent-mailbox hooks into {} (your settings were NOT modified; the snippet above can be installed by hand)",
+                        path.display()
+                    )
+                })?;
+            note(format, &merged_note(&report));
+        }
+        SettingsTarget::NoDefault {
+            looked_at: Some(path),
+        } => note(
+            format,
+            &format!(
+                "no Claude Code settings found at {}; printed the snippet instead — pass --settings <path> to create one",
+                path.display()
+            ),
+        ),
+        SettingsTarget::NoDefault { looked_at: None } => note(
+            format,
+            "no home to resolve Claude Code settings under (neither AGENT_MAILBOX_HOME nor HOME is set, or it is not absolute); printed the snippet instead — pass --settings <path> to choose one",
+        ),
+    }
+
     eprintln!("next: run `mailbox harness install-skills` to install the agent-mailbox skill");
     Ok(())
+}
+
+/// What a successful merge tells the user: where the hooks actually landed —
+/// naming the *resolved* file when a symlink was followed, since a dotfiles user's
+/// hooks land in their tracked repo, not at the path they typed — and the backup.
+fn merged_note(report: &mailbox_harness::install::MergeReport) -> String {
+    let mut message = format!(
+        "merged agent-mailbox hooks into {}",
+        report.written.display()
+    );
+    if let Some(link) = &report.via_symlink {
+        message.push_str(&format!(
+            " (via the symlink {}, which was followed, not replaced)",
+            link.display()
+        ));
+    }
+    if let Some(backup) = &report.backup {
+        message.push_str(&format!(
+            "; your previous settings are at {}",
+            backup.display()
+        ));
+    }
+    message
+}
+
+/// A human note that belongs on stdout — unless `--json` is on, where stdout is a
+/// machine contract and the note would corrupt it, so it goes to stderr instead
+/// (the same split `install-skills` makes for its pointer and warnings).
+fn note(format: OutputFormat, message: &str) {
+    if format.is_json() {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
 }
 
 /// `install-skills`: write every embedded skill to `<skills-dir>/<name>/SKILL.md`

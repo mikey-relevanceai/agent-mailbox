@@ -36,6 +36,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::atomic::write_atomic;
+use crate::home::{CLAUDE_DIR, ENV_HOME, harness_home};
 
 /// A skill shipped inside the binary: its directory name and its `SKILL.md` body.
 ///
@@ -61,15 +62,10 @@ pub const SKILLS: &[EmbeddedSkill] = &[EmbeddedSkill {
 /// The file each skill installs to, inside its own directory.
 const SKILL_FILE: &str = "SKILL.md";
 
-/// The default skills directory under a home: `~/.claude/skills`.
-const CLAUDE_DIR: &str = ".claude";
+/// The skills subdirectory under Claude Code's config dir: `~/.claude/skills`.
+/// (The home itself, and `.claude`, come from [`crate::home`] — the one resolution
+/// `install-hooks` shares.)
 const SKILLS_SUBDIR: &str = "skills";
-
-/// Env var overriding the home used for the default skills dir, falling back to
-/// `HOME`. Mirrors the storage layer's `AGENT_MAILBOX_HOME` precedence so tests
-/// and sandboxes have ONE way to escape the real home — a second convention here
-/// would be a second thing to remember to override.
-const ENV_HOME: &str = "AGENT_MAILBOX_HOME";
 
 /// What installing one skill did to its `SKILL.md`.
 ///
@@ -223,7 +219,7 @@ impl std::error::Error for InstallSkillsError {
 /// The default skills directory (`<home>/.claude/skills`), resolving home from
 /// `AGENT_MAILBOX_HOME` then `HOME`.
 pub fn default_skills_dir() -> Result<PathBuf, SkillInstallError> {
-    resolve_skills_dir(env_path(ENV_HOME).or_else(|| env_path("HOME")))
+    resolve_skills_dir(harness_home())
 }
 
 /// The skills dir for an already-resolved home. Pure, so both the layout and the
@@ -232,13 +228,6 @@ pub fn default_skills_dir() -> Result<PathBuf, SkillInstallError> {
 fn resolve_skills_dir(home: Option<PathBuf>) -> Result<PathBuf, SkillInstallError> {
     let home = home.ok_or(SkillInstallError::NoHome)?;
     Ok(home.join(CLAUDE_DIR).join(SKILLS_SUBDIR))
-}
-
-/// A non-empty env var read as a path.
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 /// Install every [`SKILLS`] entry under `skills_dir`, one directory each.

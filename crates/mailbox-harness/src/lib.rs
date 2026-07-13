@@ -12,11 +12,14 @@
 //! - `SessionEnd` runs [`cleanup`](cleanup) — it reaps the waiter and drops the
 //!   session's interests/subscriptions (feeding the card-08 refcount so no zombie
 //!   poller outlives the session).
-//! - [`install`](install) emits the `settings.json` snippet that wires all three.
+//! - [`install`](install) wires all three into `~/.claude/settings.json` (when that
+//!   file exists — else it prints the snippet and says why), merging rather than
+//!   clobbering.
 //!
 //! The other half of setup is [`skills`](skills), which installs the embedded
 //! `agent-mailbox` skill into the user's Claude Code skills dir. The hooks make
-//! wake infrastructure; the skill teaches the agent the loop it wakes into.
+//! wake infrastructure; the skill teaches the agent the loop it wakes into. Both
+//! default under the same home ([`home`](home)) — one convention, one override.
 //!
 //! # Why this crate holds the logic (and shells out for the bridge)
 //!
@@ -38,6 +41,7 @@
 pub mod arm;
 pub mod atomic;
 pub mod cleanup;
+pub mod home;
 pub mod hook;
 pub mod install;
 pub mod skills;
