@@ -62,8 +62,14 @@ impl OutputFormat {
 /// a user-scoped Unix socket (no TCP). When the daemon is down they fail loudly
 /// (ADR-0004). `wait` is the sole read-only exception: it opens the store
 /// read-only and blocks on its wake FIFO, never touching the socket.
+/// The version `mailbox --version` reports: the crate version plus the commit it
+/// was built from (and `-dirty` for an uncommitted tree), baked in by `build.rs`.
+/// Lets an installed binary be traced to a commit — a plain crate version cannot
+/// distinguish a fresh build from a stale one.
+pub const LONG_VERSION: &str = env!("MAILBOX_LONG_VERSION");
+
 #[derive(Parser, Debug)]
-#[command(name = "mailbox", version, about, long_about = None)]
+#[command(name = "mailbox", version = LONG_VERSION, about, long_about = None)]
 pub struct Cli {
     /// Emit machine-readable JSON on stdout (for agents). Human-readable
     /// otherwise. Logs always go to stderr, so JSON output is never polluted.
@@ -93,7 +99,7 @@ pub enum Command {
     Unwatch(UnwatchArgs),
     /// Show watches (interest + child pid) and this session's unread counts.
     Status(SessionOpt),
-    /// Print this session's own id and inbox topic (card 16). Needs no bridge.
+    /// Print this session's own id and inbox topic. Needs no bridge.
     Whoami(SessionOpt),
     /// Message a peer agent: publish to its inbox, stamped with your session id.
     Send(SendArgs),
@@ -104,8 +110,7 @@ pub enum Command {
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
     Wait(WaitArgs),
     /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
-    /// install-skills). The harness owns the wake loop so the agent never re-arms
-    /// (card 11).
+    /// install-skills). The harness owns the wake loop so the agent never re-arms.
     Harness(HarnessArgs),
 }
 
@@ -189,9 +194,9 @@ pub struct WaitArgs {
     #[command(flatten)]
     pub session: SessionOpt,
     /// If set, block at most this long before re-execing a fresh waiter (the
-    /// self-respawn that keeps a long idle armed, card 11). Absent = block forever
-    /// (the card-05 default). The harness passes this; a bare `mailbox wait` does
-    /// not, preserving the original blocking contract.
+    /// self-respawn that keeps a long idle armed). Absent = block forever. The
+    /// harness passes this; a bare `mailbox wait` does not, preserving the
+    /// original blocking contract.
     #[arg(long)]
     pub max_block_ms: Option<u64>,
 }
@@ -321,8 +326,8 @@ pub struct WatchArgs {
 pub enum WatchTargetCmd {
     /// Watch a GitHub pull request.
     GithubPr(GithubPrWatchArgs),
-    /// Watch a stub publisher (the reference adapter; card 09). Publishes a
-    /// synthetic event on an interval to prove the whole path end to end.
+    /// Watch a stub publisher (a built-in test adapter). Publishes a synthetic
+    /// event on an interval to prove the whole path end to end.
     Stub(StubWatchArgs),
 }
 

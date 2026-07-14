@@ -199,6 +199,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 
     let limits = Limits::from_env();
     info!(
+        version = crate::cli::LONG_VERSION,
         socket = %socket_path.display(),
         db = %config.path().display(),
         max_connections = limits.max_connections,

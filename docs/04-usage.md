@@ -52,6 +52,17 @@ So if `mailbox` and the two adapters live in the same directory, watches Just
 Work with no extra configuration. The github-pr adapter also shells out to `gh`,
 overridable via `MAILBOX_GH_BIN` (tests point it at a fake).
 
+### Confirm which build you installed
+
+```bash
+mailbox --version        # e.g. mailbox 0.1.0 (git 6b5e56b77ca2, 2026-07-14)
+```
+
+The commit hash is baked in at build time, so after a rebuild-and-reinstall you
+can check the installed binary matches the source you built from (a `-dirty`
+suffix means it was built from an uncommitted tree). The running daemon also logs
+its version on the `bridge serving` startup line.
+
 ### Where state lives
 
 The daemon keeps everything under one directory (default
