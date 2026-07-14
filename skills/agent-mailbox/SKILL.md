@@ -32,14 +32,25 @@ read the two hard rules below.
 Violating either rule recreates the exact failure the mailbox was built to kill:
 zombie pollers and lost wakes.
 
+## Your session identity is automatic — do NOT pass `--session`
+
+`mailbox` figures out which session you are on its own, from the
+`$CLAUDE_CODE_SESSION_ID` that Claude Code sets for every command you run. So the
+commands below take **no `--session` flag** — just run them.
+
+> **Do not write `--session "$MAILBOX_SESSION_ID"`.** That variable is usually
+> **empty** in your shell (the hooks set it only for the background waiter, not
+> for your commands), so it expands to `--session ""` and binds a phantom empty
+> session instead of you. Omit the flag and let `mailbox` resolve you correctly.
+
+Run `mailbox whoami` any time to confirm who you are. Pass `--session <id>` only
+when you deliberately want to act as a *different* session.
+
 ## Prerequisites (assume already set up; do not do these yourself)
 
 - `mailbox serve` is running (the bridge daemon).
-- The Claude Code hooks are installed
-  (`mailbox harness install-hooks`), so arming and cleanup are automatic.
-- Your session id is available as `$MAILBOX_SESSION_ID` (the hooks set it). If it
-  is not, `mailbox` falls back to `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets
-  for you — so `mailbox whoami` always works. The `--session` flag overrides both.
+- The Claude Code hooks are installed (`mailbox harness install-hooks`), so
+  arming and cleanup are automatic.
 
 If `mailbox` commands fail with `bridge not running; start it with 'mailbox
 serve'`, tell the user — do not try to start a daemon or poll yourself.
@@ -49,7 +60,7 @@ serve'`, tell the user — do not try to start a daemon or poll yourself.
 ### Watch a GitHub PR
 
 ```bash
-mailbox watch github-pr OWNER/REPO#NUMBER --session "$MAILBOX_SESSION_ID"
+mailbox watch github-pr OWNER/REPO#NUMBER
 ```
 
 This records your interest, subscribes you to the PR topic, and (via the daemon)
@@ -60,7 +71,7 @@ comment, or CI rollup going red. Then **go idle or do other work** — do not po
 ### Subscribe to a custom topic
 
 ```bash
-mailbox subscribe TOPIC --session "$MAILBOX_SESSION_ID"
+mailbox subscribe TOPIC
 # a peer agent (or you) publishes with:
 mailbox publish TOPIC --body '{"...":"..."}'
 ```
@@ -72,7 +83,7 @@ surfaces a system reminder like `mail on topic github.pr.OWNER/REPO#NUMBER`. Whe
 you see it:
 
 ```bash
-mailbox read --session "$MAILBOX_SESSION_ID"
+mailbox read
 ```
 
 `read` returns the unread events and advances your cursor (exactly-once). React
@@ -83,7 +94,7 @@ nothing to re-arm.**
 ### Check state (read-only)
 
 ```bash
-mailbox status --session "$MAILBOX_SESSION_ID"
+mailbox status
 ```
 
 Shows your watches (and whether each poller is `running` with a pid), your
@@ -92,9 +103,9 @@ subscriptions, and per-topic unread counts. It does not consume events.
 ### When done
 
 ```bash
-mailbox unwatch github-pr OWNER/REPO#NUMBER --session "$MAILBOX_SESSION_ID"
+mailbox unwatch github-pr OWNER/REPO#NUMBER
 # or, for a plain topic:
-mailbox unsubscribe TOPIC --session "$MAILBOX_SESSION_ID"
+mailbox unsubscribe TOPIC
 ```
 
 You do not have to clean up on exit — the `SessionEnd` hook drops your
@@ -114,15 +125,13 @@ The loop: **discover → send → the peer wakes → it reads → it replies.**
 ```bash
 # 1. Who am I, and who can I reach?
 mailbox whoami
-mailbox agents --session "$MAILBOX_SESSION_ID"
+mailbox agents
 
 # 2. Poke a peer (bare session id, or its full agent.* topic).
-mailbox send PEER_SESSION_ID --text "review done on PR 42, please rebase" \
-  --session "$MAILBOX_SESSION_ID"
+mailbox send PEER_SESSION_ID --text "review done on PR 42, please rebase"
 
 # ...or send a structured body:
-mailbox send PEER_SESSION_ID --body '{"kind":"review-done","pr":42}' \
-  --session "$MAILBOX_SESSION_ID"
+mailbox send PEER_SESSION_ID --body '{"kind":"review-done","pr":42}'
 ```
 
 The peer's idle waiter wakes with `mail on topic agent.<its-id>`; it runs
@@ -138,24 +147,27 @@ Notes that matter:
 - **`send` to an unregistered agent FAILS** (non-zero, naming the target). That is
   correct: such a message could never be delivered. Run `mailbox agents` to see who
   is actually addressable — do not retry or work around it.
-- **Liveness in `mailbox agents`**: `idle (waiter blocked)` means a send wakes that
-  peer immediately; `busy or unarmed` means it is mid-turn — your message still
-  lands in its inbox and it will see it on its next read. It is not a heartbeat.
+- **Liveness in `mailbox agents`**: `idle (waiter appears blocked)` means a send
+  should wake that peer immediately; `busy or unarmed` means it is mid-turn — your
+  message still lands in its inbox and it will see it on its next read. It is a
+  best-effort probe, not a heartbeat.
 
 ## Quick reference
+
+Session identity is automatic — none of these take `--session`.
 
 | Verb | Command |
 |---|---|
 | who am I | `mailbox whoami` |
-| list peer agents | `mailbox agents --session "$MAILBOX_SESSION_ID"` |
-| message a peer | `mailbox send PEER_ID --text "..." --session "$MAILBOX_SESSION_ID"` |
-| watch a PR | `mailbox watch github-pr OWNER/REPO#N --session "$MAILBOX_SESSION_ID"` |
-| subscribe to a topic | `mailbox subscribe TOPIC --session "$MAILBOX_SESSION_ID"` |
+| list peer agents | `mailbox agents` |
+| message a peer | `mailbox send PEER_ID --text "..."` |
+| watch a PR | `mailbox watch github-pr OWNER/REPO#N` |
+| subscribe to a topic | `mailbox subscribe TOPIC` |
 | list topics | `mailbox topics [--prefix agent.]` |
-| read on wake | `mailbox read --session "$MAILBOX_SESSION_ID"` |
-| check state | `mailbox status --session "$MAILBOX_SESSION_ID"` |
-| stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N --session "$MAILBOX_SESSION_ID"` |
-| unsubscribe | `mailbox unsubscribe TOPIC --session "$MAILBOX_SESSION_ID"` |
+| read on wake | `mailbox read` |
+| check state | `mailbox status` |
+| stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N` |
+| unsubscribe | `mailbox unsubscribe TOPIC` |
 
 Never: `ipc-arm.sh`, `gh-watch.sh`, a background `gh` poll loop, or any re-arm
 command. Arming, inbox registration, and poller supervision are infrastructure,

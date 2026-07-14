@@ -165,6 +165,17 @@ fn resolve_session(
     mailbox_env: Option<String>,
     claude_env: Option<String>,
 ) -> anyhow::Result<SessionId> {
+    // An empty/whitespace `--session` is treated as absent, not as a real (empty)
+    // session id, so it falls through to the env fallbacks. This is the common
+    // trap: `--session "$MAILBOX_SESSION_ID"` with that var unset expands to
+    // `--session ""`, and an explicit flag wins the precedence — so without this
+    // it would bind a phantom empty session instead of resolving via
+    // `CLAUDE_CODE_SESSION_ID`. (The env sources are already emptiness-filtered by
+    // `env_session`.)
+    let flag = flag.and_then(|s| {
+        let trimmed = s.as_str().trim();
+        (!trimmed.is_empty()).then(|| SessionId::new(trimmed))
+    });
     flag.or_else(|| mailbox_env.map(SessionId::new))
         .or_else(|| claude_env.map(SessionId::new))
         .context(
@@ -1584,6 +1595,27 @@ mod tests {
     fn claude_env_is_the_last_fallback() {
         let resolved = resolve_session(None, None, Some("from-claude-env".to_string())).unwrap();
         assert_eq!(resolved, SessionId::new("from-claude-env"));
+    }
+
+    #[test]
+    fn empty_session_flag_falls_back_to_env_not_a_phantom_session() {
+        // The trap: `--session "$MAILBOX_SESSION_ID"` with that var unset expands to
+        // `--session ""`. An empty flag must be treated as absent and fall through
+        // to CLAUDE_CODE_SESSION_ID, NOT bind an anonymous empty session.
+        let resolved = resolve_session(
+            Some(SessionId::new("")),
+            None,
+            Some("from-claude-env".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved, SessionId::new("from-claude-env"));
+
+        // Whitespace-only is treated the same, and a kept flag is trimmed for
+        // consistency with the env sources.
+        let whitespace = resolve_session(Some(SessionId::new("   ")), None, None).unwrap_err();
+        assert!(format!("{whitespace}").contains("no session id"));
+        let trimmed = resolve_session(Some(SessionId::new("  real  ")), None, None).unwrap();
+        assert_eq!(trimmed, SessionId::new("real"));
     }
 
     #[test]

@@ -280,19 +280,18 @@ subscribe  ──►  (idle; hooks keep the waiter armed)  ──►  read  ─�
     └──────────────────────  unsubscribe when done  ◄──────────────────┘
 ```
 
-1. **subscribe** (once) — `mailbox subscribe <topic> --session <id>`, or
-   `mailbox watch github-pr <owner>/<repo>#<n> --session <id>` (which subscribes
-   *and* starts the shared poller). Baseline-on-subscribe: you only ever see
-   events published *after* you subscribe.
+1. **subscribe** (once) — `mailbox subscribe <topic>`, or
+   `mailbox watch github-pr <owner>/<repo>#<n>` (which subscribes *and* starts the
+   shared poller). Baseline-on-subscribe: you only ever see events published
+   *after* you subscribe.
 2. **idle** — do other work, or nothing. The `SessionStart`/`Stop` hooks keep a
    waiter armed. **The agent does not arm anything and does not poll.**
 3. **read** — on wake (a system reminder like `mail on topic X`), run
-   `mailbox read --session <id>`. It returns unread events and advances your
-   cursor (exactly-once, advance-on-read).
+   `mailbox read`. It returns unread events and advances your cursor
+   (exactly-once, advance-on-read).
 4. **react** — do the work: resolve the conflict, address the review, fix CI.
-5. **unsubscribe** — `mailbox unsubscribe <topic> --session <id>` (or
-   `mailbox unwatch …`) when you no longer care. `SessionEnd` does this for you
-   if you just end the session.
+5. **unsubscribe** — `mailbox unsubscribe <topic>` (or `mailbox unwatch …`) when
+   you no longer care. `SessionEnd` does this for you if you just end the session.
 
 **The two rules that make this different from the old skill loop:** the agent
 **never re-arms** after a wake, and the agent **never spawns a background
@@ -302,25 +301,37 @@ loop, stop: declare a `watch` instead.
 
 ### The commands, precisely
 
-Run `mailbox <cmd> --help` for the authoritative flags. The session-scoped ones
-take `--session <id>`, falling back to `$MAILBOX_SESSION_ID` (the harness hooks set
-it) and then `$CLAUDE_CODE_SESSION_ID` (Claude Code exports it into every tool
-call). The flag wins over both; `MAILBOX_SESSION_ID` wins over
-`CLAUDE_CODE_SESSION_ID`. Add global `--json` for machine-readable stdout.
+Run `mailbox <cmd> --help` for the authoritative flags.
+
+**Session identity is automatic.** The session-scoped commands resolve *you* from
+`$CLAUDE_CODE_SESSION_ID` (which Claude Code exports into every tool call), so you
+do **not** pass `--session` — just run them, and `mailbox whoami` confirms who you
+are. Pass `--session <id>` only to act as a *different* session. Full resolution
+order: `--session` > `$MAILBOX_SESSION_ID` > `$CLAUDE_CODE_SESSION_ID`.
+
+> **Pitfall:** do not write `--session "$MAILBOX_SESSION_ID"`. In an agent's shell
+> that variable is usually **empty** (the hooks set it only for the background
+> waiter), so it expands to `--session ""`. An empty flag is treated as absent and
+> falls through to `$CLAUDE_CODE_SESSION_ID` — but the clearer fix is to just omit
+> the flag.
+
+Add global `--json` for machine-readable stdout. Below, `--session` is shown only
+where it is a genuine argument; the session-scoped commands take the optional
+override but do not need it.
 
 | Command | What it does |
 |---|---|
-| `mailbox subscribe <topic> --session <id>` | Subscribe (baseline-on-subscribe). |
-| `mailbox unsubscribe <topic> --session <id>` | Unsubscribe. |
-| `mailbox read --session <id> [--limit <n>]` | Return unread events, advance the cursor. |
-| `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>] --session <id>` | Watch a PR: record interest, subscribe to the PR topic, and (via the daemon) spawn the shared edge-triggered `github-pr` poller. Default interval 60s. |
-| `mailbox unwatch github-pr <owner>/<repo>#<n> --session <id>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
-| `mailbox watch stub <label> [--interval-ms <n>] [--count <n>] --session <id>` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
-| `mailbox unwatch stub <label> --session <id>` | Drop interest in the stub watch. |
+| `mailbox subscribe <topic>` | Subscribe (baseline-on-subscribe). |
+| `mailbox unsubscribe <topic>` | Unsubscribe. |
+| `mailbox read [--limit <n>]` | Return unread events, advance the cursor. |
+| `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>]` | Watch a PR: record interest, subscribe to the PR topic, and (via the daemon) spawn the shared edge-triggered `github-pr` poller. Default interval 60s. |
+| `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
+| `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
+| `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
 | `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event (normally an adapter's job; handy for testing). |
 | `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
-| `mailbox send <target> [--text <s>] [--body <json>] --session <id>` | Message a peer agent (see below). |
-| `mailbox agents [--json] --session <id>` | List the agents you can `send` to. |
+| `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). |
+| `mailbox agents [--json]` | List the agents you can `send` to. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
 
 ---
@@ -339,7 +350,7 @@ replies.**
 ```bash
 # 1. Who am I, and who can I reach?
 mailbox whoami
-mailbox agents --session "$MAILBOX_SESSION_ID"
+mailbox agents
 ```
 
 ```text
@@ -350,19 +361,17 @@ mailbox agents --session "$MAILBOX_SESSION_ID"
 
 ```bash
 # 2. Message a peer (bare session id, or its full agent.* topic).
-mailbox send 9d2e7c05-… --text "review done on PR 42, please rebase" \
-  --session "$MAILBOX_SESSION_ID"
+mailbox send 9d2e7c05-… --text "review done on PR 42, please rebase"
 
 # ...or with a structured body:
-mailbox send 9d2e7c05-… --body '{"kind":"review-done","pr":42}' \
-  --session "$MAILBOX_SESSION_ID"
+mailbox send 9d2e7c05-… --body '{"kind":"review-done","pr":42}'
 ```
 
 The peer's idle waiter wakes (`mail on topic agent.9d2e7c05-…` — payload-free, as
 always), and it reads the message like any other event:
 
 ```bash
-mailbox read --session "$MAILBOX_SESSION_ID"
+mailbox read
 ```
 
 ```json
