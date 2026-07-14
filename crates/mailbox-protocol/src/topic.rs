@@ -132,7 +132,18 @@ pub fn inbox_topic(session: &SessionId) -> Result<Topic, TopicError> {
 /// [`Topic::as_agent_inbox`] (parsing) so the round trip is lossless by
 /// construction. A `.` is allowed (session ids may contain one, and the prefix is
 /// stripped exactly once), so `agent.a.b` addresses the session `a.b`.
+///
+/// A session id that itself begins with the `agent.` prefix is refused
+/// ([`TopicError::SessionLooksLikeInbox`]): minting `agent.agent.<id>` would break
+/// the injectivity discovery and `parse_send_target` rely on (both strip the
+/// prefix exactly once). Enforcing it here keeps construction and parsing in
+/// agreement — a topic we would never mint is also one we refuse to parse.
 fn check_inbox_segment(session: &str) -> Result<(), TopicError> {
+    if session.starts_with(AGENT_INBOX_PREFIX) {
+        return Err(TopicError::SessionLooksLikeInbox {
+            value: session.to_string(),
+        });
+    }
     let invalid = session.is_empty()
         || session
             .chars()
@@ -420,6 +431,22 @@ mod tests {
                 "expected session {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn inbox_topic_refuses_a_session_that_looks_like_an_inbox() {
+        // Injectivity (card 16 / FIX 6): a session id beginning with `agent.` would
+        // mint `agent.agent.<id>`, which discovery + `parse_send_target` (each
+        // stripping the prefix once) would misroute. It is refused outright.
+        assert!(matches!(
+            inbox_topic(&SessionId::new("agent.victim")),
+            Err(TopicError::SessionLooksLikeInbox { .. })
+        ));
+        // A normal id that merely CONTAINS "agent" (no `agent.` prefix) round-trips.
+        let ok = SessionId::new("agent-smith");
+        let topic = inbox_topic(&ok).unwrap();
+        assert_eq!(topic.as_str(), "agent.agent-smith");
+        assert_eq!(topic.as_agent_inbox().unwrap(), ok);
     }
 
     #[test]

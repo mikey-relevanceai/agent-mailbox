@@ -31,6 +31,16 @@ pub enum TopicError {
     #[error("not an agent inbox topic: expected `agent.<session-id>`")]
     NotAgentInbox,
 
+    // A session id may not itself begin with the `agent.` inbox prefix: it would
+    // mint `agent.agent.<id>`, which discovery (`mailbox agents`, printing the
+    // bare id) and `parse_send_target` (which strips `agent.` exactly once) would
+    // misroute to a DIFFERENT session. Refused so the inbox address space is
+    // injective by construction. Real harness session ids are UUIDs, so this only
+    // ever rejects a pathological id. The echoed `value` is a bounded session
+    // segment (same deliberate echo as `InvalidSegment`), never a message body.
+    #[error("session id may not begin with the agent-inbox prefix: {value:?}")]
+    SessionLooksLikeInbox { value: String },
+
     // The embedded `value` echoes adapter-authored topic data (owner/repo/PR
     // number, or a session id) so the diagnostic points at the exact bad input.
     // This is a DELIBERATE, size-bounded echo of a topic segment — do NOT copy
