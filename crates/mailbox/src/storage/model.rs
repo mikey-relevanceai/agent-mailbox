@@ -263,4 +263,11 @@ pub enum SubscribeOutcome {
     /// `None` when the topic was empty (no head yet, so the next read starts at
     /// the oldest event — which will itself be a post-subscribe publish).
     Subscribed { baseline: Option<Offset> },
+    /// Refused: the session ended within the tombstone guard window
+    /// (`SUBSCRIBE_TOMBSTONE_GUARD_MS`), so re-subscribing it now would resurrect a
+    /// session that has just gone away — the arm-vs-cleanup race (ADR-0007). No
+    /// subscription row was created and no cursor was touched; the honest outcome
+    /// is reported rather than a silent success, so a caller (e.g. the harness
+    /// inbox registrar) can log that the session was recently ended.
+    RefusedSessionRecentlyEnded,
 }

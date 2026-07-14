@@ -15,8 +15,9 @@ use super::error::StorageError;
 ///
 /// v2 (card 08) adds `watch_interest.last_seen` for the TTL sweeper — see
 /// [`SCHEMA_V2`]. v3 (card 09) widens the interval to milliseconds and adds
-/// `watch.publish_count` for the stub adapter — see [`SCHEMA_V3`].
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+/// `watch.publish_count` for the stub adapter — see [`SCHEMA_V3`]. v4 (card 16)
+/// adds `session_tombstone` for the inbox-resurrection guard — see [`SCHEMA_V4`].
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 /// Version 1 of the schema.
 ///
@@ -124,6 +125,31 @@ UPDATE watch SET interval_ms = interval_ms * 1000;
 ALTER TABLE watch ADD COLUMN publish_count INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Version 4 of the schema (card 16): the session tombstone.
+///
+/// `EndSession` records the wall-clock instant a session ended here, in the same
+/// transaction that deletes its subscriptions/interests. The `Subscribe` writer
+/// path consults it to refuse a subscription that would *resurrect* a session
+/// that ended moments ago — the arm-Subscribe-vs-cleanup-EndSession race
+/// (ADR-0007): a `Stop` arm's inbox re-registration can land on the writer just
+/// after `SessionEnd`'s delete, permanently re-creating the inbox of a dead
+/// session. A short guard window (`SUBSCRIBE_TOMBSTONE_GUARD_MS`) closes that
+/// sub-second race; a genuine resume of the same id happens far later and is let
+/// through (the tombstone is aged out — see `do_subscribe_and_baseline`).
+///
+/// Additive, like every prior step: a fresh table, no existing row touched.
+///
+/// Growth is bounded in practice: one row per session id ever ended (PRIMARY KEY,
+/// INSERT OR REPLACE), and a session's aged tombstone is cleared the next time it
+/// subscribes. On a local single-user bus that is at most a handful of kilobytes
+/// over the daemon's life; a dedicated sweep of aged rows is unneeded for the MVP.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE session_tombstone (
+    session_id  TEXT    PRIMARY KEY,
+    ended_at_ms INTEGER NOT NULL
+);
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -155,6 +181,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 3 {
         sql.push_str(SCHEMA_V3);
+    }
+    if current < 4 {
+        sql.push_str(SCHEMA_V4);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -188,6 +217,29 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v2, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_a_v3_db_to_v4_adding_the_tombstone_table() {
+        // A v3 DB (pre card-16) must gain the `session_tombstone` table additively
+        // — the resurrection guard depends on it — without disturbing prior rows.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3").unwrap();
+
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // The new table is present and writable.
+        conn.execute(
+            "INSERT INTO session_tombstone (session_id, ended_at_ms) VALUES ('s', 1)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

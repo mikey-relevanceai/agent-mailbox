@@ -338,7 +338,7 @@ pub async fn end_session(
     supervisor: &Supervisor,
     session: SessionId,
 ) -> Result<SessionEnded, WatchError> {
-    let outcome = storage.end_session(session.clone()).await?;
+    let outcome = storage.end_session(session.clone(), now_millis()).await?;
 
     // The durable rows are already committed, so one adapter's stop failing must
     // NOT abort the others — an early return here would leak the later emptied

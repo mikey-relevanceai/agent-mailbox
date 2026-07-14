@@ -310,14 +310,21 @@ impl Storage {
     /// subscribe is a no-op that leaves the cursor untouched. See
     /// [`SubscribeOutcome`] and the writer's `do_subscribe_and_baseline` for the
     /// baseline-on-subscribe rationale.
+    ///
+    /// `now_ms` (Unix millis, caller-stamped) drives the tombstone guard: a
+    /// subscribe racing this session's own recent `end_session` is REFUSED
+    /// ([`SubscribeOutcome::RefusedSessionRecentlyEnded`]) rather than resurrect a
+    /// dead inbox (ADR-0007).
     pub async fn subscribe_and_baseline(
         &self,
         session: SessionId,
         topic: Topic,
+        now_ms: i64,
     ) -> Result<SubscribeOutcome, StorageError> {
         self.call(|reply| Command::SubscribeAndBaseline {
             session,
             topic,
+            now_ms,
             reply,
         })
         .await
@@ -539,9 +546,21 @@ impl Storage {
     /// stops each [`EndSessionOutcome::emptied_watches`] adapter — the same signal
     /// the TTL sweeper uses, but triggered promptly by an explicit session end
     /// rather than by ageing out.
-    pub async fn end_session(&self, session: SessionId) -> Result<EndSessionOutcome, StorageError> {
-        self.call(|reply| Command::EndSession { session, reply })
-            .await
+    ///
+    /// `now_ms` (Unix millis, caller-stamped) is recorded as the session's
+    /// tombstone in the same transaction, so a `subscribe` racing this end is
+    /// refused rather than resurrecting the inbox (ADR-0007).
+    pub async fn end_session(
+        &self,
+        session: SessionId,
+        now_ms: i64,
+    ) -> Result<EndSessionOutcome, StorageError> {
+        self.call(|reply| Command::EndSession {
+            session,
+            now_ms,
+            reply,
+        })
+        .await
     }
 
     /// The stored adapter baseline for `watch`, or `None` if unset. Opaque JSON

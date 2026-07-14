@@ -48,6 +48,7 @@ use tracing::{info, warn};
 
 use mailbox_protocol::{AdapterId, Event, Timestamp, Topic};
 
+use crate::clock::now_millis;
 use crate::storage::{Storage, StorageError};
 use crate::wake::Waker;
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
@@ -224,10 +225,13 @@ impl Bus {
         topics: &[Topic],
     ) -> Result<SubscribeSummary, BusError> {
         let mut summary = SubscribeSummary::with_capacity(topics.len());
+        // One clock read for the whole call: the tombstone guard compares this
+        // against the session's own recent `end_session` (ADR-0007).
+        let now_ms = now_millis();
         for topic in topics {
             let outcome = self
                 .storage
-                .subscribe_and_baseline(session.clone(), topic.clone())
+                .subscribe_and_baseline(session.clone(), topic.clone(), now_ms)
                 .await?;
             // Log the decision (the storage layer stays silent on success). Flatten
             // the baseline to a grep-able numeric field, present only when there was
@@ -250,6 +254,15 @@ impl Bus {
                     session = session.as_str(),
                     topic = topic.as_str(),
                     "subscribe was a no-op (already subscribed)"
+                ),
+                // The session ended within the guard window; refusing here is what
+                // stops a racing re-registration from resurrecting a dead inbox
+                // (ADR-0007). Not an error — the session really did just end.
+                SubscribeOutcome::RefusedSessionRecentlyEnded => warn!(
+                    session = session.as_str(),
+                    topic = topic.as_str(),
+                    "refused a subscribe: the session ended moments ago (tombstone guard); \
+                     not resurrecting its inbox"
                 ),
             }
             summary.push((topic.clone(), outcome));

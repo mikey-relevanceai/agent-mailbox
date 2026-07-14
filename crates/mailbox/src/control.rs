@@ -210,6 +210,10 @@ pub enum SubscribeState {
     Subscribed { baseline: Option<Offset> },
     /// Already subscribed; an idempotent no-op that left the cursor untouched.
     AlreadySubscribed,
+    /// Refused: the session ended within the tombstone guard window, so no
+    /// subscription was created (the resurrection guard, ADR-0007). The caller can
+    /// see the subscribe honestly did nothing rather than assume it took effect.
+    RefusedSessionRecentlyEnded,
 }
 
 impl From<SubscribeOutcome> for SubscribeState {
@@ -217,6 +221,9 @@ impl From<SubscribeOutcome> for SubscribeState {
         match outcome {
             SubscribeOutcome::Subscribed { baseline } => SubscribeState::Subscribed { baseline },
             SubscribeOutcome::AlreadySubscribed => SubscribeState::AlreadySubscribed,
+            SubscribeOutcome::RefusedSessionRecentlyEnded => {
+                SubscribeState::RefusedSessionRecentlyEnded
+            }
         }
     }
 }
