@@ -605,6 +605,20 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
 }
 
 async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
+    // An agent inbox is writable ONLY through `mailbox send`, which stamps
+    // provenance (`from`) and refuses an unregistered target (ADR-0007). The
+    // generic publish path does neither, so allowing it here would let any caller
+    // forge a `from` into a victim's inbox — or write into an inbox nobody has
+    // registered, where baseline-on-subscribe guarantees it can never be read.
+    // Reuse the protocol's own grammar (`as_agent_inbox`) rather than string-
+    // matching `"agent."`, so the namespace test can never drift from the minter.
+    if topic.as_agent_inbox().is_ok() {
+        return Response::error(format!(
+            "refusing to publish to inbox topic {}: agent inboxes are writable only via \
+             `mailbox send`, which stamps the sender and checks the target is registered",
+            topic.as_str()
+        ));
+    }
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
     match bus
         .publish(
