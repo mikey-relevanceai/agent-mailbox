@@ -37,6 +37,12 @@ place (`mailbox_protocol::inbox_topic` / `Topic::as_agent_inbox`), alongside the
 consumer cannot drift. It is fallible, not total: a `SessionId` is an opaque
 harness label whose grammar is *not* a subset of the topic grammar (whitespace,
 control characters, `/`, `#`), so a pathological id is refused rather than mangled.
+The address space is also **injective by construction**: a session id that itself
+begins with the `agent.` prefix is refused (`TopicError::SessionLooksLikeInbox`),
+because minting `agent.agent.<id>` would collide under the single-strip parse that
+discovery and `parse_send_target` use — it would misroute to a *different*
+session. Real harness ids are UUIDs, so this only rejects a pathological id; such a
+session simply gets no inbox (logged, and now visible at default verbosity).
 
 **2. Registration is ALWAYS-ON, done by the harness.** `mailbox harness arm`
 subscribes the session to its own inbox before it probes and arms — on every
@@ -45,6 +51,27 @@ subscribed and leaves the delivery cursor untouched, so a re-arm can never skip
 unread mail). `harness cleanup` (SessionEnd) already drops every subscription, so
 the inbox deregisters when the session ends. An agent does nothing to be
 addressable.
+
+**2a. A writer-enforced tombstone closes the resurrection race.** Because `arm`
+re-registers on *every* `Stop` — including the final one — an arm's inbox
+`Subscribe` can reach the single writer *just after* `cleanup`'s `EndSession`
+delete. Subscriptions have no TTL (only watch interest is swept), so in the order
+[EndSession delete] → [arm Subscribe] the inbox would be resurrected
+**permanently**: an orphan waiter outlives the session, `agents` lists a corpse,
+and `send`'s registration check passes for a session that no longer exists —
+inverting the guarantee in decision 3. The fix is a
+`session_tombstone(session_id, ended_at_ms)` table (schema v4): `EndSession`
+records the end instant in the *same transaction* as the delete, and the
+`Subscribe` writer path refuses to create a subscription for a session whose
+tombstone is younger than `SUBSCRIBE_TOMBSTONE_GUARD_MS` (10s), returning an honest
+`RefusedSessionRecentlyEnded` outcome (logged, never a silent success). A tombstone
+*older* than the guard is a genuine resume long after the end: it is deleted and
+the subscribe proceeds (self-healing). The 10s window is chosen because the
+arm/cleanup race is sub-second while a real resume of the same id happens far
+later — it covers the race with vast head room without depending on Claude Code's
+unverifiable SessionStart-on-resume matcher behaviour. In BOTH interleavings the
+subscription ends up deleted and tombstoned; the card-11 waiter still self-exits on
+its post-lock `has_subscription` re-check, so no orphan survives.
 
 **3. `send` to an unregistered agent is a hard error.** Because of
 baseline-on-subscribe, publishing to a session with no inbox subscription would
@@ -78,13 +105,20 @@ did not invent a heartbeat we do not have, and the CLI says exactly this.
   best-effort — it never fails the hook). The waiter still re-checks
   `has_subscription` after taking its lock and self-exits if a `SessionEnd` raced
   it. A session id that cannot form a topic simply gets no inbox, logged.
-- **Trust model: any local same-user process can publish to any inbox.** This is
-  the accepted boundary — one user, one machine, no TCP (ADR-0001/0004), and every
-  peer agent is already running with that user's full authority. Message bodies
-  remain **untrusted data, never authority** (ADR-0001): a body may inform an
-  agent, never instruct it. The `from` stamp (which the bridge writes, overwriting
-  any caller-supplied value) is *provenance* — good enough to route a reply, not to
-  authorize an action.
+- **Trust model: any local same-user process can reach any inbox — but only
+  through `send`.** This is the accepted boundary — one user, one machine, no TCP
+  (ADR-0001/0004), and every peer agent is already running with that user's full
+  authority. What is *not* accepted is bypassing provenance: the generic
+  `mailbox publish` / `Request::Publish` path **refuses `agent.*` topics** (tested
+  via `Topic::as_agent_inbox().is_ok()`, reusing the grammar rather than
+  string-matching), because it stamps no `from` and runs no registration check —
+  allowing it would let a caller forge a `from` into a victim's inbox, or write into
+  an unregistered inbox where baseline-on-subscribe guarantees the message is
+  unreadable. Inboxes are therefore writable *only* via `send`, which stamps the
+  sender and checks the target is registered. Message bodies remain **untrusted
+  data, never authority** (ADR-0001): a body may inform an agent, never instruct it.
+  The `from` stamp (which the bridge writes, overwriting any caller-supplied value)
+  is *provenance* — good enough to route a reply, not to authorize an action.
 - **The wake stays payload-free.** A peer message wakes the recipient with
   `mail on topic agent.<id>` and nothing more; the body is read afterwards through
   `mailbox read`, exactly like every other event.
