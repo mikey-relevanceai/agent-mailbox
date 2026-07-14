@@ -53,7 +53,7 @@ use crate::storage::{Storage, StorageError};
 use crate::wake::Waker;
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
-pub use crate::storage::{SessionId, SubscribeOutcome};
+pub use crate::storage::{SessionId, SubscribeKind, SubscribeOutcome};
 
 /// Errors from a bus operation.
 ///
@@ -219,10 +219,45 @@ impl Bus {
     ///
     /// Returns the per-topic [`SubscribeOutcome`]s (see [`SubscribeSummary`]) so the
     /// decision is not thrown away.
+    ///
+    /// This is the EXPLICIT path ([`SubscribeKind::Explicit`]): the `mailbox
+    /// subscribe` command and the `watch`/`stub` subscribe both route here. An
+    /// explicit subscribe comes from a live turn, so it is never the doomed arm the
+    /// tombstone guard defends against — it proceeds and clears any tombstone
+    /// (ADR-0007). The one guarded path is [`Bus::subscribe_auto_inbox`].
     pub async fn subscribe(
         &self,
         session: SessionId,
         topics: &[Topic],
+    ) -> Result<SubscribeSummary, BusError> {
+        self.subscribe_with_kind(session, topics, SubscribeKind::Explicit)
+            .await
+    }
+
+    /// Register a session's own agent inbox via the automatic `harness arm` path
+    /// ([`SubscribeKind::AutoInbox`], the ONLY guarded subscribe). Unlike
+    /// [`Bus::subscribe`], a re-registration racing this session's own `SessionEnd`
+    /// is refused rather than resurrect the just-ended inbox (ADR-0007). Kept a
+    /// distinct entry point (not a flag on `subscribe`) so the guarded path has one
+    /// obvious caller — `register_inbox` — and every other subscribe is unguarded by
+    /// construction.
+    pub async fn subscribe_auto_inbox(
+        &self,
+        session: SessionId,
+        topics: &[Topic],
+    ) -> Result<SubscribeSummary, BusError> {
+        self.subscribe_with_kind(session, topics, SubscribeKind::AutoInbox)
+            .await
+    }
+
+    /// Shared body of the two subscribe entry points: per-topic
+    /// `subscribe_and_baseline` under the given [`SubscribeKind`], with the decision
+    /// logged. `kind` is threaded to the writer, where it scopes the tombstone guard.
+    async fn subscribe_with_kind(
+        &self,
+        session: SessionId,
+        topics: &[Topic],
+        kind: SubscribeKind,
     ) -> Result<SubscribeSummary, BusError> {
         let mut summary = SubscribeSummary::with_capacity(topics.len());
         // One clock read for the whole call: the tombstone guard compares this
@@ -231,7 +266,7 @@ impl Bus {
         for topic in topics {
             let outcome = self
                 .storage
-                .subscribe_and_baseline(session.clone(), topic.clone(), now_ms)
+                .subscribe_and_baseline(session.clone(), topic.clone(), now_ms, kind)
                 .await?;
             // Log the decision (the storage layer stays silent on success). Flatten
             // the baseline to a grep-able numeric field, present only when there was

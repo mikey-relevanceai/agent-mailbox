@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use mailbox_protocol::{Cursor, Event, Offset};
 // The session identity is shared with the harness, so it lives in the protocol
 // crate (see `mailbox_protocol::session`). Re-exported here so the many existing
@@ -242,6 +244,34 @@ pub struct TopicSummary {
 pub struct ReadPage {
     pub events: Vec<Event>,
     pub next: Cursor,
+}
+
+/// Which caller is asking to subscribe — the axis the tombstone guard branches on.
+///
+/// Threaded from the request edge down to `do_subscribe_and_baseline` (exactly
+/// like `now_ms`), never derived from a clock or a global, so the writer stays a
+/// pure function of its inputs and a test can drive either path directly.
+///
+/// # Why the guard is scoped to one path (ADR-0007)
+///
+/// The resurrection race the tombstone defends against has ONE culprit: the
+/// automatic inbox re-registration `harness arm` fires on every SessionStart/Stop.
+/// That arm is asynchronous and can land on the writer *just after* `SessionEnd`'s
+/// delete, permanently re-creating a dead session's inbox. An EXPLICIT
+/// `subscribe`/`watch`, by contrast, is issued synchronously from a live turn — it
+/// completes before that turn's `SessionEnd` — so it can never BE the doomed racing
+/// command. It is therefore legitimate proof-of-life and must not be refused; on the
+/// contrary, it clears any stale tombstone so the resumed session is healthy again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscribeKind {
+    /// The automatic `harness arm` inbox auto-registration (the ONLY guarded path):
+    /// a subscribe within the tombstone window is refused rather than resurrect a
+    /// just-ended inbox.
+    AutoInbox,
+    /// An explicit, user/agent-initiated `subscribe` or `watch` (unguarded): it
+    /// proceeds and clears any existing tombstone for the session id.
+    Explicit,
 }
 
 /// What an atomic subscribe-and-baseline did.

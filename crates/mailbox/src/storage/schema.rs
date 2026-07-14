@@ -139,10 +139,19 @@ ALTER TABLE watch ADD COLUMN publish_count INTEGER NOT NULL DEFAULT 0;
 ///
 /// Additive, like every prior step: a fresh table, no existing row touched.
 ///
-/// Growth is bounded in practice: one row per session id ever ended (PRIMARY KEY,
-/// INSERT OR REPLACE), and a session's aged tombstone is cleared the next time it
-/// subscribes. On a local single-user bus that is at most a handful of kilobytes
-/// over the daemon's life; a dedicated sweep of aged rows is unneeded for the MVP.
+/// Growth, honestly: the table holds one row per DISTINCT session id ever ended
+/// over the daemon's lifetime (PRIMARY KEY, INSERT OR REPLACE dedupes re-ends of
+/// the same id). A row is cleared only when that id subscribes again — either an
+/// aged AutoInbox re-registration past the guard window, or any explicit
+/// subscribe/watch (which clears the tombstone as proof-of-life). Most ended
+/// sessions never resume, so their rows simply persist. There is NO dedicated
+/// sweeper in the MVP. This is acceptable because the rows are tiny (a short id
+/// string + an `i64`) and the daemon is a local, single-user process that restarts
+/// often (a restart starts a fresh DB only if the file is new; an existing file
+/// keeps its rows, but the count still grows only with genuinely-distinct ended
+/// sessions, which is small in practice). If a long-lived shared deployment ever
+/// makes this unbounded growth matter, add a periodic sweep of tombstones older
+/// than the guard window — they can never refuse anything once aged.
 const SCHEMA_V4: &str = r#"
 CREATE TABLE session_tombstone (
     session_id  TEXT    PRIMARY KEY,
@@ -240,6 +249,103 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn on_disk_v3_to_v4_migration_preserves_existing_rows() {
+        // The in-memory test above proves the new table is writable; this proves the
+        // UPGRADE PATH is non-destructive on a real file with real data. Build a v3
+        // DB with a subscription, a watch + interest, and a delivery cursor, close
+        // it, reopen, migrate to v4, and assert every prior row survived untouched
+        // and the new tombstone table is usable.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mailbox.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            // Real rows across the tables the guard/read paths depend on.
+            conn.execute(
+                "INSERT INTO subscription (session_id, topic) VALUES ('s-keep', 'agent.s-keep')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO delivery_cursor (session_id, topic, offset)
+                 VALUES ('s-keep', 'agent.s-keep', 7)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+                 VALUES (1, 'stub', 'lbl', 0, 1000, 0, 'desired', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO watch_interest (watch_id, session_id, last_seen) VALUES (1, 's-keep', 42)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        }
+
+        // Reopen the FILE and migrate to v4.
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // Every prior row survived, byte-for-byte.
+        let sub: String = conn
+            .query_row(
+                "SELECT topic FROM subscription WHERE session_id = 's-keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub, "agent.s-keep", "subscription preserved");
+        let cursor: i64 = conn
+            .query_row(
+                "SELECT offset FROM delivery_cursor WHERE session_id = 's-keep' AND topic = 'agent.s-keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 7, "delivery cursor preserved");
+        let (repo, interval, last_seen): (String, i64, i64) = conn
+            .query_row(
+                "SELECT w.repo, w.interval_ms, wi.last_seen
+                 FROM watch w JOIN watch_interest wi ON wi.watch_id = w.id
+                 WHERE w.id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (repo.as_str(), interval, last_seen),
+            ("lbl", 1000, 42),
+            "watch + interest preserved (interval NOT re-multiplied by the v3 step)"
+        );
+
+        // And the new v4 table is present and usable.
+        conn.execute(
+            "INSERT INTO session_tombstone (session_id, ended_at_ms) VALUES ('s-keep', 99)",
+            [],
+        )
+        .unwrap();
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at_ms FROM session_tombstone WHERE session_id = 's-keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended, 99);
     }
 
     #[test]

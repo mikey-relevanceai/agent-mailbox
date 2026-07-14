@@ -27,8 +27,8 @@ use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Top
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, TopicSummary, Watch, WatchId,
-    WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
+    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -109,6 +109,10 @@ pub(crate) enum Command {
         /// caller stamps it (like `AddInterest.last_seen`) so the writer never
         /// reaches for the clock itself and tests can inject an instant.
         now_ms: i64,
+        /// Which caller path this is — the axis the tombstone guard branches on.
+        /// Threaded like `now_ms` (never inferred inside the writer) so only the
+        /// automatic inbox re-registration is guarded (ADR-0007).
+        kind: SubscribeKind,
         reply: oneshot::Sender<Result<SubscribeOutcome, StorageError>>,
     },
     /// Read a session's unread events across ALL its subscribed topics AND advance
@@ -380,9 +384,10 @@ fn handle(conn: &mut Connection, cmd: Command) {
             session,
             topic,
             now_ms,
+            kind,
             reply,
         } => {
-            let result = do_subscribe_and_baseline(conn, &session, &topic, now_ms);
+            let result = do_subscribe_and_baseline(conn, &session, &topic, now_ms, kind);
             log_on_err(&result, "subscribe_and_baseline", || {
                 format!("session={} topic={}", session.as_str(), topic.as_str())
             });
@@ -855,41 +860,71 @@ fn advance_cursor_tx(
 /// forward move; reusing the monotonic advance keeps that guarantee even against
 /// a stale cursor left behind by an earlier unsubscribe.
 ///
-/// # The tombstone guard (ADR-0007, resurrection race)
+/// # The tombstone guard, scoped to the auto-inbox path (ADR-0007, resurrection race)
 ///
 /// Before creating the subscription we consult the session's tombstone (written
-/// by [`do_end_session`]). The race this closes: `harness arm` re-registers the
-/// inbox on every `Stop`, including the final one, so an arm's `Subscribe` can
-/// reach the single writer *just after* `SessionEnd`'s delete — and, because
-/// subscriptions have no TTL, would resurrect the dead session's inbox forever
-/// (an orphan waiter, `agents` listing a corpse, `send` succeeding into a void).
-/// So: a tombstone younger than [`SUBSCRIBE_TOMBSTONE_GUARD_MS`] ⇒ REFUSE (create
-/// nothing, report [`SubscribeOutcome::RefusedSessionRecentlyEnded`]); a tombstone
-/// OLDER than the guard is a genuine restart/resume long after the end ⇒ delete
-/// the stale tombstone and proceed; no tombstone ⇒ proceed. All three run inside
-/// this one transaction so the check and the write commit together.
+/// by [`do_end_session`]) — but ONLY on the [`SubscribeKind::AutoInbox`] path. The
+/// race this closes: `harness arm` re-registers the inbox on every `Stop`, including
+/// the final one, so an arm's auto-registration `Subscribe` can reach the single
+/// writer *just after* `SessionEnd`'s delete — and, because subscriptions have no
+/// TTL, would resurrect the dead session's inbox forever (an orphan waiter, `agents`
+/// listing a corpse, `send` succeeding into a void). So for `AutoInbox`: a tombstone
+/// younger than [`SUBSCRIBE_TOMBSTONE_GUARD_MS`] ⇒ REFUSE (create nothing, report
+/// [`SubscribeOutcome::RefusedSessionRecentlyEnded`]); a tombstone OLDER than the
+/// guard is a genuine restart long after the end ⇒ delete the stale tombstone and
+/// proceed; no tombstone ⇒ proceed.
+///
+/// # Why Explicit is exempt (and safe to exempt)
+///
+/// An [`SubscribeKind::Explicit`] subscribe/watch is issued SYNCHRONOUSLY from a
+/// live turn, which by construction completes before that turn's `SessionEnd` hook
+/// fires. It therefore CANNOT be the doomed post-teardown async arm the guard
+/// defends against — that culprit is exclusively `register_inbox` (AutoInbox). An
+/// explicit subscribe reaching this writer after a tombstone was written is thus a
+/// genuinely-resumed session proving it is alive, so it must PROCEED and CLEAR the
+/// tombstone (else the resumed session would silently receive zero deliveries: a
+/// running poller + interest row but no subscription). The resurrection guarantee
+/// is untouched — the only path the racing arm uses is still fully guarded.
+///
+/// All branches run inside this one transaction so the check and the write commit
+/// together.
 fn do_subscribe_and_baseline(
     conn: &mut Connection,
     session: &SessionId,
     topic: &Topic,
     now_ms: i64,
+    kind: SubscribeKind,
 ) -> Result<SubscribeOutcome, StorageError> {
     // Silent on success (the bus layer owns the subscribe log, like unsubscribe);
     // storage only logs failures via `log_on_err`.
     let tx = conn.transaction()?;
 
-    if let Some(ended_at_ms) = tombstone_ended_at(&tx, session)? {
-        if now_ms.saturating_sub(ended_at_ms) < SUBSCRIBE_TOMBSTONE_GUARD_MS {
-            // Within the race window: refuse. The tx drops (rolls back) with
-            // nothing written — no subscription row, tombstone left in place.
-            return Ok(SubscribeOutcome::RefusedSessionRecentlyEnded);
+    match kind {
+        // Explicit proof-of-life: clear any tombstone unconditionally and proceed.
+        // Safe because a synchronous live-turn subscribe cannot be the racing arm
+        // (see the fn docs); a no-op DELETE when there is no tombstone.
+        SubscribeKind::Explicit => {
+            tx.execute(
+                "DELETE FROM session_tombstone WHERE session_id = ?1",
+                params![session.as_str()],
+            )?;
         }
-        // Aged tombstone: a real restart well after the end. Clear it so this and
-        // future subscribes proceed normally (self-healing).
-        tx.execute(
-            "DELETE FROM session_tombstone WHERE session_id = ?1",
-            params![session.as_str()],
-        )?;
+        // Auto-inbox re-registration: the guarded path.
+        SubscribeKind::AutoInbox => {
+            if let Some(ended_at_ms) = tombstone_ended_at(&tx, session)? {
+                if now_ms.saturating_sub(ended_at_ms) < SUBSCRIBE_TOMBSTONE_GUARD_MS {
+                    // Within the race window: refuse. The tx drops (rolls back) with
+                    // nothing written — no subscription row, tombstone left in place.
+                    return Ok(SubscribeOutcome::RefusedSessionRecentlyEnded);
+                }
+                // Aged tombstone: a real restart well after the end. Clear it so this
+                // and future subscribes proceed normally (self-healing).
+                tx.execute(
+                    "DELETE FROM session_tombstone WHERE session_id = ?1",
+                    params![session.as_str()],
+                )?;
+            }
+        }
     }
 
     let changed = tx.execute(
@@ -1611,6 +1646,28 @@ mod tests {
         conn
     }
 
+    /// An EXPLICIT subscribe (the common case in these unit tests): unguarded, and
+    /// clears any tombstone. Thin wrapper so the many call sites stay readable and
+    /// only the guard-specific tests spell out [`SubscribeKind::AutoInbox`].
+    fn subscribe_explicit(
+        conn: &mut Connection,
+        session: &SessionId,
+        topic: &Topic,
+        now_ms: i64,
+    ) -> Result<SubscribeOutcome, StorageError> {
+        do_subscribe_and_baseline(conn, session, topic, now_ms, SubscribeKind::Explicit)
+    }
+
+    /// The guarded AUTO-INBOX subscribe (the `harness arm` re-registration path).
+    fn subscribe_auto_inbox(
+        conn: &mut Connection,
+        session: &SessionId,
+        topic: &Topic,
+        now_ms: i64,
+    ) -> Result<SubscribeOutcome, StorageError> {
+        do_subscribe_and_baseline(conn, session, topic, now_ms, SubscribeKind::AutoInbox)
+    }
+
     #[test]
     fn reconstruct_state_rejects_unknown_state() {
         let err = reconstruct_state("weird", None, WatchId::new(1)).unwrap_err();
@@ -1734,7 +1791,7 @@ mod tests {
         assert!(do_sessions_subscribed(&conn, &topic).unwrap().is_empty());
 
         // Subscribing a different topic must not leak into this one.
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &SessionId::new("s"),
             &Topic::parse("t.other").unwrap(),
@@ -1748,8 +1805,8 @@ mod tests {
     fn sessions_subscribed_returns_all_subscribers() {
         let mut conn = migrated();
         let topic = Topic::parse("t.sub.y").unwrap();
-        do_subscribe_and_baseline(&mut conn, &SessionId::new("alice"), &topic, 1_000_000).unwrap();
-        do_subscribe_and_baseline(&mut conn, &SessionId::new("bob"), &topic, 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &SessionId::new("alice"), &topic, 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &SessionId::new("bob"), &topic, 1_000_000).unwrap();
 
         let mut got: Vec<String> = do_sessions_subscribed(&conn, &topic)
             .unwrap()
@@ -1769,14 +1826,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &session,
             &Topic::parse("t.b").unwrap(),
             1_000_000,
         )
         .unwrap();
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &session,
             &Topic::parse("t.a").unwrap(),
@@ -1784,7 +1841,7 @@ mod tests {
         )
         .unwrap();
         // Another session's subscription must not leak into this one's list.
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &SessionId::new("other"),
             &Topic::parse("t.z").unwrap(),
@@ -1831,14 +1888,14 @@ mod tests {
         do_add_interest(&conn, solo, &session, 0).unwrap();
         do_add_interest(&conn, shared, &session, 0).unwrap();
         do_add_interest(&conn, shared, &other, 0).unwrap();
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &session,
             &Topic::parse("t.x").unwrap(),
             1_000_000,
         )
         .unwrap();
-        do_subscribe_and_baseline(
+        subscribe_explicit(
             &mut conn,
             &session,
             &Topic::parse("t.y").unwrap(),
@@ -1890,15 +1947,16 @@ mod tests {
 
     #[test]
     fn subscribe_within_guard_after_end_is_refused() {
-        // The arm-vs-cleanup race: EndSession commits, then a racing arm Subscribe
-        // lands a beat later — inside the guard window. It must be REFUSED, not
-        // resurrect the dead session's inbox.
+        // The arm-vs-cleanup race: EndSession commits, then a racing arm auto-inbox
+        // re-registration lands a beat later — inside the guard window. It must be
+        // REFUSED, not resurrect the dead session's inbox. Only the AutoInbox path is
+        // guarded, so this is the path the doomed arm actually uses.
         let mut conn = migrated();
         let session = SessionId::new("s-race");
         let topic = inbox_topic(&session).unwrap();
-        do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000).unwrap();
+        subscribe_auto_inbox(&mut conn, &session, &topic, 1_000).unwrap();
         do_end_session(&mut conn, &session, 10_000).unwrap();
-        let outcome = do_subscribe_and_baseline(&mut conn, &session, &topic, 10_500).unwrap();
+        let outcome = subscribe_auto_inbox(&mut conn, &session, &topic, 10_500).unwrap();
         assert_eq!(outcome, SubscribeOutcome::RefusedSessionRecentlyEnded);
         // Nothing was resurrected: no subscription row, so `agents` lists nobody.
         assert!(
@@ -1913,15 +1971,16 @@ mod tests {
 
     #[test]
     fn subscribe_after_aged_tombstone_succeeds_and_clears_it() {
-        // A genuine resume of the same id, well after the end: the stale tombstone
-        // is aged out, the subscribe proceeds, and the tombstone is cleared so it
-        // cannot linger and refuse a future arm.
+        // A genuine resume of the same id, well after the end, arriving on the
+        // guarded AUTO-INBOX path: the stale tombstone is aged out, the subscribe
+        // proceeds, and the tombstone is cleared so it cannot linger and refuse a
+        // future arm.
         let mut conn = migrated();
         let session = SessionId::new("s-resume");
         let topic = inbox_topic(&session).unwrap();
         do_end_session(&mut conn, &session, 0).unwrap();
         let now = SUBSCRIBE_TOMBSTONE_GUARD_MS + 1;
-        let outcome = do_subscribe_and_baseline(&mut conn, &session, &topic, now).unwrap();
+        let outcome = subscribe_auto_inbox(&mut conn, &session, &topic, now).unwrap();
         assert!(matches!(outcome, SubscribeOutcome::Subscribed { .. }));
         assert_eq!(do_list_agent_inboxes(&conn).unwrap(), vec![session.clone()]);
         assert_eq!(
@@ -1932,15 +1991,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_subscribe_within_guard_proceeds_and_clears_the_tombstone() {
+        // The fix: an EXPLICIT subscribe by a genuinely-resumed session, arriving
+        // WITHIN the guard window, must NOT be refused — it comes from a live turn,
+        // so it cannot be the doomed post-teardown arm. It proceeds and clears the
+        // tombstone, restoring a healthy inbox. (The AutoInbox path in the sibling
+        // test is still refused in the same window.)
+        let mut conn = migrated();
+        let session = SessionId::new("s-explicit-resume");
+        let topic = inbox_topic(&session).unwrap();
+        subscribe_auto_inbox(&mut conn, &session, &topic, 1_000).unwrap();
+        do_end_session(&mut conn, &session, 10_000).unwrap();
+        assert_eq!(tombstone_row(&conn, "s-explicit-resume"), Some(10_000));
+
+        // Well inside the 10s window (500ms after the end):
+        let outcome = subscribe_explicit(&mut conn, &session, &topic, 10_500).unwrap();
+        assert!(
+            matches!(outcome, SubscribeOutcome::Subscribed { .. }),
+            "an explicit subscribe within the window proceeds, not refused: {outcome:?}"
+        );
+        assert_eq!(
+            do_list_agent_inboxes(&conn).unwrap(),
+            vec![session.clone()],
+            "the resumed session is addressable again"
+        );
+        assert_eq!(
+            tombstone_row(&conn, "s-explicit-resume"),
+            None,
+            "an explicit subscribe clears the tombstone (proof-of-life)"
+        );
+    }
+
+    #[test]
     fn both_arm_cleanup_orderings_leave_no_resurrected_inbox() {
-        // Order A: cleanup EndSession commits first, then the racing arm Subscribe.
+        // Order A: cleanup EndSession commits first, then the racing arm auto-inbox
+        // re-registration (the guarded path).
         {
             let mut conn = migrated();
             let s = SessionId::new("s-order-a");
             let t = inbox_topic(&s).unwrap();
-            do_subscribe_and_baseline(&mut conn, &s, &t, 1_000).unwrap();
+            subscribe_auto_inbox(&mut conn, &s, &t, 1_000).unwrap();
             do_end_session(&mut conn, &s, 2_000).unwrap();
-            let out = do_subscribe_and_baseline(&mut conn, &s, &t, 2_050).unwrap();
+            let out = subscribe_auto_inbox(&mut conn, &s, &t, 2_050).unwrap();
             assert_eq!(out, SubscribeOutcome::RefusedSessionRecentlyEnded);
             assert!(do_list_agent_inboxes(&conn).unwrap().is_empty());
         }
@@ -1949,7 +2041,7 @@ mod tests {
             let mut conn = migrated();
             let s = SessionId::new("s-order-b");
             let t = inbox_topic(&s).unwrap();
-            do_subscribe_and_baseline(&mut conn, &s, &t, 1_000).unwrap();
+            subscribe_auto_inbox(&mut conn, &s, &t, 1_000).unwrap();
             do_end_session(&mut conn, &s, 2_000).unwrap();
             assert!(
                 do_session_subscriptions(&conn, &s).unwrap().is_empty(),
@@ -1989,12 +2081,11 @@ mod tests {
         let mut conn = migrated();
         let a = SessionId::new("s-a");
         let b = SessionId::new("s-b");
-        do_subscribe_and_baseline(&mut conn, &a, &inbox_topic(&a).unwrap(), 1_000_000).unwrap();
-        do_subscribe_and_baseline(&mut conn, &b, &inbox_topic(&b).unwrap(), 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &a, &inbox_topic(&a).unwrap(), 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &b, &inbox_topic(&b).unwrap(), 1_000_000).unwrap();
         // The lurker subscribes to a's inbox, not its own.
         let lurker = SessionId::new("s-lurker");
-        do_subscribe_and_baseline(&mut conn, &lurker, &inbox_topic(&a).unwrap(), 1_000_000)
-            .unwrap();
+        subscribe_explicit(&mut conn, &lurker, &inbox_topic(&a).unwrap(), 1_000_000).unwrap();
 
         let ids: Vec<String> = do_list_agent_inboxes(&conn)
             .unwrap()
@@ -2035,7 +2126,7 @@ mod tests {
         insert_event(&conn, "t.test.x", 1);
 
         // First subscribe baselines to the head (offset 1): no replay of 0/1.
-        let first = do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000_000).unwrap();
+        let first = subscribe_explicit(&mut conn, &session, &topic, 1_000_000).unwrap();
         assert_eq!(
             first,
             SubscribeOutcome::Subscribed {
@@ -2052,7 +2143,7 @@ mod tests {
 
         // Re-subscribing while still subscribed is a no-op that must NOT advance
         // the cursor past the unread event 2.
-        let again = do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000_000).unwrap();
+        let again = subscribe_explicit(&mut conn, &session, &topic, 1_000_000).unwrap();
         assert_eq!(again, SubscribeOutcome::AlreadySubscribed);
         assert_eq!(
             do_get_cursor(&conn, &session, &topic).unwrap(),
@@ -2067,7 +2158,7 @@ mod tests {
         let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.empty.x").unwrap();
 
-        let outcome = do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000_000).unwrap();
+        let outcome = subscribe_explicit(&mut conn, &session, &topic, 1_000_000).unwrap();
         // No head to baseline to; the cursor stays absent so the first future
         // publish (offset 0) is still delivered.
         assert_eq!(outcome, SubscribeOutcome::Subscribed { baseline: None });
@@ -2081,7 +2172,7 @@ mod tests {
         let topic = Topic::parse("t.read.x").unwrap();
 
         // Subscribe to an empty topic: no cursor row yet.
-        do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &session, &topic, 1_000_000).unwrap();
         assert_eq!(do_get_cursor(&conn, &session, &topic).unwrap(), None);
 
         // Reading with nothing unread must NOT create/advance a cursor.
@@ -2109,7 +2200,7 @@ mod tests {
         let mut conn = migrated();
         let session = SessionId::new("s".to_string());
         let topic = Topic::parse("t.limit.x").unwrap();
-        do_subscribe_and_baseline(&mut conn, &session, &topic, 1_000_000).unwrap();
+        subscribe_explicit(&mut conn, &session, &topic, 1_000_000).unwrap();
         for i in 0..5 {
             insert_event(&conn, "t.limit.x", i);
         }

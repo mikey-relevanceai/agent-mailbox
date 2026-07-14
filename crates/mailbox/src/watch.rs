@@ -474,6 +474,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_by_a_resumed_session_within_guard_takes_the_explicit_path() {
+        // A watch is an EXPLICIT, live-turn action, so `record` → `bus.subscribe`
+        // must take the unguarded Explicit path: even when the same id's session
+        // ended a beat ago (a tombstone within the guard window), the subscribe
+        // PROCEEDS rather than being refused like the auto-inbox re-registration.
+        // This is the watch-driven half of the fix (the plain-subscribe half is
+        // covered by the storage + CLI e2e tests).
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let pr = pr(1);
+        let session = SessionId::new("s-resumed");
+
+        // The session ended just now: tombstone within SUBSCRIBE_TOMBSTONE_GUARD_MS.
+        storage
+            .end_session(session.clone(), now_millis())
+            .await
+            .unwrap();
+
+        let recorded = record(
+            &bus,
+            &storage,
+            &supervisor,
+            &pr,
+            Duration::from_secs(30),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(recorded.subscribe, SubscribeOutcome::Subscribed { .. }),
+            "an explicit watch by a resumed session proceeds, not refused: {:?}",
+            recorded.subscribe
+        );
+        // The subscription is real (delivery can flow), and the tombstone was cleared.
+        let subs = storage.session_subscriptions(session).await.unwrap();
+        assert!(
+            subs.contains(&pr.topic()),
+            "the resumed session is subscribed to the PR topic: {subs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn drop_interest_reports_remaining_and_no_such_watch() {
         let (bus, storage, supervisor, _dir) = fresh().await;
         let watched = pr(1);

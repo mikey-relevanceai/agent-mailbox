@@ -13,7 +13,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing::{error, info, warn};
 
-use mailbox::storage::{SessionId, StorageConfig};
+use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox::wake::{WaitOutcome, Waiter, WakeOutcome};
 use mailbox_harness::arm::{ArmDecision, SubscriptionProbe};
 use mailbox_harness::hook::HookInput;
@@ -430,6 +430,10 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
         Request::Subscribe {
             session: resolve_session_or_fail(format, &args.session)?,
             topic,
+            // An explicit `mailbox subscribe` from a live turn: unguarded, and it
+            // clears any tombstone (proof-of-life, ADR-0007). Only the automatic
+            // inbox re-registration below takes the guarded AutoInbox path.
+            kind: SubscribeKind::Explicit,
         },
     )
     .await
@@ -672,7 +676,7 @@ fn resolve_session_or_fail(
 fn request_context(request: &Request) -> String {
     match request {
         Request::Publish { topic, .. } => format!("publishing to {}", topic.as_str()),
-        Request::Subscribe { session, topic } => {
+        Request::Subscribe { session, topic, .. } => {
             format!("subscribing {} to {}", session.as_str(), topic.as_str())
         }
         Request::Unsubscribe { session, topic } => {
@@ -1089,6 +1093,11 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
     let request = Request::Subscribe {
         session: session.clone(),
         topic: topic.clone(),
+        // The automatic inbox re-registration — the ONLY guarded subscribe. This is
+        // the exact path that can race `SessionEnd`; the tombstone refuses it within
+        // the window so a doomed post-teardown arm cannot resurrect the inbox
+        // (ADR-0007). An explicit subscribe/watch instead takes the Explicit path.
+        kind: SubscribeKind::AutoInbox,
     };
     match client::send(&config.socket_path(), &request).await {
         // The guard refused this registration: the session ended within the

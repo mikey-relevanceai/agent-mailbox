@@ -44,8 +44,8 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeOutcome, TopicSummary, Watch, WatchId,
-    WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
+    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -311,20 +311,24 @@ impl Storage {
     /// [`SubscribeOutcome`] and the writer's `do_subscribe_and_baseline` for the
     /// baseline-on-subscribe rationale.
     ///
-    /// `now_ms` (Unix millis, caller-stamped) drives the tombstone guard: a
-    /// subscribe racing this session's own recent `end_session` is REFUSED
+    /// `now_ms` (Unix millis, caller-stamped) drives the tombstone guard, and
+    /// `kind` scopes it: an [`SubscribeKind::AutoInbox`] re-registration racing this
+    /// session's own recent `end_session` is REFUSED
     /// ([`SubscribeOutcome::RefusedSessionRecentlyEnded`]) rather than resurrect a
-    /// dead inbox (ADR-0007).
+    /// dead inbox (ADR-0007), whereas an [`SubscribeKind::Explicit`] subscribe from a
+    /// live turn proceeds and clears any tombstone (proof-of-life).
     pub async fn subscribe_and_baseline(
         &self,
         session: SessionId,
         topic: Topic,
         now_ms: i64,
+        kind: SubscribeKind,
     ) -> Result<SubscribeOutcome, StorageError> {
         self.call(|reply| Command::SubscribeAndBaseline {
             session,
             topic,
             now_ms,
+            kind,
             reply,
         })
         .await

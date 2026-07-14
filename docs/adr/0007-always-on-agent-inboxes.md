@@ -73,6 +73,37 @@ unverifiable SessionStart-on-resume matcher behaviour. In BOTH interleavings the
 subscription ends up deleted and tombstoned; the card-11 waiter still self-exits on
 its post-lock `has_subscription` re-check, so no orphan survives.
 
+**2b. The guard is scoped to the automatic inbox path only — explicit subscribes
+are exempt.** The tombstone must NOT refuse an explicit `mailbox subscribe` /
+`watch` issued by a genuinely-resumed session within the 10s window. Only ONE path
+can be the doomed racing command: the automatic `register_inbox` that `arm` fires
+asynchronously after a turn ends. An explicit `subscribe`/`watch`, by contrast, is
+issued *synchronously from a live turn*, which by construction completes before that
+turn's `SessionEnd` — so it can never be the post-teardown arm the guard defends
+against. It is therefore legitimate proof-of-life. The `Subscribe` writer command
+carries a `SubscribeKind` (`AutoInbox` vs `Explicit`), threaded from the request
+edge exactly like `now_ms` (never inferred inside the writer). `register_inbox` — the
+only caller that races teardown — is the sole `AutoInbox` (guarded) path; the
+explicit `mailbox subscribe` command and the `watch`/`stub` subscribe (via
+`bus.subscribe`) are `Explicit`: they proceed AND clear any tombstone, so a resumed
+session's inbox is restored rather than silently left with a running poller and
+interest row but no subscription (zero deliveries). Without this scoping the guard
+was over-broad: an explicit re-subscribe within 10s of a prior end returned an
+overall-success `Watched { subscribe: Refused }` (exit 0) yet delivered nothing. The
+resurrection guarantee (2a) is untouched — the racing arm's path is still fully
+guarded — because the exemption applies only to commands that cannot be that arm.
+
+**2c. Tombstone growth, honestly.** The `session_tombstone` table holds one row per
+DISTINCT session id ever ended over the daemon's lifetime (`PRIMARY KEY`, `INSERT OR
+REPLACE` dedupes re-ends of the same id). A row is cleared only when that id
+subscribes again — an aged `AutoInbox` re-registration past the guard window, or any
+`Explicit` subscribe/watch (which clears it as proof-of-life). Most ended sessions
+never resume, so their rows simply persist. Rows are tiny (a short id string + an
+`i64`) and the daemon is a local, single-user process, so the unbounded-in-principle
+growth is negligible in practice; there is deliberately **no dedicated sweeper in the
+MVP**. If a long-lived shared deployment ever makes this matter, add a periodic sweep
+of tombstones older than the guard window (they can never refuse anything once aged).
+
 **3. `send` to an unregistered agent is a hard error.** Because of
 baseline-on-subscribe, publishing to a session with no inbox subscription would
 durably store a message that can never be read, while telling the sender it

@@ -251,45 +251,134 @@ fn generic_publish_to_an_inbox_topic_is_rejected() {
 
 // ==== FIX 1: the resurrection race — a re-registration after end is refused ======
 
-/// After a session ends (cleanup → `EndSession` tombstones the id), a
-/// re-registration landing within the guard window is REFUSED, so the dead session
-/// is not resurrected in `agents` (ADR-0007). Driven through the CLI, deterministic
-/// because everything happens far inside the 10s guard.
+/// After a session ends (cleanup → `EndSession` tombstones the id), the AUTOMATIC
+/// inbox re-registration that `harness arm` fires — the ONLY path that can race the
+/// teardown — is REFUSED within the guard window, so the dead session is not
+/// resurrected in `agents` (ADR-0007). Driven through the real `harness arm`, which
+/// is what performs the guarded auto-registration; deterministic because everything
+/// happens far inside the 10s guard.
 #[test]
-fn a_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
+fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
     let b = "s-b";
-    env.run_ok(
-        &["subscribe", &format!("agent.{b}"), "--session", b],
-        "register",
-    );
+    // B registers + arms via the real hook (the auto-inbox path), then goes idle.
+    let arm = arm_idle(&env, b);
     assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
 
-    // SessionEnd drops the subscription and tombstones the id.
+    // SessionEnd reaps the waiter, drops the subscription, and tombstones the id.
+    drop(arm);
     let _ = env.cleanup(b);
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "an ended session is no longer an agent"
     );
 
-    // A racing re-registration within the guard window is refused: it exits 0 (a
-    // no-op, not an error) but creates no subscription.
-    let out = env.run_ok(
-        &["subscribe", &format!("agent.{b}"), "--session", b],
-        "re-register",
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
+    // A racing arm re-registration within the guard window is refused: the inbox
+    // subscribe is rejected, so arm finds no subscription and does NOT spawn a
+    // waiter — the process just exits without arming.
+    let mut rearm = env.spawn_arm(b, &[]);
+    let _status = poll_until("the racing re-arm exits without arming", SETTLE, || {
+        rearm.try_wait().ok().flatten()
+    });
     assert!(
-        text.contains("refused"),
-        "the re-register is refused: {text}"
+        !env.waiter_pidfile(b).exists(),
+        "no waiter is armed: the auto-registration was refused"
     );
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "the dead session must not be resurrected as an agent"
+    );
+
+    guard.assert_clean();
+}
+
+/// The fix, end to end: a session ends (tombstone written), then the SAME id
+/// genuinely resumes and issues an EXPLICIT `mailbox subscribe` WITHIN the guard
+/// window. Unlike the guarded auto-registration above, the explicit subscribe
+/// PROCEEDS (proof-of-life) — the subscription is created and a subsequently
+/// published event is delivered to that session's read cursor. Driven through the
+/// real CLI + daemon; deterministic because it stays far inside the 10s guard.
+#[test]
+fn an_explicit_subscribe_by_a_resumed_session_within_guard_delivers() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let b = "s-resumed";
+    let topic = "team.updates";
+    // B subscribes explicitly, then its session ends (tombstone written).
+    env.run_ok(&["subscribe", topic, "--session", b], "subscribe");
+    let _ = env.cleanup(b);
+
+    // Within the guard window the resumed session re-subscribes explicitly. It must
+    // NOT be refused (that is the whole bug): an explicit subscribe is a live-turn
+    // action, never the doomed post-teardown arm.
+    let out = env.run_ok(
+        &["subscribe", topic, "--session", b],
+        "explicit re-subscribe",
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("refused"),
+        "an explicit subscribe by a resumed session must proceed, not be refused: {text}"
+    );
+    assert!(
+        env.subscriptions(b).iter().any(|t| t == topic),
+        "the resumed session's subscription was created"
+    );
+
+    // A publish after the resume lands and is delivered to B's cursor — proving the
+    // subscription is real, not a silently-dropped no-op.
+    env.publish(topic);
+    let events = env.read_events(b);
+    assert_eq!(
+        events.len(),
+        1,
+        "the resumed session receives the post-resume event: {events:?}"
+    );
+    assert_eq!(events[0]["topic"], topic);
+
+    guard.assert_clean();
+}
+
+/// Publish-namespace injectivity at the publish layer: three near-miss topics that
+/// look inbox-ish but address NO registerable inbox are ordinary topics — a generic
+/// `publish` to each is ALLOWED (harmless) — while the exact `agent.<valid-session>`
+/// form stays REJECTED (writable only via `send`). This pins the load-bearing
+/// injectivity of the inbox mapping.
+#[test]
+fn publish_namespace_near_misses_are_allowed_but_a_real_inbox_is_rejected() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    // None of these is a registerable inbox, so each is an ordinary topic a generic
+    // publish may write to:
+    //  - `agent.agent.x`: the session segment would itself start with `agent.`, a
+    //    form `inbox_topic` refuses to mint (injectivity), so it is not an inbox.
+    //  - `agent.`:        an empty session segment is never a valid inbox.
+    //  - `Agent.x`:       the `agent.` namespace is case-sensitive; this is not it.
+    for topic in ["agent.agent.x", "agent.", "Agent.x"] {
+        env.run_ok(&["publish", topic], "publish near-miss");
+    }
+
+    // But the exact `agent.<valid-session>` form IS an inbox and stays rejected on
+    // the generic publish path (only `send` may write it).
+    let out = env.run(&["publish", "agent.s-real", "--body", r#"{"from":"x"}"#]);
+    assert!(
+        !out.status.success(),
+        "a real inbox topic must be rejected on generic publish"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mailbox send"),
+        "the rejection names the sanctioned path: {stderr}"
     );
 
     guard.assert_clean();

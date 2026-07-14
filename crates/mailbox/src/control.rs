@@ -42,7 +42,9 @@ use mailbox_protocol::{
     inbox_topic,
 };
 
-use mailbox::storage::{SessionId, SubscribeOutcome, TopicSummary, WatchKind, WatchState};
+use mailbox::storage::{
+    SessionId, SubscribeKind, SubscribeOutcome, TopicSummary, WatchKind, WatchState,
+};
 use mailbox::watch::{StatusView, UnwatchOutcome, WatchEntry};
 
 /// A one-shot request from a CLI client to the `serve` daemon.
@@ -59,8 +61,15 @@ pub enum Request {
         adapter: AdapterId,
         body: Value,
     },
-    /// Subscribe `session` to `topic` (baseline-on-subscribe).
-    Subscribe { session: SessionId, topic: Topic },
+    /// Subscribe `session` to `topic` (baseline-on-subscribe). `kind` distinguishes
+    /// an explicit user/agent subscribe from the automatic `harness arm` inbox
+    /// re-registration, which is the only path the tombstone guard scopes to
+    /// (ADR-0007); it is carried on the wire because both use this one variant.
+    Subscribe {
+        session: SessionId,
+        topic: Topic,
+        kind: SubscribeKind,
+    },
     /// Unsubscribe `session` from `topic`.
     Unsubscribe { session: SessionId, topic: Topic },
     /// Read `session`'s unread events across all its topics (advance-on-read).
@@ -488,6 +497,7 @@ mod tests {
         round_trip_request(Request::Subscribe {
             session: SessionId::new("s1"),
             topic: Topic::parse("t.a.b").unwrap(),
+            kind: SubscribeKind::Explicit,
         });
         round_trip_request(Request::Read {
             session: SessionId::new("s1"),

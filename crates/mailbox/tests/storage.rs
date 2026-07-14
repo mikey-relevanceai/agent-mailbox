@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use mailbox::storage::{
-    SessionId, Storage, StorageConfig, StorageError, WatchSpec, WatchState, WatchTarget,
+    SessionId, Storage, StorageConfig, StorageError, SubscribeKind, WatchSpec, WatchState,
+    WatchTarget,
 };
 use mailbox_protocol::{AdapterId, Cursor, GithubPr, Offset, Timestamp, Topic};
 use serde_json::json;
@@ -256,11 +257,21 @@ async fn two_subscribers_have_independent_cursors() {
 
     // Subscribe on the empty topic so both baseline to "from the start".
     storage
-        .subscribe_and_baseline(alice.clone(), topic.clone(), mailbox::clock::now_millis())
+        .subscribe_and_baseline(
+            alice.clone(),
+            topic.clone(),
+            mailbox::clock::now_millis(),
+            SubscribeKind::Explicit,
+        )
         .await
         .unwrap();
     storage
-        .subscribe_and_baseline(bob.clone(), topic.clone(), mailbox::clock::now_millis())
+        .subscribe_and_baseline(
+            bob.clone(),
+            topic.clone(),
+            mailbox::clock::now_millis(),
+            SubscribeKind::Explicit,
+        )
         .await
         .unwrap();
 
@@ -458,7 +469,12 @@ async fn subscribe_unsubscribe_semantics() {
     let count = || count_rows(&path, "SELECT COUNT(*) FROM subscription");
 
     let first = storage
-        .subscribe_and_baseline(session.clone(), topic.clone(), mailbox::clock::now_millis())
+        .subscribe_and_baseline(
+            session.clone(),
+            topic.clone(),
+            mailbox::clock::now_millis(),
+            SubscribeKind::Explicit,
+        )
         .await
         .unwrap();
     // Empty topic, so a fresh subscription with no baseline.
@@ -467,7 +483,12 @@ async fn subscribe_unsubscribe_semantics() {
 
     // Double-subscribe: no error, no duplicate, reported as an idempotent no-op.
     let again = storage
-        .subscribe_and_baseline(session.clone(), topic.clone(), mailbox::clock::now_millis())
+        .subscribe_and_baseline(
+            session.clone(),
+            topic.clone(),
+            mailbox::clock::now_millis(),
+            SubscribeKind::Explicit,
+        )
         .await
         .unwrap();
     assert_eq!(again, SubscribeOutcome::AlreadySubscribed);

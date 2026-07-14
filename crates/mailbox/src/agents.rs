@@ -214,10 +214,11 @@ mod tests {
         (bus, storage, dir)
     }
 
-    /// Register `session`'s inbox exactly as `harness arm` does.
+    /// Register `session`'s inbox exactly as `harness arm` does — via the guarded
+    /// auto-inbox path (the only path the tombstone scopes to).
     async fn register(bus: &Bus, session: &SessionId) {
         let topic = inbox_topic(session).unwrap();
-        bus.subscribe(session.clone(), std::slice::from_ref(&topic))
+        bus.subscribe_auto_inbox(session.clone(), std::slice::from_ref(&topic))
             .await
             .unwrap();
     }
@@ -315,15 +316,16 @@ mod tests {
     #[tokio::test]
     async fn a_subscribe_racing_a_recent_end_does_not_resurrect_the_inbox() {
         // The arm-vs-cleanup race at the bus level: end the session, then a racing
-        // re-registration (an arm's Subscribe) within the guard window is refused,
-        // so the dead session never reappears in `agents` (FIX 1).
+        // auto-inbox re-registration (an arm's Subscribe) within the guard window is
+        // refused, so the dead session never reappears in `agents` (FIX 1). Only the
+        // AutoInbox path is guarded — the path the doomed arm actually uses.
         let (bus, storage, dir) = fresh().await;
         let b = SessionId::new("s-b");
         register(&bus, &b).await;
         storage.end_session(b.clone(), now_millis()).await.unwrap();
 
         let summary = bus
-            .subscribe(b.clone(), std::slice::from_ref(&inbox_topic(&b).unwrap()))
+            .subscribe_auto_inbox(b.clone(), std::slice::from_ref(&inbox_topic(&b).unwrap()))
             .await
             .unwrap();
         assert_eq!(

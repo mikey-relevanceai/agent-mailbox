@@ -68,7 +68,7 @@ use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
-use mailbox::storage::{SessionId, Storage, StorageConfig};
+use mailbox::storage::{SessionId, Storage, StorageConfig, SubscribeKind};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
@@ -528,7 +528,11 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             adapter,
             body,
         } => publish(bus, topic, adapter, body).await,
-        Request::Subscribe { session, topic } => subscribe(bus, session, topic).await,
+        Request::Subscribe {
+            session,
+            topic,
+            kind,
+        } => subscribe(bus, session, topic, kind).await,
         Request::Unsubscribe { session, topic } => unsubscribe(bus, session, topic).await,
         Request::Read { session, limit } => read(bus, session, limit).await,
         Request::Watch {
@@ -637,8 +641,18 @@ async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::
     }
 }
 
-async fn subscribe(bus: &Bus, session: SessionId, topic: Topic) -> Response {
-    match bus.subscribe(session, std::slice::from_ref(&topic)).await {
+async fn subscribe(bus: &Bus, session: SessionId, topic: Topic, kind: SubscribeKind) -> Response {
+    // The auto-inbox re-registration is the ONLY guarded path (the tombstone
+    // refuses a resurrection); an explicit subscribe proceeds and clears any
+    // tombstone. Routing on `kind` keeps that distinction at the one wire edge.
+    let result = match kind {
+        SubscribeKind::Explicit => bus.subscribe(session, std::slice::from_ref(&topic)).await,
+        SubscribeKind::AutoInbox => {
+            bus.subscribe_auto_inbox(session, std::slice::from_ref(&topic))
+                .await
+        }
+    };
+    match result {
         Ok(mut summary) => match summary.pop() {
             Some((_, outcome)) => Response::Subscribed {
                 topic,
