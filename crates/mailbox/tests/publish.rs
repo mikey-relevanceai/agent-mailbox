@@ -4,14 +4,20 @@
 //! `publish` used to be session-less: it fanned a wake kick out to every subscriber,
 //! including the publisher itself, so an agent subscribed to a topic it published to
 //! **woke itself on its own message**. Threading the caller's session through makes
-//! three rules expressible, and this file is where they are held:
+//! these rules expressible, and this file is where they are held:
 //!
-//! 1. **Be caught up to speak.** A publish is REFUSED (non-zero, nothing written) if
-//!    the caller is subscribed to the topic and has unread events on it.
+//! 1. **Be caught up to speak.** A publish is REFUSED (its own exit code, nothing
+//!    written) if the caller is subscribed to the topic and has unread events on it
+//!    **that someone else wrote**.
 //! 2. **No self-wake.** The publisher is never kicked for its own event; a PEER
 //!    subscriber is.
-//! 3. **Its own event does not block its next publish** — the publisher's cursor
-//!    advances past what it wrote, or rule 1 would deadlock it on its own message.
+//! 3. **Its own event does not block its next publish** — the rule counts only what it
+//!    did not author — **but it is never hidden from it either**: it stays unread, and
+//!    `read` returns it. The publish used to advance the publisher's own cursor
+//!    instead, and that was silent mail loss, because the "publisher" is inferred from
+//!    `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into every process an agent
+//!    spawns. `--no-session` is the explicit way for such a process to publish as
+//!    nobody (no author → no rules, and it wakes EVERY subscriber).
 //!
 //! And the two contracts that must be untouched: an **adapter** publish (no session
 //! anywhere) still kicks everyone and is exempt from rule 1, and **`send`** — which
@@ -80,17 +86,20 @@ fn a_publisher_is_not_woken_by_its_own_event_but_a_peer_subscriber_is() {
         "the peer's wake must name the topic it has mail on"
     );
 
-    // The PUBLISHER does not. It is mid-turn, it knows what it just said, and (by the
-    // cursor advance below) it has nothing unread to read.
+    // The PUBLISHER does not. It is mid-turn and knows what it just said.
     assert!(
         wait_within(&mut publisher_waiter, NO_WAKE_GRACE).is_none(),
         "the publisher must NOT be woken by its own event (no self-wake)"
     );
 
+    // But its own event is NOT hidden from it. It used to be — the publish advanced the
+    // publisher's own cursor — and that was silent mail loss, because the "publisher" is
+    // inferred from an ambient env var that Claude Code exports into every process an
+    // agent spawns. Nothing may mark an event read except a `read`.
     assert_eq!(
         env.unread_on(publisher, topic),
-        0,
-        "a publisher's own event must not count as unread against it"
+        1,
+        "a publisher's own event stays VISIBLE to it (it just never wakes or blocks it)"
     );
     assert_eq!(
         env.unread_on(peer, topic),
@@ -129,14 +138,17 @@ fn publish_is_refused_when_the_caller_has_unread_on_that_topic() {
         agent,
         &["publish", topic, "--body", r#"{"text":"my turn"}"#],
     );
-    assert!(
-        !out.status.success(),
-        "publishing with unread on the topic must FAIL (be caught up to speak)"
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "publishing with unread on the topic must be REFUSED, with the refusal's own exit code \
+         (be caught up to speak)"
     );
-    let err = String::from_utf8_lossy(&out.stderr);
+    // The refusal is this command's RESULT, not an error, so it is rendered on stdout.
+    let rendered = String::from_utf8_lossy(&out.stdout);
     assert!(
-        err.contains('1') && err.contains(topic) && err.contains("mailbox read"),
-        "the refusal must name the count, the topic, and the command that fixes it; got: {err}"
+        rendered.contains('1') && rendered.contains(topic) && rendered.contains("mailbox read"),
+        "the refusal must name the count, the topic, and the command that fixes it; got: {rendered}"
     );
 
     // Nothing was written: the log is exactly as it was.
@@ -159,12 +171,17 @@ fn publish_is_refused_when_the_caller_has_unread_on_that_topic() {
     daemon.stop();
 }
 
-/// The refusal must not deadlock the publisher on its OWN message: publishing
-/// advances the publisher's cursor past what it wrote, so a second publish (and a
-/// third) still goes through. Without that, rule 1 would make an agent's first
+/// The refusal must not deadlock the publisher on its OWN message: a second publish
+/// (and a third) still goes through. Without that, rule 1 would make an agent's first
 /// publish its last.
+///
+/// The mechanism CHANGED (adv-2): the publish no longer advances the publisher's cursor
+/// past its own event — that silently marked mail read, and the "publisher" is inferred
+/// from an ambient env var, so it could be the wrong session entirely. Instead the rule
+/// counts only events the caller did NOT author. Same property, nothing hidden: the
+/// agent's own words remain fully visible to it.
 #[test]
-fn a_publishers_own_event_never_blocks_its_next_publish() {
+fn a_publishers_own_event_never_blocks_its_next_publish_but_stays_visible() {
     let env = Env::new();
     let daemon = env.start_daemon();
 
@@ -178,20 +195,67 @@ fn a_publishers_own_event_never_blocks_its_next_publish() {
             &["publish", topic, "--body", r#"{"n":1}"#],
             &format!("publish {i}"),
         );
-        assert_eq!(
-            env.unread_on(agent, topic),
-            0,
-            "publish {i}: an agent's own event must never sit unread against it"
-        );
     }
     assert_eq!(env.event_count(topic), 3, "all three publishes landed");
 
-    // And it really has nothing to read — the cursor advanced, it did not just hide.
-    let events = env.read_events(agent);
-    assert!(
-        events.is_empty(),
-        "a publisher must not be handed back its own messages to read: {events:?}"
+    // Its own events do not GAG it (the rule ignores what you wrote)...
+    assert_eq!(
+        env.unread_on(agent, topic),
+        3,
+        "...but they are not HIDDEN from it either: they count as unread, and `read` \
+         returns them. Only a `read` may mark an event read."
     );
+    let events = env.read_events(agent);
+    assert_eq!(
+        events.len(),
+        3,
+        "the agent's own messages are readable back to it: {events:?}"
+    );
+
+    daemon.stop();
+}
+
+/// **The anti-silent-loss test (adv-2).**
+///
+/// Claude Code exports `$CLAUDE_CODE_SESSION_ID` into EVERY process an agent spawns — a
+/// build script, a git hook, a subagent. So such a process's `mailbox publish` is
+/// attributed to the AGENT. That used to silently advance the agent's cursor past the
+/// event AND exclude it from the kick: the agent never saw the message and was never
+/// woken. Reproduced, and it is real message loss.
+///
+/// Now the event is stamped with its (mis-attributed) author but nothing is marked read:
+/// it is STILL in the agent's `read` and STILL counted as unread. The residual, stated
+/// honestly, is that it will not WAKE the session it was attributed to — which is what
+/// `--no-session` exists to fix (see the test below).
+#[test]
+fn a_publish_carrying_an_ambient_session_id_is_still_visible_to_that_session() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+
+    let topic = "team.build";
+    let agent = "s-ambient";
+    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+
+    // A build script the agent spawned. It passes no --session and does not mean to
+    // publish "as" the agent — it simply inherited the env var.
+    env.run_as_ok(
+        agent,
+        &["publish", topic, "--body", r#"{"build":"failed"}"#],
+        "a spawned script publishes with the agent's ambient session id",
+    );
+
+    assert_eq!(
+        env.unread_on(agent, topic),
+        1,
+        "the message must NOT vanish: it is unread for the session it was mis-attributed to"
+    );
+    let events = env.read_events(agent);
+    assert_eq!(
+        events.len(),
+        1,
+        "and `read` must return it — a mis-attributed publish is not silently consumed: {events:?}"
+    );
+    assert_eq!(events[0]["body"]["build"], "failed");
 
     daemon.stop();
 }
@@ -263,6 +327,117 @@ fn an_adapter_publish_has_no_session_kicks_everyone_and_ignores_the_unread_rule(
     env.cleanup(agent);
     daemon.stop();
     guard.assert_clean();
+}
+
+// ==== `--no-session`: the escape hatch from the ambient-session trap ============
+
+/// `--no-session` publishes ANONYMOUSLY: the event has no author, so it obeys no
+/// caller-aware rule and kicks EVERY subscriber — including the agent whose
+/// `$CLAUDE_CODE_SESSION_ID` this process inherited. That is what any script, hook or
+/// subagent an agent spawns should use, and it is the complete answer to the
+/// mis-attribution trap (the residual left by the test above).
+#[test]
+fn a_no_session_publish_wakes_every_subscriber_including_the_ambient_agent() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+
+    let topic = "team.ci";
+    let agent = "s-ci";
+    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    let mut waiter = arm(&env, agent);
+
+    // The spawned script publishes with the agent's session id in its environment —
+    // but says, explicitly, "this is not from the agent".
+    env.run_as_ok(
+        agent,
+        &[
+            "publish",
+            topic,
+            "--no-session",
+            "--body",
+            r#"{"ci":"red"}"#,
+        ],
+        "an anonymous publish from a process that inherited the agent's session id",
+    );
+
+    let status = wait_within(&mut waiter, WAKE)
+        .expect("an anonymous publish must wake the subscriber, ambient session id or not");
+    assert_eq!(status.code(), Some(2));
+    assert!(
+        drain_stderr(&mut waiter).contains(&format!("mail on topic {topic}")),
+        "the wake must name the topic"
+    );
+    assert_eq!(env.unread_on(agent, topic), 1);
+
+    drop(waiter);
+    env.cleanup(agent);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// `--no-session` is also exempt from the unread rule (it is nobody's message, so
+/// "be caught up to speak" cannot apply to it) — an adapter-shaped publish in every
+/// respect, from inside a session's environment.
+#[test]
+fn a_no_session_publish_is_exempt_from_the_unread_rule() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+
+    let topic = "team.exempt";
+    let agent = "s-exempt";
+    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    env.publish(topic); // the agent is now behind: a session publish would be REFUSED.
+    assert_eq!(env.unread_on(agent, topic), 1);
+
+    env.run_as_ok(
+        agent,
+        &["publish", topic, "--no-session"],
+        "an anonymous publish is never refused",
+    );
+    assert_eq!(env.event_count(topic), 2);
+
+    daemon.stop();
+}
+
+// ==== the refusal has its own exit code =========================================
+
+/// A refusal is not a failure: nothing was written, nothing is broken, and the remedy
+/// is defined ("read, then retry"). It used to exit 1 — the same code as "the bridge is
+/// down" — so a scripted publisher could not tell them apart without parsing stderr.
+/// It now has its own code (3, never 2: 2 is the WAKE code).
+#[test]
+fn a_refused_publish_exits_with_its_own_code_distinct_from_a_hard_failure() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+
+    let topic = "team.codes";
+    let agent = "s-codes";
+    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    env.publish(topic); // the agent is behind.
+
+    let refused = env.run_as(agent, &["publish", topic]);
+    assert_eq!(
+        refused.status.code(),
+        Some(3),
+        "a refusal has its own exit code, so a script can retry after reading; stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("mailbox read"),
+        "the refusal must name the command that fixes it"
+    );
+
+    // A REAL failure is still exit 1, and is distinguishable: the bridge is down.
+    daemon.stop();
+    let broken = env.run_as(agent, &["publish", topic]);
+    assert_eq!(
+        broken.status.code(),
+        Some(1),
+        "a genuine failure (bridge down) stays exit 1 — the whole point of giving the \
+         refusal its own code"
+    );
 }
 
 // ==== `send` is unaffected ======================================================

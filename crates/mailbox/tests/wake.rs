@@ -16,11 +16,15 @@
 //! Children/threads are always reaped: every spawned child is `wait`ed or killed
 //! on timeout, and every waiter thread is woken and joined.
 
+mod common;
+
+use common::mailbox_command;
+
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -101,7 +105,11 @@ fn adapter() -> AdapterId {
 /// `debug`, sets `MAILBOX_WAIT_DEBUG=1` so the child appends its wake reason to
 /// stderr (test-only; not the harness-facing reminder).
 fn spawn_waiter(h: &Harness, session: &str, debug: bool) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mailbox"));
+    // Through the SHARED spawner (tests/common), which strips the ambient
+    // CLAUDE_CODE_SESSION_ID / MAILBOX_SESSION_ID. Benign here today — every call site
+    // passes `--session` — but a waiter that could silently inherit the developer's own
+    // session id is a trap, and `cargo test` runs inside exactly such a session.
+    let mut cmd = mailbox_command();
     cmd.args(["wait", "--session", session])
         .env("AGENT_MAILBOX_DB", h.config.path())
         .stdin(Stdio::null())

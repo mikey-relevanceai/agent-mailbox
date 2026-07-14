@@ -58,7 +58,10 @@ fn main() -> ExitCode {
                 }
             };
             match runtime.block_on(cli::run(cli::output_format(cli.json), command)) {
-                Ok(()) => ExitCode::SUCCESS,
+                // The command owns its exit code: almost always SUCCESS, but a REFUSED
+                // publish ("you have unread mail; read first") has its own, so a
+                // scripted publisher can tell "retry after reading" from a real error.
+                Ok(code) => code,
                 Err(err) => {
                     // `{err:#}` includes the anyhow context chain. Goes to stderr,
                     // so `--json` stdout is unaffected.

@@ -51,7 +51,7 @@ client):
 
 | Hook | Command | What it does |
 |---|---|---|
-| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` 1h by default) | Reads `session_id` from the hook stdin JSON, **registers the session's agent inbox** (`agent.<session-id>`, always-on — ADR-0007), asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
+| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` 1h by default) | Reads `session_id` from the hook stdin JSON, **registers the session's agent inbox** (`agent.<session-id>`, always-on — ADR-0007), asks the bridge whether the session has any subscriptions, and `exec`s `mailbox wait` — unless the bridge answers cleanly that it subscribes to **nothing** (→ exit 0, no wake: nothing to be woken about). A bridge that is **down or erroring** is retried briefly and then **armed anyway** (fail-open): the waiter needs no daemon and re-checks subscriptions itself under its lock, so it self-exits if there are none — whereas skipping would leave an idle session with no waiter and no further `Stop` to retry it (ADR-0006). |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the waiter (`SIGTERM` the pidfile PID, remove the pidfile) and calls the bridge to drop this session's subscriptions **and** interests, stopping any adapter whose last interest it held (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` — `--settings <path>`, else `~/.claude/settings.json` when it exists — *atomically*, preserving unrelated settings; prints only (with the reason) when there is no such file. |
 
@@ -144,7 +144,11 @@ The cost is one benign wake per `max_block` of continuous idle (55 min by defaul
 An agent that sees it should do **nothing** — ending the turn is what re-arms it.
 **A larger `--timeout-secs` (with a matching `--max-block-ms`) means fewer such
 wakes**; `install-hooks` refuses a `max_block` that is not safely below `timeout`,
-because that pairing silently reintroduces the bug. The whole loop is exercised
+because that pairing silently reintroduces the bug — and `arm` enforces the same rule
+at run time, clamping (loudly) a `--max-block-ms` that is not safely below the
+`--timeout-secs` it was launched with (assuming Claude Code's own 600s default when the
+hook carries no `timeout`). The invariant is checked where it is *used*, not only where
+it is written. The whole loop is exercised
 without a live Claude Code (`crates/mailbox/tests/harness.rs`, which churns the
 re-arm boundary and asserts the session is never left unarmed).
 
@@ -154,18 +158,19 @@ re-arm boundary and asserts the session is never left unarmed).
 settings file — `--settings <file>` if given (created if missing), else
 `~/.claude/settings.json` when it exists — idempotently, preserving unrelated
 settings; with no such file it only emits the snippet (JSON) and says why. The
-`arm` command carries `--max-block-ms` so the re-arm bound travels with the hook,
-and the install **fails loudly** if `--max-block-ms` is not safely below
-`--timeout-secs`.
+`arm` command carries `--max-block-ms` **and `--timeout-secs`**, so both the re-arm
+bound and the deadline it must stay under travel with the hook; the install **fails
+loudly** if `--max-block-ms` is not safely below `--timeout-secs`, and `arm` clamps it
+loudly at run time if the hook it was launched from says otherwise.
 
 ```json
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
-      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000",
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
       "asyncRewake": true, "timeout": 3600 }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000",
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
       "asyncRewake": true, "timeout": 3600 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness cleanup" }] }]

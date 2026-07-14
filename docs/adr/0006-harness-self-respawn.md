@@ -77,12 +77,22 @@ correct response is to do nothing at all. The wake stays payload-free.
 The cost is one benign wake per `max_block` of idle. That is why the default
 `timeout` is raised: **a larger timeout means fewer re-arm wakes.**
 
-**2. Timing defaults, and install-time validation.** `install-hooks` writes
-`timeout = 3600` (1h, verified honoured) and `max_block = 3_300_000` ms (55 min),
+**2. Timing defaults, validated at install AND at the point of use.** `install-hooks`
+writes `timeout = 3600` (1h, verified honoured) and `max_block = 3_300_000` ms (55 min),
 and both remain knobs (`--timeout-secs`, `--max-block-ms`). It **refuses** a spec
 whose `max_block` is not below `timeout` by a margin (10% of the timeout, clamped to
 10s..=5min): a `max_block >= timeout` silently reintroduces the exact bug above, so
 it is a hard install-time failure, never a warning.
+
+Install-time validation alone was **not enough** (adv-3): it guards where the value is
+*written*, and a `settings.json` can be hand-edited — or carry an arm hook with no
+`timeout` field at all, in which case Claude Code applies its **own 600s default**,
+under which our 55-minute `max_block` is lethal. So `install-hooks` now writes
+`--timeout-secs` into the arm command, and **`arm` enforces the same invariant itself**:
+it clamps a `max_block` that is not safely below the deadline it actually runs under
+(assuming 600s when the flag is absent) and logs the clamp at `error`. It clamps rather
+than refuses because refusing to arm *is* the deafness the invariant protects against;
+a waiter that yields early is merely noisy.
 
 **3. The waiter owns the pidfile, written after the lock.** `arm` does not write it.
 The waiter writes it (own pid) only *after* acquiring the single-waiter advisory
@@ -94,16 +104,38 @@ dead pid is what made the failure invisible. On `Woken` it leaves the pidfile (a
 racing `cleanup` must still find something to reap). `cleanup` reaps that pid with
 `SIGTERM` and removes the pidfile.
 
-**4. `arm` reaps a stale pidfile.** Before arming, `arm` removes a pidfile whose pid
-is dead — the residue of a waiter that was killed or crashed. A **live** pid is left
-untouched: that is the winner of a SessionStart-vs-Stop arm race, and this arm's
-waiter will correctly lose the lock and exit.
+**4. `arm` reaps a stale pidfile — by compare-and-delete.** Before arming, `arm`
+removes a pidfile whose pid is dead — the residue of a waiter that was killed or
+crashed. A **live** pid is left untouched: that is the winner of a
+SessionStart-vs-Stop arm race, and this arm's waiter will correctly lose the lock and
+exit. The delete is guarded by a **re-read**: it unlinks only if the file still names
+the same dead pid it probed. Deleting by path was a TOCTOU (adv-4) — a concurrent arm's
+waiter can take the lock and write its own *live* pid into that file between the probe
+and the unlink, and destroying a live waiter's pidfile leaves `cleanup` nothing to reap
+on `SessionEnd` (an orphan) and `agents`/`status` under-reporting it. POSIX has no
+atomic compare-and-unlink, so a microsecond window remains; taking the waiter lock here
+would be worse (a concurrent waiter would see it held and exit as a lock-loser, which
+is the un-armed session we are avoiding).
 
-**5. Arm-iff-subscribed, enforced twice.** `arm` probes the bridge and only arms a
-subscribed session (a down/erroring bridge or no subscription → exit 0, no wake).
-The waiter *also* re-checks `has_subscription` after taking the lock and self-exits
-(`Unsubscribed`, exit 0, pidfile removed) if there is none — catching an `arm` whose
-probe passed but whose `SessionEnd` then landed (fixes HIGH#2).
+**5. Arm-iff-subscribed, enforced by the WAITER — and `arm` FAILS OPEN.** `arm` probes
+the bridge, but the probe is only an optimisation: it skips arming **only** on a clean
+"this session subscribes to nothing" (exit 0, no wake — there is nothing to be woken
+about). A probe that FAILS (bridge down, bridge error) **arms anyway**, after a bounded
+retry with a short backoff.
+
+Skipping on a failed probe was a permanent-deafness bug (adv-1): the re-arm loop now
+depends on `arm` running at *every* re-arm `Stop`, and an idle session fires no further
+`Stop` — so one momentary bridge blip left the session with no waiter and nothing to
+retry it, forever. Arming on an unknown subscription state is safe because **the waiter
+validates itself**: it needs no socket (it opens the store read-only), and it re-checks
+`has_subscription` *after* taking the single-waiter lock, self-exiting (`Unsubscribed`,
+exit 0, pidfile removed) if there is none — which also fixes HIGH#2 (an `arm` whose
+probe passed but whose `SessionEnd` then landed). A waiter with no store at all exits 0
+the same way.
+
+Exiting **2** on a probe failure was considered and rejected: it would hot-loop wakes
+for as long as the bridge is down. Arming and blocking is correct — when the daemon
+returns and publishes, the kick reaches the already-blocked waiter's FIFO.
 
 **6. exec-failure and bridge-down degrade safely.** A failed arm-exec exits **2** (a
 wake → the harness re-runs `Stop` and re-arms) rather than 1 (a silent un-arm), after
@@ -119,14 +151,32 @@ the `serve` daemon's stderr. The benign `AlreadyWaiting` lock-race loser — the
 *expected* outcome of the single-waiter invariant — is logged at `info`, not `error`;
 logging it as a failure sent a bug reporter down a dead end.
 
+**8. The publish rules (and what they may NOT do).** A session-aware `publish` is
+REFUSED if the caller has unread events on that topic **that it did not author**, and
+the publisher is never kicked for its own event. It may **not** advance anyone's cursor:
+an earlier version marked the publisher's own event read, and since the publisher is
+*inferred* from `$CLAUDE_CODE_SESSION_ID` — which Claude Code exports into every process
+an agent spawns — a build script / git hook / subagent publishing under that id had its
+event silently consumed on the agent's behalf and excluded from the kick: **silent mail
+loss** (adv-2). The author is now stamped on the event (`event.author_session`, schema
+v5, `NULL` for adapters) and nothing is ever marked read except by a `read`. The residual
+is stated honestly: a mis-attributed publish stays visible and unread, but it will not
+*wake* the session it was attributed to — `mailbox publish --no-session` is the explicit
+fix, and is what any process an agent spawns should use.
+
 ## Consequences
 
-- Easier: an idle session can no longer be silently un-armed; a killed waiter leaves
-  no phantom pidfile behind it; the wake loop is diagnosable from `harness.log` alone.
+- Easier: an idle session can no longer be silently un-armed — not by the hook timeout,
+  and not by a bridge blip at a re-arm `Stop`; a killed waiter leaves no phantom pidfile
+  behind it; the wake loop is diagnosable from `harness.log` alone.
+- New: a bridge that is down no longer suppresses arming, so a session keeps a live,
+  blocked waiter across a daemon restart and is woken by the first publish after it.
 - Cost: a benign re-arm wake every `max_block` (55 min by default) on a long idle.
   It costs the agent one turn boundary and nothing else — the notice tells it to do
   nothing. Raising `--timeout-secs` (with `--max-block-ms`) reduces the frequency.
-- Constrained: `max_block < timeout` is load-bearing and enforced at install time.
+- Constrained: `max_block < timeout` is load-bearing and enforced BOTH at install time
+  (a refusal) and at the point of use in `arm` (a loud clamp), because a settings file
+  can be written by hand.
 - Bounded by the harness: the maximum unbroken idle is one hook `timeout`. We ship
   the verified-safe 1h; a longer probe for a cap between 1h and 8h was still running
   when this landed, so **3600s is the maximum we rely on** until it reports.

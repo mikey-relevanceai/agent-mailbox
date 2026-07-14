@@ -209,6 +209,15 @@ pub enum Response {
         interests_dropped: u64,
         adapters_stopped: u64,
     },
+    /// A publish was REFUSED because the caller is not caught up on the topic: it has
+    /// `unread` event(s) there that someone else wrote. **Nothing was written.**
+    ///
+    /// This is its own response (and its own CLI exit code) rather than a generic
+    /// [`Response::Error`] because it is not a failure: it is a "retry after reading"
+    /// instruction with a defined remedy, and a scripted publisher must be able to
+    /// tell it apart from "the bridge is down" — which it could not when both exited
+    /// 1 with a string.
+    PublishRefused { topic: Topic, unread: u64 },
     /// The command was well-formed but could not be serviced (bad topic, storage
     /// error, …). Human-readable detail only; not machine-dispatched on.
     Error { message: String },

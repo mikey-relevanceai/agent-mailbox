@@ -36,24 +36,13 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-fn mailbox_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_mailbox")
-}
+mod common;
 
-/// A `mailbox` command with the AMBIENT session environment stripped.
-///
-/// `cargo test` inherits the developer's environment, and inside a Claude Code
-/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
-/// resolves as the caller's session (that is the point of auto-resolution, and
-/// `publish` now uses it). A test that did not strip it would run its commands as
-/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
-/// test subprocess starts with NO session unless the test names one itself.
-fn mailbox_command() -> Command {
-    let mut cmd = Command::new(mailbox_bin());
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("MAILBOX_SESSION_ID");
-    cmd
-}
+// The ONE session-stripping spawner, shared by every test binary (tests/common).
+// Every `mailbox` subprocess in this file goes through it, so no test can silently
+// inherit the DEVELOPER's `CLAUDE_CODE_SESSION_ID` and behave differently on a laptop
+// than in CI.
+use common::{mailbox_bin, mailbox_command};
 
 /// The reference stub adapter binary, built if missing (only the interest test
 /// needs it). Mirrors `tests/stub_e2e.rs`.
@@ -120,6 +109,32 @@ impl Daemon {
         };
         wait_for_socket(&socket_path, Duration::from_secs(10));
         daemon
+    }
+
+    /// Stop the bridge process (graceful SIGTERM, then reap) WITHOUT dropping the
+    /// tempdir — the store survives, so a test can arm against a store whose daemon is
+    /// down (the bridge-blip case) and then bring the bridge back with
+    /// [`Daemon::start_bridge`].
+    fn stop_bridge(&mut self) {
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+        let _ = self.child.wait();
+        // The socket file outlives the process; remove it so a client fails fast with
+        // "bridge down" rather than blocking on a connect to a dead listener.
+        let _ = std::fs::remove_file(socket_for(&self.db_path));
+    }
+
+    /// Bring the bridge back up on the SAME store.
+    fn start_bridge(&mut self) {
+        self.child = mailbox_command()
+            .arg("serve")
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("respawn mailbox serve");
+        wait_for_socket(&socket_for(&self.db_path), Duration::from_secs(10));
     }
 
     fn waiters_dir(&self) -> PathBuf {
@@ -491,11 +506,20 @@ fn agent_sessions(daemon: &Daemon) -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ==== bridge-down fail-safe: arm does NOT wake when the bridge is unreachable ====
+// ==== bridge-down: arm FAILS OPEN (it arms anyway) but never wakes =============
 
+/// With no bridge AND no store at all, there is genuinely nothing to wait on: `arm`
+/// still launches the waiter (fail-open — it cannot know whether the session is
+/// subscribed), and the waiter finds no store and exits 0. No wake, no leaked process.
+///
+/// **Contract change** (was: "a down bridge means arm skips"): skipping was the bug —
+/// see `arm_with_the_bridge_down_still_arms_a_waiter_that_wakes_when_it_returns`. What
+/// is preserved, and is what this test guards, is that a down bridge never produces a
+/// WAKE (exit 2) — that would hot-loop the session for as long as the bridge is down.
 #[test]
-fn arm_with_bridge_down_exits_zero_without_waking() {
-    // A tempdir with NO daemon: the socket is absent, so the probe fails.
+fn arm_with_bridge_down_and_no_store_exits_zero_without_waking() {
+    // A tempdir with NO daemon and NO db file: the socket is absent, so the probe
+    // fails, and the waiter we fail-open into has no store to open.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("mailbox.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -517,10 +541,142 @@ fn arm_with_bridge_down_exits_zero_without_waking() {
     assert_eq!(
         status.code(),
         Some(0),
-        "fail-safe: a down bridge means exit 0 (do not wake)"
+        "a down bridge must never WAKE (exit 2 would hot-loop while it is down); with no store \
+         there is nothing to wait on either, so the waiter exits 0"
     );
     let pidfile = dir.path().join("waiters").join("s-bd.waiter.pid");
-    assert!(!pidfile.exists(), "no waiter armed when the bridge is down");
+    assert!(
+        !pidfile.exists(),
+        "the self-exiting waiter must leave no pidfile behind"
+    );
+}
+
+/// **The regression test for adv-1: a bridge blip at a re-arm `Stop` must not deafen
+/// the session forever.**
+///
+/// `arm` probes the bridge to decide whether to arm. It used to SKIP on a probe failure
+/// ("fail safe: do not wake"). But the re-arm loop now depends on `arm` succeeding at
+/// *every* re-arm `Stop` (ADR-0006), and an idle session fires no further `Stop` — so a
+/// single momentary blip left the session with no waiter and nothing to retry it. Deaf,
+/// permanently, from one dropped connection.
+///
+/// So arm FAILS OPEN: it arms anyway, which is safe because the waiter re-checks
+/// subscriptions itself under its lock. This proves the whole path: with the bridge
+/// DOWN, a live waiter is armed; when the bridge comes back and publishes, that waiter
+/// — blocked on its FIFO the entire time — is kicked and wakes with the topic.
+#[test]
+fn arm_with_the_bridge_down_still_arms_a_waiter_that_wakes_when_it_returns() {
+    let mut daemon = Daemon::start();
+    let session = "s-blip";
+    let topic = "t.blip";
+    assert_ok(
+        &daemon.run(&["subscribe", topic, "--session", session]),
+        "subscribe",
+    );
+
+    // The blip: the bridge goes away just as the agent goes idle and `Stop` fires.
+    daemon.stop_bridge();
+
+    let mut arm = daemon.spawn_arm(session, &["--max-block-ms", "60000"]);
+    let pid = poll_until(
+        "a live waiter is armed even though the bridge probe FAILED (fail-open)",
+        Duration::from_secs(10),
+        || daemon.pidfile_pid(session).filter(|&pid| pid_alive(pid)),
+    );
+
+    // The bridge returns and a peer publishes. The waiter never needed the daemon to
+    // block; it needs it only for the kick, which now lands on its FIFO.
+    daemon.start_bridge();
+    assert_ok(&daemon.run(&["publish", topic]), "publish");
+
+    let status = wait_within(&mut arm, Duration::from_secs(10)).expect("the waiter must wake");
+    let stderr = drain_stderr(&mut arm);
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "the waiter armed during the blip must still be woken by the publish that follows \
+         (pid {pid}); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(topic),
+        "the wake must name the topic with mail; got: {stderr}"
+    );
+}
+
+/// The other half of the fail-open rule: a CLEAN "you subscribe to nothing" still arms
+/// nothing. Fail-open must not become arm-always — a session with no subscriptions has
+/// nothing to be woken about, and a waiter for it would be pure noise.
+///
+/// The session id here cannot form an inbox topic (a slash is not in the grammar), so
+/// the always-on inbox registration cannot give it a subscription — which is exactly
+/// the state that must skip.
+#[test]
+fn arm_with_a_clean_no_subscriptions_answer_arms_nothing() {
+    let daemon = Daemon::start();
+    let session = "s/unaddressable";
+
+    let mut arm = daemon.spawn_arm(session, &["--max-block-ms", "60000"]);
+    let status = wait_within(&mut arm, Duration::from_secs(10)).expect("arm should exit");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a session the bridge says subscribes to nothing must not be armed (and must not wake)"
+    );
+    assert!(
+        !daemon.pidfile(session).exists(),
+        "no waiter for an unsubscribed session"
+    );
+}
+
+/// **adv-3: the `max_block < timeout` invariant, enforced where it is USED.**
+///
+/// `install-hooks` validating the pairing protects nothing if `arm` is launched from a
+/// hand-edited settings.json — or from a hook entry with no `timeout` at all, where
+/// Claude Code applies its own 600s default and our 55-minute max-block gets the waiter
+/// KILLED mid-block (after which an idle session, firing no further `Stop`, is never
+/// re-armed: the headline bug).
+///
+/// So `arm` takes the deadline it runs under (`--timeout-secs`, written into the hook
+/// command by `install-hooks`) and CLAMPS an unsafe `--max-block-ms` down, loudly.
+/// Here: an 11s deadline with a 60s block. Unclamped, the waiter would sit blocked for
+/// 60s (long past the kill). Clamped, it yields at ~1s with the benign re-arm notice —
+/// so the session stays armed, and the log says exactly what happened.
+#[test]
+fn arm_clamps_a_max_block_that_is_not_safely_below_the_hook_timeout() {
+    let daemon = Daemon::start();
+    let session = "s-clamp";
+    let topic = "t.clamp";
+    assert_ok(
+        &daemon.run(&["subscribe", topic, "--session", session]),
+        "subscribe",
+    );
+
+    let mut arm = daemon.spawn_arm(
+        session,
+        // 60s of blocking under an 11s kill deadline: the exact shape of the bug.
+        &["--max-block-ms", "60000", "--timeout-secs", "11"],
+    );
+    let status = wait_within(&mut arm, Duration::from_secs(20))
+        .expect("the waiter must yield for a re-arm well before its 60s block would have ended");
+    let stderr = drain_stderr(&mut arm);
+
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "the clamped waiter must yield for a re-arm (exit 2), not be killed mid-block; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("re-arming"),
+        "the yield must carry the benign re-arm notice, not a claim of mail; got: {stderr}"
+    );
+
+    // ...and it must be LOUD: the operator has a broken hook config to fix.
+    let log = std::fs::read_to_string(daemon.db_path.parent().unwrap().join("harness.log"))
+        .expect("harness.log");
+    assert!(
+        log.contains("Clamped down to a safe block"),
+        "the clamp must be reported at error level in harness.log; got:\n{log}"
+    );
 }
 
 // ==== B: cleanup with the bridge down still exits 0 (TTL sweeper is the backstop) =

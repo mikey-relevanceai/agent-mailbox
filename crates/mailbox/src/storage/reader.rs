@@ -99,6 +99,13 @@ impl ReadOnlyStore {
 /// [`Connection`] — the read-only side connection in production, and an
 /// in-memory connection in unit tests — without opening a file.
 ///
+/// Events the session AUTHORED itself are excluded: you are never woken by your own
+/// message (the durable half of the no-self-kick — the kick filter alone would only
+/// hold for a waiter that was already blocked, while a waiter armed *after* the
+/// publish would find its own event unread and wake on it). Nothing is hidden by
+/// this: the event is still returned by `read` and still counted by `status` — it
+/// simply is not a reason to wake the session that wrote it.
+///
 /// A subscription row can only hold a topic the bridge accepted, so a stored
 /// value that fails the grammar is corrupt storage, not user input (mirrors
 /// `read_topic_unread`).
@@ -113,6 +120,7 @@ fn query_topics_with_unread(
            AND EXISTS (
                SELECT 1 FROM event e
                WHERE e.topic = s.topic
+                 AND (e.author_session IS NULL OR e.author_session <> s.session_id)
                  AND e.offset > COALESCE(
                      (SELECT dc.offset FROM delivery_cursor dc
                       WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
@@ -163,6 +171,15 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_event_by(conn: &Connection, topic: &str, offset: i64, author: &str) {
+        conn.execute(
+            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
+             VALUES (?1, ?2, ?3, 'a', 0, '{}', ?4)",
+            params![topic, offset, format!("evt-{topic}-{offset}"), author],
+        )
+        .unwrap();
+    }
+
     fn set_cursor(conn: &Connection, session: &str, topic: &str, offset: i64) {
         conn.execute(
             "INSERT INTO delivery_cursor (session_id, topic, offset) VALUES (?1, ?2, ?3)
@@ -170,6 +187,41 @@ mod tests {
             params![session, topic, offset],
         )
         .unwrap();
+    }
+
+    /// You are never woken by your own message — the durable half of the no-self-kick
+    /// (a waiter armed *after* your publish must not wake on it either). A PEER's
+    /// event on the same topic still wakes you, and an anonymous (adapter /
+    /// `--no-session`) event wakes everyone.
+    #[test]
+    fn an_event_you_authored_does_not_wake_you_but_a_peers_does() {
+        let conn = migrated();
+        subscribe(&conn, "s", "t.a");
+        subscribe(&conn, "peer", "t.a");
+
+        insert_event_by(&conn, "t.a", 0, "s");
+        assert!(
+            query_topics_with_unread(&conn, "s").unwrap().is_empty(),
+            "your own event must not wake you"
+        );
+        assert_eq!(
+            query_topics_with_unread(&conn, "peer").unwrap().len(),
+            1,
+            "but it IS mail for the peer"
+        );
+
+        // A peer's event wakes you.
+        insert_event_by(&conn, "t.a", 1, "peer");
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
+
+        // Caught up again (the cursor covers both) => quiet.
+        set_cursor(&conn, "s", "t.a", 1);
+        assert!(query_topics_with_unread(&conn, "s").unwrap().is_empty());
+
+        // An anonymous publish (adapter / `--no-session`) wakes EVERY subscriber,
+        // including a session that happens to have spawned the publisher.
+        insert_event(&conn, "t.a", 2);
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
     }
 
     #[test]

@@ -140,6 +140,17 @@ pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 3600;
 /// precedes the harness's kill, with room to spare.
 pub const DEFAULT_MAX_BLOCK_MS: u64 = 3_300_000;
 
+/// Claude Code's OWN default `timeout` for a command hook (**600s**), which applies
+/// whenever a hook entry omits the field.
+///
+/// This is what `arm` must assume when the hook that launched it did not tell it
+/// otherwise — and it is precisely why [`DEFAULT_MAX_BLOCK_MS`] (55m) cannot be
+/// trusted blindly at the point of use: under a 600s deadline it would have the waiter
+/// killed mid-block, and an idle session fires no further `Stop` to re-arm it. A
+/// hand-edited `settings.json`, or an arm hook written without our `timeout`, lands
+/// exactly there. See [`resolve_max_block`].
+pub const CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
+
 /// The lower bound of the safety margin between `max_block_ms` and the hook
 /// `timeout` (10s). Enough for the waiter to notice its deadline, drop its pidfile
 /// and exit.
@@ -171,6 +182,79 @@ pub enum InstallError {
     },
 }
 
+/// The safety margin a `max_block` must leave below a hook `timeout`: 10% of the
+/// timeout, clamped to [`MIN_TIMING_MARGIN_MS`]..=[`MAX_TIMING_MARGIN_MS`].
+fn timing_margin_ms(timeout_ms: u64) -> u64 {
+    (timeout_ms / 10).clamp(MIN_TIMING_MARGIN_MS, MAX_TIMING_MARGIN_MS)
+}
+
+/// The largest `max_block_ms` that is safely below `timeout_secs` — i.e. the biggest
+/// value [`HookInstallSpec::validate`] would accept.
+///
+/// Floored at 1s: a hook `timeout` so small that no positive max-block is safe (≤10s)
+/// is a broken configuration with no good outcome, and of the two bad ones we pick the
+/// LOUD one. A tiny max-block re-arms noisily and visibly; refusing to arm at all
+/// would be silent, permanent deafness — the bug this whole design exists to prevent.
+pub fn max_safe_max_block_ms(timeout_secs: u64) -> u64 {
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    timeout_ms
+        .saturating_sub(timing_margin_ms(timeout_ms))
+        .max(1_000)
+}
+
+/// What `arm` will actually block for, given the hook `timeout` it runs under and the
+/// `max_block` it was asked for.
+///
+/// The `max_block < timeout` invariant is load-bearing (ADR-0006) and used to be
+/// checked ONLY at install time — where the value is written, not where it is used. So
+/// a hand-edited `settings.json`, or an arm hook whose entry omits `timeout` (Claude
+/// Code then applies its own 600s default, under which our 55m default max-block is
+/// lethal), silently restored the original catastrophic bug. This is the same rule,
+/// enforced at the point of use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxBlockDecision {
+    /// The requested max-block is safely below the timeout: use it as asked.
+    AsRequested(u64),
+    /// The requested max-block would have let Claude Code kill the waiter mid-block.
+    /// CLAMPED down to the largest safe value, loudly — clamping keeps the session
+    /// armed (a waiter that yields early is harmless), whereas refusing to arm would
+    /// be the very deafness the invariant protects against.
+    Clamped {
+        requested: u64,
+        resolved: u64,
+        timeout_secs: u64,
+    },
+}
+
+impl MaxBlockDecision {
+    /// The max-block to actually pass to the waiter.
+    pub fn resolved(self) -> u64 {
+        match self {
+            MaxBlockDecision::AsRequested(ms) => ms,
+            MaxBlockDecision::Clamped { resolved, .. } => resolved,
+        }
+    }
+}
+
+/// Enforce `max_block < timeout` at the point of use (see [`MaxBlockDecision`]).
+pub fn resolve_max_block(timeout_secs: u64, requested_ms: u64) -> MaxBlockDecision {
+    let spec_ok = HookInstallSpec {
+        mailbox_bin: String::new(),
+        timeout_secs,
+        max_block_ms: requested_ms,
+    }
+    .validate()
+    .is_ok();
+    if spec_ok {
+        return MaxBlockDecision::AsRequested(requested_ms);
+    }
+    MaxBlockDecision::Clamped {
+        requested: requested_ms,
+        resolved: max_safe_max_block_ms(timeout_secs),
+        timeout_secs,
+    }
+}
+
 impl HookInstallSpec {
     /// Reject a spec whose `max_block_ms` is not safely below the async-hook
     /// `timeout`. The waiter must reach its max-block AND exit 2 before Claude
@@ -179,10 +263,11 @@ impl HookInstallSpec {
     ///
     /// This is the load-bearing invariant (ADR-0006): a `max_block >= timeout`
     /// silently reintroduces the un-armed-forever bug, so it is a hard install-time
-    /// failure and never a warning.
+    /// failure and never a warning. `arm` enforces the SAME rule at the point of use
+    /// ([`resolve_max_block`]), because settings.json can also be written by hand.
     pub fn validate(&self) -> Result<(), InstallError> {
         let timeout_ms = self.timeout_secs.saturating_mul(1000);
-        let margin_ms = (timeout_ms / 10).clamp(MIN_TIMING_MARGIN_MS, MAX_TIMING_MARGIN_MS);
+        let margin_ms = timing_margin_ms(timeout_ms);
         if self.max_block_ms.saturating_add(margin_ms) > timeout_ms {
             return Err(InstallError::MaxBlockNotBelowTimeout {
                 max_block_ms: self.max_block_ms,
@@ -194,11 +279,16 @@ impl HookInstallSpec {
         Ok(())
     }
 
-    /// The `arm` hook command string (`<bin> harness arm --max-block-ms <n>`).
+    /// The `arm` hook command string
+    /// (`<bin> harness arm --max-block-ms <n> --timeout-secs <t>`).
+    ///
+    /// `--timeout-secs` is passed so the armed process KNOWS the deadline Claude Code
+    /// will kill it at, and can enforce `max_block < timeout` itself
+    /// ([`resolve_max_block`]) instead of trusting a settings file it did not write.
     fn arm_command(&self) -> String {
         format!(
-            "{} harness arm --max-block-ms {}",
-            self.mailbox_bin, self.max_block_ms
+            "{} harness arm --max-block-ms {} --timeout-secs {}",
+            self.mailbox_bin, self.max_block_ms, self.timeout_secs
         )
     }
 
@@ -616,7 +706,7 @@ mod tests {
         assert_eq!(arm["type"], "command");
         assert_eq!(
             arm["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000"
+            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
         );
         assert_eq!(arm["asyncRewake"], true);
         assert_eq!(arm["timeout"], 3600);
@@ -625,7 +715,7 @@ mod tests {
         assert_eq!(hooks["Stop"][0]["matcher"], "");
         assert_eq!(
             hooks["Stop"][0]["hooks"][0]["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000"
+            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
         );
 
         // SessionEnd: cleanup, NOT asyncRewake.
@@ -695,6 +785,53 @@ mod tests {
         );
     }
 
+    /// The invariant, enforced where it is USED. `install-hooks` validating at write
+    /// time protects nothing if `arm` is launched from a hand-edited settings.json —
+    /// or from a hook entry with no `timeout` field at all, where Claude Code applies
+    /// its own 600s default and our 55-minute max-block becomes lethal.
+    #[test]
+    fn resolve_max_block_clamps_a_max_block_that_is_not_safely_below_the_timeout() {
+        // The shipped pairing passes through untouched.
+        assert_eq!(
+            resolve_max_block(DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS),
+            MaxBlockDecision::AsRequested(DEFAULT_MAX_BLOCK_MS)
+        );
+
+        // The trap: the shipped default max-block under Claude Code's OWN default
+        // timeout. Left alone this is the original bug — the waiter is killed at 600s,
+        // 50 minutes before it would have yielded, and an idle session fires no further
+        // Stop to re-arm it.
+        let decision =
+            resolve_max_block(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS);
+        assert_eq!(
+            decision,
+            MaxBlockDecision::Clamped {
+                requested: DEFAULT_MAX_BLOCK_MS,
+                resolved: 540_000, // 600s - the 60s margin
+                timeout_secs: CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS,
+            }
+        );
+        // And the clamped value is one `validate` itself accepts — the two rules agree.
+        HookInstallSpec {
+            mailbox_bin: String::new(),
+            timeout_secs: CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS,
+            max_block_ms: decision.resolved(),
+        }
+        .validate()
+        .expect("the clamped max-block must satisfy the install-time rule");
+    }
+
+    /// A timeout too small for ANY safe max-block has no good outcome. We pick the loud
+    /// one: a floor of 1s, so the waiter re-arms noisily and visibly. Refusing to arm
+    /// would be silent, permanent deafness — the failure mode this design exists to
+    /// prevent.
+    #[test]
+    fn an_absurdly_small_timeout_still_arms_with_a_floored_max_block() {
+        assert_eq!(max_safe_max_block_ms(5), 1_000);
+        assert_eq!(resolve_max_block(5, DEFAULT_MAX_BLOCK_MS).resolved(), 1_000);
+        assert!(resolve_max_block(5, DEFAULT_MAX_BLOCK_MS).resolved() > 0);
+    }
+
     #[test]
     fn merge_into_empty_settings_yields_the_snippet_hooks() {
         let merged = merge_into_settings(json!({}), &hooks_snippet(&spec()));
@@ -722,7 +859,7 @@ mod tests {
         assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
         assert_eq!(
             stop[1]["hooks"][0]["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000"
+            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
         );
     }
 
@@ -1084,7 +1221,7 @@ mod tests {
         assert_eq!(stop.len(), 1, "exactly ONE arm hook, not two: {stop:?}");
         assert_eq!(
             stop[0],
-            "/home/u/.local/bin/mailbox harness arm --max-block-ms 120000"
+            "/home/u/.local/bin/mailbox harness arm --max-block-ms 120000 --timeout-secs 300"
         );
         let end = hook_commands(&twice, "SessionEnd");
         assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
@@ -1105,7 +1242,7 @@ mod tests {
             stop,
             vec![
                 "echo other".to_string(),
-                "/opt/mailbox harness arm --max-block-ms 3300000".to_string(),
+                "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600".to_string(),
             ],
             "a foreign hook survives every re-merge, and ours is not duplicated"
         );

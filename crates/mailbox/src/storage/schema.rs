@@ -17,7 +17,8 @@ use super::error::StorageError;
 /// [`SCHEMA_V2`]. v3 (card 09) widens the interval to milliseconds and adds
 /// `watch.publish_count` for the stub adapter — see [`SCHEMA_V3`]. v4 (card 16)
 /// adds `session_tombstone` for the inbox-resurrection guard — see [`SCHEMA_V4`].
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+/// v5 (card 19) stamps the AUTHORING session on an event — see [`SCHEMA_V5`].
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 /// Version 1 of the schema.
 ///
@@ -159,6 +160,33 @@ CREATE TABLE session_tombstone (
 );
 "#;
 
+/// Version 5 of the schema (card 19): the authoring session of an event.
+///
+/// `event.author_session` is the session id of the agent that published the event,
+/// or `NULL` when nobody did — an adapter, a cron script, or an explicit
+/// `mailbox publish --no-session`. It is *provenance for the caller-aware rules*,
+/// nothing more: the body stays opaque and the adapter label stays the publisher's
+/// name, exactly as before (ADR-0001).
+///
+/// It exists because the alternative was silent mail loss. The caller-aware publish
+/// used to advance the publisher's own delivery cursor past its own event, so that
+/// its own message could not block its next publish. But the publisher is inferred
+/// from the ambient `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into EVERY
+/// process an agent spawns (a build script, a git hook, a subagent) — so any of
+/// those publishing on a topic the agent subscribes to had the event silently marked
+/// read *for the agent*, and the agent was excluded from the kick: it never saw the
+/// message and was never woken. With the author stamped on the row, no cursor is
+/// ever advanced behind anyone's back: the event stays unread and readable, and only
+/// the two rules that legitimately need to know who wrote it consult this column
+/// (the "be caught up to speak" check, and the no-self-wake filter).
+///
+/// Additive, like every prior step: a nullable column on `event`. Rows written
+/// before v5 (every adapter publish there has ever been) migrate to `NULL`, which is
+/// exactly right — they had no authoring session.
+const SCHEMA_V5: &str = r#"
+ALTER TABLE event ADD COLUMN author_session TEXT;
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -193,6 +221,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 4 {
         sql.push_str(SCHEMA_V4);
+    }
+    if current < 5 {
+        sql.push_str(SCHEMA_V5);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -346,6 +377,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ended, 99);
+    }
+
+    /// The v5 step is ADDITIVE on a real file: every event written before it keeps
+    /// its body/offset/adapter and simply gains a NULL author — which is the honest
+    /// value, since a pre-v5 publish had no authoring session to record.
+    #[test]
+    fn on_disk_v4_to_v5_migration_preserves_events_and_defaults_the_author_to_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mailbox.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
+                 VALUES ('t.a', 0, 'evt-1', 'github-pr', 123, '{\"edge\":\"ci\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 4").unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let (body, adapter, author): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT body, adapter, author_session FROM event WHERE event_id = 'evt-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "{\"edge\":\"ci\"}", "the body survives verbatim");
+        assert_eq!(adapter, "github-pr", "provenance survives");
+        assert_eq!(author, None, "a pre-v5 event has no authoring session");
+
+        // The new column is writable, and NULL vs a session id are distinguishable.
+        conn.execute(
+            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
+             VALUES ('t.a', 1, 'evt-2', 'cli', 124, '{}', 's-agent')",
+            [],
+        )
+        .unwrap();
+        let author: Option<String> = conn
+            .query_row(
+                "SELECT author_session FROM event WHERE event_id = 'evt-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(author.as_deref(), Some("s-agent"));
     }
 
     #[test]

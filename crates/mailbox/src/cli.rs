@@ -17,7 +17,10 @@ use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox::wake::{REARM_NOTICE, WaitOutcome, Waiter, WakeError, WakeOutcome};
 use mailbox_harness::arm::{ArmDecision, StalePidfile, SubscriptionProbe};
 use mailbox_harness::hook::HookInput;
-use mailbox_harness::install::{DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS};
+use mailbox_harness::install::{
+    CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS,
+    MaxBlockDecision,
+};
 use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
 
 use crate::client;
@@ -30,6 +33,18 @@ use crate::serve;
 /// Opt-in env var: when `1`, `wait` appends its wake reason to stderr as a second
 /// diagnostic line. TEST-only — the default payload-free reminder is unaffected.
 const WAIT_DEBUG_ENV: &str = "MAILBOX_WAIT_DEBUG";
+
+/// Exit code for a REFUSED publish ("you have unread mail on this topic; read first").
+///
+/// Its own code, because it is not a failure: nothing was written, nothing is broken,
+/// and the remedy is defined (`mailbox read`, then retry). It used to exit 1 — the
+/// same code as "the bridge is down" — so a scripted publisher could not tell "retry
+/// after reading" from a real error without string-matching stderr.
+///
+/// **Not 2**: 2 is the wake code (`wait`/`arm`), and Claude Code treats an exit 2 from
+/// an asyncRewake hook as "wake this session". Reusing it here would be a category
+/// error. Clap's own usage errors also exit 2, which is another reason to keep away.
+const PUBLISH_REFUSED_EXIT: u8 = 3;
 
 /// How a command renders its result on stdout.
 ///
@@ -167,6 +182,11 @@ fn env_session(key: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The user-facing diagnostic for an ignored empty `--session`. A real stderr line
+/// (see [`resolve_session`]), not a filtered log event.
+const EMPTY_SESSION_WARNING: &str = "mailbox: warning: ignoring an empty --session (it names no session); \
+     falling back to MAILBOX_SESSION_ID / CLAUDE_CODE_SESSION_ID — omit the flag instead";
+
 /// The session-resolution rule, as a pure function of its three inputs so the
 /// precedence is unit-testable without touching process env.
 fn resolve_session(
@@ -186,12 +206,16 @@ fn resolve_session(
         if trimmed.is_empty() {
             // Never silent: the caller believes they named a session and did not, so
             // whichever session we DO bind is not the one they typed. (This is the
-            // `--session "$MAILBOX_SESSION_ID"` trap; the warn is what makes it
-            // diagnosable from harness.log instead of by re-deriving it.)
-            warn!(
-                "ignoring an empty --session (it names no session); \
-                 falling back to MAILBOX_SESSION_ID / CLAUDE_CODE_SESSION_ID — omit the flag instead"
-            );
+            // `--session "$MAILBOX_SESSION_ID"` trap.)
+            //
+            // A DIRECT stderr line, not a `tracing` event: at the default filter
+            // (ERROR) a `warn!` was swallowed for exactly the commands where the trap
+            // bites — `mailbox publish --session ""` printed nothing at all — so the
+            // one diagnostic that names the trap never reached the agent that walked
+            // into it. It is also duplicated into `tracing` so it lands in harness.log
+            // for `wait`/`arm`, whose stderr goes elsewhere.
+            eprintln!("{EMPTY_SESSION_WARNING}");
+            warn!("{EMPTY_SESSION_WARNING}");
             return None;
         }
         Some(SessionId::new(trimmed))
@@ -245,13 +269,24 @@ pub enum HarnessCommand {
 #[derive(Args, Debug)]
 pub struct ArmArgs {
     /// Max block the armed waiter uses before it yields for a re-arm (see
-    /// [`WaitArgs`]). Must stay below the hook's `timeout` — `install-hooks`
-    /// validates that pairing.
+    /// [`WaitArgs`]). Must stay below the hook's `timeout`; `arm` CLAMPS it if not
+    /// (see `--timeout-secs`).
     ///
     /// `arm` always reads the session id from the hook's stdin JSON, so it needs no
     /// `--session` flag.
     #[arg(long, default_value_t = DEFAULT_MAX_BLOCK_MS)]
     pub max_block_ms: u64,
+
+    /// The Claude Code hook `timeout` (seconds) this process runs under — i.e. the
+    /// deadline at which the harness will KILL it. `install-hooks` writes it into the
+    /// hook command so `arm` can enforce `max_block < timeout` itself.
+    ///
+    /// Defaults to Claude Code's own default (600s) when absent, which is the honest
+    /// assumption for a hook entry that carries no `timeout` field — including a
+    /// hand-edited settings.json. Validating this pairing only at install time was not
+    /// enough: the value is USED here.
+    #[arg(long)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -293,6 +328,14 @@ pub struct InstallSkillsArgs {
 /// session id anywhere, and publishing must keep working exactly as it always has
 /// for it. A resolved session turns on the two caller-aware rules — be caught up to
 /// speak, and never wake yourself — in [`crate::serve`].
+///
+/// `--no-session` publishes ANONYMOUSLY on purpose. It matters because Claude Code
+/// exports `$CLAUDE_CODE_SESSION_ID` into every process an agent spawns — a build
+/// script, a git hook, a subagent — so such a process's `publish` is otherwise
+/// attributed to the AGENT, and an agent is never woken by its own message. Any
+/// process the agent spawned that publishes on the agent's behalf should pass
+/// `--no-session`, so the event has no author and wakes every subscriber, the agent
+/// included.
 #[derive(Args, Debug)]
 pub struct PublishArgs {
     /// Topic to publish to (e.g. `github.pr.owner/repo#42`).
@@ -303,6 +346,13 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
+    /// Publish with NO authoring session, ignoring `--session` and the ambient
+    /// `$CLAUDE_CODE_SESSION_ID` / `$MAILBOX_SESSION_ID`. The event then belongs to
+    /// nobody: no unread rule applies to it, and it wakes EVERY subscriber — including
+    /// the agent whose session id this process happened to inherit. Use it from any
+    /// script/hook/subagent an agent spawns.
+    #[arg(long, conflicts_with = "session")]
+    pub no_session: bool,
     #[command(flatten)]
     pub session: SessionOpt,
 }
@@ -421,9 +471,11 @@ pub struct StubUnwatchArgs {
     pub session: SessionOpt,
 }
 
-/// Run an async command (everything except `wait`). Returns `Ok(())` on success;
-/// the caller maps `Err` to a non-zero exit.
-pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<()> {
+/// Run an async command (everything except `wait`). Returns the process exit code on
+/// success — [`ExitCode::SUCCESS`] for almost everything, but `publish` has a REFUSED
+/// outcome that is neither success nor failure and gets [`PUBLISH_REFUSED_EXIT`]. The
+/// caller maps `Err` to a plain non-zero exit.
+pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::Serve => run_serve().await,
         Command::Publish(args) => run_publish(format, args).await,
@@ -443,9 +495,10 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<()> {
     }
 }
 
-async fn run_serve() -> anyhow::Result<()> {
+async fn run_serve() -> anyhow::Result<ExitCode> {
     let config = StorageConfig::from_env().context("resolving storage path for serve")?;
-    serve::run(config).await
+    serve::run(config).await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `publish`: append an event to a topic.
@@ -456,23 +509,30 @@ async fn run_serve() -> anyhow::Result<()> {
 /// that topic, and never kick the publisher for its own event (ADR-0006 / §Publish
 /// in docs/04-usage.md). With no session (an adapter, a cron script) the publish
 /// behaves exactly as it always did: no unread rule, kick every subscriber.
-async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<()> {
+async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<ExitCode> {
     let topic = parse_topic(&args.topic)?;
     let body: serde_json::Value =
         serde_json::from_str(&args.body).context("--body must be valid JSON")?;
+    // `--no-session` deliberately drops the ambient identity: the caller is a script
+    // an agent spawned, not the agent, and it must NOT publish as it (see PublishArgs).
+    let session = if args.no_session {
+        None
+    } else {
+        args.session.resolve_optional()
+    };
     request(
         format,
         Request::Publish {
             topic,
             adapter: AdapterId(args.adapter),
             body,
-            session: args.session.resolve_optional(),
+            session,
         },
     )
     .await
 }
 
-async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<()> {
+async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<ExitCode> {
     let topic = parse_topic(&args.topic)?;
     request(
         format,
@@ -488,7 +548,7 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
     .await
 }
 
-async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<()> {
+async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<ExitCode> {
     let topic = parse_topic(&args.topic)?;
     request(
         format,
@@ -500,7 +560,7 @@ async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Resul
     .await
 }
 
-async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
+async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Read {
@@ -514,7 +574,7 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
 /// `whoami`: this session's id and its inbox topic — the address a peer uses to
 /// `send` to it. Deliberately NOT a socket call: identity does not depend on the
 /// bridge, so an agent can always answer "who am I" even when the daemon is down.
-fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
+fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
     let session = resolve_session_or_fail(format, &args)?;
     let inbox = inbox_topic(&session)
         .with_context(|| format!("session {:?} cannot form an inbox topic", session.as_str()))?;
@@ -528,13 +588,13 @@ fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
         println!("session: {}", session.as_str());
         println!("inbox:   {}", inbox.as_str());
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `send`: message a peer agent. The body the bridge publishes is
 /// `{"from": "<sender>", ...}` — see [`mailbox::agents`] for the convention and
 /// for why an unregistered target is a hard error rather than a silent publish.
-async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<()> {
+async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCode> {
     let from = resolve_session_or_fail(format, &args.session)?;
     let to = parse_send_target(&args.target)?;
     let body = send_body(args.text, args.body)?;
@@ -594,7 +654,7 @@ fn parse_send_target(raw: &str) -> anyhow::Result<SessionId> {
     }
 }
 
-async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
+async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Agents {
@@ -604,7 +664,7 @@ async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()
     .await
 }
 
-async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<()> {
+async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Topics {
@@ -614,7 +674,7 @@ async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<()
     .await
 }
 
-async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> {
+async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<ExitCode> {
     let req = match args.target {
         WatchTargetCmd::GithubPr(gh) => Request::Watch {
             session: resolve_session_or_fail(format, &gh.session)?,
@@ -633,7 +693,7 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> 
     request(format, req).await
 }
 
-async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<()> {
+async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<ExitCode> {
     let req = match args.target {
         UnwatchTargetCmd::GithubPr(gh) => Request::Unwatch {
             session: resolve_session_or_fail(format, &gh.session)?,
@@ -647,7 +707,7 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
     request(format, req).await
 }
 
-async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
+async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Status {
@@ -665,7 +725,7 @@ async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()
 /// - the bridge is down / unreachable ([`client::ClientError`]) → the actionable
 ///   "start it with `mailbox serve`" error, tagged with the op/session it was
 ///   trying to run (F13). Both failure paths exit non-zero.
-async fn request(format: OutputFormat, request: Request) -> anyhow::Result<()> {
+async fn request(format: OutputFormat, request: Request) -> anyhow::Result<ExitCode> {
     let config = StorageConfig::from_env().context("resolving storage path")?;
     let socket = config.socket_path();
 
@@ -688,7 +748,13 @@ async fn request(format: OutputFormat, request: Request) -> anyhow::Result<()> {
     } else {
         render_human(&response);
     }
-    Ok(())
+    // A refused publish is the ONE serviced, non-error outcome with its own exit code:
+    // "you are not caught up; read and retry" is not a failure, and a scripted
+    // publisher must be able to tell it from one (FIX 6). Everything else is success.
+    Ok(match &response {
+        Response::PublishRefused { .. } => ExitCode::from(PUBLISH_REFUSED_EXIT),
+        _ => ExitCode::SUCCESS,
+    })
 }
 
 /// Build the edge error. In JSON mode it first prints the TYPED
@@ -847,6 +913,15 @@ fn render_human(response: &Response) {
             adapters_stopped,
         } => println!(
             "ended session (subscriptions dropped={subscriptions_dropped}, interests dropped={interests_dropped}, adapters stopped={adapters_stopped})"
+        ),
+        // Be caught up to speak. Named counts, the topic, and the ONE command that
+        // fixes it: an agent must be able to act on this without guessing. Nothing was
+        // written, so it can simply read and retry. Printed on stdout (it is this
+        // command's result, not an error), and the exit code says so too.
+        Response::PublishRefused { topic, unread } => println!(
+            "refused: you have {unread} unread event(s) on {} — run `mailbox read` first, then \
+             publish again (nothing was published)",
+            topic.as_str()
         ),
         // Error is handled before rendering; nothing to print here.
         Response::Error { message } => eprintln!("error: {message}"),
@@ -1042,7 +1117,7 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
 
 /// Dispatch a `harness` subcommand. `arm`/`cleanup` are socket clients; the two
 /// `install-*` setup commands touch no bridge.
-async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<()> {
+async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<ExitCode> {
     match args.command {
         HarnessCommand::Arm(args) => run_harness_arm(args).await,
         HarnessCommand::Cleanup => run_harness_cleanup().await,
@@ -1051,80 +1126,140 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
     }
 }
 
-/// The `SessionStart` / `Stop` hook: register this session's agent inbox, then
-/// launch a waiter IFF the session is subscribed. Session identity comes from the
-/// hook's stdin JSON (settled decision, card 11). Fail-safe: a down/erroring
-/// bridge or a session with no subscriptions all skip arming (no wake).
+/// The `SessionStart` / `Stop` hook: register this session's agent inbox, then launch
+/// a waiter unless the bridge says cleanly that the session subscribes to nothing.
+/// Session identity comes from the hook's stdin JSON (settled decision, card 11).
 ///
 /// **Always-on inbox (card 16 / ADR-0007).** Registration happens here, before the
 /// probe, on every arm — so a session is addressable by its peers from its first
 /// `SessionStart` with nothing for the agent to do. The consequence is intended:
-/// every live session now has ≥1 subscription, so every live session arms a waiter
-/// while the bridge is up. Every fail-safe is untouched: a bridge that is down or
-/// erroring still skips arming (registration fails the same way the probe does),
-/// and the waiter still re-checks `has_subscription` after taking its lock.
+/// every live session has ≥1 subscription, so every live session arms a waiter.
 ///
-/// On the `Arm` path this **execs** `mailbox wait` (it does NOT write the
-/// pidfile — the waiter writes it after taking the single-waiter lock, so a
-/// doomed second arm can never overwrite the live waiter's pidfile; card 11
-/// HIGH#1). A failure to exec exits **2** (a wake → the harness re-runs Stop and
-/// re-arms) rather than exit 1 (a silent un-arm), first clearing any stale
-/// pidfile (item E / ADR-0006).
+/// **A failed probe ARMS ANYWAY (fail-open).** It used to skip — "fail safe, do not
+/// wake" — and that was a permanent-deafness bug: the re-arm loop depends on `arm`
+/// running at *every* `Stop`, so a momentary bridge blip at one of them left the
+/// session with no waiter, and an idle session fires no further `Stop` to retry it.
+/// One blip, deaf forever. Arming without a confirmed subscription is safe because
+/// the waiter validates itself: `mailbox wait` needs no socket, and re-checks
+/// `has_subscription` after taking its lock (an unsubscribed session's waiter exits 0
+/// and removes its pidfile). The probe is retried a few times first, so a blip usually
+/// resolves cleanly rather than falling through to the fail-open path. See
+/// `mailbox_harness::arm`.
+///
+/// On both arm paths this **execs** `mailbox wait` (it does NOT write the pidfile —
+/// the waiter writes it after taking the single-waiter lock, so a doomed second arm
+/// can never overwrite the live waiter's pidfile; card 11 HIGH#1). A failure to exec
+/// exits **2** (a wake → the harness re-runs Stop and re-arms) rather than exit 1 (a
+/// silent un-arm), first clearing any stale pidfile (item E / ADR-0006).
 ///
 /// **Stale-pidfile reap.** Before it arms, `arm` removes a pidfile that names a DEAD
-/// pid. A waiter killed at the hook `timeout` leaves exactly that behind, and until
-/// it is cleared `mailbox agents` / `status` keep reporting a live waiter for a
-/// process that no longer exists. A LIVE pid is never touched — that is the winner
-/// of a SessionStart-vs-Stop arm race, and this arm's waiter will lose the
-/// single-waiter lock and exit, as designed.
-async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
+/// pid (compare-and-delete: never one a concurrent waiter has claimed).
+///
+/// **Timing.** `--max-block-ms` is CLAMPED to stay safely below the hook `timeout`
+/// this process runs under (`--timeout-secs`, defaulting to Claude Code's own 600s
+/// when the hook entry omits it). The invariant is enforced here, at the point of use,
+/// because settings.json can be written by hand — validating it only in
+/// `install-hooks` protected nothing.
+async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<ExitCode> {
     let config = StorageConfig::from_env().context("resolving storage path for harness arm")?;
     let session = HookInput::from_reader(std::io::stdin().lock())
         .context("reading the SessionStart/Stop hook payload from stdin")?
         .session_id;
 
+    let max_block_ms = resolve_arm_max_block(&session, &args);
+
     register_inbox(&config, &session).await;
-    let probe = probe_subscription(&config, &session).await;
-    match mailbox_harness::arm::decide(probe) {
-        ArmDecision::Arm => {
-            let stale = mailbox_harness::arm::reap_stale_pidfile(&config.waiters_dir(), &session);
-            if let StalePidfile::Reaped { pid } = stale {
-                warn!(
-                    session = %session.as_str(),
-                    pid,
-                    "removed a stale waiter pidfile (its process is gone — the waiter was killed \
-                     or crashed); arming a fresh waiter"
-                );
-            }
+    let decision = mailbox_harness::arm::decide(probe_subscription(&config, &session).await);
+    match decision {
+        ArmDecision::Skip => {
             info!(
                 session = %session.as_str(),
-                max_block_ms = args.max_block_ms,
-                stale_pidfile = stale.as_str(),
-                "armed session (subscribed); exec-ing the waiter"
+                reason = "not-subscribed",
+                "did not arm a waiter (the bridge says this session subscribes to nothing)"
             );
-            let exe = std::env::current_exe()
-                .context("resolving the mailbox binary path to exec the waiter")?;
-            // Never returns on success — the image becomes `mailbox wait`, which
-            // writes the pidfile itself after acquiring the single-waiter lock.
-            let err = mailbox_harness::arm::exec_waiter(&exe, session.as_str(), args.max_block_ms);
+            return Ok(ExitCode::SUCCESS);
+        }
+        ArmDecision::ArmUnverified(failure) => warn!(
+            session = %session.as_str(),
+            reason = failure.as_str(),
+            "could not confirm this session's subscriptions with the bridge; arming ANYWAY \
+             (fail-open). Skipping here would leave an idle session with no waiter and no further \
+             Stop to retry it — deaf forever. The waiter re-checks subscriptions itself under its \
+             lock, so an unsubscribed session simply self-exits"
+        ),
+        ArmDecision::Arm => {}
+    }
+
+    let stale = mailbox_harness::arm::reap_stale_pidfile(&config.waiters_dir(), &session);
+    if let StalePidfile::Reaped { pid } = stale {
+        warn!(
+            session = %session.as_str(),
+            pid,
+            "removed a stale waiter pidfile (its process is gone — the waiter was killed \
+             or crashed); arming a fresh waiter"
+        );
+    }
+    info!(
+        session = %session.as_str(),
+        max_block_ms,
+        stale_pidfile = stale.as_str(),
+        verified = matches!(decision, ArmDecision::Arm),
+        "armed session; exec-ing the waiter"
+    );
+    let exe =
+        std::env::current_exe().context("resolving the mailbox binary path to exec the waiter")?;
+    // Never returns on success — the image becomes `mailbox wait`, which writes the
+    // pidfile itself after acquiring the single-waiter lock.
+    let err = mailbox_harness::arm::exec_waiter(&exe, session.as_str(), max_block_ms);
+    error!(
+        session = %session.as_str(),
+        error = %err,
+        "could not exec the waiter; waking to force a re-arm rather than silently un-arming"
+    );
+    let _ = std::fs::remove_file(mailbox::wake::pidfile_path(&config.waiters_dir(), &session));
+    // Exit 2 (wake) so the harness re-runs Stop; std::process::exit skips the
+    // anyhow→exit-1 mapping this async path would otherwise apply.
+    std::process::exit(i32::from(mailbox::wake::WakeOutcome::EXIT_CODE));
+}
+
+/// The max-block this arm will actually give its waiter: the requested one, CLAMPED if
+/// it is not safely below the hook `timeout` we run under.
+///
+/// The `max_block < timeout` invariant is what stops Claude Code killing the waiter
+/// mid-block (after which an idle session, firing no further `Stop`, is never re-armed
+/// — ADR-0006). It was checked only in `install-hooks`, i.e. where the value is
+/// *written*. But the hook that launches us can be hand-edited, or can carry no
+/// `timeout` field at all — and then Claude Code applies its own 600s default, under
+/// which our 55-minute default max-block is lethal. So we enforce it HERE, where the
+/// value is used, and say so loudly in `harness.log`.
+///
+/// We clamp rather than refuse: a waiter that yields early is harmless (it just
+/// re-arms), whereas refusing to arm is the very deafness the invariant protects
+/// against. Loud, but still armed.
+fn resolve_arm_max_block(session: &SessionId, args: &ArmArgs) -> u64 {
+    let timeout_secs = args
+        .timeout_secs
+        .unwrap_or(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS);
+    match mailbox_harness::install::resolve_max_block(timeout_secs, args.max_block_ms) {
+        MaxBlockDecision::AsRequested(ms) => ms,
+        MaxBlockDecision::Clamped {
+            requested,
+            resolved,
+            timeout_secs,
+        } => {
             error!(
                 session = %session.as_str(),
-                error = %err,
-                "could not exec the waiter; waking to force a re-arm rather than silently un-arming"
+                requested_max_block_ms = requested,
+                resolved_max_block_ms = resolved,
+                timeout_secs,
+                assumed_timeout = args.timeout_secs.is_none(),
+                "the hook's --max-block-ms is NOT safely below the hook timeout this process runs \
+                 under: Claude Code would kill the waiter while it was still blocked, and an idle \
+                 session fires no further Stop, so nothing would ever re-arm it. Clamped down to a \
+                 safe block. Fix the hook: re-run `mailbox harness install-hooks` (it writes both \
+                 knobs, consistently)"
             );
-            let _ =
-                std::fs::remove_file(mailbox::wake::pidfile_path(&config.waiters_dir(), &session));
-            // Exit 2 (wake) so the harness re-runs Stop; std::process::exit skips
-            // the anyhow→exit-1 mapping this async path would otherwise apply.
-            std::process::exit(i32::from(mailbox::wake::WakeOutcome::EXIT_CODE));
-        }
-        ArmDecision::Skip(reason) => {
-            info!(
-                session = %session.as_str(),
-                reason = reason.as_str(),
-                "did not arm a waiter"
-            );
-            Ok(())
+            resolved
         }
     }
 }
@@ -1202,33 +1337,56 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
     }
 }
 
-/// Probe whether `session` has any subscriptions, over the socket. A clean
-/// `Status` with subscriptions → `Subscribed`; a clean `Status` with none →
-/// `NotSubscribed`; a serviced error/unexpected reply → `BridgeError`; an
-/// unreachable bridge → `BridgeUnreachable`. The two failure cases are logged
-/// distinctly (honest diagnostics) but both keep arming fail-safe (no wake).
+/// Number of subscription-probe attempts before `arm` gives up and arms fail-open.
+const ARM_PROBE_ATTEMPTS: u32 = 3;
+/// Base backoff between probe attempts (doubles each attempt). Short: this runs inside
+/// a hook, so a blip must be absorbed in well under a second, not waited out.
+const ARM_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Probe whether `session` has any subscriptions, over the socket, retrying a
+/// transient failure a few times with a short backoff.
+///
+/// A clean `Status` with subscriptions → `Subscribed`; a clean `Status` with none →
+/// `NotSubscribed` (both are ANSWERS, returned immediately — never retried). A
+/// serviced error/unexpected reply → `BridgeError`; an unreachable bridge →
+/// `BridgeUnreachable`; those two are retried, because a momentary blip (a daemon
+/// restarting) resolving cleanly is much better than falling through to the fail-open
+/// path, where we arm a waiter we could not justify.
+///
+/// If every attempt fails we still arm ([`mailbox_harness::arm::decide`]) — the
+/// alternative, skipping, leaves an idle session permanently unwakeable.
 async fn probe_subscription(config: &StorageConfig, session: &SessionId) -> SubscriptionProbe {
     let request = Request::Status {
         session: session.clone(),
     };
-    match client::send(&config.socket_path(), &request).await {
-        Ok(Response::Status(report)) if !report.subscriptions.is_empty() => {
-            SubscriptionProbe::Subscribed
-        }
-        Ok(Response::Status(_)) => SubscriptionProbe::NotSubscribed,
-        Ok(Response::Error { message }) => {
-            warn!(session = %session.as_str(), error = %message, "bridge errored on the subscription probe; not arming");
-            SubscriptionProbe::BridgeError
-        }
-        Ok(other) => {
-            warn!(session = %session.as_str(), reply = ?other, "unexpected bridge reply to the subscription probe; not arming");
-            SubscriptionProbe::BridgeError
-        }
-        Err(err) => {
-            warn!(session = %session.as_str(), error = %err, "bridge unreachable on the subscription probe; not arming");
-            SubscriptionProbe::BridgeUnreachable
+    let mut backoff = ARM_PROBE_BACKOFF;
+    let mut last = SubscriptionProbe::BridgeUnreachable;
+
+    for attempt in 1..=ARM_PROBE_ATTEMPTS {
+        last = match client::send(&config.socket_path(), &request).await {
+            Ok(Response::Status(report)) if !report.subscriptions.is_empty() => {
+                return SubscriptionProbe::Subscribed;
+            }
+            Ok(Response::Status(_)) => return SubscriptionProbe::NotSubscribed,
+            Ok(Response::Error { message }) => {
+                warn!(session = %session.as_str(), attempt, error = %message, "bridge errored on the subscription probe");
+                SubscriptionProbe::BridgeError
+            }
+            Ok(other) => {
+                warn!(session = %session.as_str(), attempt, reply = ?other, "unexpected bridge reply to the subscription probe");
+                SubscriptionProbe::BridgeError
+            }
+            Err(err) => {
+                warn!(session = %session.as_str(), attempt, error = %err, "bridge unreachable on the subscription probe");
+                SubscriptionProbe::BridgeUnreachable
+            }
+        };
+        if attempt < ARM_PROBE_ATTEMPTS {
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
         }
     }
+    last
 }
 
 /// The `SessionEnd` hook: reap the waiter (process half) and drop the session's
@@ -1241,7 +1399,7 @@ async fn probe_subscription(config: &StorageConfig, session: &SessionId) -> Subs
 /// the card-08 TTL sweeper is the ultimate backstop: an un-torn-down interest
 /// ages out via its `last_seen` (exactly the hard-died-session case it exists for)
 /// — so we log and exit 0 rather than build a durable pending-end queue for MVP.
-async fn run_harness_cleanup() -> anyhow::Result<()> {
+async fn run_harness_cleanup() -> anyhow::Result<ExitCode> {
     let config = StorageConfig::from_env().context("resolving storage path for harness cleanup")?;
     let session = HookInput::from_reader(std::io::stdin().lock())
         .context("reading the SessionEnd hook payload from stdin")?
@@ -1251,7 +1409,7 @@ async fn run_harness_cleanup() -> anyhow::Result<()> {
     info!(session = %session.as_str(), outcome = reap.as_str(), "reaped session waiter");
 
     end_session_with_retry(&config, &session).await;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Number of `EndSession` attempts before deferring to the TTL sweeper.
@@ -1316,7 +1474,7 @@ async fn end_session_with_retry(config: &StorageConfig, session: &SessionId) {
 /// exhaustively below, so a print-only run always arrives with its reason. With no
 /// settings file (and no `--settings`) this writes nothing at all: conjuring a
 /// `settings.json` on a machine with no Claude Code is not ours to do.
-fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::Result<()> {
+fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::Result<ExitCode> {
     use mailbox_harness::install::{BackupPolicy, SettingsTarget};
 
     let mailbox_bin = match args.mailbox_bin {
@@ -1381,7 +1539,7 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
     }
 
     eprintln!("next: run `mailbox harness install-skills` to install the agent-mailbox skill");
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// What a successful merge tells the user: where the hooks actually landed —
@@ -1429,7 +1587,10 @@ fn note(format: OutputFormat, message: &str) {
 ///
 /// A failure still renders what DID install before returning non-zero: with more
 /// than one skill, "it failed" without naming what landed is not actionable.
-fn run_harness_install_skills(format: OutputFormat, args: InstallSkillsArgs) -> anyhow::Result<()> {
+fn run_harness_install_skills(
+    format: OutputFormat,
+    args: InstallSkillsArgs,
+) -> anyhow::Result<ExitCode> {
     let skills_dir = match args.skills_dir {
         Some(dir) => dir,
         None => mailbox_harness::skills::default_skills_dir()
@@ -1440,7 +1601,7 @@ fn run_harness_install_skills(format: OutputFormat, args: InstallSkillsArgs) -> 
         Ok(report) => {
             render_skill_report(format, &report)?;
             eprintln!("next: run `mailbox harness install-hooks` to wire the wake hooks");
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
         Err(err) => {
             // Report the skills that DID land before failing, so a partial install
@@ -1522,8 +1683,8 @@ fn render_skill_report(
 ///
 /// Exit codes: `2` = wake the session (mail, OR the benign re-arm boundary — both
 /// carry their reason on stderr); `1` = a waiter error, including an unresolvable
-/// session (a waiter with no identity has nothing to wait on); `0` = the session has
-/// no subscriptions, so there is nothing to wake about.
+/// session (a waiter with no identity has nothing to wait on); `0` = there is nothing
+/// to wake about (the session has no subscriptions, or no store exists at all).
 ///
 /// With `--max-block-ms`, a block that elapses with no mail exits **2** with
 /// [`REARM_NOTICE`]. That is the whole re-arm design (ADR-0006): the waiter cannot
@@ -1549,6 +1710,21 @@ pub fn run_wait(args: &WaitArgs) -> ExitCode {
         }
     };
     let session = &session;
+
+    // No store at all: the bridge has never run here, so there is nothing to be woken
+    // about and nothing to block on. Exit 0 (no wake), quietly — this is the state a
+    // machine with the hooks installed but no daemon started is in, and `arm` now
+    // launches us even when it could not reach the bridge (fail-open), so it is
+    // reached on every `Stop` there. It is a clean "nothing to do", not a failure.
+    if !config.path().exists() {
+        info!(
+            session = %session.as_str(),
+            db = %config.path().display(),
+            "no mailbox store exists; exiting without waking (start the bridge with `mailbox serve`)"
+        );
+        return ExitCode::SUCCESS;
+    }
+
     let waiter = Waiter::new(
         config.waiters_dir(),
         config.path().to_path_buf(),

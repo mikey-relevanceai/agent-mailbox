@@ -78,19 +78,33 @@ mailbox publish TOPIC --body '{"...":"..."}'
 
 **Two rules when you publish to a topic you subscribe to:**
 
-- **Be caught up to speak.** If you have unread events on that topic, the publish
-  is **refused** and nothing is written:
+- **Be caught up to speak.** If you have unread events on that topic **that someone
+  else wrote**, the publish is **refused** (exit 3) and nothing is written:
 
   ```text
-  mailbox: refusing to publish: you have 3 unread event(s) on `gibson`;
-  run `mailbox read` before publishing (nothing was published)
+  refused: you have 3 unread event(s) on gibson — run `mailbox read` first, then
+  publish again (nothing was published)
   ```
 
   Do exactly what it says: `mailbox read`, take in what your peers said, then
   publish. Do not try to work around it — speaking over mail you have not read is
   the thing it is stopping.
-- **Your own message never wakes you** and never counts as unread against you, so
-  it cannot block your next publish. You do not need to read your own words back.
+- **Your own message never wakes you**, and never blocks your next publish. It is
+  still *visible* to you (it shows in `mailbox read` and in your unread count) — that
+  is deliberate, so nothing can ever be silently hidden from you. Seeing your own
+  message come back is normal; just move on.
+
+**If you spawn a process that publishes (a build script, a git hook, a subagent),
+give it `--no-session`:**
+
+```bash
+mailbox publish ci.builds --no-session --body '{"build":"failed"}'
+```
+
+Claude Code puts your session id in the environment of **everything you spawn**, so
+without that flag the event is attributed to *you* — and you are never woken by your
+own message. `--no-session` publishes it as nobody, which wakes every subscriber,
+including you.
 
 ### On wake
 
@@ -201,6 +215,7 @@ Session identity is automatic — none of these take `--session`.
 | watch a PR | `mailbox watch github-pr OWNER/REPO#N` |
 | subscribe to a topic | `mailbox subscribe TOPIC` |
 | publish to a topic | `mailbox publish TOPIC --body '{...}'` (read first if you have unread there) |
+| publish from a script you spawned | `mailbox publish TOPIC --no-session --body '{...}'` |
 | list topics | `mailbox topics [--prefix agent.]` |
 | read on wake | `mailbox read` |
 | check state | `mailbox status` |

@@ -819,6 +819,20 @@ async fn populated_v1_db_migrates_to_v2() {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             r#"
+            -- A real v1 DB has the event log too; these fixtures used to omit it because
+            -- no migration touched it. v5 (the author stamp) ALTERs `event`, so the
+            -- fixture must be a faithful v1 schema or the migration has nothing to alter.
+            CREATE TABLE event (
+                event_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic        TEXT    NOT NULL,
+                offset       INTEGER NOT NULL,
+                event_id     TEXT    NOT NULL UNIQUE,
+                adapter      TEXT    NOT NULL,
+                timestamp    INTEGER NOT NULL,
+                body         TEXT    NOT NULL,
+                UNIQUE(topic, offset)
+            );
+            CREATE INDEX idx_event_topic_offset ON event(topic, offset);
             CREATE TABLE watch (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind          TEXT    NOT NULL,
@@ -886,6 +900,20 @@ async fn populated_v2_db_migrates_to_v3() {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             r#"
+            -- A real v1 DB has the event log too; these fixtures used to omit it because
+            -- no migration touched it. v5 (the author stamp) ALTERs `event`, so the
+            -- fixture must be a faithful v1 schema or the migration has nothing to alter.
+            CREATE TABLE event (
+                event_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic        TEXT    NOT NULL,
+                offset       INTEGER NOT NULL,
+                event_id     TEXT    NOT NULL UNIQUE,
+                adapter      TEXT    NOT NULL,
+                timestamp    INTEGER NOT NULL,
+                body         TEXT    NOT NULL,
+                UNIQUE(topic, offset)
+            );
+            CREATE INDEX idx_event_topic_offset ON event(topic, offset);
             CREATE TABLE watch (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind          TEXT    NOT NULL,

@@ -23,25 +23,11 @@ use tempfile::TempDir;
 
 // ---- daemon process helpers ---------------------------------------------------
 
-/// Path to the freshly built `mailbox` binary under test.
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_mailbox")
-}
+mod common;
 
-/// A `mailbox` command with the AMBIENT session environment stripped.
-///
-/// `cargo test` inherits the developer's environment, and inside a Claude Code
-/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
-/// resolves as the caller's session (that is the point of auto-resolution, and
-/// `publish` now uses it). A test that did not strip it would run its commands as
-/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
-/// test subprocess starts with NO session unless the test names one itself.
-fn mailbox_command() -> Command {
-    let mut cmd = Command::new(bin());
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("MAILBOX_SESSION_ID");
-    cmd
-}
+// The ONE session-stripping spawner + bin path, shared by every test binary
+// (tests/common): a test must never inherit the developer's CLAUDE_CODE_SESSION_ID.
+use common::{mailbox_bin as bin, mailbox_command};
 
 /// The reference stub adapter binary, beside the `mailbox` bin (built if missing).
 ///
@@ -931,4 +917,37 @@ fn session_env_fallback_is_used_when_flag_absent() {
         .expect("run subscribe with env session");
     assert_ok(&output, "subscribe via env session");
     assert!(stdout(&output).contains("subscribed to test.topic.env"));
+}
+
+/// **The empty-`--session` trap must be VISIBLE (verifier FIX 5).**
+///
+/// `--session "$MAILBOX_SESSION_ID"` with that var unset expands to `--session ""`, and
+/// an explicit flag wins the precedence — so the command silently binds a *different*
+/// session (whatever the env says) than the one the caller believes they named. The
+/// diagnostic for that used to be a `tracing::warn!`, which the default filter (ERROR)
+/// swallowed for exactly the commands where the trap bites: `mailbox publish --session
+/// ""` printed nothing at all. It must be a real stderr line at DEFAULT verbosity —
+/// no RUST_LOG, no flags.
+#[test]
+fn an_empty_session_flag_warns_on_stderr_at_default_verbosity() {
+    let out = mailbox_command()
+        .args(["--json", "whoami", "--session", ""])
+        .env("CLAUDE_CODE_SESSION_ID", "s-real")
+        // NO RUST_LOG: the default filter is what swallowed this before.
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run whoami");
+
+    let stderr = stderr(&out);
+    assert!(
+        stderr.contains("empty --session"),
+        "the ignored empty --session must be reported on stderr at default verbosity; got: \
+         {stderr:?}"
+    );
+    // And it says what it fell back to, so the agent can see which session it really is.
+    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
+    assert_eq!(
+        value["session"], "s-real",
+        "the empty flag is ignored, not bound as a phantom empty session"
+    );
 }

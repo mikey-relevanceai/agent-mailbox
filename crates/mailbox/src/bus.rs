@@ -196,23 +196,28 @@ impl Bus {
     }
 
     /// Publish `body` to `topic` **as `publisher`** — an agent, not an adapter —
-    /// applying the two caller-aware rules and then kicking every subscriber EXCEPT
-    /// the publisher.
+    /// applying the caller-aware rule and then kicking every subscriber EXCEPT the
+    /// publisher.
     ///
-    /// The rules themselves are one atomic writer command
+    /// The rule itself is one atomic writer command
     /// ([`Storage::publish_as_session`], see [`PublishAttempt`]):
     ///
     /// 1. **Be caught up to speak.** A publisher subscribed to the topic with unread
-    ///    events on it is REFUSED, and nothing is written. It must `read` first.
-    /// 2. **Its own event advances its own cursor**, so it does not count as unread
-    ///    against it — otherwise rule 1 would block its very next publish.
+    ///    events on it *that it did not write itself* is REFUSED, and nothing is
+    ///    written. It must `read` first.
     ///
     /// And here, at the wake boundary:
     ///
-    /// 3. **No self-wake.** The publisher is never kicked for its own event. It is
-    ///    mid-turn (it just ran a command), it already knows what it said, and waking
-    ///    it on it would be a wake with nothing to read — plus, by rule 2, it has no
-    ///    unread anyway, so a woken waiter would find nothing and block again.
+    /// 2. **No self-wake.** The publisher is never kicked for its own event. It is
+    ///    mid-turn (it just ran a command) and already knows what it said. This is the
+    ///    kick half; the durable half is the waiter's unread query, which likewise
+    ///    ignores events the session authored (`storage::reader`) — otherwise a waiter
+    ///    armed *after* the publish would simply wake on it anyway.
+    ///
+    /// Nothing is hidden from the publisher by either half: its own event stays in
+    /// `read` and in its unread count. `--no-session` publishes anonymously (no
+    /// author), which is what a script an agent spawns should do — then EVERY
+    /// subscriber is kicked, the agent included.
     ///
     /// A REFUSED publish kicks nobody: there is nothing to wake about.
     pub async fn publish_as_session(
@@ -246,23 +251,20 @@ impl Bus {
         Ok(attempt)
     }
 
-    /// Kick every session subscribed to `topic`, except `skip` (the publisher, on the
-    /// session-aware path — rule 3 above).
+    /// Kick every session subscribed to `topic`, except `author` (the publisher, on
+    /// the session-aware path — rule 2 above).
     ///
     /// Best-effort and it must never fail a publish: the event is already durable,
     /// and a session with no live waiter is normal. If listing the subscribers itself
     /// fails, we log and move on — a later waiter's unread check still covers the
     /// mail.
-    async fn kick_subscribers(&self, topic: &Topic, skip: Option<&SessionId>) {
+    async fn kick_subscribers(&self, topic: &Topic, author: Option<&SessionId>) {
         let Some(waker) = &self.waker else {
             return;
         };
         match self.storage.sessions_subscribed(topic.clone()).await {
             Ok(sessions) => {
-                let targets: Vec<SessionId> = sessions
-                    .into_iter()
-                    .filter(|session| Some(session) != skip)
-                    .collect();
+                let targets = kick_targets(sessions, author);
                 waker.kick_all(&targets, topic);
             }
             Err(err) => warn!(
@@ -411,5 +413,62 @@ impl Bus {
     pub async fn read(&self, session: SessionId, limit: Option<u32>) -> Result<Delivery, BusError> {
         let events = self.storage.read_unread(session, limit).await?;
         Ok(Delivery::new(events))
+    }
+}
+
+/// The no-self-kick filter: which of a topic's `subscribers` get a wake byte for an
+/// event authored by `author`.
+///
+/// Pure, so the rule that decides who is woken is testable without a store, a waker
+/// or a FIFO. `author = None` (an adapter, or `publish --no-session`) kicks EVERYONE —
+/// that is the whole point of publishing anonymously from a process an agent spawned.
+fn kick_targets(subscribers: Vec<SessionId>, author: Option<&SessionId>) -> Vec<SessionId> {
+    subscribers
+        .into_iter()
+        .filter(|session| Some(session) != author)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sessions(ids: &[&str]) -> Vec<SessionId> {
+        ids.iter().map(|id| SessionId::new(*id)).collect()
+    }
+
+    /// The publisher is never kicked for its own event; every peer is. This is the
+    /// kick half of "you are never woken by your own message" (the durable half is
+    /// the waiter's unread query, tested in `storage::reader`).
+    #[test]
+    fn an_authored_event_kicks_every_subscriber_except_its_author() {
+        let subscribers = sessions(&["s-a", "s-b", "s-c"]);
+        let author = SessionId::new("s-b");
+        assert_eq!(
+            kick_targets(subscribers, Some(&author)),
+            sessions(&["s-a", "s-c"])
+        );
+    }
+
+    /// An ANONYMOUS publish (an adapter, or `publish --no-session` from a script the
+    /// agent spawned) has no author, so it kicks everyone — including the session
+    /// that happens to have spawned the publisher. That is the escape hatch from the
+    /// ambient-session trap.
+    #[test]
+    fn an_anonymous_event_kicks_every_subscriber() {
+        let subscribers = sessions(&["s-a", "s-b"]);
+        assert_eq!(kick_targets(subscribers.clone(), None), subscribers);
+    }
+
+    /// An author who does not subscribe to the topic it published to (the `send`
+    /// shape: writing to a peer's inbox) removes nobody.
+    #[test]
+    fn an_author_who_is_not_a_subscriber_filters_nothing() {
+        let subscribers = sessions(&["s-a"]);
+        let author = SessionId::new("s-outsider");
+        assert_eq!(
+            kick_targets(subscribers.clone(), Some(&author)),
+            subscribers
+        );
     }
 }

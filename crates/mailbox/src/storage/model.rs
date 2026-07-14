@@ -287,13 +287,14 @@ pub enum SubscribeKind {
 /// worse, permit — on a view of the log that no longer exists.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PublishAttempt {
-    /// The event was appended. If the publisher was subscribed to the topic, its own
-    /// delivery cursor was advanced past this event in the same transaction, so its
-    /// own message never counts as unread against it (without that, rule "be caught
-    /// up to speak" would deadlock an agent on its own last message).
+    /// The event was appended, stamped with its authoring session. No cursor moved:
+    /// the publisher's own event is unread to it like everyone else's (it shows in
+    /// `read` and in `status`), it simply does not count against the "be caught up to
+    /// speak" rule and never wakes its author.
     Published(Event),
     /// REFUSED, and nothing was written: the caller is subscribed to the topic and
-    /// has `unread` event(s) it has not read. You must be caught up before you speak.
+    /// has `unread` event(s) — written by someone OTHER than itself — that it has not
+    /// read. You must be caught up before you speak.
     RefusedUnread { unread: u64 },
 }
 

@@ -1,10 +1,30 @@
 //! The arm decision, the waiter pidfile (reader side), and exec-into-waiter.
 //!
-//! `arm` is the `SessionStart` / `Stop` hook target. It launches a waiter only
-//! when the session has subscriptions — otherwise there is nothing to be woken
-//! about, so waking would be noise. The decision is modelled as a type so a
-//! caller cannot forget the fail-safe: a bridge that is down or a session with no
-//! subscriptions both resolve to [`ArmDecision::Skip`], never to a wake.
+//! `arm` is the `SessionStart` / `Stop` hook target. It launches a waiter unless the
+//! bridge says, cleanly, that the session subscribes to nothing — then there is
+//! nothing to be woken about, so waking would be noise.
+//!
+//! # Why a failed probe ARMS ANYWAY (fail-OPEN)
+//!
+//! It used to skip: a bridge that was down or erroring resolved to `Skip`, "failing
+//! safe" by not waking. That was backwards, and it was a permanent-deafness bug.
+//! `arm` runs on `Stop`, and the re-arm loop now depends on it running successfully
+//! *every* `max_block`, forever (ADR-0006). A momentary bridge blip at one of those
+//! re-arm `Stop`s left the session with NO waiter — and an idle session fires no
+//! further `Stop`, so nothing ever retried. One blip, deaf forever.
+//!
+//! Arming without a confirmed subscription is safe because **the waiter validates
+//! itself**: `mailbox wait` needs no daemon socket (it opens the store read-only) and
+//! re-checks `has_subscription` *after* taking the single-waiter lock. A session that
+//! genuinely subscribes to nothing therefore gets a waiter that immediately self-exits
+//! 0 and removes its own pidfile — the same outcome `Skip` would have produced, minus
+//! the deafness. And if the store cannot be opened at all, the waiter exits cleanly
+//! too.
+//!
+//! Exiting 2 on a probe failure would be the other way to keep the loop alive, and it
+//! is WRONG: it would hot-loop wakes for as long as the bridge is down. Blocking is
+//! correct — when the daemon comes back and publishes, the kick reaches the waiter
+//! that is already blocked on the FIFO.
 //!
 //! When it does arm, the hook process **execs** the card-05 waiter (`mailbox
 //! wait`), replacing its own image. exec preserves the PID, so the pidfile the
@@ -37,60 +57,73 @@ use nix::unistd::Pid;
 /// What the bridge said about a session's subscriptions when `arm` asked.
 ///
 /// A four-way answer, not a `bool`, so "the bridge errored" and "the bridge was
-/// unreachable" are their own cases (both skip arming, but they are logged apart
-/// for honest diagnostics).
+/// unreachable" are their own cases: both arm anyway, but they are logged apart for
+/// honest diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriptionProbe {
     /// The session has at least one subscription — arm a waiter.
     Subscribed,
     /// The bridge answered and the session has no subscriptions.
     NotSubscribed,
-    /// The bridge was reachable but returned an error / unexpected reply. Fail
-    /// SAFE: do not wake.
+    /// The bridge was reachable but returned an error / unexpected reply.
     BridgeError,
-    /// The bridge could not be reached (down, timed out). Fail SAFE: do not wake.
+    /// The bridge could not be reached (down, timed out).
     BridgeUnreachable,
 }
 
-/// Whether `arm` should launch a waiter, and if not, why.
+/// Why the bridge could not tell us whether the session is subscribed.
+///
+/// Kept as its own type (rather than folded into "skip") because the *decision* it
+/// leads to is now the opposite of a skip: we arm regardless, and this is only the
+/// label on the `warn!` that says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArmDecision {
-    /// Launch the waiter for this session.
-    Arm,
-    /// Do not launch a waiter; the reason is for an honest log line.
-    Skip(SkipReason),
-}
-
-/// Why `arm` declined to launch a waiter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    /// The session subscribes to nothing, so there is nothing to wake about.
-    NotSubscribed,
-    /// The bridge returned an error/unexpected reply; arming fail-safe → no wake.
+pub enum ProbeFailure {
+    /// The bridge returned an error / unexpected reply.
     BridgeError,
-    /// The bridge was unreachable; arming fail-safe → no wake.
+    /// The bridge was unreachable (down, timed out).
     BridgeUnreachable,
 }
 
-impl SkipReason {
+impl ProbeFailure {
     /// Stable label for the structured log line.
     pub fn as_str(self) -> &'static str {
         match self {
-            SkipReason::NotSubscribed => "not-subscribed",
-            SkipReason::BridgeError => "bridge-error",
-            SkipReason::BridgeUnreachable => "bridge-unreachable",
+            ProbeFailure::BridgeError => "bridge-error",
+            ProbeFailure::BridgeUnreachable => "bridge-unreachable",
         }
     }
 }
 
-/// Map a subscription probe to an arm decision. The whole "arm iff subscribed,
-/// fail-safe on a down/erroring bridge" rule, in one exhaustive match.
+/// Whether `arm` should launch a waiter — and, when it does so without a confirmed
+/// subscription, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmDecision {
+    /// The bridge confirmed at least one subscription: launch the waiter.
+    Arm,
+    /// The probe FAILED, so we do not know. Launch the waiter anyway (fail-open — see
+    /// the module docs): the waiter re-checks `has_subscription` itself after taking
+    /// its lock, so an unsubscribed session self-exits cleanly, whereas NOT arming
+    /// would leave an idle session permanently unwakeable.
+    ArmUnverified(ProbeFailure),
+    /// The bridge answered cleanly: this session subscribes to nothing, so there is
+    /// nothing to wake it about. The ONLY case that does not arm.
+    Skip,
+}
+
+/// Map a subscription probe to an arm decision: arm unless the bridge said, clearly,
+/// that there are no subscriptions — the whole rule, in one exhaustive match.
 pub fn decide(probe: SubscriptionProbe) -> ArmDecision {
     match probe {
         SubscriptionProbe::Subscribed => ArmDecision::Arm,
-        SubscriptionProbe::NotSubscribed => ArmDecision::Skip(SkipReason::NotSubscribed),
-        SubscriptionProbe::BridgeError => ArmDecision::Skip(SkipReason::BridgeError),
-        SubscriptionProbe::BridgeUnreachable => ArmDecision::Skip(SkipReason::BridgeUnreachable),
+        SubscriptionProbe::NotSubscribed => ArmDecision::Skip,
+        // Fail-OPEN. A bridge blip at a re-arm `Stop` used to skip the waiter, and an
+        // idle session fires no further `Stop` to retry — so one blip deafened the
+        // session forever. The waiter's own post-lock re-check is what makes arming
+        // on an unknown subscription state safe.
+        SubscriptionProbe::BridgeError => ArmDecision::ArmUnverified(ProbeFailure::BridgeError),
+        SubscriptionProbe::BridgeUnreachable => {
+            ArmDecision::ArmUnverified(ProbeFailure::BridgeUnreachable)
+        }
     }
 }
 
@@ -131,6 +164,10 @@ pub enum StalePidfile {
     /// pidfile survives, so `mailbox agents` / `status` keep reporting a live waiter
     /// that does not exist. Reaped here, on the way to arming a real one.
     Reaped { pid: u32 },
+    /// The pidfile changed under us between the liveness probe and the delete: a
+    /// concurrent arm's waiter took the lock and wrote its own pid. Left ALONE — the
+    /// whole point of the compare-and-delete (see [`reap_stale_pidfile`]).
+    Raced { pid: u32 },
 }
 
 impl StalePidfile {
@@ -140,6 +177,7 @@ impl StalePidfile {
             StalePidfile::None => "none",
             StalePidfile::Live { .. } => "live",
             StalePidfile::Reaped { .. } => "reaped",
+            StalePidfile::Raced { .. } => "raced",
         }
     }
 }
@@ -151,9 +189,36 @@ impl StalePidfile {
 /// removal failure is reported as `None` rather than failing the hook (the incoming
 /// waiter overwrites the pidfile under lock anyway).
 ///
-/// Note the residual PID-reuse hazard, unchanged from `waiter_alive`: `kill(pid, 0)`
-/// only proves *some* process holds that pid. We accept it for a local dev bus.
+/// # Compare-and-delete, not delete-by-path
+///
+/// The delete is guarded by a re-read: we unlink ONLY if the file still names the
+/// same dead pid we probed. Deleting by path alone was a TOCTOU bug — between the
+/// `kill(P, 0)` that proved P dead and the `remove_file`, a concurrent `arm`'s waiter
+/// can take the single-waiter lock and write its own LIVE pid into that very file, and
+/// we would then delete a live waiter's pidfile. The damage is real and lasting: the
+/// waiter keeps running and keeps the lock (so no later waiter replaces the file), but
+/// `cleanup` has nothing to reap on `SessionEnd` (an orphan surviving the session) and
+/// `agents` / `status` under-report it.
+///
+/// Residual, stated honestly: the re-read narrows the window to the microseconds
+/// between it and the `unlink` — POSIX has no atomic compare-and-unlink, and taking
+/// the waiter lock here would be worse (a concurrent waiter would see the lock held
+/// and exit as a "loser", which is exactly the un-armed session we are trying to
+/// prevent). PID reuse is the same accepted hazard as `waiter_alive`: `kill(pid, 0)`
+/// only proves *some* process holds that pid.
 pub fn reap_stale_pidfile(waiters_dir: &Path, session: &SessionId) -> StalePidfile {
+    reap_stale_pidfile_racing(waiters_dir, session, || {})
+}
+
+/// [`reap_stale_pidfile`] with a seam for the ONE race that matters: `interleave` runs
+/// between the liveness probe and the compare-and-delete, so a test can deterministically
+/// plant a concurrent waiter's live pid in that window instead of hoping to hit it.
+/// Production passes a no-op.
+fn reap_stale_pidfile_racing(
+    waiters_dir: &Path,
+    session: &SessionId,
+    interleave: impl FnOnce(),
+) -> StalePidfile {
     let Some(pid) = read_pidfile(waiters_dir, session) else {
         return StalePidfile::None;
     };
@@ -161,9 +226,22 @@ pub fn reap_stale_pidfile(waiters_dir: &Path, session: &SessionId) -> StalePidfi
     if kill(Pid::from_raw(pid as i32), None) != Err(Errno::ESRCH) {
         return StalePidfile::Live { pid };
     }
-    match std::fs::remove_file(pidfile_path(waiters_dir, session)) {
-        Ok(()) => StalePidfile::Reaped { pid },
-        Err(_) => StalePidfile::None,
+    interleave();
+    // Compare-and-delete: whoever owns the pidfile NOW must still be the dead pid we
+    // just probed. If a concurrent waiter has rewritten it with its own live pid, that
+    // file is not ours to remove.
+    match read_pidfile(waiters_dir, session) {
+        Some(current) if current == pid => {
+            match std::fs::remove_file(pidfile_path(waiters_dir, session)) {
+                Ok(()) => StalePidfile::Reaped { pid },
+                Err(_) => StalePidfile::None,
+            }
+        }
+        // Rewritten under us: a concurrent arm's waiter claimed the session while we
+        // were probing. Not ours to remove.
+        Some(current) => StalePidfile::Raced { pid: current },
+        // Removed under us (a racing `cleanup`): nothing left to reap.
+        None => StalePidfile::None,
     }
 }
 
@@ -203,20 +281,21 @@ pub(crate) fn write_pidfile_for_test(
 mod tests {
     use super::*;
 
+    /// The ONLY thing that must not arm is a clean "you subscribe to nothing". A
+    /// failed probe arms anyway (fail-open): skipping it left an idle session with no
+    /// waiter, and an idle session fires no further `Stop`, so nothing ever retried —
+    /// one bridge blip and the session was deaf forever.
     #[test]
-    fn subscribed_arms_everything_else_skips() {
+    fn only_a_clean_not_subscribed_skips_a_failed_probe_arms_anyway() {
         assert_eq!(decide(SubscriptionProbe::Subscribed), ArmDecision::Arm);
-        assert_eq!(
-            decide(SubscriptionProbe::NotSubscribed),
-            ArmDecision::Skip(SkipReason::NotSubscribed)
-        );
+        assert_eq!(decide(SubscriptionProbe::NotSubscribed), ArmDecision::Skip);
         assert_eq!(
             decide(SubscriptionProbe::BridgeError),
-            ArmDecision::Skip(SkipReason::BridgeError)
+            ArmDecision::ArmUnverified(ProbeFailure::BridgeError)
         );
         assert_eq!(
             decide(SubscriptionProbe::BridgeUnreachable),
-            ArmDecision::Skip(SkipReason::BridgeUnreachable)
+            ArmDecision::ArmUnverified(ProbeFailure::BridgeUnreachable)
         );
     }
 
@@ -262,6 +341,35 @@ mod tests {
             StalePidfile::Live { pid: live }
         );
         assert_eq!(read_pidfile(dir.path(), &s), Some(live));
+    }
+
+    /// The TOCTOU that delete-by-path had: between "pid P is dead" and the unlink, a
+    /// concurrent arm's waiter takes the single-waiter lock and writes its own LIVE pid
+    /// into the same file. Deleting by path then destroys a LIVE waiter's pidfile — the
+    /// waiter keeps running and keeps the lock (so nothing rewrites the file), leaving
+    /// `cleanup` nothing to reap on `SessionEnd` and `agents`/`status` under-reporting it.
+    /// The compare-and-delete must see the new pid and leave the file alone.
+    #[test]
+    fn a_concurrent_waiters_live_pidfile_is_never_deleted_by_the_reaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = SessionId::new("s1");
+        let dead = 2_000_000_000u32; // above any platform PID_MAX: never a live pid.
+        let live = std::process::id();
+
+        write_pidfile_for_test(dir.path(), &s, dead).unwrap();
+
+        // The race, deterministically: the concurrent waiter wins the lock and records
+        // itself in the window between our liveness probe and our delete.
+        let outcome = reap_stale_pidfile_racing(dir.path(), &s, || {
+            write_pidfile_for_test(dir.path(), &s, live).unwrap();
+        });
+
+        assert_eq!(outcome, StalePidfile::Raced { pid: live });
+        assert_eq!(
+            read_pidfile(dir.path(), &s),
+            Some(live),
+            "the live waiter's pidfile must survive the reap (else cleanup cannot reap it)"
+        );
     }
 
     #[test]

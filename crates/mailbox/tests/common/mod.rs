@@ -24,10 +24,16 @@
 
 #![allow(dead_code)] // A shared harness: not every helper is used by every test file.
 
-// TODO(card-12 follow-up): `stub_e2e.rs`, `github_pr_e2e.rs`, and `harness.rs`
-// still carry their own copies of `Daemon` / `poll_until` / `wait_for_socket` /
-// `FAKE_GH`. They should be folded onto this shared module so the 4× duplication
-// is retired (deferred here to avoid churning other cards' green suites).
+// [`mailbox_command`] — the session-stripping spawner — IS now shared by every test
+// binary in the crate (`cli.rs`, `harness.rs`, `wake.rs`, `stub_e2e.rs`,
+// `github_pr_e2e.rs`, and the `Env`-based suites): it is a correctness helper, not a
+// convenience, so the 5 hand-copied variants were a real hazard (one of them, in
+// `wake.rs`, had already drifted and did NOT strip the ambient session).
+//
+// TODO(card-12 follow-up): `stub_e2e.rs`, `github_pr_e2e.rs`, and `harness.rs` still
+// carry their own copies of `Daemon` / `poll_until` / `wait_for_socket` / `FAKE_GH`.
+// Those are convenience fixtures (a drifted copy fails its own test loudly rather than
+// changing behaviour), so folding them in is deferred to avoid churning green suites.
 
 use std::collections::HashSet;
 use std::io::Write;

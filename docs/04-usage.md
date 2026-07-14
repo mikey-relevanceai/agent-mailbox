@@ -186,11 +186,11 @@ The snippet wires three hooks:
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness arm --max-block-ms 540000",
-      "asyncRewake": true, "timeout": 600 }] }],
+      "command": "/abs/path/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
+      "asyncRewake": true, "timeout": 3600 }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness arm --max-block-ms 540000",
-      "asyncRewake": true, "timeout": 600 }] }],
+      "command": "/abs/path/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
+      "asyncRewake": true, "timeout": 3600 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness cleanup" }] }]
   }
@@ -203,8 +203,15 @@ What each hook does:
   Reads the `session_id` from the hook's stdin JSON, **registers the session's
   agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
   agents, see §4), asks the bridge whether the session has any subscriptions, and
-  — **iff subscribed** — `exec`s the waiter. The bridge down/erroring → exit 0,
-  **no wake** (fail-safe). This is the only reason the agent never re-arms.
+  — unless the bridge answers cleanly that it subscribes to **nothing** — `exec`s the
+  waiter. This is the only reason the agent never re-arms.
+
+  If the bridge is **down or erroring**, `arm` retries briefly and then **arms anyway**
+  (fail-open): the waiter needs no daemon and re-checks subscriptions itself, so an
+  unsubscribed session's waiter simply self-exits — whereas *not* arming would leave an
+  idle session with no waiter and no further `Stop` to retry it, i.e. permanently
+  unwakeable. A down bridge never produces a *wake*; the waiter just blocks, and the
+  first publish after the daemon returns kicks it.
 - **`SessionEnd` → `mailbox harness cleanup`.** Reaps the waiter and drops this
   session's subscriptions (including its inbox — it stops being addressable)
   **and** watch interests, stopping any adapter whose last interested session it
@@ -226,7 +233,11 @@ That wake carries **no mail**. If you see it: do nothing, and end your turn — 
 3600` (1h) and `--max-block-ms 3300000` (55m), so this happens at most once an hour
 of continuous idle; **a larger `--timeout-secs` means fewer of these wakes.**
 `install-hooks` **refuses** a `--max-block-ms` that is not safely below
-`--timeout-secs` — that pairing silently reintroduces the un-armed-forever bug. See
+`--timeout-secs` — that pairing silently reintroduces the un-armed-forever bug — and
+`arm` enforces the same rule again *at run time*, clamping (loudly, in `harness.log`) a
+max-block that is not safely below the hook `timeout` it was launched with. That covers
+a hand-edited `settings.json`, and a hook entry with no `timeout` at all (where Claude
+Code applies its own 600s default). See
 [01-wake-and-rearm](01-wake-and-rearm.md) § "Timeout survival" and
 [ADR-0006](adr/0006-harness-self-respawn.md).
 
@@ -341,7 +352,7 @@ override but do not need it.
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
-| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event to a topic (see the rules below). |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>] [--no-session]` | Publish an event to a topic (see the rules below). `--no-session` publishes anonymously — use it from any script/hook/subagent the agent spawns. |
 | `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
 | `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). |
 | `mailbox agents [--json]` | List the agents you can `send` to. |
@@ -350,29 +361,57 @@ override but do not need it.
 ### Publishing: two rules for agents (adapters are unaffected)
 
 `publish` resolves *you* the same way every other command does, so a publish from an
-agent is attributed to that agent's session. Two rules follow from that, and they
-only apply to a **topic you subscribe to**:
+agent is attributed to that agent's session — the event carries your session id as its
+**author**. Two rules follow, and they only apply to a **topic you subscribe to**:
 
-1. **Be caught up to speak.** A publish is **refused** (non-zero exit, nothing
-   written) if you have unread events on that topic. You would be talking past mail
-   you have not read.
+1. **Be caught up to speak.** A publish is **refused** (exit **3**, nothing written) if
+   you have unread events on that topic **that someone else wrote**. You would be
+   talking past mail you have not read.
 
    ```text
-   mailbox: refusing to publish: you have 3 unread event(s) on `gibson`;
-   run `mailbox read` before publishing (nothing was published)
+   refused: you have 3 unread event(s) on gibson — run `mailbox read` first, then
+   publish again (nothing was published)
    ```
 
    Run `mailbox read`, react to what is there, then publish. Nothing was lost — the
    event you tried to send was simply not written, so just publish it again.
 
+   Exit **3** is the refusal's own code, so a script can tell it apart from a real
+   failure (a bridge that is down is still exit 1). It is never exit 2 — that is the
+   wake code.
+
 2. **You are never woken by your own message.** The publish kicks every *other*
-   subscriber; your own event advances your own cursor, so it never counts as
-   unread against you (and therefore never blocks your *next* publish).
+   subscriber, and your own event never wakes you.
+
+   Your own event is **not hidden from you**, though: it stays unread, `mailbox read`
+   returns it, and `mailbox status` counts it. It simply does not *gag* you (rule 1
+   ignores what you wrote) and does not *wake* you.
 
 **Adapters are exempt from both.** An adapter has no session, so its publish behaves
 exactly as it always has: no unread rule, and every subscriber is kicked. That is the
 point of a mailbox — a poller must be able to publish into a topic whose subscribers
 are far behind.
+
+### `--no-session`: publishing from a script the agent spawned
+
+Claude Code exports `$CLAUDE_CODE_SESSION_ID` into **every process an agent spawns** — a
+build script, a git hook, a subagent. So a `mailbox publish` from any of them is
+attributed to the *agent*, and by rule 2 it will not wake the agent.
+
+Pass **`--no-session`** from any such process:
+
+```bash
+# in a build script / git hook / subagent the agent spawned
+mailbox publish ci.builds --no-session --body '{"build":"failed"}'
+```
+
+The event is then authored by **nobody**: no unread rule applies to it, and it wakes
+**every** subscriber — the agent included. This is the right flag for anything that
+publishes *on the agent's behalf* rather than *as* the agent.
+
+Without it, the message is still durable and still visible (it is unread for the agent,
+and `mailbox read` returns it) — it just will not *wake* the session it was
+mis-attributed to.
 
 ---
 

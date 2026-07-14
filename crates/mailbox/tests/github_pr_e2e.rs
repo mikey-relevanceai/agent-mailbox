@@ -28,24 +28,11 @@ use tempfile::TempDir;
 
 // ---- locating the binaries under test -----------------------------------------
 
-fn mailbox_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_mailbox")
-}
+mod common;
 
-/// A `mailbox` command with the AMBIENT session environment stripped.
-///
-/// `cargo test` inherits the developer's environment, and inside a Claude Code
-/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
-/// resolves as the caller's session (that is the point of auto-resolution, and
-/// `publish` now uses it). A test that did not strip it would run its commands as
-/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
-/// test subprocess starts with NO session unless the test names one itself.
-fn mailbox_command() -> Command {
-    let mut cmd = Command::new(mailbox_bin());
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("MAILBOX_SESSION_ID");
-    cmd
-}
+// The ONE session-stripping spawner + bin path (tests/common): a test must never
+// inherit the developer's CLAUDE_CODE_SESSION_ID.
+use common::{mailbox_bin, mailbox_command};
 
 /// The freshly built github-pr adapter, beside the `mailbox` bin in the shared
 /// target dir. A full `cargo test --workspace` builds it in the build phase; the

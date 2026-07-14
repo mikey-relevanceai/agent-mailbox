@@ -616,12 +616,13 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
 /// Two callers, two contracts, kept apart by whether a `session` came with the
 /// request:
 ///
-/// - **An adapter** (no session) publishes exactly as it always has: no unread rule,
-///   every subscriber kicked. Adapters are the original publisher and have no session
-///   id to resolve — changing this path would break them.
-/// - **An agent** (a session) is held to the two caller-aware rules: it must be
-///   caught up on the topic to publish to it, and it is never woken by its own event
-///   (see [`Bus::publish_as_session`]).
+/// - **An adapter** (no session — including an agent's own `publish --no-session`)
+///   publishes exactly as it always has: no unread rule, every subscriber kicked, no
+///   author stamped. Adapters are the original publisher and have no session id to
+///   resolve — changing this path would break them.
+/// - **An agent** (a session) is held to the caller-aware rules: it must be caught up
+///   on the topic to publish to it, and it is never woken by its own event (see
+///   [`Bus::publish_as_session`]).
 async fn publish(
     bus: &Bus,
     topic: Topic,
@@ -664,14 +665,12 @@ async fn publish(
             id: event.id,
             offset: event.offset,
         },
-        // Be caught up to speak. The message names the count, the topic, and the ONE
-        // command that fixes it — an agent must be able to act on this without
-        // guessing, and nothing was written, so it can simply read and retry.
-        Ok(PublishAttempt::RefusedUnread { unread }) => Response::error(format!(
-            "refusing to publish: you have {unread} unread event(s) on `{}`; \
-             run `mailbox read` before publishing (nothing was published)",
-            topic.as_str()
-        )),
+        // Be caught up to speak. A TYPED refusal, not an `Error`: nothing failed and
+        // nothing was written, so a scripted publisher must be able to tell this
+        // ("read, then retry") from a real error ("the bridge is down") — which it
+        // could not while both came back as a string and exit 1. The CLI renders it
+        // with the one command that fixes it, and exits with its own code.
+        Ok(PublishAttempt::RefusedUnread { unread }) => Response::PublishRefused { topic, unread },
         Err(err) => Response::error(err.to_string()),
     }
 }
