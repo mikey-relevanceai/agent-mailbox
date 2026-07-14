@@ -63,6 +63,20 @@ can check the installed binary matches the source you built from (a `-dirty`
 suffix means it was built from an uncommitted tree). The running daemon also logs
 its version on the `bridge serving` startup line.
 
+### Bump the version
+
+The whole workspace shares one version (`[workspace.package] version` in the root
+`Cargo.toml`, inherited by every crate). Bump it in one step:
+
+```bash
+scripts/bump-version.sh patch      # 0.1.0 -> 0.1.1  (also minor | major | X.Y.Z)
+scripts/bump-version.sh minor --tag  # bump, sync Cargo.lock, commit + tag vX.Y.Z
+```
+
+Without `--tag` it edits `Cargo.toml`/`Cargo.lock` and prints the commit/tag
+commands so you can review the diff first. The new number then shows in
+`mailbox --version` after a rebuild.
+
 ### Where state lives
 
 The daemon keeps everything under one directory (default
