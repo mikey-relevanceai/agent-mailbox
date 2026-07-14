@@ -53,7 +53,7 @@ use crate::storage::{Storage, StorageError};
 use crate::wake::Waker;
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
-pub use crate::storage::{SessionId, SubscribeKind, SubscribeOutcome};
+pub use crate::storage::{PublishAttempt, SessionId, SubscribeKind, SubscribeOutcome};
 
 /// Errors from a bus operation.
 ///
@@ -190,19 +190,88 @@ impl Bus {
             .publish(topic.clone(), adapter, timestamp, body)
             .await?;
 
-        if let Some(waker) = &self.waker {
-            match self.storage.sessions_subscribed(topic.clone()).await {
-                Ok(sessions) => waker.kick_all(&sessions, &topic),
-                Err(err) => warn!(
-                    topic = topic.as_str(),
-                    error = %err,
-                    "could not list subscribers to kick after publish; \
-                     relying on waiter unread-check"
-                ),
-            }
-        }
+        self.kick_subscribers(&topic, None).await;
 
         Ok(event)
+    }
+
+    /// Publish `body` to `topic` **as `publisher`** — an agent, not an adapter —
+    /// applying the two caller-aware rules and then kicking every subscriber EXCEPT
+    /// the publisher.
+    ///
+    /// The rules themselves are one atomic writer command
+    /// ([`Storage::publish_as_session`], see [`PublishAttempt`]):
+    ///
+    /// 1. **Be caught up to speak.** A publisher subscribed to the topic with unread
+    ///    events on it is REFUSED, and nothing is written. It must `read` first.
+    /// 2. **Its own event advances its own cursor**, so it does not count as unread
+    ///    against it — otherwise rule 1 would block its very next publish.
+    ///
+    /// And here, at the wake boundary:
+    ///
+    /// 3. **No self-wake.** The publisher is never kicked for its own event. It is
+    ///    mid-turn (it just ran a command), it already knows what it said, and waking
+    ///    it on it would be a wake with nothing to read — plus, by rule 2, it has no
+    ///    unread anyway, so a woken waiter would find nothing and block again.
+    ///
+    /// A REFUSED publish kicks nobody: there is nothing to wake about.
+    pub async fn publish_as_session(
+        &self,
+        publisher: SessionId,
+        topic: Topic,
+        adapter: AdapterId,
+        timestamp: Timestamp,
+        body: Value,
+    ) -> Result<PublishAttempt, BusError> {
+        let attempt = self
+            .storage
+            .publish_as_session(topic.clone(), adapter, timestamp, body, publisher.clone())
+            .await?;
+
+        match &attempt {
+            PublishAttempt::Published(_) => {
+                self.kick_subscribers(&topic, Some(&publisher)).await;
+            }
+            // Log the decision: a refused publish is a real, observable outcome the
+            // agent must act on (read first), not a silent no-op.
+            PublishAttempt::RefusedUnread { unread } => info!(
+                session = publisher.as_str(),
+                topic = topic.as_str(),
+                unread,
+                "refused a publish: the publisher has unread events on this topic \
+                 (be caught up to speak); nothing was written"
+            ),
+        }
+
+        Ok(attempt)
+    }
+
+    /// Kick every session subscribed to `topic`, except `skip` (the publisher, on the
+    /// session-aware path — rule 3 above).
+    ///
+    /// Best-effort and it must never fail a publish: the event is already durable,
+    /// and a session with no live waiter is normal. If listing the subscribers itself
+    /// fails, we log and move on — a later waiter's unread check still covers the
+    /// mail.
+    async fn kick_subscribers(&self, topic: &Topic, skip: Option<&SessionId>) {
+        let Some(waker) = &self.waker else {
+            return;
+        };
+        match self.storage.sessions_subscribed(topic.clone()).await {
+            Ok(sessions) => {
+                let targets: Vec<SessionId> = sessions
+                    .into_iter()
+                    .filter(|session| Some(session) != skip)
+                    .collect();
+                waker.kick_all(&targets, topic);
+            }
+            Err(err) => warn!(
+                topic = topic.as_str(),
+                error = %err,
+                "could not list subscribers to kick after publish; \
+                 relying on waiter unread-check"
+            ),
+        }
     }
 
     /// Subscribe `session` to each of `topics`, baselining its delivery cursor to

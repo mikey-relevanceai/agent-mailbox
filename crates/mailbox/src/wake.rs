@@ -202,7 +202,7 @@ enum Pass {
 }
 
 /// Why one `poll` on the FIFO returned: a kick byte arrived (drain + re-check),
-/// or the bounded block elapsed with no kick (the self-respawn boundary, card 11).
+/// or the bounded block elapsed with no kick (the re-arm boundary, ADR-0006).
 /// A named enum, not a `bool`, so the branch reads plainly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Blocked {
@@ -214,18 +214,26 @@ enum Blocked {
 
 /// The result of a [`Waiter::wait`]: how a blocking wait ended.
 ///
-/// A three-way outcome, so the harness's arm-iff-subscribed and self-respawn
+/// A three-way outcome, so the harness's arm-iff-subscribed and re-arm
 /// coordination are both representable and exhaustively handled at the call site
 /// (no `unreachable!`): see docs/01-wake-and-rearm.md and ADR-0006.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// The session has unread mail; exit 2 and surface the reminder.
     Woken(WakeOutcome),
-    /// No mail within `budget`; the caller should re-exec a fresh waiter. Only
-    /// ever returned when a `max_block` was supplied (an unbounded wait blocks
-    /// forever). `budget` is carried so the caller re-arms with the same bound
-    /// without re-reading it from elsewhere.
-    TimedOut { budget: Duration },
+    /// No mail within `max_block`: the waiter has reached its re-arm boundary and
+    /// must hand back to the harness. The caller exits **2** with the benign
+    /// [`REARM_NOTICE`] on stderr — a wake with no mail — so the session's next
+    /// `Stop` runs `arm` and a FRESH hook process (with a FRESH `timeout`) takes
+    /// over. Only ever returned when a `max_block` was supplied (an unbounded wait
+    /// blocks forever).
+    ///
+    /// Why exit rather than re-exec (the card-11 design, now retired — ADR-0006): the waiter's
+    /// life is hard-bounded by Claude Code's per-hook `timeout`, and `execv` does
+    /// NOT reset that clock (it preserves the PID, and the deadline is per-process).
+    /// A waiter therefore cannot outrun the timeout — it can only *yield* before it,
+    /// which is what this outcome is. See ADR-0006.
+    TimedOut,
     /// The session has NO subscriptions, so there is nothing to be woken about —
     /// exit cleanly WITHOUT waking. This is the waiter-side half of
     /// arm-iff-subscribed: an `arm` that raced a `SessionEnd`/unsubscribe (interest
@@ -233,6 +241,16 @@ pub enum WaitOutcome {
     /// orphan waiter survives (card 11 HIGH#2 fix).
     Unsubscribed,
 }
+
+/// The stderr line a re-arm exit writes (exit 2, no mail).
+///
+/// It MUST NOT look like mail: the agent that sees it has nothing to read, and its
+/// only correct response is to do nothing and end its turn — which fires `Stop`,
+/// which re-arms a fresh waiter. Kept beside [`WakeOutcome::reminder`] so the two
+/// stderr wire strings — the only things wake ever writes — are defined together
+/// and stay obviously distinct. Payload-free, like every other wake.
+pub const REARM_NOTICE: &str = "mailbox: re-arming the waiter (no new mail) — nothing to read; \
+                                just end your turn and the Stop hook will re-arm it";
 
 /// The result of a completed [`Waiter::wait`]: the session has mail and should
 /// be woken.
@@ -505,21 +523,22 @@ impl Waiter {
     ///    [`WaitOutcome::Unsubscribed`] (no orphan; card 11 HIGH#2 fix).
     /// 4. Loop: check unread. If there is mail, return `Woken`. Otherwise `poll`
     ///    until a kick (drain + re-check) or, with a `max_block`, the budget
-    ///    elapses → `TimedOut` (the caller re-execs a fresh waiter).
+    ///    elapses → `TimedOut` (the caller exits 2 to force a fresh re-arm).
     ///
     /// `max_block = None` blocks indefinitely (the original card-05 contract, so a
     /// bare `mailbox wait` never times out). `Some(budget)` is a per-block bound:
-    /// the self-respawn primitive that keeps a long idle armed without the
-    /// harness's per-hook timeout ever landing on a live wait (see
-    /// docs/01-wake-and-rearm.md). The same open→check→block ordering runs on every
-    /// fresh waiter, so a publish during a re-exec gap is caught, not missed.
+    /// the re-arm boundary that keeps a long idle armed by handing back to the
+    /// harness *before* its per-hook `timeout` would kill this process (see
+    /// docs/01-wake-and-rearm.md and ADR-0006). The same open→check→block ordering
+    /// runs on every fresh waiter, so a publish during the re-arm gap is caught by
+    /// the next waiter's unread check, not missed.
     ///
-    /// The pidfile is removed only on the `Unsubscribed` exit (while the lock is
-    /// still held, so no concurrent waiter can have written a fresh one). On
-    /// `Woken` and `TimedOut` it is deliberately LEFT in place: on `TimedOut` the
-    /// same-pid re-exec re-writes it (and a `cleanup` racing the exec gap can still
-    /// reap our live pid); on `Woken` the process is exiting and the next `arm`'s
-    /// waiter overwrites it under lock.
+    /// The pidfile is removed on the `Unsubscribed` and `TimedOut` exits (while the
+    /// lock is still held, so no concurrent waiter can have written a fresh one) —
+    /// this process is about to die, and a pidfile naming a dead pid is exactly what
+    /// made the old failure invisible. On `Woken` it is deliberately LEFT in place:
+    /// `cleanup` may still race the exit and must find something to reap, and the
+    /// next `arm`'s waiter overwrites it under lock (and reaps a stale one).
     pub fn wait(&self, max_block: Option<Duration>) -> Result<WaitOutcome, WakeError> {
         // Step 0: single-waiter lock. Held for the whole call; released on drop
         // (any return path). `_lock` must stay bound so it is not dropped early.
@@ -583,21 +602,23 @@ impl Waiter {
                 Blocked::TimedOut => {
                     // Re-check once before giving up: a publish may have landed
                     // during this block without a delivered kick (the same durable
-                    // safety the first-pass check relies on). If still nothing, the
-                    // caller re-arms a fresh waiter.
+                    // safety the first-pass check relies on). If still nothing, we
+                    // hand back to the harness for a fresh re-arm.
                     if !store.topics_with_unread(&self.session)?.is_empty() {
                         continue;
                     }
-                    // `budget` is the max_block that produced this timeout; a
-                    // `None` (unbounded) wait never reaches here (its poll blocks
+                    // This process is about to exit, so drop the pidfile (still
+                    // under the lock): leaving one that names a soon-dead pid is
+                    // what made a killed waiter look alive.
+                    self.remove_pidfile();
+                    // A `None` (unbounded) wait never reaches here (its poll blocks
                     // forever), so this is only ever the bounded case.
-                    let budget = max_block.unwrap_or_default();
                     info!(
                         session = self.session.as_str(),
-                        max_block_ms = budget.as_millis(),
-                        "waiter reached its max-block with no mail; yielding for re-arm"
+                        max_block_ms = max_block.unwrap_or_default().as_millis(),
+                        "waiter reached its max-block with no mail; exiting 2 to force a fresh re-arm"
                     );
-                    return Ok(WaitOutcome::TimedOut { budget });
+                    return Ok(WaitOutcome::TimedOut);
                 }
             }
         }
@@ -617,8 +638,8 @@ impl Waiter {
         })
     }
 
-    /// Remove the pidfile, ignoring a missing file. Best-effort: only called on
-    /// the clean `Unsubscribed` exit while still holding the lock.
+    /// Remove the pidfile, ignoring a missing file. Best-effort: only called on the
+    /// clean `Unsubscribed` / `TimedOut` exits, while still holding the lock.
     fn remove_pidfile(&self) {
         if let Err(err) = std::fs::remove_file(&self.pidfile_path)
             && err.kind() != io::ErrorKind::NotFound
@@ -643,7 +664,7 @@ impl Waiter {
     ///
     /// With `max_block = None` the poll blocks indefinitely (card-05 behaviour);
     /// with `Some(budget)` it returns [`Blocked::TimedOut`] when the budget
-    /// elapses before any kick — the self-respawn boundary (card 11).
+    /// elapses before any kick — the re-arm boundary (ADR-0006).
     fn block_for_kick(
         &self,
         fifo: &mut std::fs::File,
@@ -847,5 +868,17 @@ mod tests {
             outcome.reminder(),
             "mail on topic github.pr.o/r#1, github.pr.o/r#2"
         );
+    }
+
+    /// The re-arm exit is a wake with NO mail, so its notice must never be
+    /// mistakable for the mail reminder — an agent that "reads" on it would find
+    /// nothing and learn to distrust the wake wire. The two strings are the whole
+    /// stderr contract, so the distinction is asserted, not assumed.
+    #[test]
+    fn the_rearm_notice_is_benign_and_never_claims_mail() {
+        assert!(!REARM_NOTICE.contains("mail on topic"), "{REARM_NOTICE}");
+        assert!(REARM_NOTICE.contains("re-arming"), "{REARM_NOTICE}");
+        // Payload-free like every other wake: it names no topic and carries no body.
+        assert!(!REARM_NOTICE.contains('{'), "{REARM_NOTICE}");
     }
 }

@@ -204,18 +204,31 @@ What each hook does:
   agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
   agents, see §4), asks the bridge whether the session has any subscriptions, and
   — **iff subscribed** — `exec`s the waiter. The bridge down/erroring → exit 0,
-  **no wake** (fail-safe). The armed waiter self-respawns before Claude Code's
-  `timeout` would kill it, so a long idle stays armed. This is the only reason the
-  agent never re-arms.
+  **no wake** (fail-safe). This is the only reason the agent never re-arms.
 - **`SessionEnd` → `mailbox harness cleanup`.** Reaps the waiter and drops this
   session's subscriptions (including its inbox — it stops being addressable)
   **and** watch interests, stopping any adapter whose last interested session it
   was (no zombie poller outlives the session).
 
-The `--max-block-ms` (waiter self-respawn bound) is kept safely below the
-async-hook `timeout`; both are install-time knobs (`--max-block-ms`,
-`--timeout-secs`). See [01-wake-and-rearm](01-wake-and-rearm.md) § "Timeout
-survival" for the reasoning.
+**Keeping a long idle armed (and the benign "re-arming" wake).** Claude Code kills a
+hook at its `timeout`, and the waiter *cannot* extend that deadline — so instead of
+being killed mid-block (which would leave an idle session silently unwakeable,
+because an idle session fires no further `Stop`), the waiter **yields**: at
+`--max-block-ms` it exits 2 with
+
+```text
+mailbox: re-arming the waiter (no new mail) — nothing to read; just end your turn
+and the Stop hook will re-arm it
+```
+
+That wake carries **no mail**. If you see it: do nothing, and end your turn — the
+`Stop` hook arms a fresh waiter with a fresh timeout. Defaults are `--timeout-secs
+3600` (1h) and `--max-block-ms 3300000` (55m), so this happens at most once an hour
+of continuous idle; **a larger `--timeout-secs` means fewer of these wakes.**
+`install-hooks` **refuses** a `--max-block-ms` that is not safely below
+`--timeout-secs` — that pairing silently reintroduces the un-armed-forever bug. See
+[01-wake-and-rearm](01-wake-and-rearm.md) § "Timeout survival" and
+[ADR-0006](adr/0006-harness-self-respawn.md).
 
 ### 2b. Install the skill
 
@@ -328,11 +341,38 @@ override but do not need it.
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
-| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event (normally an adapter's job; handy for testing). |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event to a topic (see the rules below). |
 | `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
 | `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). |
 | `mailbox agents [--json]` | List the agents you can `send` to. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
+
+### Publishing: two rules for agents (adapters are unaffected)
+
+`publish` resolves *you* the same way every other command does, so a publish from an
+agent is attributed to that agent's session. Two rules follow from that, and they
+only apply to a **topic you subscribe to**:
+
+1. **Be caught up to speak.** A publish is **refused** (non-zero exit, nothing
+   written) if you have unread events on that topic. You would be talking past mail
+   you have not read.
+
+   ```text
+   mailbox: refusing to publish: you have 3 unread event(s) on `gibson`;
+   run `mailbox read` before publishing (nothing was published)
+   ```
+
+   Run `mailbox read`, react to what is there, then publish. Nothing was lost — the
+   event you tried to send was simply not written, so just publish it again.
+
+2. **You are never woken by your own message.** The publish kicks every *other*
+   subscriber; your own event advances your own cursor, so it never counts as
+   unread against you (and therefore never blocks your *next* publish).
+
+**Adapters are exempt from both.** An adapter has no session, so its publish behaves
+exactly as it always has: no unread rule, and every subscriber is kicked. That is the
+point of a mailbox — a poller must be able to publish into a topic whose subscribers
+are far behind.
 
 ---
 

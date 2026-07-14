@@ -5,9 +5,11 @@
 //! binary. This module owns the *process* half: terminate the session's waiter so
 //! it does not outlive the session, and remove its pidfile.
 //!
-//! The waiter is a single stable PID for the whole idle (the hook exec'd into it
-//! and it self-respawns in place — see [`crate::arm`]), so reaping is: read the
-//! pidfile, `SIGTERM` that PID if it is still alive, and delete the pidfile.
+//! The waiter is one process for the life of its hook (the hook exec'd into it —
+//! see [`crate::arm`]), and its pidfile names that PID, so reaping is: read the
+//! pidfile, `SIGTERM` that PID if it is still alive, and delete the pidfile. A PID
+//! that is already gone is normal (the waiter may have yielded for a re-arm, or been
+//! killed at the hook timeout) and reads as `AlreadyGone`.
 
 use std::path::Path;
 

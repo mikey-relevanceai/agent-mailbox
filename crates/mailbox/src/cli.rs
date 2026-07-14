@@ -14,9 +14,10 @@ use clap::{Args, Parser, Subcommand};
 use tracing::{error, info, warn};
 
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
-use mailbox::wake::{WaitOutcome, Waiter, WakeOutcome};
-use mailbox_harness::arm::{ArmDecision, SubscriptionProbe};
+use mailbox::wake::{REARM_NOTICE, WaitOutcome, Waiter, WakeError, WakeOutcome};
+use mailbox_harness::arm::{ArmDecision, StalePidfile, SubscriptionProbe};
 use mailbox_harness::hook::HookInput;
+use mailbox_harness::install::{DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS};
 use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
 
 use crate::client;
@@ -147,6 +148,14 @@ impl SessionOpt {
             env_session(ENV_CLAUDE_SESSION),
         )
     }
+
+    /// Resolve the session where having none is LEGAL — the `publish` path, whose
+    /// caller may be an adapter or a plain script with no session anywhere. `None`
+    /// is the adapter contract (kick every subscriber; no caller-aware rules), so it
+    /// must not be an error the way it is for a session-scoped command.
+    pub fn resolve_optional(&self) -> Option<SessionId> {
+        self.resolve().ok()
+    }
 }
 
 /// A non-empty environment variable, trimmed of surrounding whitespace. An empty
@@ -174,7 +183,18 @@ fn resolve_session(
     // `env_session`.)
     let flag = flag.and_then(|s| {
         let trimmed = s.as_str().trim();
-        (!trimmed.is_empty()).then(|| SessionId::new(trimmed))
+        if trimmed.is_empty() {
+            // Never silent: the caller believes they named a session and did not, so
+            // whichever session we DO bind is not the one they typed. (This is the
+            // `--session "$MAILBOX_SESSION_ID"` trap; the warn is what makes it
+            // diagnosable from harness.log instead of by re-deriving it.)
+            warn!(
+                "ignoring an empty --session (it names no session); \
+                 falling back to MAILBOX_SESSION_ID / CLAUDE_CODE_SESSION_ID — omit the flag instead"
+            );
+            return None;
+        }
+        Some(SessionId::new(trimmed))
     });
     flag.or_else(|| mailbox_env.map(SessionId::new))
         .or_else(|| claude_env.map(SessionId::new))
@@ -190,24 +210,15 @@ fn parse_session(raw: &str) -> Result<SessionId, Infallible> {
     Ok(SessionId::new(raw))
 }
 
-/// Default waiter max-block before self-respawn (9 minutes). Kept below Claude
-/// Code's default async-hook `timeout` (10 min) so the waiter re-execs a fresh
-/// image before the harness would kill it (card 11, docs/01-wake-and-rearm.md).
-const DEFAULT_ARM_MAX_BLOCK_MS: u64 = 540_000;
-
-/// Default async-hook `timeout` the install snippet writes, in **seconds** (10
-/// minutes — Claude Code's documented default for command hooks).
-const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
-
-/// Arguments to `wait`: the session plus an optional self-respawn bound.
+/// Arguments to `wait`: the session plus an optional re-arm bound.
 #[derive(Args, Debug)]
 pub struct WaitArgs {
     #[command(flatten)]
     pub session: SessionOpt,
-    /// If set, block at most this long before re-execing a fresh waiter (the
-    /// self-respawn that keeps a long idle armed). Absent = block forever. The
-    /// harness passes this; a bare `mailbox wait` does not, preserving the
-    /// original blocking contract.
+    /// If set, block at most this long, then exit 2 with a benign "re-arming"
+    /// notice so the harness re-arms a FRESH waiter (the re-arm boundary that keeps
+    /// a long idle armed — see ADR-0006). Absent = block forever. The harness passes
+    /// this; a bare `mailbox wait` does not, preserving the original contract.
     #[arg(long)]
     pub max_block_ms: Option<u64>,
 }
@@ -233,12 +244,13 @@ pub enum HarnessCommand {
 
 #[derive(Args, Debug)]
 pub struct ArmArgs {
-    /// Max block the armed waiter uses before self-respawn (see [`WaitArgs`]).
+    /// Max block the armed waiter uses before it yields for a re-arm (see
+    /// [`WaitArgs`]). Must stay below the hook's `timeout` — `install-hooks`
+    /// validates that pairing.
     ///
-    /// `arm` always reads the session id from the hook's stdin JSON — the
-    /// self-respawn re-execs `mailbox wait` directly (carrying `--session`), never
-    /// `harness arm`, so `arm` needs no `--session` flag.
-    #[arg(long, default_value_t = DEFAULT_ARM_MAX_BLOCK_MS)]
+    /// `arm` always reads the session id from the hook's stdin JSON, so it needs no
+    /// `--session` flag.
+    #[arg(long, default_value_t = DEFAULT_MAX_BLOCK_MS)]
     pub max_block_ms: u64,
 }
 
@@ -254,11 +266,14 @@ pub struct InstallHooksArgs {
     /// executable's resolved path.
     #[arg(long)]
     pub mailbox_bin: Option<std::path::PathBuf>,
-    /// Claude Code async-hook timeout to write, in seconds.
+    /// Claude Code async-hook timeout to write, in seconds. It hard-bounds the
+    /// waiter's life, so a LARGER timeout means FEWER (benign) re-arm wakes; it must
+    /// stay above `--max-block-ms` with a margin, or the install is refused.
     #[arg(long, default_value_t = DEFAULT_HOOK_TIMEOUT_SECS)]
     pub timeout_secs: u64,
-    /// Waiter max-block to write into the arm command, in milliseconds.
-    #[arg(long, default_value_t = DEFAULT_ARM_MAX_BLOCK_MS)]
+    /// Waiter max-block to write into the arm command, in milliseconds. The waiter
+    /// yields for a re-arm at this bound; it must stay below `--timeout-secs`.
+    #[arg(long, default_value_t = DEFAULT_MAX_BLOCK_MS)]
     pub max_block_ms: u64,
 }
 
@@ -271,6 +286,13 @@ pub struct InstallSkillsArgs {
     pub skills_dir: Option<std::path::PathBuf>,
 }
 
+/// Arguments to `publish`.
+///
+/// The session is resolved like every other session-scoped command, but is
+/// **optional**: an adapter (or any script outside a Claude Code session) has no
+/// session id anywhere, and publishing must keep working exactly as it always has
+/// for it. A resolved session turns on the two caller-aware rules — be caught up to
+/// speak, and never wake yourself — in [`crate::serve`].
 #[derive(Args, Debug)]
 pub struct PublishArgs {
     /// Topic to publish to (e.g. `github.pr.owner/repo#42`).
@@ -281,6 +303,8 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
+    #[command(flatten)]
+    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -424,6 +448,14 @@ async fn run_serve() -> anyhow::Result<()> {
     serve::run(config).await
 }
 
+/// `publish`: append an event to a topic.
+///
+/// The caller's session is resolved when there IS one (an agent's shell always has
+/// `$CLAUDE_CODE_SESSION_ID`), and carried on the wire. That is what lets the bridge
+/// apply the two caller-aware rules — refuse a publish from a caller with unread on
+/// that topic, and never kick the publisher for its own event (ADR-0006 / §Publish
+/// in docs/04-usage.md). With no session (an adapter, a cron script) the publish
+/// behaves exactly as it always did: no unread rule, kick every subscriber.
 async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<()> {
     let topic = parse_topic(&args.topic)?;
     let body: serde_json::Value =
@@ -434,6 +466,7 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
             topic,
             adapter: AdapterId(args.adapter),
             body,
+            session: args.session.resolve_optional(),
         },
     )
     .await
@@ -1037,6 +1070,13 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
 /// HIGH#1). A failure to exec exits **2** (a wake → the harness re-runs Stop and
 /// re-arms) rather than exit 1 (a silent un-arm), first clearing any stale
 /// pidfile (item E / ADR-0006).
+///
+/// **Stale-pidfile reap.** Before it arms, `arm` removes a pidfile that names a DEAD
+/// pid. A waiter killed at the hook `timeout` leaves exactly that behind, and until
+/// it is cleared `mailbox agents` / `status` keep reporting a live waiter for a
+/// process that no longer exists. A LIVE pid is never touched — that is the winner
+/// of a SessionStart-vs-Stop arm race, and this arm's waiter will lose the
+/// single-waiter lock and exit, as designed.
 async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
     let config = StorageConfig::from_env().context("resolving storage path for harness arm")?;
     let session = HookInput::from_reader(std::io::stdin().lock())
@@ -1047,9 +1087,19 @@ async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<()> {
     let probe = probe_subscription(&config, &session).await;
     match mailbox_harness::arm::decide(probe) {
         ArmDecision::Arm => {
+            let stale = mailbox_harness::arm::reap_stale_pidfile(&config.waiters_dir(), &session);
+            if let StalePidfile::Reaped { pid } = stale {
+                warn!(
+                    session = %session.as_str(),
+                    pid,
+                    "removed a stale waiter pidfile (its process is gone — the waiter was killed \
+                     or crashed); arming a fresh waiter"
+                );
+            }
             info!(
                 session = %session.as_str(),
                 max_block_ms = args.max_block_ms,
+                stale_pidfile = stale.as_str(),
                 "armed session (subscribed); exec-ing the waiter"
             );
             let exe = std::env::current_exe()
@@ -1279,7 +1329,8 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
         max_block_ms: args.max_block_ms,
     };
     // Reject a max-block that would let Claude Code kill the waiter before it can
-    // self-respawn (the load-bearing invariant, ADR-0006).
+    // yield for a re-arm — that pairing silently un-arms an idle session forever
+    // (the load-bearing invariant, ADR-0006).
     spec.validate().context("invalid hook timing")?;
     let snippet = mailbox_harness::install::hooks_snippet(&spec);
 
@@ -1469,14 +1520,18 @@ fn render_skill_report(
 /// block on the FIFO. Finalizes the card-05 PROVISIONAL command into its real
 /// shape — `mailbox wait --session <id>` — with the same exit-code contract.
 ///
-/// Exit codes: `2` = the session has mail (wake it; reminder on stderr);
-/// `1` = a waiter error, including an unresolvable session (no `--session` and no
-/// session env var — a waiter with no identity has nothing to wait on).
+/// Exit codes: `2` = wake the session (mail, OR the benign re-arm boundary — both
+/// carry their reason on stderr); `1` = a waiter error, including an unresolvable
+/// session (a waiter with no identity has nothing to wait on); `0` = the session has
+/// no subscriptions, so there is nothing to wake about.
 ///
-/// With `--max-block-ms`, a block that elapses with no mail re-execs a FRESH
-/// waiter (same PID) rather than returning — the self-respawn that keeps a long
-/// idle armed without Claude Code's per-hook timeout ever killing a live wait
-/// (card 11). Without it, `wait` blocks indefinitely (the card-05 contract).
+/// With `--max-block-ms`, a block that elapses with no mail exits **2** with
+/// [`REARM_NOTICE`]. That is the whole re-arm design (ADR-0006): the waiter cannot
+/// outlive its hook process (Claude Code kills it at the `timeout`, and `execv` does
+/// not reset that clock), and a truly idle session fires no further `Stop` — so a
+/// killed waiter would never be re-armed. Waking *before* the deadline is what
+/// guarantees a `Stop`, and therefore a fresh `arm` with a fresh timeout. Without
+/// `--max-block-ms`, `wait` blocks indefinitely (the card-05 contract).
 pub fn run_wait(args: &WaitArgs) -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
@@ -1514,14 +1569,30 @@ pub fn run_wait(args: &WaitArgs) -> ExitCode {
         // The session unsubscribed (or a SessionEnd raced this arm): nothing to
         // wake about. The waiter already dropped its pidfile; exit 0, no wake.
         Ok(WaitOutcome::Unsubscribed) => ExitCode::SUCCESS,
-        Ok(WaitOutcome::TimedOut { budget }) => {
-            // Re-exec a fresh waiter. exec preserves the PID (so the pidfile stays
-            // valid) and gives the harness a fresh process to reset its async-hook
-            // timeout against; the fresh waiter's check-then-block catches any
-            // publish that landed during the exec gap. `budget` carries the same
-            // max-block forward.
-            let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
-            reexec_or_wake(&waiter, session, ms)
+        // The re-arm boundary: no mail, but this process is near its hook timeout
+        // and cannot extend its own life. Wake the session with an HONEST, benign
+        // notice (never "mail on topic X" — there is none) so the agent's next
+        // `Stop` arms a fresh waiter with a fresh timeout. The agent's correct
+        // response is to do nothing at all; the skill says so.
+        Ok(WaitOutcome::TimedOut) => {
+            eprintln!("{REARM_NOTICE}");
+            ExitCode::from(WakeOutcome::EXIT_CODE)
+        }
+        // The single-waiter invariant working as designed: a SessionStart-vs-Stop
+        // arm race means two waiters try to arm and the loser must exit. It is the
+        // EXPECTED outcome of that race, not a fault — logging it at error sent a
+        // bug reporter chasing a phantom, so it is `info` with a message that says
+        // plainly that it is benign. Genuine waiter failures stay at `error`.
+        Err(WakeError::AlreadyWaiting { path }) => {
+            info!(
+                session = %session.as_str(),
+                lock = %path.display(),
+                "another waiter already holds this session's lock; exiting (benign — this is the \
+                 single-waiter invariant: an arm race has one winner, and the live waiter keeps \
+                 the session armed)"
+            );
+            eprintln!("mailbox wait: a waiter is already armed for this session (nothing to do)");
+            ExitCode::FAILURE
         }
         Err(err) => {
             error!(session = %session.as_str(), error = %err, "waiter failed");
@@ -1529,29 +1600,6 @@ pub fn run_wait(args: &WaitArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Re-exec a fresh waiter (self-respawn). On a re-exec FAILURE we exit **2**, not
-/// 1: exit 2 is a wake, so the harness re-runs `Stop` and re-arms — a silent
-/// un-arm (exit 1, no wake) would be worse than a spurious wake. Any stale pidfile
-/// is removed first so a later arm/cleanup does not chase a dead pid (card 11,
-/// item E / ADR-0006).
-fn reexec_or_wake(waiter: &Waiter, session: &SessionId, max_block_ms: u64) -> ExitCode {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            error!(session = %session.as_str(), error = %err, "could not resolve binary to re-exec");
-            let _ = std::fs::remove_file(waiter.pidfile_path());
-            eprintln!("mailbox wait: could not resolve binary to re-exec: {err}");
-            return ExitCode::from(WakeOutcome::EXIT_CODE);
-        }
-    };
-    // exec only returns on failure.
-    let err = mailbox_harness::arm::exec_waiter(&exe, session.as_str(), max_block_ms);
-    error!(session = %session.as_str(), error = %err, "could not re-exec waiter; waking instead of silently un-arming");
-    let _ = std::fs::remove_file(waiter.pidfile_path());
-    eprintln!("mailbox wait: could not re-exec waiter: {err}");
-    ExitCode::from(WakeOutcome::EXIT_CODE)
 }
 
 fn wait_debug_enabled() -> bool {

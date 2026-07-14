@@ -28,6 +28,21 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox")
 }
 
+/// A `mailbox` command with the AMBIENT session environment stripped.
+///
+/// `cargo test` inherits the developer's environment, and inside a Claude Code
+/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
+/// resolves as the caller's session (that is the point of auto-resolution, and
+/// `publish` now uses it). A test that did not strip it would run its commands as
+/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
+/// test subprocess starts with NO session unless the test names one itself.
+fn mailbox_command() -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("MAILBOX_SESSION_ID");
+    cmd
+}
+
 /// The reference stub adapter binary, beside the `mailbox` bin (built if missing).
 ///
 /// These CLI tests exercise the watch/status *surface*, not adapter behaviour, so
@@ -61,7 +76,7 @@ fn socket_for(db_path: &Path) -> PathBuf {
 /// Spawn a `mailbox serve` daemon against `db_path` with extra env (e.g. limit
 /// overrides). stdin is null; stderr is inherited so logs show under --nocapture.
 fn spawn_serve(db_path: &Path, extra_env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(bin());
+    let mut cmd = mailbox_command();
     cmd.arg("serve")
         .env("AGENT_MAILBOX_DB", db_path)
         .env("RUST_LOG", "error")
@@ -127,7 +142,7 @@ impl Daemon {
 
     /// Run a `mailbox` client command against this daemon's DB.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(bin())
+        mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")
@@ -271,7 +286,7 @@ fn ac2_client_fails_loudly_when_bridge_is_down() {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("mailbox.db");
 
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .args(["status", "--session", "s"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -298,7 +313,7 @@ fn bridge_down_json_mode_emits_error_object() {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("mailbox.db");
 
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .args(["--json", "status", "--session", "s"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -326,7 +341,7 @@ fn no_session_json_mode_emits_error_object() {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("mailbox.db");
 
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .args(["--json", "status"]) // no --session
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -563,7 +578,7 @@ fn second_serve_on_same_db_fails_loudly() {
 
     // Second daemon on the SAME DB must fail loudly (lock held) and exit non-zero
     // WITHOUT becoming a second writer.
-    let second = Command::new(bin())
+    let second = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -641,7 +656,7 @@ fn hardening_failure_is_fatal() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
     let db_path = dir.path().join("sub").join("mailbox.db");
 
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -670,7 +685,7 @@ fn sigterm_shuts_down_cleanly_and_removes_socket() {
 
     // A publish that completes (gets its ack) before shutdown — the normal ack
     // path the drain protects during shutdown.
-    let publish = Command::new(bin())
+    let publish = mailbox_command()
         .args(["--json", "publish", "test.shutdown.topic"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -793,7 +808,7 @@ fn concurrent_publish_burst_yields_contiguous_offsets() {
         .map(|i| {
             let db = db.clone();
             std::thread::spawn(move || {
-                let out = Command::new(bin())
+                let out = mailbox_command()
                     .args([
                         "--json",
                         "publish",
@@ -844,7 +859,7 @@ fn human_publish_output_is_readable() {
 /// reserved for the waiter's wake signal.
 #[test]
 fn missing_session_everywhere_is_an_actionable_error() {
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .args(["read"])
         .env_remove("MAILBOX_SESSION_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
@@ -873,7 +888,7 @@ fn missing_session_everywhere_is_an_actionable_error() {
 fn claude_code_session_env_is_the_last_fallback() {
     // `whoami` is a local command (identity does not depend on the bridge), so no
     // daemon is needed to exercise the resolution order end to end.
-    let out = Command::new(bin())
+    let out = mailbox_command()
         .args(["--json", "whoami"])
         .env_remove("MAILBOX_SESSION_ID")
         .env("CLAUDE_CODE_SESSION_ID", "s-claude")
@@ -884,7 +899,7 @@ fn claude_code_session_env_is_the_last_fallback() {
     assert_eq!(value["inbox_topic"], "agent.s-claude");
 
     // MAILBOX_SESSION_ID wins over it...
-    let out = Command::new(bin())
+    let out = mailbox_command()
         .args(["--json", "whoami"])
         .env("MAILBOX_SESSION_ID", "s-mailbox")
         .env("CLAUDE_CODE_SESSION_ID", "s-claude")
@@ -894,7 +909,7 @@ fn claude_code_session_env_is_the_last_fallback() {
     assert_eq!(value["session"], "s-mailbox");
 
     // ...and the explicit flag wins over both.
-    let out = Command::new(bin())
+    let out = mailbox_command()
         .args(["--json", "whoami", "--session", "s-flag"])
         .env("MAILBOX_SESSION_ID", "s-mailbox")
         .env("CLAUDE_CODE_SESSION_ID", "s-claude")
@@ -907,7 +922,7 @@ fn claude_code_session_env_is_the_last_fallback() {
 #[test]
 fn session_env_fallback_is_used_when_flag_absent() {
     let daemon = Daemon::start();
-    let output = Command::new(bin())
+    let output = mailbox_command()
         .args(["subscribe", "test.topic.env"])
         .env("AGENT_MAILBOX_DB", &daemon.db_path)
         .env("MAILBOX_SESSION_ID", "from-env")

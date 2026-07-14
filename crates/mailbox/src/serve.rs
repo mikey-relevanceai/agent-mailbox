@@ -68,7 +68,7 @@ use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
-use mailbox::storage::{SessionId, Storage, StorageConfig, SubscribeKind};
+use mailbox::storage::{PublishAttempt, SessionId, Storage, StorageConfig, SubscribeKind};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
@@ -471,13 +471,14 @@ fn request_op(request: &Request) -> &'static str {
     }
 }
 
-/// The session a request is for, if any (publish carries none — its provenance
-/// is the adapter id).
+/// The session a request is for, if any.
 fn request_session(request: &Request) -> Option<&SessionId> {
     match request {
-        // Publish carries no session (its provenance is the adapter id), and
-        // `topics` is a global read with no session at all.
-        Request::Publish { .. } | Request::Topics { .. } => None,
+        // A publish MAY carry a session (an agent) or not (an adapter, whose
+        // provenance is its adapter id instead); `topics` is a global read with no
+        // session at all.
+        Request::Publish { session, .. } => session.as_ref(),
+        Request::Topics { .. } => None,
         Request::Subscribe { session, .. }
         | Request::Unsubscribe { session, .. }
         | Request::Read { session, .. }
@@ -528,7 +529,8 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             topic,
             adapter,
             body,
-        } => publish(bus, topic, adapter, body).await,
+            session,
+        } => publish(bus, topic, adapter, body, session).await,
         Request::Subscribe {
             session,
             topic,
@@ -609,7 +611,24 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
     }
 }
 
-async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
+/// Publish an event.
+///
+/// Two callers, two contracts, kept apart by whether a `session` came with the
+/// request:
+///
+/// - **An adapter** (no session) publishes exactly as it always has: no unread rule,
+///   every subscriber kicked. Adapters are the original publisher and have no session
+///   id to resolve — changing this path would break them.
+/// - **An agent** (a session) is held to the two caller-aware rules: it must be
+///   caught up on the topic to publish to it, and it is never woken by its own event
+///   (see [`Bus::publish_as_session`]).
+async fn publish(
+    bus: &Bus,
+    topic: Topic,
+    adapter: AdapterId,
+    body: serde_json::Value,
+    session: Option<SessionId>,
+) -> Response {
     // An agent inbox is writable ONLY through `mailbox send`, which stamps
     // provenance (`from`) and refuses an unregistered target (ADR-0007). The
     // generic publish path does neither, so allowing it here would let any caller
@@ -625,19 +644,34 @@ async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::
         ));
     }
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
+    let timestamp = Timestamp(mailbox::clock::now_millis());
+
+    let Some(session) = session else {
+        return match bus.publish(topic, adapter, timestamp, body).await {
+            Ok(event) => Response::Published {
+                id: event.id,
+                offset: event.offset,
+            },
+            Err(err) => Response::error(err.to_string()),
+        };
+    };
+
     match bus
-        .publish(
-            topic,
-            adapter,
-            Timestamp(mailbox::clock::now_millis()),
-            body,
-        )
+        .publish_as_session(session, topic.clone(), adapter, timestamp, body)
         .await
     {
-        Ok(event) => Response::Published {
+        Ok(PublishAttempt::Published(event)) => Response::Published {
             id: event.id,
             offset: event.offset,
         },
+        // Be caught up to speak. The message names the count, the topic, and the ONE
+        // command that fixes it — an agent must be able to act on this without
+        // guessing, and nothing was written, so it can simply read and retry.
+        Ok(PublishAttempt::RefusedUnread { unread }) => Response::error(format!(
+            "refusing to publish: you have {unread} unread event(s) on `{}`; \
+             run `mailbox read` before publishing (nothing was published)",
+            topic.as_str()
+        )),
         Err(err) => Response::error(err.to_string()),
     }
 }

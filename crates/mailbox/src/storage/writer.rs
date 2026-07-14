@@ -27,8 +27,8 @@ use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Top
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
-    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, PublishAttempt, ReadPage, SessionId, SubscribeKind, SubscribeOutcome,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -86,6 +86,19 @@ pub(crate) enum Command {
         timestamp: Timestamp,
         body: Value,
         reply: oneshot::Sender<Result<Event, StorageError>>,
+    },
+    /// Publish on behalf of a SESSION (an agent), rather than an adapter: check the
+    /// publisher is caught up on the topic, append, and advance its own cursor past
+    /// its own event — all in ONE transaction, so the "caught up" check cannot go
+    /// stale between the check and the append. See [`PublishAttempt`] and
+    /// `do_publish_as_session`.
+    PublishAsSession {
+        topic: Topic,
+        adapter: AdapterId,
+        timestamp: Timestamp,
+        body: Value,
+        publisher: SessionId,
+        reply: oneshot::Sender<Result<PublishAttempt, StorageError>>,
     },
     ReadEvents {
         topic: Topic,
@@ -321,6 +334,20 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "publish", || format!("topic={}", topic.as_str()));
             let _ = reply.send(result);
         }
+        Command::PublishAsSession {
+            topic,
+            adapter,
+            timestamp,
+            body,
+            publisher,
+            reply,
+        } => {
+            let result = do_publish_as_session(conn, &topic, &adapter, timestamp, body, &publisher);
+            log_on_err(&result, "publish_as_session", || {
+                format!("topic={} session={}", topic.as_str(), publisher.as_str())
+            });
+            let _ = reply.send(result);
+        }
         Command::ReadEvents {
             topic,
             cursor,
@@ -528,8 +555,95 @@ fn do_publish(
     timestamp: Timestamp,
     body: Value,
 ) -> Result<Event, StorageError> {
-    let body_text = serde_json::to_string(&body)?;
     let tx = conn.transaction()?;
+    let event = append_event_tx(&tx, topic, adapter, timestamp, body)?;
+    tx.commit()?;
+    Ok(event)
+}
+
+/// Publish on behalf of a session (an agent), enforcing the two caller-aware rules
+/// in ONE transaction with the append (see [`PublishAttempt`]):
+///
+/// 1. **Be caught up to speak.** If the publisher is subscribed to the topic and has
+///    unread events on it, REFUSE — nothing is written. An agent that speaks over
+///    mail it has not read is talking past its peers, and the durable log would
+///    interleave a reply to a message it never saw.
+/// 2. **Do not deadlock the publisher on its own message.** If it IS subscribed, its
+///    delivery cursor is advanced past its OWN event here. Without that, rule 1
+///    would refuse the agent's very next publish because its own last message sits
+///    unread against it — a self-inflicted deadlock with no way out but a `read` of
+///    its own words.
+///
+/// Both rules only apply while subscribed: a session publishing to a topic it does
+/// not subscribe to has no cursor and no unread, and is unaffected. The atomicity is
+/// load-bearing — a check in one transaction and an append in another could be
+/// separated by a concurrent publish, which would decide the rule on a log that no
+/// longer exists by the time the event lands.
+fn do_publish_as_session(
+    conn: &mut Connection,
+    topic: &Topic,
+    adapter: &AdapterId,
+    timestamp: Timestamp,
+    body: Value,
+    publisher: &SessionId,
+) -> Result<PublishAttempt, StorageError> {
+    let tx = conn.transaction()?;
+
+    let subscribed: bool = tx
+        .query_row(
+            "SELECT 1 FROM subscription WHERE session_id = ?1 AND topic = ?2",
+            params![publisher.as_str(), topic.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    if subscribed {
+        // The same unread predicate as `do_unread_counts` / `read_topic_unread`:
+        // strictly beyond the delivery cursor (absent cursor => -1 => everything).
+        let unread: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM event
+             WHERE topic = ?1
+               AND offset > COALESCE(
+                   (SELECT offset FROM delivery_cursor
+                    WHERE session_id = ?2 AND topic = ?1),
+                   -1)",
+            params![topic.as_str(), publisher.as_str()],
+            |row| row.get(0),
+        )?;
+        if unread > 0 {
+            // Refuse: the tx drops (rolls back) with nothing written.
+            return Ok(PublishAttempt::RefusedUnread {
+                unread: unread.max(0) as u64,
+            });
+        }
+    }
+
+    let event = append_event_tx(&tx, topic, adapter, timestamp, body)?;
+
+    if subscribed {
+        // Rule 2: consume our own event on our own cursor, in the same transaction
+        // that created it — so it is never unread *to us*, and never blocks our next
+        // publish. (It is still delivered to every OTHER subscriber, whose cursors
+        // are untouched.)
+        advance_cursor_tx(&tx, publisher, topic, offset_to_sqlite(event.offset)?)?;
+    }
+
+    tx.commit()?;
+    Ok(PublishAttempt::Published(event))
+}
+
+/// Append one event to a topic's log inside an open transaction, assigning the next
+/// per-topic offset and the opaque event id. Shared by the adapter publish and the
+/// session publish so the two can never drift in how an event is minted.
+fn append_event_tx(
+    tx: &rusqlite::Transaction<'_>,
+    topic: &Topic,
+    adapter: &AdapterId,
+    timestamp: Timestamp,
+    body: Value,
+) -> Result<Event, StorageError> {
+    let body_text = serde_json::to_string(&body)?;
 
     // Per-topic offset: strictly the next value after the current max for THIS
     // topic. Safe without locking because the single writer is the only place
@@ -565,7 +679,6 @@ fn do_publish(
         "UPDATE event SET event_id = ?1 WHERE event_row_id = ?2",
         params![event_id, row_id],
     )?;
-    tx.commit()?;
 
     Ok(Event {
         id: EventId(event_id),
@@ -825,7 +938,13 @@ fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, 
 /// make `do_read_unread` silently skip the gap — a permanent lost delivery. The
 /// `MAX(offset, excluded.offset)` upsert keeps the cursor monotonic (a late or
 /// duplicate advance can never rewind delivery); this helper is `tx`-scoped so
-/// the advance always commits atomically with the read that produced `offset`.
+/// the advance always commits atomically with the operation that produced `offset`.
+///
+/// Exactly three callers may advance a cursor, and each commits the advance with the
+/// thing that justifies it: the read that delivered the events
+/// (`read_topic_unread`), the fresh subscription that baselines to the head
+/// (`do_subscribe_and_baseline`), and a session's publish of its OWN event
+/// (`do_publish_as_session` — an event you wrote is not mail *to you*).
 fn advance_cursor_tx(
     tx: &rusqlite::Transaction,
     session: &SessionId,

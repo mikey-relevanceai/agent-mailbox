@@ -54,12 +54,26 @@ use mailbox::watch::{StatusView, UnwatchOutcome, WatchEntry};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Publish an event to a topic. No session: provenance is the [`AdapterId`]
-    /// (the daemon stamps the timestamp, exactly as the durable bridge does).
+    /// Publish an event to a topic. The daemon stamps the timestamp, exactly as the
+    /// durable bridge does; provenance is the [`AdapterId`] (a name, not authority).
+    ///
+    /// `session` is the CALLER, when there is one — an agent's `mailbox publish`
+    /// resolves it from the environment like every other session-scoped command. It
+    /// is `Option` because the original publisher, an **adapter**, genuinely has no
+    /// session, and its contract must not change: no session → no unread rule, and
+    /// every subscriber is kicked. With a session, two rules apply (see
+    /// [`crate::serve`]): the publish is REFUSED if that session has unread events
+    /// on the topic ("be caught up to speak"), and the publisher is never kicked for
+    /// its own event (no self-wake).
+    ///
+    /// `#[serde(default)]` so a frame from an older client (which had no such field)
+    /// still decodes as the session-less adapter publish it was.
     Publish {
         topic: Topic,
         adapter: AdapterId,
         body: Value,
+        #[serde(default)]
+        session: Option<SessionId>,
     },
     /// Subscribe `session` to `topic` (baseline-on-subscribe). `kind` distinguishes
     /// an explicit user/agent subscribe from the automatic `harness arm` inbox
@@ -493,6 +507,14 @@ mod tests {
             topic: Topic::parse("github.pr.o/r#1").unwrap(),
             adapter: AdapterId("cli".to_string()),
             body: serde_json::json!({ "hello": "world" }),
+            session: None,
+        });
+        // The session-aware (agent) publish carries the caller.
+        round_trip_request(Request::Publish {
+            topic: Topic::parse("github.pr.o/r#1").unwrap(),
+            adapter: AdapterId("cli".to_string()),
+            body: serde_json::json!({ "hello": "world" }),
+            session: Some(SessionId::new("s-pub")),
         });
         round_trip_request(Request::Subscribe {
             session: SessionId::new("s1"),
@@ -515,6 +537,26 @@ mod tests {
         round_trip_request(Request::Status {
             session: SessionId::new("s1"),
         });
+    }
+
+    /// A publish frame with NO `session` key — what an older client, or any encoder
+    /// that predates the caller-aware publish, emits — must still decode as the
+    /// session-less adapter publish it is, rather than failing the frame.
+    #[test]
+    fn a_publish_frame_without_a_session_decodes_as_session_less() {
+        let line = format!(
+            r#"{{"version":{PROTOCOL_VERSION},"op":"publish","topic":"t.a","adapter":"gh","body":{{}}}}"#
+        );
+        let decoded: Request = decode_frame(&line).expect("legacy publish frame must decode");
+        assert_eq!(
+            decoded,
+            Request::Publish {
+                topic: Topic::parse("t.a").unwrap(),
+                adapter: AdapterId("gh".to_string()),
+                body: serde_json::json!({}),
+                session: None,
+            }
+        );
     }
 
     #[test]

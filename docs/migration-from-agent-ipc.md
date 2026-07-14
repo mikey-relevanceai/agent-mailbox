@@ -19,7 +19,7 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 | Old skill loop | New agent-mailbox flow |
 |---|---|
 | Agent runs `ipc-arm.sh` in the background after each turn to re-arm the wake | **Nothing.** `SessionStart`/`Stop` hooks run `mailbox harness arm`; the agent never re-arms |
-| One arm = one wake; agent must re-arm after reading | Hooks keep the waiter armed across wakes; the waiter self-respawns before the hook timeout |
+| One arm = one wake; agent must re-arm after reading | Hooks keep the waiter armed across wakes; the waiter yields (a benign re-arm wake) before the hook timeout would kill it, so the next `Stop` arms a fresh one |
 | Agent spawns `gh-watch.sh` per PR with `run_in_background`, must remember to kill it | `mailbox watch github-pr OWNER/REPO#N` — the **daemon** owns the poller; one per PR, shared across sessions |
 | Watcher state in `~/.claude/agent-ipc/watchers/*.state` files | Baseline persists centrally in the bridge's SQLite (`adapter_baseline`), round-tripped via the protocol |
 | Durable NDJSON inbox + FIFO kick, per agent | Durable topic log + per-subscriber cursors in the bridge; multi-subscriber topics |

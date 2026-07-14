@@ -47,6 +47,21 @@ pub fn mailbox_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox")
 }
 
+/// A `mailbox` command with the AMBIENT session environment stripped.
+///
+/// `cargo test` inherits the developer's environment, and inside a Claude Code
+/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
+/// resolves as the caller's session (that is the point of auto-resolution, and
+/// `publish` now uses it). A test that did not strip it would run its commands as
+/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
+/// test subprocess starts with NO session unless the test names one itself.
+pub fn mailbox_command() -> Command {
+    let mut cmd = Command::new(mailbox_bin());
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("MAILBOX_SESSION_ID");
+    cmd
+}
+
 /// A sibling adapter binary (`name`) beside the `mailbox` bin in the shared target
 /// dir, built on demand if missing. `CARGO_BIN_EXE_*` is only set for the crate
 /// that DEFINES the bin, so the mailbox-crate tests locate the adapters by path
@@ -208,7 +223,7 @@ impl Env {
     /// resolvers pointed at the freshly built binaries and the github-pr poller's
     /// `gh` overridden to the fake. Blocks until the socket is accepting.
     pub fn start_daemon(&self) -> Daemon {
-        let child = Command::new(mailbox_bin())
+        let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_adapter_bin())
@@ -238,12 +253,68 @@ impl Env {
 
     /// Run a one-shot `mailbox` client command against this env's daemon.
     pub fn run(&self, args: &[&str]) -> Output {
-        Command::new(mailbox_bin())
+        mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
+    }
+
+    /// Run a one-shot `mailbox` client command **as `session`**, via the env var
+    /// Claude Code itself exports into every tool call.
+    ///
+    /// This is the AGENT's real path: an agent passes no `--session`, and the CLI
+    /// resolves it from `$CLAUDE_CODE_SESSION_ID`. Tests that want to prove the
+    /// auto-resolution (rather than the explicit `--session` override) drive it here.
+    pub fn run_as(&self, session: &str, args: &[&str]) -> Output {
+        mailbox_command()
+            .args(args)
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("CLAUDE_CODE_SESSION_ID", session)
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("run mailbox client")
+    }
+
+    /// Run a client command as `session` and assert it exited 0.
+    pub fn run_as_ok(&self, session: &str, args: &[&str], what: &str) -> Output {
+        let out = self.run_as(session, args);
+        assert!(
+            out.status.success(),
+            "{what} should exit 0; got {:?}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    /// This session's unread count on ONE topic, from `status` (does not consume).
+    pub fn unread_on(&self, session: &str, topic: &str) -> u64 {
+        self.status(session)["unread"]
+            .as_array()
+            .and_then(|topics| {
+                topics
+                    .iter()
+                    .find(|u| u["topic"] == topic)
+                    .and_then(|u| u["unread"].as_u64())
+            })
+            .unwrap_or(0)
+    }
+
+    /// How many events exist on `topic` (from `topics`), so a test can prove a
+    /// REFUSED publish wrote nothing at all.
+    pub fn event_count(&self, topic: &str) -> u64 {
+        let out = self.run_ok(&["--json", "topics"], "topics");
+        parse_json(&String::from_utf8_lossy(&out.stdout))["topics"]
+            .as_array()
+            .and_then(|topics| {
+                topics
+                    .iter()
+                    .find(|t| t["topic"] == topic)
+                    .and_then(|t| t["events"].as_u64())
+            })
+            .unwrap_or(0)
     }
 
     /// Run a client command and assert it exited 0.
@@ -273,7 +344,7 @@ impl Env {
     /// (the fake harness driver — exactly what Claude Code's hook does). Returns an
     /// [`ArmChild`] so a test panic can never leak the live waiter it execs into.
     pub fn spawn_arm(&self, session: &str, extra: &[&str]) -> ArmChild {
-        let mut child = Command::new(mailbox_bin())
+        let mut child = mailbox_command()
             .args(["harness", "arm"])
             .args(extra)
             .env("AGENT_MAILBOX_DB", &self.db_path)
@@ -295,7 +366,7 @@ impl Env {
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload),
     /// the fake harness driver's teardown half. Returns its output.
     pub fn cleanup(&self, session: &str) -> Output {
-        let mut child = Command::new(mailbox_bin())
+        let mut child = mailbox_command()
             .args(["harness", "cleanup"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")

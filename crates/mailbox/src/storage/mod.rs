@@ -44,8 +44,8 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
-    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, PublishAttempt, ReadPage, SessionId, SubscribeKind, SubscribeOutcome,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -265,6 +265,37 @@ impl Storage {
             adapter,
             timestamp,
             body,
+            reply,
+        })
+        .await
+    }
+
+    /// Append an event published BY a session (an agent), rather than by an adapter.
+    ///
+    /// One atomic writer command, because the caller-aware rules and the append must
+    /// agree on one view of the log (see [`PublishAttempt`]):
+    ///
+    /// - refuse ([`PublishAttempt::RefusedUnread`], nothing written) when `publisher`
+    ///   is subscribed to `topic` and has unread events on it — be caught up to speak;
+    /// - otherwise append, and — if `publisher` is subscribed — advance its own
+    ///   delivery cursor past its own event, so it is never unread against itself.
+    ///
+    /// The adapter path ([`Storage::publish`]) is deliberately left alone: an adapter
+    /// has no session, no cursor and no unread, and its contract must not change.
+    pub async fn publish_as_session(
+        &self,
+        topic: Topic,
+        adapter: AdapterId,
+        timestamp: Timestamp,
+        body: Value,
+        publisher: SessionId,
+    ) -> Result<PublishAttempt, StorageError> {
+        self.call(|reply| Command::PublishAsSession {
+            topic,
+            adapter,
+            timestamp,
+            body,
+            publisher,
             reply,
         })
         .await

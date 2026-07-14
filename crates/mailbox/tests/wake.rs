@@ -635,12 +635,12 @@ async fn missed_kick_boundary_stress() {
     }
 }
 
-// ==== bounded wait: the self-respawn boundary at the Waiter level (card 11) ======
+// ==== bounded wait: the re-arm boundary at the Waiter level (ADR-0006) ==========
 
-/// A bounded wait with nothing unread must give up (so the caller re-execs a
-/// fresh waiter) rather than block forever; and a *fresh* bounded waiter's
-/// check-then-block still wakes on mail that landed while no waiter was live —
-/// the exact "publish during the re-exec gap is not missed" property.
+/// A bounded wait with nothing unread must give up (so the caller exits 2 and the
+/// harness re-arms a fresh waiter) rather than block forever; and a *fresh* bounded
+/// waiter's check-then-block still wakes on mail that landed while no waiter was
+/// live — the exact "publish during the re-arm gap is not missed" property.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_bounded_times_out_then_a_fresh_waiter_still_wakes() {
     let h = harness().await;
@@ -648,17 +648,25 @@ async fn wait_bounded_times_out_then_a_fresh_waiter_still_wakes() {
     h.subscribe("sess-bounded", &t).await;
 
     let waiter = h.waiter("sess-bounded");
+    let pidfile = waiter.pidfile_path().to_path_buf();
     let timed_out =
         tokio::task::spawn_blocking(move || waiter.wait(Some(Duration::from_millis(200))))
             .await
             .unwrap()
             .unwrap();
+    assert_eq!(
+        timed_out,
+        WaitOutcome::TimedOut,
+        "a bounded wait with no mail must yield for re-arm"
+    );
+    // The re-arm exit takes its pidfile with it: a pidfile naming a process that is
+    // about to die is exactly what made a killed waiter look alive.
     assert!(
-        matches!(timed_out, WaitOutcome::TimedOut { .. }),
-        "a bounded wait with no mail must yield for re-arm, got {timed_out:?}"
+        !pidfile.exists(),
+        "the re-arm exit must not leave a pidfile naming its dead pid"
     );
 
-    // Mail lands while no waiter is live (the re-exec gap).
+    // Mail lands while no waiter is live (the re-arm gap).
     h.publish(&t, 0, json!({ "i": 0 })).await;
 
     let waiter = h.waiter("sess-bounded");

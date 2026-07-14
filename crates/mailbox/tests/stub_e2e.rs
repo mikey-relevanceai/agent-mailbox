@@ -35,6 +35,21 @@ fn mailbox_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox")
 }
 
+/// A `mailbox` command with the AMBIENT session environment stripped.
+///
+/// `cargo test` inherits the developer's environment, and inside a Claude Code
+/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
+/// resolves as the caller's session (that is the point of auto-resolution, and
+/// `publish` now uses it). A test that did not strip it would run its commands as
+/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
+/// test subprocess starts with NO session unless the test names one itself.
+fn mailbox_command() -> Command {
+    let mut cmd = Command::new(mailbox_bin());
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("MAILBOX_SESSION_ID");
+    cmd
+}
+
 /// The reference stub adapter binary (`mailbox-stub-adapter`), built if missing.
 ///
 /// It lives beside the `test_adapter` bin in the shared target dir. A full
@@ -91,7 +106,7 @@ impl Daemon {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("mailbox.db");
         let socket_path = socket_for(&db_path);
-        let child = Command::new(mailbox_bin())
+        let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
             // The env override that makes `serve`'s stub resolver run the freshly
@@ -112,7 +127,7 @@ impl Daemon {
 
     /// Run a `mailbox` client command against this daemon and return its output.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(mailbox_bin())
+        mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")
@@ -122,7 +137,7 @@ impl Daemon {
 
     /// Spawn a `mailbox wait --session <session>` child (does NOT block the test).
     fn spawn_wait(&self, session: &str) -> Child {
-        Command::new(mailbox_bin())
+        mailbox_command()
             .args(["wait", "--session", session])
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")

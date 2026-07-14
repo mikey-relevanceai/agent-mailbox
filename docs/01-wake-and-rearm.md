@@ -35,8 +35,10 @@ unsubscribe is the whole agent-facing loop.
 
 Caveats:
 
-- Async hook **timeout** (default ~10m) — the waiter needs a long timeout or must
-  self-respawn before the harness kills it.
+- Async hook **timeout** (Claude Code's default ~10m) — it is a hard kill deadline
+  on the waiter process, and **nothing the waiter does can extend it** (see
+  [Timeout survival](#timeout-survival-the-re-arm-exit)). It must therefore *yield*
+  before the deadline, and the timeout must be configured long.
 - Tear down the waiter on `SessionEnd` / unsubscribe.
 - Wake payload should be a short reminder (“mail on topic X”), not a re-run of a
   slash command. Body stays in the durable log (payload-free wake).
@@ -49,7 +51,7 @@ client):
 
 | Hook | Command | What it does |
 |---|---|---|
-| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` ~10m) | Reads `session_id` from the hook stdin JSON, **registers the session's agent inbox** (`agent.<session-id>`, always-on — ADR-0007), asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
+| `SessionStart` (matcher `startup`) / `Stop` | `mailbox harness arm` (`asyncRewake: true`, `timeout` 1h by default) | Reads `session_id` from the hook stdin JSON, **registers the session's agent inbox** (`agent.<session-id>`, always-on — ADR-0007), asks the bridge whether the session has any subscriptions, and — **iff subscribed** — `exec`s `mailbox wait`. Not subscribed, or the bridge is down/erroring → exit 0, **no wake** (fail-safe). |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the waiter (`SIGTERM` the pidfile PID, remove the pidfile) and calls the bridge to drop this session's subscriptions **and** interests, stopping any adapter whose last interest it held (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` — `--settings <path>`, else `~/.claude/settings.json` when it exists — *atomically*, preserving unrelated settings; prints only (with the reason) when there is no such file. |
 
@@ -96,35 +98,55 @@ raced the arm still self-exits rather than orphaning a waiter.
 agent's later `read`. To keep that wire clean regardless of `RUST_LOG`, `wait` and
 `harness arm` route their `tracing` to `<db-dir>/harness.log`, never stderr.
 
-### Timeout survival: self-respawn by re-exec
+### Timeout survival: the re-arm exit
 
-Claude Code kills a `command` hook after its `timeout` (default 10 minutes). A
-truly idle session gets no further `Stop`, so if the waiter were simply killed the
-session would silently go un-armed. The waiter therefore **self-respawns**:
+Claude Code kills a `command` hook at its `timeout`. **The waiter cannot outlive its
+hook process, and nothing it does can extend that deadline.** Two things settle the
+design, and both are now measured rather than assumed (they were the ADR's "open
+empirical question" — it is closed):
 
-- `arm` execs `mailbox wait --max-block-ms <N>` with `N` shorter than the hook
-  `timeout` (defaults: `N = 540 000` ms vs `timeout = 600` s).
-- `mailbox wait` blocks on the kick for at most `N`. On mail → exit 2 (wake). On
-  reaching `N` with no mail → it **re-execs itself** (`execv`, same argv).
-- `execv` replaces the process image but **preserves the PID**, so the harness's
-  pidfile keeps identifying the live waiter across every respawn, and `cleanup`
-  reaps that one stable PID.
+1. **`execv` does NOT reset the hook timeout.** It preserves the PID and the deadline
+   is measured per process, so a waiter that re-execs itself is killed on the
+   original clock anyway.
+2. **A large `timeout` IS honoured.** A hook with `timeout: 3600` ran far past the
+   600s default (alive at 703s). There is no hidden 600s cap.
+
+And the thing that makes a killed waiter *fatal* rather than merely inconvenient:
+**a truly idle session fires no further `Stop`.** Nothing re-arms it. So a waiter
+killed mid-block leaves the session permanently, silently unwakeable — subscription
+intact, events still landing durably, `publish` quietly reporting `NoReader`. That
+was a real bug (ADR-0006), and its fingerprint was a **stale pidfile naming a dead
+pid**, which made `mailbox agents` keep reporting a waiter that no longer existed.
+
+The waiter therefore **yields before the deadline instead of trying to beat it**:
+
+- `arm` execs `mailbox wait --max-block-ms <N>` with `N` safely below the hook
+  `timeout` (defaults: `N = 3 300 000` ms = 55 min, `timeout = 3600` s = 1 h).
+- `mailbox wait` blocks on the kick for at most `N`. On mail → **exit 2**, stderr
+  `mail on topic X`. On reaching `N` with no mail → **exit 2** with a *benign* notice:
+
+  ```text
+  mailbox: re-arming the waiter (no new mail) — nothing to read; just end your turn
+  and the Stop hook will re-arm it
+  ```
+
+- Either way the exit-2 wakes the session → the agent's turn ends → `Stop` fires →
+  `arm` runs → a **fresh hook process with a fresh timeout**. The loop is closed:
+  there is no state in which an idle session is armed by nobody.
+- The yielding waiter removes its own pidfile (it is about to die), and `arm` reaps a
+  stale pidfile naming a dead pid before it arms — so a killed waiter can never keep
+  passing for a live one.
 - Each fresh waiter repeats the card-05 **open → check-then-block** ordering, so a
-  publish that lands during the re-exec gap is caught by the next waiter's unread
+  publish that lands during the re-arm gap is caught by the next waiter's unread
   check rather than missed.
 
-Why re-exec (a fresh process image) rather than an internal loop: the goal is to
-present the harness with a *new* process before its per-hook timeout lands on a
-live wait. Whether Claude Code measures the async-hook timeout per PID or per
-process-image across `execv` is **not documented** (we could not confirm it either
-way). We therefore keep `max_block` well under `timeout` so the re-exec always
-precedes the kill deadline, and expose both as install-time knobs
-(`--max-block-ms`, `--timeout-secs`): if `execv` resets the timer, an arbitrarily
-long idle stays armed; if it does not, the waiter still survives to the configured
-`timeout`, after which the next `Stop` re-arms — and an operator can raise
-`--timeout-secs` for a longer guaranteed idle. This uncertainty is the one open
-empirical question; everything else is exercised without a live Claude Code
-(`crates/mailbox/tests/harness.rs`).
+The cost is one benign wake per `max_block` of continuous idle (55 min by default).
+An agent that sees it should do **nothing** — ending the turn is what re-arms it.
+**A larger `--timeout-secs` (with a matching `--max-block-ms`) means fewer such
+wakes**; `install-hooks` refuses a `max_block` that is not safely below `timeout`,
+because that pairing silently reintroduces the bug. The whole loop is exercised
+without a live Claude Code (`crates/mailbox/tests/harness.rs`, which churns the
+re-arm boundary and asserts the session is never left unarmed).
 
 ### install-hooks
 
@@ -132,23 +154,39 @@ empirical question; everything else is exercised without a live Claude Code
 settings file — `--settings <file>` if given (created if missing), else
 `~/.claude/settings.json` when it exists — idempotently, preserving unrelated
 settings; with no such file it only emits the snippet (JSON) and says why. The
-`arm` command carries `--max-block-ms` so the self-respawn bound travels with the
-hook.
+`arm` command carries `--max-block-ms` so the re-arm bound travels with the hook,
+and the install **fails loudly** if `--max-block-ms` is not safely below
+`--timeout-secs`.
 
 ```json
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
-      "command": "/abs/path/to/mailbox harness arm --max-block-ms 540000",
-      "asyncRewake": true, "timeout": 600 }] }],
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000",
+      "asyncRewake": true, "timeout": 3600 }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/to/mailbox harness arm --max-block-ms 540000",
-      "asyncRewake": true, "timeout": 600 }] }],
+      "command": "/abs/path/to/mailbox harness arm --max-block-ms 3300000",
+      "asyncRewake": true, "timeout": 3600 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness cleanup" }] }]
   }
 }
 ```
+
+### Diagnosing a wake ("why didn't my agent wake?")
+
+The waiter lifecycle is logged at **INFO** (the default) to `<db-dir>/harness.log`,
+and the daemon logs its kick counts at INFO on its own stderr. Between them they
+answer the question directly:
+
+| Line | Means |
+|---|---|
+| `armed session (subscribed); exec-ing the waiter` | a waiter was launched (and whether a stale pidfile was reaped) |
+| `waiter found no subscriptions; exiting without waking` | arm-iff-subscribed said no |
+| `waiter woke; session has unread mail (exiting 2)` | a real wake, with the topics |
+| `waiter reached its max-block with no mail; exiting 2 to force a fresh re-arm` | the benign re-arm boundary |
+| `kicked subscribed sessions after publish` (`delivered` / `no_reader`) | whether the publish actually reached a live waiter |
+| `another waiter already holds this session's lock` | **benign** — the expected loser of a SessionStart-vs-Stop arm race |
 
 ## Codex CLI: no equivalent yet
 

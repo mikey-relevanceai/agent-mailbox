@@ -4,8 +4,8 @@
 //! Each test simulates the hook environment: it feeds the hook payload JSON on
 //! `mailbox harness arm` / `cleanup`'s stdin (exactly as Claude Code would) and
 //! runs everything against a real `mailbox serve` daemon in a tempdir. No agent
-//! ever runs an arm command — the hook launches the waiter, which self-respawns
-//! and wakes on its own.
+//! ever runs an arm command — the hook launches the waiter, and the waiter's exit-2
+//! is what drives the next re-arm.
 //!
 //! Covered (the four acceptance criteria):
 //! - **AC1**: an idle *subscribed* session wakes (exit 2) on a publish, with no
@@ -16,8 +16,13 @@
 //!   arm (the delivery cursor keeps it unread until read).
 //! - **AC3**: `cleanup` reaps the waiter (pid gone, process dead) AND drops the
 //!   session's interests/subscriptions (interest count 0).
-//! - **AC4**: the waiter survives a shrunk max-block by self-respawning, and still
-//!   wakes on a publish that arrives after several re-execs.
+//! - **AC4** (rewritten for ADR-0006): every crossing of the waiter's max-block is a
+//!   **wake** (exit 2) carrying the benign re-arm notice — never a silent death — so
+//!   an idle session is never left armed by nobody; and a publish across that
+//!   boundary still wakes it. This is the regression test for the wake-lifetime bug:
+//!   the waiter used to re-exec itself at the boundary, which did NOT reset the hook
+//!   timeout, so the harness killed it — and an idle session fires no further `Stop`
+//!   to re-arm it.
 //!
 //! Flakiness discipline (mirrors `tests/stub_e2e.rs`): poll for readiness with
 //! bounded deadlines rather than fixed sleeps; reap every child on drop.
@@ -33,6 +38,21 @@ use tempfile::TempDir;
 
 fn mailbox_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox")
+}
+
+/// A `mailbox` command with the AMBIENT session environment stripped.
+///
+/// `cargo test` inherits the developer's environment, and inside a Claude Code
+/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
+/// resolves as the caller's session (that is the point of auto-resolution, and
+/// `publish` now uses it). A test that did not strip it would run its commands as
+/// the DEVELOPER's session and behave differently on a laptop than in CI. So every
+/// test subprocess starts with NO session unless the test names one itself.
+fn mailbox_command() -> Command {
+    let mut cmd = Command::new(mailbox_bin());
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("MAILBOX_SESSION_ID");
+    cmd
 }
 
 /// The reference stub adapter binary, built if missing (only the interest test
@@ -85,7 +105,7 @@ impl Daemon {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("mailbox.db");
         let socket_path = socket_for(&db_path);
-        let child = Command::new(mailbox_bin())
+        let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
@@ -115,7 +135,7 @@ impl Daemon {
 
     /// Run a `mailbox` client command against this daemon and return its output.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(mailbox_bin())
+        mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")
@@ -128,7 +148,7 @@ impl Daemon {
     /// reminder can be asserted; stdout is discarded. Returned in an [`ArmChild`]
     /// so a test panic can never leak the live waiter it execs into.
     fn spawn_arm(&self, session: &str, extra: &[&str]) -> ArmChild {
-        let mut cmd = Command::new(mailbox_bin());
+        let mut cmd = mailbox_command();
         cmd.args(["harness", "arm"])
             .args(extra)
             .env("AGENT_MAILBOX_DB", &self.db_path)
@@ -150,7 +170,7 @@ impl Daemon {
     /// own arm-iff-subscribed re-check. Wrapped in [`ArmChild`] for the same
     /// leak-proof teardown.
     fn spawn_wait(&self, session: &str, extra: &[&str]) -> ArmChild {
-        let child = Command::new(mailbox_bin())
+        let child = mailbox_command()
             .args(["wait", "--session", session])
             .args(extra)
             .env("AGENT_MAILBOX_DB", &self.db_path)
@@ -175,7 +195,7 @@ impl Daemon {
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload)
     /// and return its output.
     fn cleanup(&self, session: &str) -> Output {
-        let mut child = Command::new(mailbox_bin())
+        let mut child = mailbox_command()
             .args(["harness", "cleanup"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("RUST_LOG", "error")
@@ -199,10 +219,10 @@ impl Drop for Daemon {
     }
 }
 
-/// A spawned `mailbox harness arm` child, which execs (same PID) into the waiter
-/// and may self-respawn in place. Wrapped in a Drop guard so a test panic can
-/// never leak a live waiter process (item J). Deref(Mut) to the inner `Child` so
-/// the existing `child`-taking helpers keep working via deref coercion.
+/// A spawned `mailbox harness arm` child, which execs (same PID) into the waiter.
+/// Wrapped in a Drop guard so a test panic can never leak a live waiter process
+/// (item J). Deref(Mut) to the inner `Child` so the existing `child`-taking helpers
+/// keep working via deref coercion.
 struct ArmChild(Child);
 
 impl std::ops::Deref for ArmChild {
@@ -255,6 +275,15 @@ fn poll_until<T>(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<T>
         assert!(Instant::now() < deadline, "condition never held: {what}");
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// `kill(pid, 0)`: true while `pid` still names a live (non-reaped) process. The
+/// same probe `waiter_alive` uses, so a test sees exactly what `mailbox agents` sees.
+fn pid_alive(pid: u32) -> bool {
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Ok(())
+    )
 }
 
 /// Wait for `child` to exit within `timeout`, killing it if it overruns. Returns
@@ -471,7 +500,7 @@ fn arm_with_bridge_down_exits_zero_without_waking() {
     let db_path = dir.path().join("mailbox.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
-    let mut child = Command::new(mailbox_bin())
+    let mut child = mailbox_command()
         .args(["harness", "arm"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -504,7 +533,7 @@ fn cleanup_with_bridge_down_still_exits_zero() {
     let db_path = dir.path().join("mailbox.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
-    let mut child = Command::new(mailbox_bin())
+    let mut child = mailbox_command()
         .args(["harness", "cleanup"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
@@ -739,10 +768,44 @@ fn high2_waiter_started_after_session_end_self_exits_no_orphan() {
     );
 }
 
-// ==== AC4: the waiter self-respawns across a shrunk max-block and still wakes ====
+// ==== AC4: the re-arm boundary — the regression test for the silent-un-arm bug ===
 
+/// One turn of the REAL Claude Code loop: arm (the hook), let the waiter run to an
+/// exit, and report `(exit code, stderr)`. Exit 2 is what makes the harness wake the
+/// session — and therefore what makes the next `Stop` fire and re-arm. Returns the
+/// pid the waiter recorded, so the caller can prove a live waiter actually existed.
+fn arm_cycle(daemon: &Daemon, session: &str, max_block_ms: &str) -> (Option<i32>, String, u32) {
+    let mut arm = daemon.spawn_arm(session, &["--max-block-ms", max_block_ms]);
+    // A live waiter must exist for this cycle: the pidfile appears (written by the
+    // waiter under its lock) and names a running process. This is the "never zero
+    // live waiters" half — every cycle genuinely arms one.
+    let pid = poll_until("a live waiter arms", Duration::from_secs(10), || {
+        daemon.pidfile_pid(session).filter(|&pid| pid_alive(pid))
+    });
+    let status = wait_within(&mut arm, Duration::from_secs(20)).expect("the waiter must exit");
+    (status.code(), drain_stderr(&mut arm), pid)
+}
+
+/// **The regression test for the headline bug.**
+///
+/// The waiter cannot outlive its hook process: Claude Code kills it at the hook
+/// `timeout`, and `execv` does not reset that clock. The old design re-exec'd at
+/// `max_block` and hoped for a fresh timeout; it did not get one, so the waiter was
+/// killed mid-block — and because a truly idle session fires **no further `Stop`**,
+/// nothing ever re-armed it. The session went silently, permanently unwakeable.
+///
+/// The fix is that the waiter *yields* at `max_block` instead: exit 2 (a wake) with a
+/// benign notice, which guarantees a `Stop`, which re-arms a FRESH hook process. So
+/// this test churns the boundary with a tiny `max_block` and asserts:
+///
+/// 1. every boundary crossing is a **wake (exit 2)**, never a silent exit — an exit 0
+///    or 1 here IS the bug, because nothing would follow it;
+/// 2. its stderr is the **benign re-arm notice**, and never claims mail that does not
+///    exist;
+/// 3. across the churn, every publish still produces a **mail wake** — the boundary
+///    loses no events.
 #[test]
-fn ac4_waiter_self_respawns_across_max_block_and_still_wakes() {
+fn ac4_the_rearm_boundary_always_wakes_so_an_idle_session_is_never_left_unarmed() {
     let daemon = Daemon::start();
     let session = "s4";
     let topic = "t.slow.x";
@@ -751,32 +814,102 @@ fn ac4_waiter_self_respawns_across_max_block_and_still_wakes() {
         "subscribe",
     );
 
-    // A tiny max-block forces repeated self-respawns while the session stays idle.
-    let mut arm = daemon.spawn_arm(session, &["--max-block-ms", "250"]);
-    poll_until("waiter pidfile appears", Duration::from_secs(10), || {
-        daemon.pidfile(session).exists().then_some(())
-    });
-
-    // Across ~4 max-block windows the waiter must NOT die at the first timeout —
-    // it keeps re-execing. Confirm it is still alive well past one max-block.
-    let alive_deadline = Instant::now() + Duration::from_millis(1200);
-    while Instant::now() < alive_deadline {
-        assert!(
-            arm.try_wait().expect("try_wait").is_none(),
-            "the waiter must survive its max-block by self-respawning, not exit"
+    // Phase 1 — churn the boundary with NO mail. A tiny max-block makes each cycle
+    // hit the re-arm boundary immediately.
+    for cycle in 0..3 {
+        let (code, stderr, pid) = arm_cycle(&daemon, session, "250");
+        assert_eq!(
+            code,
+            Some(2),
+            "cycle {cycle}: the re-arm boundary MUST be a wake (exit 2). Any other exit is the \
+             bug itself: an idle session fires no further Stop, so nothing would ever re-arm it. \
+             stderr: {stderr}"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            stderr.contains("re-arming"),
+            "cycle {cycle}: the re-arm wake must say plainly that it is a re-arm; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("mail on topic"),
+            "cycle {cycle}: the re-arm wake must NOT claim mail — there is none; got: {stderr}"
+        );
+        assert!(
+            !pid_alive(pid),
+            "cycle {cycle}: the yielded waiter must actually be gone"
+        );
+        assert!(
+            !daemon.pidfile(session).exists(),
+            "cycle {cycle}: a yielded waiter must not leave a pidfile naming its dead pid \
+             (that is what made a killed waiter keep passing for a live one)"
+        );
     }
 
-    // A publish after several re-execs still wakes the (respawned) waiter.
+    // Phase 2 — an event published while no waiter is live (the re-arm gap) must
+    // still wake the session on the very next arm: the durable log + the waiter's
+    // open→check→block ordering carry it across the boundary.
+    assert_ok(&daemon.run(&["publish", topic]), "publish");
+    let (code, stderr, _) = arm_cycle(&daemon, session, "60000");
+    assert_eq!(
+        code,
+        Some(2),
+        "a publish across the re-arm boundary must still wake the session; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("mail on topic {topic}")),
+        "this wake IS mail, so it must name the topic (not the re-arm notice); got: {stderr}"
+    );
+
+    // ...and the event is still there to read (the wake is a nudge; the log is truth).
+    let read = daemon.run(&["--json", "read", "--session", session]);
+    assert_ok(&read, "read");
+    assert_eq!(
+        parse_json(&stdout(&read))["events"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the event that woke the session must be readable"
+    );
+}
+
+/// A waiter the harness KILLED at its hook timeout leaves a pidfile naming a dead
+/// pid. Until it is cleared, `mailbox agents` / `status` keep reporting a live waiter
+/// that does not exist — the exact fingerprint that made the original bug so hard to
+/// see. `arm` must reap it before arming a real waiter.
+#[test]
+fn arm_reaps_a_stale_pidfile_naming_a_dead_waiter() {
+    let daemon = Daemon::start();
+    let session = "s-stale";
+    let topic = "t.stale";
+    assert_ok(
+        &daemon.run(&["subscribe", topic, "--session", session]),
+        "subscribe",
+    );
+
+    // Plant the fingerprint: a pidfile for a pid that is not running. 2_000_000_000
+    // is above any platform PID_MAX, so it can never be a live process.
+    let dead = 2_000_000_000u32;
+    std::fs::create_dir_all(daemon.waiters_dir()).unwrap();
+    std::fs::write(daemon.pidfile(session), dead.to_string()).unwrap();
+
+    let mut arm = daemon.spawn_arm(session, &["--max-block-ms", "60000"]);
+    let pid = poll_until(
+        "a fresh waiter replaces the stale pidfile",
+        Duration::from_secs(10),
+        || daemon.pidfile_pid(session).filter(|&pid| pid != dead),
+    );
+    assert!(
+        pid_alive(pid),
+        "the pidfile must now name a LIVE waiter, not the dead pid it was reaped from"
+    );
+
+    // And the freshly-armed waiter really is armed: a publish wakes it.
     assert_ok(&daemon.run(&["publish", topic]), "publish");
     let status = wait_within(&mut arm, Duration::from_secs(10)).expect("waiter should exit");
     assert_eq!(
         status.code(),
         Some(2),
-        "the self-respawned waiter must still wake on a publish"
+        "the re-armed waiter must wake on mail"
     );
-    assert!(drain_stderr(&mut arm).contains(&format!("mail on topic {topic}")));
 }
 
 // ==== install-hooks emits a valid snippet, and merges where it should ===========
@@ -788,7 +921,7 @@ fn ac4_waiter_self_respawns_across_max_block_and_still_wakes() {
 /// real `HOME` would edit the developer's own Claude Code settings. Redirecting
 /// `AGENT_MAILBOX_HOME` (which wins over `HOME`) is what makes that impossible.
 fn install_hooks(home: &Path, args: &[&str]) -> Output {
-    Command::new(mailbox_bin())
+    mailbox_command()
         .args(["harness", "install-hooks"])
         .args(args)
         .env("AGENT_MAILBOX_HOME", home)
@@ -806,7 +939,7 @@ fn default_settings(home: &Path) -> PathBuf {
 fn install_hooks_emits_valid_settings_snippet() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("mailbox.db");
-    let out = Command::new(mailbox_bin())
+    let out = mailbox_command()
         .args(["--json", "harness", "install-hooks"])
         .env("AGENT_MAILBOX_DB", &db_path)
         // The home has no `.claude/settings.json`, so this prints only — and, more
@@ -824,12 +957,16 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_eq!(hooks["SessionStart"][0]["matcher"], "startup");
     let arm = &hooks["SessionStart"][0]["hooks"][0];
     assert_eq!(arm["asyncRewake"], true);
-    assert!(arm["timeout"].as_u64().unwrap() > 0);
+    // The default timing IS the fix: a 1-hour hook timeout (a large timeout is
+    // honoured — measured), with the waiter yielding for a re-arm 5 minutes inside
+    // it. `timeout` hard-bounds the waiter's life, so a bigger one simply means
+    // fewer benign re-arm wakes.
+    assert_eq!(arm["timeout"], 3600);
     assert!(
         arm["command"]
             .as_str()
             .unwrap()
-            .contains("harness arm --max-block-ms")
+            .contains("harness arm --max-block-ms 3300000")
     );
     assert!(
         hooks["SessionEnd"][0]["hooks"][0]["command"]
@@ -851,6 +988,46 @@ fn install_hooks_emits_valid_settings_snippet() {
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
     assert!(merged["hooks"]["Stop"].is_array(), "hooks merged in");
+}
+
+/// A `max_block` at or above the hook `timeout` silently reintroduces the headline
+/// bug: Claude Code kills the waiter while it is still blocked, and an idle session
+/// fires no further `Stop`, so nothing ever re-arms it. `install-hooks` must REFUSE
+/// such a pairing — loudly, and without writing a single byte of settings.
+#[test]
+fn install_hooks_refuses_a_max_block_that_would_outlive_the_timeout() {
+    let home = home_with_settings(|path| std::fs::write(path, r#"{"model":"opus"}"#).unwrap());
+    let settings = default_settings(home.path());
+    let before = std::fs::read_to_string(&settings).unwrap();
+
+    for bad in [
+        // Equal to the timeout: the waiter is killed exactly at its boundary.
+        ["--timeout-secs", "600", "--max-block-ms", "600000"],
+        // Beyond it: killed well before it would ever yield.
+        ["--timeout-secs", "600", "--max-block-ms", "900000"],
+        // Inside the margin: no room to notice the boundary and exit.
+        ["--timeout-secs", "600", "--max-block-ms", "599000"],
+    ] {
+        let out = install_hooks(home.path(), &bad);
+        assert!(
+            !out.status.success(),
+            "{bad:?} must be refused: it would let the harness kill the waiter mid-block, and an \
+             idle session never fires the Stop that would re-arm it"
+        );
+        let err = stderr(&out);
+        assert!(
+            err.contains("max_block_ms") && err.contains("timeout"),
+            "the refusal must name both knobs so it is actionable; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            before,
+            "a refused install must not touch the user's settings"
+        );
+    }
+
+    // The shipped defaults, by contrast, install cleanly.
+    assert_ok(&install_hooks(home.path(), &[]), "default install-hooks");
 }
 
 /// `--settings <path>` is an instruction, so a MISSING file is created — that is
@@ -946,7 +1123,7 @@ fn install_hooks_without_a_default_settings_file_prints_only_and_writes_nothing(
 /// path inside someone's config.
 #[test]
 fn install_hooks_with_no_home_prints_only_without_panicking() {
-    let out = Command::new(mailbox_bin())
+    let out = mailbox_command()
         .args(["harness", "install-hooks"])
         .env_remove("AGENT_MAILBOX_HOME")
         .env_remove("HOME")
@@ -972,7 +1149,7 @@ fn install_hooks_json_keeps_stdout_clean_when_it_merges() {
     std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
     std::fs::write(&settings, "{}").unwrap();
 
-    let out = Command::new(mailbox_bin())
+    let out = mailbox_command()
         .args(["--json", "harness", "install-hooks"])
         .env("AGENT_MAILBOX_HOME", home.path())
         .env("RUST_LOG", "error")
@@ -1190,7 +1367,7 @@ fn install_hooks_refuses_a_relative_home() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(project.join("settings.json"), PRECIOUS_SETTINGS).unwrap();
 
-    let out = Command::new(mailbox_bin())
+    let out = mailbox_command()
         .args(["harness", "install-hooks"])
         .current_dir(cwd.path())
         .env("AGENT_MAILBOX_HOME", ".")
@@ -1223,7 +1400,7 @@ fn install_skills_installs_the_embedded_skill_and_is_idempotent() {
     let skills_dir = dir.path().join("skills");
 
     let install = |args: &[&str]| -> Output {
-        Command::new(mailbox_bin())
+        mailbox_command()
             .args(["--json", "harness", "install-skills", "--skills-dir"])
             .arg(&skills_dir)
             .args(args)

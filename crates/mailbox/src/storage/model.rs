@@ -274,6 +274,29 @@ pub enum SubscribeKind {
     Explicit,
 }
 
+/// What an atomic caller-aware publish did (`publish_as_session`).
+///
+/// The refusal is a VALUE, not an error: "you have unread mail on this topic" is a
+/// business outcome the caller must render as actionable advice ("read first"), not
+/// a storage failure. Modelling it as an enum also forces the call site to handle
+/// it — a `Result<Event, _>` would have let a refusal be mistaken for a publish.
+///
+/// The check and the append are ONE transaction (see the writer's
+/// `do_publish_as_session`). If they were separate, a publish landing between them
+/// could make the caller's "caught up" check stale, and the rule would refuse — or,
+/// worse, permit — on a view of the log that no longer exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublishAttempt {
+    /// The event was appended. If the publisher was subscribed to the topic, its own
+    /// delivery cursor was advanced past this event in the same transaction, so its
+    /// own message never counts as unread against it (without that, rule "be caught
+    /// up to speak" would deadlock an agent on its own last message).
+    Published(Event),
+    /// REFUSED, and nothing was written: the caller is subscribed to the topic and
+    /// has `unread` event(s) it has not read. You must be caught up before you speak.
+    RefusedUnread { unread: u64 },
+}
+
 /// What an atomic subscribe-and-baseline did.
 ///
 /// A named enum rather than an ambiguous `Option<Offset>` so the two
