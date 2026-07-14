@@ -34,7 +34,7 @@
 use std::path::Path;
 
 use serde_json::{Map, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use mailbox_protocol::{AdapterId, Event, Timestamp, Topic, TopicError, inbox_topic};
 
@@ -124,6 +124,14 @@ pub async fn send(
     let topic = inbox_topic(&to)?;
 
     if !is_registered(storage, &to).await? {
+        // Log the rejection server-side (identifiers only, NEVER the body): the
+        // daemon's generic request log shows `topic="-"` for a send, so without
+        // this a refused send leaves no trace of who tried to reach whom or why.
+        warn!(
+            from = from.as_str(),
+            to = to.as_str(),
+            "rejected a send: target has no registered inbox"
+        );
         return Err(SendError::UnknownAgent {
             session: to.as_str().to_string(),
         });
@@ -285,6 +293,48 @@ mod tests {
         assert!(
             topics.is_empty(),
             "a refused send must not create the topic: {topics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_a_recently_ended_agent_hard_errors() {
+        // After a peer ends, its inbox subscription is gone (and it is tombstoned),
+        // so a send must hard-error rather than report success for a message that
+        // could never be delivered (ADR-0007 / FIX 1).
+        let (bus, storage, _dir) = fresh().await;
+        let b = SessionId::new("s-b");
+        register(&bus, &b).await;
+        storage.end_session(b.clone(), now_millis()).await.unwrap();
+
+        let err = send(&bus, &storage, SessionId::new("s-a"), b.clone(), Map::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::UnknownAgent { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_subscribe_racing_a_recent_end_does_not_resurrect_the_inbox() {
+        // The arm-vs-cleanup race at the bus level: end the session, then a racing
+        // re-registration (an arm's Subscribe) within the guard window is refused,
+        // so the dead session never reappears in `agents` (FIX 1).
+        let (bus, storage, dir) = fresh().await;
+        let b = SessionId::new("s-b");
+        register(&bus, &b).await;
+        storage.end_session(b.clone(), now_millis()).await.unwrap();
+
+        let summary = bus
+            .subscribe(b.clone(), std::slice::from_ref(&inbox_topic(&b).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            summary[0].1,
+            crate::storage::SubscribeOutcome::RefusedSessionRecentlyEnded
+        );
+
+        let waiters = dir.path().join("waiters");
+        assert!(
+            list(&storage, &waiters, &b).await.unwrap().is_empty(),
+            "a tombstoned session must not be listed as an agent"
         );
     }
 

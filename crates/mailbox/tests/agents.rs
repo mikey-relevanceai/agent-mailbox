@@ -193,6 +193,108 @@ fn send_to_a_session_without_an_inbox_still_fails() {
     guard.assert_clean();
 }
 
+// ==== FIX 2: an inbox is writable only via `send`, never a generic publish ======
+
+/// The generic `publish` path must refuse an `agent.*` topic: it stamps no
+/// provenance and runs no registration check, so allowing it would let any caller
+/// forge a `from` into a victim's inbox (or write into an unregistered one, where
+/// baseline-on-subscribe guarantees the message is unreadable). `send` — which
+/// stamps the sender and checks the target — stays the only way in.
+#[test]
+fn generic_publish_to_an_inbox_topic_is_rejected() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let b = "s-b";
+    // B registers its inbox (a subscribe to its own inbox IS registration).
+    env.run_ok(
+        &["subscribe", &format!("agent.{b}"), "--session", b],
+        "register",
+    );
+
+    // A forged publish straight into B's inbox is refused, non-zero, and points at
+    // the sanctioned path.
+    let out = env.run(&[
+        "publish",
+        &format!("agent.{b}"),
+        "--body",
+        r#"{"from":"attacker"}"#,
+    ]);
+    assert!(
+        !out.status.success(),
+        "publishing to an inbox topic must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mailbox send"),
+        "the error names the sanctioned path: {stderr}"
+    );
+    // The rejected publish wrote nothing into B's inbox.
+    assert_eq!(
+        env.unread_total(b),
+        0,
+        "a rejected publish delivers nothing"
+    );
+
+    // The sanctioned path is unaffected: a peer `send` still delivers.
+    env.run_ok(&["send", b, "--text", "legit", "--session", "s-a"], "send");
+    assert_eq!(
+        env.unread_total(b),
+        1,
+        "send still delivers to a registered inbox"
+    );
+
+    guard.assert_clean();
+}
+
+// ==== FIX 1: the resurrection race — a re-registration after end is refused ======
+
+/// After a session ends (cleanup → `EndSession` tombstones the id), a
+/// re-registration landing within the guard window is REFUSED, so the dead session
+/// is not resurrected in `agents` (ADR-0007). Driven through the CLI, deterministic
+/// because everything happens far inside the 10s guard.
+#[test]
+fn a_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let b = "s-b";
+    env.run_ok(
+        &["subscribe", &format!("agent.{b}"), "--session", b],
+        "register",
+    );
+    assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
+
+    // SessionEnd drops the subscription and tombstones the id.
+    let _ = env.cleanup(b);
+    assert!(
+        agent_row(&env, "s-a", b).is_none(),
+        "an ended session is no longer an agent"
+    );
+
+    // A racing re-registration within the guard window is refused: it exits 0 (a
+    // no-op, not an error) but creates no subscription.
+    let out = env.run_ok(
+        &["subscribe", &format!("agent.{b}"), "--session", b],
+        "re-register",
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("refused"),
+        "the re-register is refused: {text}"
+    );
+    assert!(
+        agent_row(&env, "s-a", b).is_none(),
+        "the dead session must not be resurrected as an agent"
+    );
+
+    guard.assert_clean();
+}
+
 // ==== discovery: agents (liveness + self) and topics ===========================
 
 /// `agents` lists registered inboxes, marks the caller, and reports live-waiter
