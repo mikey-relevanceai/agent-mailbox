@@ -26,6 +26,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 use cli::{Cli, Command, HarnessCommand};
 
@@ -84,22 +85,35 @@ fn is_wire_stderr(command: &Command) -> bool {
 /// Initialise the `tracing` subscriber. Wire-stderr commands (`wait`, `harness
 /// arm`) log to `<db-dir>/harness.log` (append) so their stderr stays a clean wake
 /// channel; if that file cannot be opened, or for any other command, tracing goes
-/// to stderr as usual. Filtered by `RUST_LOG` (quiet — error only — by default).
+/// to stderr as usual. Filtered by `RUST_LOG`.
+///
+/// The two sinks default differently ON PURPOSE (card 16 / FIX 3). Other commands'
+/// stderr stays quiet — ERROR only — so an agent's terminal is not flooded. The
+/// `harness.log` file defaults to WARN, because it is the *only* place a hook
+/// leaves a trace: a silently-unregistered inbox (→ a permanently unreachable
+/// agent) is logged by `register_inbox` at warn/error, and at ERROR-only those
+/// warns would vanish, leaving zero visible signal. `RUST_LOG` overrides either.
 fn init_tracing(command: &Command) {
-    let filter = || EnvFilter::from_default_env();
     if is_wire_stderr(command)
         && let Some(file) = wire_log_file()
     {
+        // Default to WARN (not ERROR) for the harness log so the transient
+        // "bridge unreachable/errored while registering the inbox" lines are
+        // visible; a set `RUST_LOG` still wins. This raises verbosity ONLY on the
+        // harness.log sink — no other command's stderr is affected.
+        let filter = EnvFilter::builder()
+            .with_default_directive(LevelFilter::WARN.into())
+            .from_env_lossy();
         // `with_writer` takes a MakeWriter; a closure returning a fresh handle each
         // time satisfies it, and appends interleave safely on our targets.
         tracing_subscriber::fmt()
-            .with_env_filter(filter())
+            .with_env_filter(filter)
             .with_ansi(false)
             .with_writer(move || file.try_clone().unwrap_or_else(|_| open_null()))
             .init();
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(filter())
+            .with_env_filter(EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .init();
     }

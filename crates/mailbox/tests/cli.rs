@@ -317,6 +317,42 @@ fn bridge_down_json_mode_emits_error_object() {
     );
 }
 
+#[test]
+fn no_session_json_mode_emits_error_object() {
+    // FIX 5 (card 16): an unresolvable session must honour the same `--json`
+    // contract as a serviced failure — a typed error object on stdout — rather
+    // than failing silently before any `fail()`/request call. The bridge is never
+    // even contacted (resolution fails first), so no daemon is needed.
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("mailbox.db");
+
+    let output = Command::new(bin())
+        .args(["--json", "status"]) // no --session
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        // Ensure neither the test env nor a real Claude Code session leaks in.
+        .env_remove("MAILBOX_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .expect("run json status with no session");
+
+    assert!(!output.status.success(), "must exit non-zero");
+    // NOT exit 2 — that is the wake code, and a resolution failure is an error.
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "must not use the wake exit code"
+    );
+    let value = parse_json(&stdout(&output));
+    assert_eq!(value["result"], "error");
+    let message = value["message"].as_str().unwrap_or_default();
+    // The message names every place we looked, so the agent can fix it.
+    assert!(
+        message.contains("--session") && message.contains("MAILBOX_SESSION_ID"),
+        "json error message should be actionable; got: {message}"
+    );
+}
+
 // ==== AC3: status shows a watch with its interest count ========================
 
 #[test]

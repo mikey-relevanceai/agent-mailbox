@@ -297,19 +297,22 @@ pub fn pidfile_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
 
 /// Whether a session currently has a LIVE waiter blocked on its FIFO.
 ///
-/// The honest definition, because `mailbox agents` reports it and must not
+/// A best-effort probe, because `mailbox agents` reports it and must not
 /// overclaim: this reads the session's pidfile and probes that PID with
 /// `kill(pid, 0)`. Post-ADR-0006 the pidfile is written by the waiter itself,
 /// only after it takes the single-waiter lock, so it reliably names the one
-/// lock-holding waiter for the session. A live PID therefore means "this agent is
-/// idle and listening — a publish to its topics will wake it now".
+/// lock-holding waiter for the session. A live PID therefore *suggests* "this
+/// agent is idle and listening — a publish to its topics should wake it".
 ///
-/// What it is NOT: a heartbeat, or proof the *agent* is healthy. `false` only
-/// means no waiter is blocked at this instant — typically because the session is
-/// mid-turn (busy), or because it never armed. A message published to a
-/// subscribed session with no live waiter is still durably delivered; it surfaces
-/// on that session's next read/arm. There is no liveness signal beyond this, and
-/// we deliberately do not invent one.
+/// What it is NOT: a heartbeat, or proof the *agent* is healthy — and it cannot
+/// even rule out a false positive. `kill(pid, 0)` only asks "is SOME process
+/// alive under this PID"; a `Woken` waiter exits leaving its pidfile in place, so
+/// after PID reuse this can name an unrelated process and read `true` for a waiter
+/// that is gone. `false` only means no such PID is alive at this instant —
+/// typically because the session is mid-turn (busy), or never armed. Either way a
+/// message published to a subscribed session is still durably delivered; it
+/// surfaces on that session's next read/arm. There is no liveness signal beyond
+/// this, and we deliberately do not invent one.
 pub fn waiter_alive(waiters_dir: &Path, session: &SessionId) -> bool {
     let Ok(text) = std::fs::read_to_string(pidfile_path(waiters_dir, session)) else {
         return false;
@@ -799,6 +802,36 @@ mod tests {
                 .unwrap(),
             "a%2Fb"
         );
+    }
+
+    #[test]
+    fn waiter_alive_probes_the_pidfile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let waiters = dir.path();
+
+        // Absent pidfile => no live waiter.
+        let session = SessionId::new("s-alive");
+        assert!(!waiter_alive(waiters, &session));
+
+        // A pidfile naming THIS live process => alive (kill(pid,0) succeeds).
+        std::fs::write(
+            pidfile_path(waiters, &session),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert!(waiter_alive(waiters, &session));
+
+        // A pidfile naming an almost-certainly-dead PID => not alive. 2_000_000_000
+        // is well above any platform PID_MAX, so the probe gets ESRCH (or EINVAL),
+        // never a false positive.
+        let dead = SessionId::new("s-dead");
+        std::fs::write(pidfile_path(waiters, &dead), "2000000000").unwrap();
+        assert!(!waiter_alive(waiters, &dead));
+
+        // A garbage (unparseable) pidfile names no waiter.
+        let garbage = SessionId::new("s-garbage");
+        std::fs::write(pidfile_path(waiters, &garbage), "not-a-pid").unwrap();
+        assert!(!waiter_alive(waiters, &garbage));
     }
 
     #[test]

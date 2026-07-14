@@ -428,7 +428,7 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
     request(
         format,
         Request::Subscribe {
-            session: args.session.resolve()?,
+            session: resolve_session_or_fail(format, &args.session)?,
             topic,
         },
     )
@@ -440,7 +440,7 @@ async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Resul
     request(
         format,
         Request::Unsubscribe {
-            session: args.session.resolve()?,
+            session: resolve_session_or_fail(format, &args.session)?,
             topic,
         },
     )
@@ -451,7 +451,7 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
     request(
         format,
         Request::Read {
-            session: args.session.resolve()?,
+            session: resolve_session_or_fail(format, &args.session)?,
             limit: args.limit,
         },
     )
@@ -462,7 +462,7 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<()> {
 /// `send` to it. Deliberately NOT a socket call: identity does not depend on the
 /// bridge, so an agent can always answer "who am I" even when the daemon is down.
 fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
-    let session = args.resolve()?;
+    let session = resolve_session_or_fail(format, &args)?;
     let inbox = inbox_topic(&session)
         .with_context(|| format!("session {:?} cannot form an inbox topic", session.as_str()))?;
 
@@ -482,7 +482,7 @@ fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()> {
 /// `{"from": "<sender>", ...}` — see [`mailbox::agents`] for the convention and
 /// for why an unregistered target is a hard error rather than a silent publish.
 async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<()> {
-    let from = args.session.resolve()?;
+    let from = resolve_session_or_fail(format, &args.session)?;
     let to = parse_send_target(&args.target)?;
     let body = send_body(args.text, args.body)?;
     request(format, Request::Send { from, to, body }).await
@@ -545,7 +545,7 @@ async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()
     request(
         format,
         Request::Agents {
-            session: args.resolve()?,
+            session: resolve_session_or_fail(format, &args)?,
         },
     )
     .await
@@ -564,12 +564,12 @@ async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<()
 async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> {
     let req = match args.target {
         WatchTargetCmd::GithubPr(gh) => Request::Watch {
-            session: gh.session.resolve()?,
+            session: resolve_session_or_fail(format, &gh.session)?,
             target: parse_pr_spec(&gh.spec)?,
             interval_secs: gh.interval,
         },
         WatchTargetCmd::Stub(stub) => Request::WatchStub {
-            session: stub.session.resolve()?,
+            session: resolve_session_or_fail(format, &stub.session)?,
             // Validate the label at the edge (same as the daemon) so a bad label
             // is a clean local error, not a round-trip.
             label: parse_stub_label(&stub.label)?,
@@ -583,11 +583,11 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<()> 
 async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<()> {
     let req = match args.target {
         UnwatchTargetCmd::GithubPr(gh) => Request::Unwatch {
-            session: gh.session.resolve()?,
+            session: resolve_session_or_fail(format, &gh.session)?,
             target: parse_pr_spec(&gh.spec)?,
         },
         UnwatchTargetCmd::Stub(stub) => Request::UnwatchStub {
-            session: stub.session.resolve()?,
+            session: resolve_session_or_fail(format, &stub.session)?,
             label: parse_stub_label(&stub.label)?,
         },
     };
@@ -598,7 +598,7 @@ async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<()
     request(
         format,
         Request::Status {
-            session: args.resolve()?,
+            session: resolve_session_or_fail(format, &args)?,
         },
     )
     .await
@@ -649,6 +649,22 @@ fn fail(format: OutputFormat, message: &str) -> anyhow::Error {
         println!("{json}");
     }
     anyhow::anyhow!("{message}")
+}
+
+/// Resolve the session for a session-scoped command, routing a failure through
+/// [`fail`] so `--json` mode still emits a typed [`Response::Error`] on stdout —
+/// the same contract every serviced failure honours. Without this, a missing
+/// session (no `--session`, no env) failed *before* any `fail`/`request` call, so
+/// `mailbox --json <cmd>` printed nothing on stdout and only a plain-text stderr
+/// line. Exits non-zero (via the returned `Err` → `ExitCode::FAILURE`), never
+/// exit 2 — a resolution failure is an error, not a wake.
+fn resolve_session_or_fail(
+    format: OutputFormat,
+    session: &SessionOpt,
+) -> anyhow::Result<SessionId> {
+    session
+        .resolve()
+        .map_err(|err| fail(format, &format!("{err:#}")))
 }
 
 /// A short "what was being attempted" label for a failed request, for the stderr
@@ -793,16 +809,21 @@ fn describe_sub(state: &SubscribeState) -> String {
             "new, empty topic (no baseline)".to_string()
         }
         SubscribeState::AlreadySubscribed => "already subscribed".to_string(),
+        SubscribeState::RefusedSessionRecentlyEnded => {
+            "refused: session recently ended (not resurrecting its inbox)".to_string()
+        }
     }
 }
 
 /// Render the registered agent inboxes.
 ///
 /// The liveness column is stated in full rather than as a bare `live`/`idle`
-/// flag, because it is easy to over-read: it means "a waiter is blocked for this
-/// session right now", not "this agent is healthy". A `send` to an agent with no
-/// live waiter still lands durably — so the footer says so instead of leaving the
-/// reader to guess (there is no heartbeat here, and we do not pretend otherwise).
+/// flag, because it is easy to over-read: at best it means "a waiter *appears*
+/// blocked for this session", not "this agent is healthy". It is a best-effort
+/// probe (`kill(pid, 0)` on a pidfile) that cannot rule out PID reuse, so the
+/// wording hedges. A `send` to an agent with no live waiter still lands durably —
+/// so the footer says so instead of leaving the reader to guess (there is no
+/// heartbeat here, and we do not pretend otherwise).
 fn render_agents(agents: &[AgentSummary]) {
     if agents.is_empty() {
         println!("no agents registered (nobody is addressable yet)");
@@ -811,7 +832,7 @@ fn render_agents(agents: &[AgentSummary]) {
     println!("{} agent(s):", agents.len());
     for agent in agents {
         let waiter = if agent.live_waiter {
-            "idle (waiter blocked — a send wakes it now)"
+            "idle (waiter appears blocked — a send should wake it)"
         } else {
             "busy or unarmed (a send still lands in its inbox)"
         };
@@ -1054,7 +1075,10 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
     let topic = match inbox_topic(session) {
         Ok(topic) => topic,
         Err(err) => {
-            warn!(
+            // Permanent and actionable: this session id will NEVER be addressable,
+            // so peers can never `send` to it. Logged at error so it survives the
+            // harness.log default filter (there is no transient retry that fixes it).
+            error!(
                 session = %session.as_str(),
                 error = %err,
                 "session id cannot form an inbox topic; not registering an inbox (peers cannot address this session)"
@@ -1067,6 +1091,18 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
         topic: topic.clone(),
     };
     match client::send(&config.socket_path(), &request).await {
+        // The guard refused this registration: the session ended within the
+        // tombstone window (the arm-vs-cleanup race, ADR-0007). Honest, not a
+        // silent success — logged at warn so it is visible in harness.log.
+        Ok(Response::Subscribed {
+            outcome: SubscribeState::RefusedSessionRecentlyEnded,
+            ..
+        }) => warn!(
+            session = %session.as_str(),
+            topic = %topic.as_str(),
+            "did not register the agent inbox: session recently ended (tombstone guard); \
+             it will re-register on a later arm if the session genuinely resumes"
+        ),
         Ok(Response::Subscribed { outcome, .. }) => info!(
             session = %session.as_str(),
             topic = %topic.as_str(),
