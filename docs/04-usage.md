@@ -63,6 +63,12 @@ can check the installed binary matches the source you built from (a `-dirty`
 suffix means it was built from an uncommitted tree). The running daemon also logs
 its version on the `bridge serving` startup line.
 
+> **macOS `Killed: 9` after reinstalling?** On Apple Silicon a locally-built binary
+> can be SIGKILLed on launch after an in-place reinstall (a code-signature-cache
+> quirk, not a bug). Fix it with `codesign --force -s - ~/.local/bin/mailbox`, or
+> avoid it by installing to a fresh inode (`rm -f` the target first). See
+> [05-release](05-release.md#macos-killed-9-after-a-local-reinstall).
+
 ### Bump the version
 
 The whole workspace shares one version (`[workspace.package] version` in the root

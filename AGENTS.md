@@ -6,6 +6,8 @@ Orientation for agents working in this repo. **Read [docs/00-index.md](docs/00-i
 
 When you change architecture, crate boundaries, commands, or agent-facing conventions, update this file and/or the relevant `docs/*.md` in the same change. Significant decisions also need an [ADR](docs/adr/README.md).
 
+**Durable learnings live in the repo, not in an agent's private memory.** A root cause, a constraint, a gotcha, or a decision that a future agent (or teammate) would benefit from goes in the relevant `docs/*.md` or an ADR — where everyone can see it — not in per-agent memory that no one else can read. If you learn something worth keeping, write it down here or under `docs/`.
+
 ## What this is
 
 Local durable **topic bus** for coding agents: adapters publish world-change events; the bridge stores them and kicks waiters; harness integrators wake idle sessions (Claude Code first via `asyncRewake`). Agents react — they do not poll, and they should not re-arm themselves.
