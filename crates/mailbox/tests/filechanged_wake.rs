@@ -378,7 +378,10 @@ fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
     let session = "stop-liveness";
     env.run_as_ok(session, &["subscribe", &env.pr_topic(6)], "subscribe");
 
-    // (i) No watcher yet → ensure-watcher respawns one, re-prints watchPaths, exits 0.
+    // (i) No watcher yet → ensure-watcher respawns one, exits 0, and prints NOTHING.
+    // A Stop hook must not emit a `hookSpecificOutput` (Claude Code rejects a Stop hook
+    // whose output carries `hookEventName: "SessionStart"` — the watchPaths registration
+    // is SessionStart-only). Regression guard for that bug.
     let out = env.ensure_watcher(session);
     assert_eq!(
         out.status.code(),
@@ -386,12 +389,10 @@ fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
         "ensure-watcher must exit 0 (never a wake); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let value: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("watchPaths JSON");
-    assert_eq!(
-        value["hookSpecificOutput"]["watchPaths"][0],
-        env.sentinel_path(session).display().to_string(),
-        "ensure-watcher re-prints this session's watchPaths"
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "the Stop hook must print nothing to stdout (no watchPaths / hookEventName); got: {stdout}"
     );
     wait_until_armed(&env, session);
     let live_pid = watcher_pid(&env, session).expect("a watcher pid");

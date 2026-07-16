@@ -2115,23 +2115,22 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
 /// The `Stop` hook (ADR-0008 Stop-liveness): the pessimistic safety net that keeps a
 /// session's detached watcher alive across turns, and NEVER wakes.
 ///
-/// It is the recovery mechanism for the two failure modes the detached watcher cannot
-/// self-heal:
+/// It is the recovery mechanism for **a dead watcher**: if the watcher died (a crash, an
+/// OS/OOM kill, an unrecoverable FIFO error), a session that keeps taking turns re-spawns
+/// it here. It respawns only when the pidfile is missing or names a dead pid; a LIVE
+/// watcher is left untouched — and even a redundant spawn is free, because the loser
+/// loses the single-instance lock and exits `AlreadyWaiting` (exit 0).
 ///
-/// 1. **A dead watcher.** If the watcher died (a crash, an OS/OOM kill, an
-///    unrecoverable FIFO error), a session that keeps taking turns re-spawns it here.
-///    It respawns only when the pidfile is missing or names a dead pid; a LIVE watcher
-///    is left untouched — and even a redundant spawn is free, because the loser loses
-///    the single-instance lock and exits `AlreadyWaiting` (exit 0).
-/// 2. **watchPath persistence.** It re-prints the `watchPaths` registration, defending
-///    the [UNDOCUMENTED] risk that a `SessionStart`-registered watchPath lapses over a
-///    long session.
+/// It **prints nothing to stdout**: a Stop hook cannot register `watchPaths` (that is a
+/// `SessionStart`-only output — emitting it from a Stop fails Claude Code's event-name
+/// check), so watchPath registration lives solely in the `SessionStart` hook and is
+/// assumed to persist for the session (an accepted residual, ADR-0008).
 ///
 /// It **never exits 2** (it is not an `asyncRewake` hook), so a Stop can never itself
 /// wake the session — that is the load-bearing invariant. It exits 1 on a config/stdin
 /// error (it could do nothing useful) and 0 otherwise, including every no-op and every
-/// respawn. It needs no bridge socket — watcher liveness and watchPaths are both local —
-/// so it is fast and cannot be blocked by a down daemon.
+/// respawn. It needs no bridge socket — watcher liveness is local — so it is fast and
+/// cannot be blocked by a down daemon.
 ///
 /// The residual it does NOT cover (documented in ADR-0008): a session that goes idle
 /// **forever** — never another Stop — whose watcher then dies stays deaf until it next
@@ -2155,18 +2154,13 @@ pub fn run_ensure_watcher_hook() -> ExitCode {
         }
     };
 
-    // Re-print the watchPaths registration (defends watchPath persistence across idle).
-    // A failure to resolve the sentinel root is logged but never fatal — the hook must
-    // still exit 0, and the watcher liveness check below is independent of it.
-    match Sentinel::for_session(&session) {
-        Ok(sentinel) => print_watch_paths(sentinel.path()),
-        Err(err) => error!(
-            session = %session.as_str(),
-            error = %err,
-            "ensure-watcher could not resolve the wake sentinel path; not re-printing watchPaths \
-             (the session still receives mail durably; set MAILBOX_SENTINEL_ROOT or a home)"
-        ),
-    }
+    // A Stop hook must NOT print a `watchPaths` registration: Claude Code validates that
+    // a hook's `hookSpecificOutput.hookEventName` matches the firing event, and watchPath
+    // registration is a `SessionStart`-only output — emitting it here fails the Stop hook
+    // ("expected 'Stop' but got 'SessionStart'"). So this hook stays silent on stdout and
+    // only ensures watcher liveness. (Consequence: a `SessionStart`-registered watchPath
+    // cannot be re-registered mid-session; we rely on it persisting for the session — an
+    // accepted residual documented in ADR-0008.)
 
     // Ensure a detached watcher is alive; respawn only when it is missing or dead. A
     // live watcher is left strictly alone (the respawn would lose the single-instance
