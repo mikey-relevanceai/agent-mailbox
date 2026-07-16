@@ -12,8 +12,9 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0003](0003-single-writer-sqlite.md) | Single-writer SQLite; others queue via the bridge | Accepted |
 | [0004](0004-cli-serve-daemon-and-socket.md) | `serve` daemon + Unix-socket CLI clients (fail loud when down) | Accepted |
 | [0005](0005-baseline-via-protocol.md) | Edge-triggered adapter baseline persists via the protocol (config in, `Baseline` out) | Accepted |
-| [0006](0006-harness-self-respawn.md) | Harness wake loop: the re-arm exit (execv does NOT reset the hook timeout), waiter-owned pidfile after the lock, stale-pidfile reap, arm-iff-subscribed | Accepted |
+| [0006](0006-harness-self-respawn.md) | Harness wake loop: the re-arm exit (execv does NOT reset the hook timeout), waiter-owned pidfile after the lock, stale-pidfile reap, arm-iff-subscribed | Accepted; periodic re-arm **superseded by 0008** |
 | [0007](0007-always-on-agent-inboxes.md) | Always-on agent inboxes (`agent.<session-id>`), discovery, and why `send` to an unregistered agent is an error | Accepted |
+| [0008](0008-on-demand-wake-filechanged.md) | On-demand wake: a detached per-session watcher bumps a central sentinel, a `FileChanged` hook wakes only on genuine mail — no periodic re-arm | Accepted |
 
 ## When to write one
 

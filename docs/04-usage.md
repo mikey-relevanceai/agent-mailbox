@@ -94,8 +94,8 @@ The daemon keeps everything under one directory (default
 | `mailbox.db` | the durable SQLite topic log, subscriptions, cursors, watches |
 | `mailbox.sock` | the user-scoped Unix socket clients connect to (`0600`) |
 | `mailbox.lock` | the daemon's exclusive `flock` (single-writer guard) |
-| `waiters/` | per-session wake FIFOs + pidfiles |
-| `harness.log` | `wait` / `harness arm` logs (kept off stderr so wakes stay clean) |
+| `waiters/` | per-session wake FIFOs + watcher pidfiles |
+| `harness.log` | watcher / `wake` / `wait` logs (kept off stderr so wakes stay clean) |
 
 ### Start the daemon
 
@@ -122,8 +122,9 @@ mailbox harness install-skills   # skill  -> ~/.claude/skills
 mailbox harness install-hooks    # hooks  -> ~/.claude/settings.json (when it exists)
 ```
 
-- **`install-hooks`** makes wake **infrastructure** — the harness arms the waiter,
-  so the agent never has to.
+- **`install-hooks`** makes wake **infrastructure** — the `SessionStart` hook starts
+  a detached watcher that keeps the agent wakeable for the whole session (no periodic
+  re-arm; ADR-0008), so the agent never has to.
 - **`install-skills`** installs the skill that teaches the agent the loop it wakes
   into (subscribe / read / react / unsubscribe — no background pollers, no
   self-arming).
@@ -171,8 +172,9 @@ conservative:
 - It **compare-and-swaps**: if Claude Code rewrites the file while we merge (a
   `/config` change, an "always allow" click), we re-merge from its new content
   rather than discarding it.
-- Re-running with a different `--mailbox-bin` or `--max-block-ms` **updates** our
-  hooks in place; it never leaves a stale second copy pointing at an old binary.
+- Re-running with a different `--mailbox-bin` **updates** our hooks in place; it never
+  leaves a stale second copy pointing at an old binary. An upgrade from the old
+  ADR-0006 `arm` hooks also sweeps them.
 
 ```bash
 # Merge into ~/.claude/settings.json (when it exists):
@@ -186,16 +188,15 @@ mailbox harness install-hooks \
 
 Pass an **absolute** `--mailbox-bin` so the hook works regardless of the
 session's `PATH` (it defaults to the resolved path of the `mailbox` you ran).
-The snippet wires three hooks:
+The snippet wires three hooks (ADR-0008 — on-demand wake, no periodic re-arm):
 
 ```json
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
-      "asyncRewake": true, "timeout": 3600 }] }],
-    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600",
+      "command": "/abs/path/mailbox harness session-start" }] }],
+    "FileChanged": [{ "matcher": ".mailbox-wake", "hooks": [{ "type": "command",
+      "command": "/abs/path/mailbox harness wake",
       "asyncRewake": true, "timeout": 3600 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness cleanup" }] }]
@@ -205,47 +206,36 @@ The snippet wires three hooks:
 
 What each hook does:
 
-- **`SessionStart` / `Stop` → `mailbox harness arm`** (`asyncRewake: true`).
-  Reads the `session_id` from the hook's stdin JSON, **registers the session's
-  agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
-  agents, see §4), asks the bridge whether the session has any subscriptions, and
-  — unless the bridge answers cleanly that it subscribes to **nothing** — `exec`s the
-  waiter. This is the only reason the agent never re-arms.
+- **`SessionStart` → `mailbox harness session-start`** (plain, synchronous). Reads the
+  `session_id` from the hook's stdin JSON, **registers the session's agent inbox**
+  (`agent.<session-id>` — this is what makes it reachable by peer agents, see §4),
+  prints a `watchPaths` registration for this session's sentinel file, and spawns a
+  **detached watcher** that outlives the hook and blocks on the mail FIFO for the whole
+  session. It never wakes the session itself (it is not `asyncRewake`).
 
-  If the bridge is **down or erroring**, `arm` retries briefly and then **arms anyway**
-  (fail-open): the waiter needs no daemon and re-checks subscriptions itself, so an
-  unsubscribed session's waiter simply self-exits — whereas *not* arming would leave an
-  idle session with no waiter and no further `Stop` to retry it, i.e. permanently
-  unwakeable. A down bridge never produces a *wake*; the waiter just blocks, and the
-  first publish after the daemon returns kicks it.
-- **`SessionEnd` → `mailbox harness cleanup`.** Reaps the waiter and drops this
-  session's subscriptions (including its inbox — it stops being addressable)
-  **and** watch interests, stopping any adapter whose last interested session it
-  was (no zombie poller outlives the session).
+  If the bridge is **down or erroring**, it still prints the watchPaths and spawns the
+  watcher (fail-open): the watcher needs no daemon and re-checks subscriptions itself
+  under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
+  never produces a *wake*; the watcher just blocks, and the first publish after the
+  daemon returns kicks it.
+- **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
+  (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
+  idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread
+  mail**, else exits **0**. That anti-loop guard is load-bearing: a `FileChanged` fires
+  on every change to the sentinel, so waking unconditionally would loop the agent.
+- **`SessionEnd` → `mailbox harness cleanup`.** Reaps the watcher, **removes the
+  session's sentinel dir**, and drops this session's subscriptions (including its inbox
+  — it stops being addressable) **and** watch interests, stopping any adapter whose last
+  interested session it was (no zombie poller outlives the session).
 
-**Keeping a long idle armed (and the benign "re-arming" wake).** Claude Code kills a
-hook at its `timeout`, and the waiter *cannot* extend that deadline — so instead of
-being killed mid-block (which would leave an idle session silently unwakeable,
-because an idle session fires no further `Stop`), the waiter **yields**: at
-`--max-block-ms` it exits 2 with
-
-```text
-mailbox: re-arming the waiter (no new mail) — nothing to read; just end your turn
-and the Stop hook will re-arm it
-```
-
-That wake carries **no mail**. If you see it: do nothing, and end your turn — the
-`Stop` hook arms a fresh waiter with a fresh timeout. Defaults are `--timeout-secs
-3600` (1h) and `--max-block-ms 3300000` (55m), so this happens at most once an hour
-of continuous idle; **a larger `--timeout-secs` means fewer of these wakes.**
-`install-hooks` **refuses** a `--max-block-ms` that is not safely below
-`--timeout-secs` — that pairing silently reintroduces the un-armed-forever bug — and
-`arm` enforces the same rule again *at run time*, clamping (loudly, in `harness.log`) a
-max-block that is not safely below the hook `timeout` it was launched with. That covers
-a hand-edited `settings.json`, and a hook entry with no `timeout` at all (where Claude
-Code applies its own 600s default). See
-[01-wake-and-rearm](01-wake-and-rearm.md) § "Timeout survival" and
-[ADR-0006](adr/0006-harness-self-respawn.md).
+**No periodic re-arm (ADR-0008).** The old design kept a long idle armed by having the
+waiter exit 2 at `--max-block-ms` to force a re-arm — one model turn per `max_block` of
+idle. That is gone: the detached watcher blocks indefinitely with no timer, so an idle
+subscribed session costs **zero** model turns until real mail arrives, and **every wake
+is real mail**. (`mailbox wait` / `mailbox harness arm` and their timing knobs survive
+as retained primitives, but are no longer wired into the hooks.) See
+[01-wake-and-rearm](01-wake-and-rearm.md) and
+[ADR-0008](adr/0008-on-demand-wake-filechanged.md).
 
 ### 2b. Install the skill
 
@@ -314,8 +304,9 @@ subscribe  ──►  (idle; hooks keep the waiter armed)  ──►  read  ─�
    `mailbox watch github-pr <owner>/<repo>#<n>` (which subscribes *and* starts the
    shared poller). Baseline-on-subscribe: you only ever see events published
    *after* you subscribe.
-2. **idle** — do other work, or nothing. The `SessionStart`/`Stop` hooks keep a
-   waiter armed. **The agent does not arm anything and does not poll.**
+2. **idle** — do other work, or nothing. The `SessionStart` hook starts a detached
+   watcher that keeps you wakeable for the whole session (no re-arm). **The agent does
+   not arm anything and does not poll.**
 3. **read** — on wake (a system reminder like `mail on topic X`), run
    `mailbox read`. It returns unread events and advances your cursor
    (exactly-once, advance-on-read).
@@ -425,7 +416,7 @@ mis-attributed to.
 
 Agents can poke each other, with no human in the loop. Every live session is
 **automatically** given an inbox — the topic `agent.<session-id>` — which the
-`SessionStart`/`Stop` hooks register for it (always-on; see
+`SessionStart` hook registers for it (always-on; see
 [ADR-0007](adr/0007-always-on-agent-inboxes.md)). An agent does nothing to become
 addressable, and `SessionEnd` deregisters it.
 
@@ -539,7 +530,7 @@ unread:
 ```
 
 - **inbox** — this session's peer-messaging address, and whether it is
-  `registered` (the hooks do that on every `SessionStart`/`Stop`). If it says
+  `registered` (the `SessionStart` hook does that). If it says
   `NOT registered`, peers cannot `send` to this session — check the hooks are
   installed and the daemon is up.
 - **watches** — each supervised watch, its `state`

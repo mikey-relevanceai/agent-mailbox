@@ -46,6 +46,18 @@ mod topic;
 /// newer than they understand (see the module docs for the reject-newer rule).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The fixed basename of the per-session wake sentinel (ADR-0008), and — because
+/// Claude Code's `FileChanged` matcher matches by basename — the STATIC matcher the
+/// harness writes into `settings.json`.
+///
+/// It lives here, in the one crate both the bridge (which writes the sentinel path)
+/// and the harness-installer (which writes the matcher) depend on, for the SAME
+/// reason [`SessionId::encode_filename`] does: the two must agree exactly or a
+/// `FileChanged` would watch a file no one bumps. It is deliberately dotted and
+/// mailbox-specific — not the bare word `wake` — so a stray file in a recursively
+/// watched cwd cannot trip the hook.
+pub const WAKE_SENTINEL_BASENAME: &str = ".mailbox-wake";
+
 pub use error::{FramingError, IncompatibleVersion, LineError, TopicError, check_version};
 pub use framing::{decode_line, encode_line, read_lines, write_line};
 pub use ids::{AdapterId, Cursor, EventId, Offset, Timestamp};

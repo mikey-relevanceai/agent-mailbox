@@ -20,10 +20,11 @@ read the two hard rules below.
 
 ## Two hard rules (this is the whole point)
 
-1. **NEVER re-arm.** Do not run any arm command after a wake. The
-   `SessionStart` / `Stop` Claude Code hooks (`mailbox harness arm`) keep the
-   waiter armed for you. If you catch yourself about to "re-arm listening,"
-   stop — it is already armed.
+1. **NEVER re-arm.** Do not run any arm/listen command after a wake. The
+   `SessionStart` Claude Code hook (`mailbox harness session-start`) starts a
+   detached watcher that keeps you wakeable for the whole session. If you catch
+   yourself about to "re-arm listening," stop — it is already armed, and it stays
+   armed with no action from you.
 2. **NEVER spawn a background poller.** Do not run `gh-watch.sh`, and do not
    background a `while true; gh …; sleep` loop or anything like it. To watch a
    PR, declare a `watch` — the bridge daemon owns and supervises the poller (one
@@ -118,26 +119,14 @@ mailbox read
 
 `read` returns the unread events and advances your cursor (exactly-once). React
 to what you read — resolve the conflict, address the review, fix CI, reply to the
-peer. Then just end your turn; the `Stop` hook re-arms the waiter. **You do
-nothing to re-arm.**
+peer. Then just end your turn. **You do nothing to stay wakeable** — the
+infrastructure keeps you armed for the next message.
 
-### The one wake that is NOT mail: `re-arming the waiter`
-
-Sometimes you will be woken by this instead:
-
-```text
-mailbox: re-arming the waiter (no new mail) — nothing to read; just end your turn
-and the Stop hook will re-arm it
-```
-
-**There is no mail. Do nothing and end your turn.** Do not run `mailbox read`, do
-not go looking for what changed, and above all do not try to re-arm anything.
-
-This is infrastructure keeping you wakeable: the background waiter is killed by
-Claude Code at its hook timeout, so before that deadline it wakes you on purpose —
-because ending your turn is what fires the `Stop` hook that arms a *fresh* waiter.
-If it did not, you would go quietly deaf. Ending your turn IS the correct and
-complete response.
+**Every wake is real mail.** You will only ever be woken with a `mail on topic …`
+reminder — there is no "keeping you alive" nudge to ignore. When you wake, there is
+something to `mailbox read`. (Behind the scenes a detached watcher wakes you the
+moment mail arrives and stays silent otherwise, so an idle session costs nothing and
+never sees a spurious wake.)
 
 ### Check state (read-only)
 

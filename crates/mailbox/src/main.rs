@@ -48,6 +48,16 @@ fn main() -> ExitCode {
         // 2 = wake the session (mail, or the benign re-arm boundary), 1 = waiter
         // error, 0 = nothing to wake about (no subscriptions).
         Command::Wait(args) => cli::run_wait(&args),
+        // The ADR-0008 FileChanged wake hook (a read-only peek) and the detached
+        // watcher (a blocking FIFO loop) also run synchronously — no runtime — and
+        // own their own exit codes (see their handlers). Matched here so they never
+        // reach the async path.
+        Command::Harness(cli::HarnessArgs {
+            command: HarnessCommand::Wake,
+        }) => cli::run_wake_hook(),
+        Command::Harness(cli::HarnessArgs {
+            command: HarnessCommand::Watch(args),
+        }) => cli::run_watch_sentinel(&args),
         // Everything else is async (socket client, or the serve daemon).
         command => {
             let runtime = match tokio::runtime::Runtime::new() {
@@ -73,14 +83,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether this command's stderr is a wake wire channel (`wait` and `harness
-/// arm`), so its tracing must be kept OFF stderr.
+/// Whether this command's tracing must be kept OFF stderr and sent to
+/// `harness.log` instead. Two reasons a harness command qualifies:
+///
+/// - its stderr is a WAKE WIRE — `wait` and the ADR-0008 `harness wake` hook write
+///   the payload-free reminder there on exit 2, so a tracing line would pollute it;
+/// - its stdout is a HOOK CONTRACT or it is a DETACHED daemon — `harness
+///   session-start` prints the `watchPaths` JSON on stdout, and `harness watch` runs
+///   detached with no terminal; both want their lifecycle in `harness.log`, not on a
+///   channel Claude Code reads (or a stderr nobody sees).
+///
+/// `harness arm` remains here as the superseded-but-retained re-arm primitive.
 fn is_wire_stderr(command: &Command) -> bool {
     matches!(
         command,
         Command::Wait(_)
             | Command::Harness(cli::HarnessArgs {
                 command: HarnessCommand::Arm(_)
+                    | HarnessCommand::Wake
+                    | HarnessCommand::Watch(_)
+                    | HarnessCommand::SessionStart
             })
     )
 }

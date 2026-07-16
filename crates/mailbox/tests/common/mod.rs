@@ -193,6 +193,36 @@ impl Env {
         self.db_path.parent().unwrap().join("waiters")
     }
 
+    /// The ADR-0008 sentinel root for this env, under the tempdir. ALWAYS passed as
+    /// `MAILBOX_SENTINEL_ROOT` to any command that resolves a sentinel (`session-start`,
+    /// `watch`, `cleanup`), so a test can NEVER touch the real `~/.mailbox`.
+    pub fn sentinel_root(&self) -> PathBuf {
+        self.db_path.parent().unwrap().join("sentinel")
+    }
+
+    /// The absolute sentinel file path for `session` (its encoded id is itself for the
+    /// safe ids the tests use).
+    pub fn sentinel_path(&self, session: &str) -> PathBuf {
+        self.sentinel_root()
+            .join("by-agent")
+            .join(session)
+            .join(".mailbox-wake")
+    }
+
+    /// The topic names the watcher last wrote into `session`'s sentinel (payload-free),
+    /// or an empty vec if it was never written.
+    pub fn sentinel_topics(&self, session: &str) -> Vec<String> {
+        match std::fs::read_to_string(self.sentinel_path(session)) {
+            Ok(text) => text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Write a `pr` view fixture for poll index `i` (scenario 1 scripts a
     /// transition; the default is [`PR_MERGEABLE_CI_SUCCESS`] at index 0).
     pub fn set_pr_fixture(&self, i: usize, body: &str) {
@@ -375,6 +405,9 @@ impl Env {
         let mut child = mailbox_command()
             .args(["harness", "cleanup"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            // Always a tempdir sentinel root: cleanup removes the sentinel dir, so this
+            // is what keeps it off the real ~/.mailbox.
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -386,6 +419,66 @@ impl Env {
         stdin.write_all(payload.as_bytes()).expect("write payload");
         drop(stdin);
         child.wait_with_output().expect("cleanup output")
+    }
+
+    /// Run `mailbox harness session-start` (the ADR-0008 SessionStart hook), feeding it
+    /// the hook JSON on stdin exactly as Claude Code would. Returns its Output — stdout
+    /// carries the `watchPaths` registration JSON. As a side effect it spawns a DETACHED
+    /// watcher (tracked by the [`LeakGuard`] via its pidfile); reap it with `cleanup`.
+    pub fn session_start(&self, session: &str) -> Output {
+        let mut child = mailbox_command()
+            .args(["harness", "session-start"])
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mailbox harness session-start");
+        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"SessionStart"}}"#);
+        let mut stdin = child.stdin.take().expect("session-start stdin");
+        stdin.write_all(payload.as_bytes()).expect("write payload");
+        drop(stdin);
+        child.wait_with_output().expect("session-start output")
+    }
+
+    /// Spawn the detached watcher directly (`mailbox harness watch --session <id>`), for
+    /// tests that exercise the watcher in isolation. Wrapped in [`ArmChild`] so a test
+    /// panic can never leak the live watcher (its Drop kills + reaps it).
+    pub fn spawn_watcher(&self, session: &str) -> ArmChild {
+        let child = mailbox_command()
+            .args(["harness", "watch", "--session", session])
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mailbox harness watch");
+        ArmChild(child)
+    }
+
+    /// Run `mailbox harness wake` (the ADR-0008 FileChanged hook) for a session, feeding
+    /// the hook JSON. Returns its Output: exit code 2 = wake (stderr has the reminder),
+    /// 0 = no wake (the anti-loop path).
+    pub fn wake_hook(&self, session: &str) -> Output {
+        let mut child = mailbox_command()
+            .args(["harness", "wake"])
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mailbox harness wake");
+        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"FileChanged"}}"#);
+        let mut stdin = child.stdin.take().expect("wake stdin");
+        stdin.write_all(payload.as_bytes()).expect("write payload");
+        drop(stdin);
+        child.wait_with_output().expect("wake output")
     }
 
     // ---- status / read projections ------------------------------------------

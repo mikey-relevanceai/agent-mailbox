@@ -69,6 +69,7 @@ use nix::sys::stat::{Mode, SFlag};
 
 use mailbox_protocol::Topic;
 
+use crate::sentinel::Sentinel;
 use crate::storage::{ReadOnlyStore, SessionId, StorageError};
 
 /// The lone byte a kick writes into a FIFO.
@@ -239,6 +240,21 @@ pub enum WaitOutcome {
     /// arm-iff-subscribed: an `arm` that raced a `SessionEnd`/unsubscribe (interest
     /// already dropped) starts a waiter that finds nothing and self-exits, so no
     /// orphan waiter survives (card 11 HIGH#2 fix).
+    Unsubscribed,
+}
+
+/// How the detached watcher ([`Waiter::watch_sentinel`]) ended.
+///
+/// The watcher has essentially one clean exit — it either self-exits because the
+/// session subscribes to nothing, or it blocks forever until `SIGTERM` (which the
+/// OS delivers as process death, not a value). A named single-variant enum, rather
+/// than `()`, so a later reason can be added without changing the signature and so
+/// the call site reads intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchOutcome {
+    /// The session has NO subscriptions, so there is nothing to be woken about — the
+    /// watcher removed its pidfile and exited without ever arming a sentinel (the
+    /// arm-iff-subscribed re-check, mirroring [`WaitOutcome::Unsubscribed`]).
     Unsubscribed,
 }
 
@@ -621,6 +637,136 @@ impl Waiter {
                     return Ok(WaitOutcome::TimedOut);
                 }
             }
+        }
+    }
+
+    /// Peek at the session's currently-unread topics WITHOUT blocking, arming, or
+    /// consuming anything — the read the `FileChanged` wake hook makes to decide
+    /// whether a sentinel change reflects genuine mail (exit 2) or a stray touch
+    /// (exit 0). Opens the store read-only, so it needs no daemon socket; a missing
+    /// or unreadable store surfaces as an error the caller treats as "nothing to
+    /// wake about" (the anti-loop-safe default).
+    pub fn peek_unread(&self) -> Result<Vec<Topic>, WakeError> {
+        let store = ReadOnlyStore::open(&self.db_path)?;
+        Ok(store.topics_with_unread(&self.session)?)
+    }
+
+    /// Run the DETACHED WATCHER loop (ADR-0008): block on the FIFO forever and, on
+    /// every real-mail kick, write the unread topic name(s) into `sentinel` so its
+    /// mtime changes and the session's `FileChanged` hook fires. This is what
+    /// REPLACES the ADR-0006 exit-2-at-max_block re-arm — the watcher never wakes the
+    /// agent itself and never exits on a timer; it runs until `SIGTERM`'d at
+    /// `SessionEnd`, so an idle session costs zero model turns.
+    ///
+    /// It reuses the whole single-waiter machinery [`Waiter::wait`] relies on, in the
+    /// same load-bearing order:
+    ///
+    /// 0. Acquire the per-session exclusive lock — a second watcher (a racing
+    ///    `SessionStart`) loses it and exits [`WakeError::AlreadyWaiting`], leaving the
+    ///    live watcher's pidfile untouched.
+    /// 1. Write the pidfile (own pid) AFTER the lock, so it always names the one live
+    ///    lock-holding watcher — the pid `cleanup` reaps at `SessionEnd`.
+    /// 2. Ensure + open the FIFO (`O_RDWR | O_NONBLOCK`) — from here any kick is either
+    ///    buffered in the pipe or already reflected in the durable log.
+    /// 3. Open the read-only store and re-check `has_subscription`: an unsubscribed
+    ///    session (or one whose `SessionEnd` raced this start) yields
+    ///    [`WatchOutcome::Unsubscribed`] (pidfile removed, clean exit) — no orphan.
+    /// 4. Prime the sentinel once from any EXISTING unread (a publish that landed
+    ///    before the watcher armed — the missed-kick safety), then loop: block for a
+    ///    kick, re-check unread, and bump the sentinel iff there is genuinely unread
+    ///    mail. A kick with nothing unread (a self-authored publish, an already-read
+    ///    topic) touches NOTHING, so it cannot spuriously fire the wake hook.
+    ///
+    /// The sentinel carries topic NAMES only (payload-free). A sentinel write failure
+    /// is logged and the loop continues: losing one wake-trigger is far better than
+    /// the watcher dying and the session going permanently deaf.
+    ///
+    /// Never returns on its own except [`WatchOutcome::Unsubscribed`] or a hard
+    /// [`WakeError`]; steady state is an unbounded block, reaped by `SIGTERM`.
+    pub fn watch_sentinel(&self, sentinel: &Sentinel) -> Result<WatchOutcome, WakeError> {
+        // Steps 0–1: single-watcher lock, then the pidfile under it.
+        let _lock = self.acquire_lock()?;
+        self.write_pidfile()?;
+
+        // Step 2: open the FIFO before checking, so a kick is never lost.
+        self.ensure_fifo()?;
+        let mut fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&self.fifo_path)
+            .map_err(|source| WakeError::OpenFifo {
+                path: self.fifo_path.clone(),
+                source,
+            })?;
+
+        // Step 3: arm-iff-subscribed re-check (fixes the raced-SessionEnd orphan).
+        let store = ReadOnlyStore::open(&self.db_path)?;
+        if !store.has_subscription(&self.session)? {
+            self.remove_pidfile();
+            info!(
+                session = self.session.as_str(),
+                "watcher found no subscriptions; exiting without arming a sentinel"
+            );
+            return Ok(WatchOutcome::Unsubscribed);
+        }
+
+        // Step 4: prime from existing unread, then block-on-kick forever.
+        self.bump_sentinel_if_unread(&store, sentinel);
+        info!(
+            session = self.session.as_str(),
+            sentinel = %sentinel.path().display(),
+            "watcher armed; blocking on the mail FIFO (no re-arm, no timer)"
+        );
+        loop {
+            // `None` = block indefinitely; the watcher has no max-block and never
+            // times out. Both arms re-check unread (a TimedOut cannot occur with a
+            // None budget, but handling it keeps the match exhaustive and harmless).
+            match self.block_for_kick(&mut fifo, None)? {
+                Blocked::Kicked | Blocked::TimedOut => {
+                    self.bump_sentinel_if_unread(&store, sentinel);
+                }
+            }
+        }
+    }
+
+    /// Write the session's currently-unread topics into the sentinel — bumping its
+    /// mtime so the `FileChanged` hook fires — but only when there IS unread mail.
+    /// A best-effort helper: a store or sentinel failure is logged, never fatal to
+    /// the watcher (a dead watcher is the failure this whole design prevents).
+    fn bump_sentinel_if_unread(&self, store: &ReadOnlyStore, sentinel: &Sentinel) {
+        let topics = match store.topics_with_unread(&self.session) {
+            Ok(topics) => topics,
+            Err(err) => {
+                warn!(
+                    session = self.session.as_str(),
+                    error = %err,
+                    "watcher could not read unread topics; skipping this sentinel bump"
+                );
+                return;
+            }
+        };
+        if topics.is_empty() {
+            // A kick with nothing unread (self-authored publish, already-read topic).
+            // Touch NOTHING — bumping here is exactly what would loop the wake hook.
+            trace!(
+                session = self.session.as_str(),
+                "watcher kicked but nothing unread; leaving the sentinel untouched"
+            );
+            return;
+        }
+        let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
+        match sentinel.write_topics(&topics) {
+            Ok(()) => info!(
+                session = self.session.as_str(),
+                topics = names.join(","),
+                "watcher bumped the wake sentinel (unread mail; FileChanged will wake the session)"
+            ),
+            Err(err) => warn!(
+                session = self.session.as_str(),
+                error = %err,
+                "watcher could not write the wake sentinel; the session may miss this wake until the next kick"
+            ),
         }
     }
 

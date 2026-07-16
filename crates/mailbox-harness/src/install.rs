@@ -1,21 +1,24 @@
 //! Emitting (and merging) the Claude Code `settings.json` hooks snippet.
 //!
-//! `install-hooks` wires the whole loop with three hooks:
+//! `install-hooks` wires the ADR-0008 on-demand wake loop with three hooks and NO
+//! periodic re-arm:
 //!
-//! - `SessionStart` (matcher `startup`) and `Stop` run `mailbox harness arm` as a
-//!   background `asyncRewake` hook with a `timeout` (seconds). asyncRewake means
-//!   the process's exit-2 wakes the idle session; the timeout is Claude Code's
-//!   per-hook kill deadline (its default is 10 minutes; we write a longer one).
-//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook).
+//! - `SessionStart` (matcher `startup`) runs `mailbox harness session-start`, a
+//!   plain synchronous hook: it registers the inbox, prints the `watchPaths`
+//!   registering this session's sentinel, and spawns the detached watcher.
+//! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
+//!   as an `asyncRewake` hook with a `timeout` (seconds): when the watcher bumps the
+//!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
+//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a re-arm
+//!   timer.
+//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): reap
+//!   the watcher, remove the sentinel, drop interests/subscriptions.
 //!
-//! The `arm` command carries `--max-block-ms`, which it passes to the waiter it
-//! execs. That max-block MUST be below the async-hook `timeout`, because the waiter
-//! cannot outlive its hook process: it yields at the max-block (exit 2, the benign
-//! re-arm notice) so the harness re-arms a FRESH hook process — whereas a waiter
-//! still blocked when `timeout` lands is simply KILLED, and a truly idle session
-//! fires no further `Stop` to re-arm it, so it goes silently un-armed forever. That
-//! is the bug this ordering exists to prevent, which is why [`HookInstallSpec::validate`]
-//! refuses a spec that reintroduces it (see `docs/01-wake-and-rearm.md`, ADR-0006).
+//! This REPLACES the ADR-0006 `SessionStart`/`Stop` → `arm` → exit-2-re-arm loop,
+//! whose every re-arm cost a full model turn on a long idle. The `arm` command
+//! itself is retained as a primitive (and its timing knobs `--max-block-ms` /
+//! `--timeout-secs` still validated by [`HookInstallSpec::validate`]), but it is no
+//! longer wired into the snippet. See `docs/01-wake-and-rearm.md`, ADR-0008.
 //!
 //! # Where the hooks go, and why that is a TYPE
 //!
@@ -29,6 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mailbox_protocol::WAKE_SENTINEL_BASENAME;
 use serde_json::{Value, json};
 
 use crate::atomic::{write_atomic, write_atomic_guarded};
@@ -279,17 +283,19 @@ impl HookInstallSpec {
         Ok(())
     }
 
-    /// The `arm` hook command string
-    /// (`<bin> harness arm --max-block-ms <n> --timeout-secs <t>`).
-    ///
-    /// `--timeout-secs` is passed so the armed process KNOWS the deadline Claude Code
-    /// will kill it at, and can enforce `max_block < timeout` itself
-    /// ([`resolve_max_block`]) instead of trusting a settings file it did not write.
-    fn arm_command(&self) -> String {
-        format!(
-            "{} harness arm --max-block-ms {} --timeout-secs {}",
-            self.mailbox_bin, self.max_block_ms, self.timeout_secs
-        )
+    /// The `session-start` hook command (`<bin> harness session-start`). A
+    /// short-lived, synchronous hook (ADR-0008): it registers the inbox, prints the
+    /// `watchPaths`, and spawns the detached watcher, then exits 0. NOT asyncRewake —
+    /// it never wakes the session itself.
+    fn session_start_command(&self) -> String {
+        format!("{} harness session-start", self.mailbox_bin)
+    }
+
+    /// The `wake` hook command (`<bin> harness wake`). The `FileChanged` hook
+    /// (ADR-0008): it wakes the session (exit 2) only when there is genuine unread
+    /// mail, else exits 0.
+    fn wake_command(&self) -> String {
+        format!("{} harness wake", self.mailbox_bin)
     }
 
     /// The `cleanup` hook command string (`<bin> harness cleanup`).
@@ -298,31 +304,51 @@ impl HookInstallSpec {
     }
 }
 
-/// One `asyncRewake` arm hook group for a given matcher.
-fn arm_group(spec: &HookInstallSpec, matcher: &str) -> Value {
-    json!({
-        "matcher": matcher,
-        "hooks": [{
-            "type": "command",
-            "command": spec.arm_command(),
-            // asyncRewake: run in the background and wake the idle session when the
-            // process exits 2 (payload = the waiter's stderr reminder).
-            "asyncRewake": true,
-            // Claude Code's per-hook kill deadline, in seconds.
-            "timeout": spec.timeout_secs,
-        }],
-    })
-}
-
-/// Build the `{ "hooks": { … } }` snippet for the three hooks.
+/// Build the `{ "hooks": { … } }` snippet for the ADR-0008 on-demand wake loop.
+///
+/// Three hooks, and NO periodic re-arm (that is the whole point — it eliminates the
+/// spurious re-arm model turns of ADR-0006):
+///
+/// - `SessionStart` runs `session-start` (plain, synchronous): register the inbox,
+///   print the `watchPaths` registering this session's sentinel, spawn the detached
+///   watcher. There is no `Stop` hook — an idle session needs no periodic re-arm.
+/// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
+///   basename ([`WAKE_SENTINEL_BASENAME`]): when the watcher bumps the sentinel, this
+///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
+///   It carries `timeout_secs` as its kill deadline — it is a fast read-only peek, so
+///   the timeout is only a backstop.
+/// - `SessionEnd` runs `cleanup` (plain): reap the watcher, remove the sentinel, drop
+///   subscriptions/interests.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
         "hooks": {
             // SessionStart fires with source "startup" on a fresh session; arm then.
-            "SessionStart": [arm_group(spec, "startup")],
-            // Stop fires whenever the agent goes idle; re-arm (iff still subscribed).
-            "Stop": [arm_group(spec, "")],
-            // SessionEnd tears the waiter down and drops interests/subscriptions.
+            "SessionStart": [json!({
+                "matcher": "startup",
+                "hooks": [{
+                    "type": "command",
+                    "command": spec.session_start_command(),
+                }],
+            })],
+            // FileChanged fires when the watcher bumps the sentinel. The matcher is
+            // the sentinel BASENAME (Claude Code matches FileChanged by basename);
+            // per-session isolation comes from the absolute path SessionStart
+            // registered via watchPaths.
+            "FileChanged": [json!({
+                "matcher": WAKE_SENTINEL_BASENAME,
+                "hooks": [{
+                    "type": "command",
+                    "command": spec.wake_command(),
+                    // asyncRewake: wake the idle session when this exits 2 (the
+                    // payload is the wake hook's payload-free stderr reminder).
+                    "asyncRewake": true,
+                    // Claude Code's per-hook kill deadline (seconds) — a backstop for
+                    // a fast hook, not a re-arm timer.
+                    "timeout": spec.timeout_secs,
+                }],
+            })],
+            // SessionEnd tears the watcher down, removes the sentinel, and drops
+            // interests/subscriptions.
             "SessionEnd": [json!({
                 "matcher": "",
                 "hooks": [{
@@ -369,6 +395,17 @@ pub fn merge_into_settings(mut existing: Value, snippet: &Value) -> Value {
     }
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
+    // Pre-sweep: drop OUR hook groups from EVERY existing event, including ones the
+    // incoming snippet no longer writes. This is what makes an UPGRADE clean — the
+    // retired ADR-0006 `Stop` → arm hook lives on an event the ADR-0008 snippet does
+    // not touch, so without this pass the old exit-2 re-arm would keep firing. Only
+    // OUR groups are removed (foreign hooks are left exactly as they were).
+    for groups in hooks.values_mut() {
+        if let Some(array) = groups.as_array_mut() {
+            array.retain(|group| !is_our_group(group));
+        }
+    }
+
     for (event, incoming_groups) in incoming_hooks {
         let slot = hooks.entry(event).or_insert_with(|| json!([]));
         if !slot.is_array() {
@@ -394,15 +431,22 @@ fn is_our_group(group: &Value) -> bool {
     group_commands(group).iter().any(|c| is_our_command(c))
 }
 
-/// Whether a command string is `<any-bin> harness arm …` or `<any-bin> harness
-/// cleanup …`. The binary path is deliberately ignored: it is exactly the part that
-/// legitimately changes between installs.
+/// Whether a command string is one of ours: `<any-bin> harness <sub>` where `<sub>`
+/// is a hook we install or have ever installed. The binary path is deliberately
+/// ignored (it legitimately changes between installs), and the OLD `arm` subcommand
+/// is still recognised so an UPGRADE from the ADR-0006 re-arm hooks REPLACES them
+/// with the ADR-0008 on-demand hooks rather than leaving a stale arm hook behind.
 fn is_our_command(command: &str) -> bool {
     let mut tokens = command.split_whitespace();
     let has_bin = tokens.next().is_some();
     has_bin
         && tokens.next() == Some("harness")
-        && matches!(tokens.next(), Some("arm") | Some("cleanup"))
+        && matches!(
+            tokens.next(),
+            // Current (ADR-0008) hooks, plus the retired `arm` so it is swept on
+            // upgrade, plus `watch` for symmetry (never installed as a hook, but ours).
+            Some("session-start") | Some("wake") | Some("watch") | Some("arm") | Some("cleanup")
+        )
 }
 
 /// The set of command strings a hook group runs.
@@ -695,28 +739,35 @@ mod tests {
     }
 
     #[test]
-    fn snippet_is_valid_and_wires_the_three_hooks() {
+    fn snippet_is_valid_and_wires_the_adr0008_hooks() {
         let snippet = hooks_snippet(&spec());
         let hooks = &snippet["hooks"];
 
-        // SessionStart: matcher "startup", asyncRewake arm with the timeout.
+        // SessionStart: matcher "startup", a PLAIN session-start command (NOT
+        // asyncRewake — it never wakes the session itself).
         let start = &hooks["SessionStart"][0];
         assert_eq!(start["matcher"], "startup");
-        let arm = &start["hooks"][0];
-        assert_eq!(arm["type"], "command");
-        assert_eq!(
-            arm["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
+        let ss = &start["hooks"][0];
+        assert_eq!(ss["type"], "command");
+        assert_eq!(ss["command"], "/opt/mailbox harness session-start");
+        assert!(
+            ss.get("asyncRewake").is_none(),
+            "session-start must NOT be asyncRewake"
         );
-        assert_eq!(arm["asyncRewake"], true);
-        assert_eq!(arm["timeout"], 3600);
 
-        // Stop: same arm, empty matcher (fires on every idle).
-        assert_eq!(hooks["Stop"][0]["matcher"], "");
-        assert_eq!(
-            hooks["Stop"][0]["hooks"][0]["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
+        // There is NO periodic re-arm hook any more: the Stop → arm loop is gone.
+        assert!(
+            hooks.get("Stop").is_none(),
+            "the ADR-0008 loop has no Stop re-arm hook"
         );
+
+        // FileChanged: matcher = the sentinel basename, asyncRewake wake with timeout.
+        let fc = &hooks["FileChanged"][0];
+        assert_eq!(fc["matcher"], WAKE_SENTINEL_BASENAME);
+        let wake = &fc["hooks"][0];
+        assert_eq!(wake["command"], "/opt/mailbox harness wake");
+        assert_eq!(wake["asyncRewake"], true);
+        assert_eq!(wake["timeout"], 3600);
 
         // SessionEnd: cleanup, NOT asyncRewake.
         let end = &hooks["SessionEnd"][0]["hooks"][0];
@@ -847,19 +898,21 @@ mod tests {
         let existing = json!({
             "model": "sonnet",
             "hooks": {
-                "Stop": [{"matcher":"","hooks":[{"type":"command","command":"echo other"}]}]
+                // A foreign hook on an event WE ALSO write (SessionStart): it must be
+                // kept alongside ours, not clobbered.
+                "SessionStart": [{"matcher":"","hooks":[{"type":"command","command":"echo other"}]}]
             }
         });
         let merged = merge_into_settings(existing, &hooks_snippet(&spec()));
         // Unrelated top-level setting survives.
         assert_eq!(merged["model"], "sonnet");
-        // The foreign Stop hook is kept AND our arm hook is appended.
-        let stop = merged["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2);
-        assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
+        // The foreign SessionStart hook is kept AND our session-start hook is appended.
+        let start = merged["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 2);
+        assert_eq!(start[0]["hooks"][0]["command"], "echo other");
         assert_eq!(
-            stop[1]["hooks"][0]["command"],
-            "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600"
+            start[1]["hooks"][0]["command"],
+            "/opt/mailbox harness session-start"
         );
     }
 
@@ -869,7 +922,8 @@ mod tests {
         let twice = merge_into_settings(once.clone(), &hooks_snippet(&spec()));
         // Re-merging must not duplicate our hook groups.
         assert_eq!(once, twice);
-        assert_eq!(twice["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(twice["hooks"]["FileChanged"].as_array().unwrap().len(), 1);
+        assert_eq!(twice["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
     }
 
     // ==== where the hooks go: every variant, no env mutation ======================
@@ -1012,7 +1066,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["model"], "opus");
         assert_eq!(written["permissions"]["deny"][0], "Bash(rm -rf *)");
-        assert!(written["hooks"]["Stop"].is_array());
+        assert!(written["hooks"]["FileChanged"].is_array());
 
         let backup = report.backup.expect("the pre-image is kept");
         assert_eq!(
@@ -1083,7 +1137,7 @@ mod tests {
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(written["hooks"]["Stop"].is_array());
+        assert!(written["hooks"]["FileChanged"].is_array());
     }
 
     /// **(B)** A symlinked settings.json (the dotfiles setup) is written THROUGH: the
@@ -1115,7 +1169,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&tracked).unwrap()).unwrap();
         assert_eq!(written["model"], "opus", "unrelated settings survive");
         assert!(
-            written["hooks"]["Stop"].is_array(),
+            written["hooks"]["FileChanged"].is_array(),
             "the TRACKED file is the one that got the hooks"
         );
     }
@@ -1189,7 +1243,7 @@ mod tests {
         // without dropping it.
         merge(&path, BackupPolicy::Skip).expect("a quiet merge succeeds");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(value["hooks"]["Stop"].is_array());
+        assert!(value["hooks"]["FileChanged"].is_array());
         assert!(
             value.get("model").is_some(),
             "the concurrent writer's key survived the merge"
@@ -1217,32 +1271,65 @@ mod tests {
         let once = merge_into_settings(json!({}), &first);
         let twice = merge_into_settings(once, &second);
 
-        let stop = hook_commands(&twice, "Stop");
-        assert_eq!(stop.len(), 1, "exactly ONE arm hook, not two: {stop:?}");
-        assert_eq!(
-            stop[0],
-            "/home/u/.local/bin/mailbox harness arm --max-block-ms 120000 --timeout-secs 300"
-        );
+        // Exactly ONE session-start and ONE wake hook — the first bin's hooks are
+        // REPLACED, not appended (a stale hook would point at a deleted binary).
+        let start = hook_commands(&twice, "SessionStart");
+        assert_eq!(start.len(), 1, "exactly ONE session-start hook: {start:?}");
+        assert_eq!(start[0], "/home/u/.local/bin/mailbox harness session-start");
+        let wake = hook_commands(&twice, "FileChanged");
+        assert_eq!(wake.len(), 1, "exactly ONE wake hook: {wake:?}");
+        assert_eq!(wake[0], "/home/u/.local/bin/mailbox harness wake");
         let end = hook_commands(&twice, "SessionEnd");
         assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
+    }
+
+    /// An UPGRADE from the old ADR-0006 re-arm hooks must sweep the stale `arm`
+    /// groups (SessionStart + Stop) and install the ADR-0008 hooks in their place —
+    /// leaving no hook pointing at the retired mechanism.
+    #[test]
+    fn re_merging_over_the_old_arm_hooks_replaces_them_with_the_new_loop() {
+        let old = json!({
+            "hooks": {
+                "SessionStart": [{"matcher":"startup","hooks":[{"type":"command","command":"/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600","asyncRewake":true,"timeout":3600}]}],
+                "Stop": [{"matcher":"","hooks":[{"type":"command","command":"/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600","asyncRewake":true,"timeout":3600}]}],
+                "SessionEnd": [{"matcher":"","hooks":[{"type":"command","command":"/opt/mailbox harness cleanup"}]}]
+            }
+        });
+        let merged = merge_into_settings(old, &hooks_snippet(&spec()));
+
+        // The stale Stop → arm hook is swept (Stop is left empty, not carrying arm).
+        let stop = hook_commands(&merged, "Stop");
+        assert!(
+            !stop.iter().any(|c| c.contains("harness arm")),
+            "the retired arm hook must not survive an upgrade: {stop:?}"
+        );
+        // SessionStart now runs session-start, FileChanged runs wake — the new loop.
+        assert_eq!(
+            hook_commands(&merged, "SessionStart"),
+            vec!["/opt/mailbox harness session-start"]
+        );
+        assert_eq!(
+            hook_commands(&merged, "FileChanged"),
+            vec!["/opt/mailbox harness wake"]
+        );
     }
 
     #[test]
     fn re_merging_still_leaves_foreign_hooks_untouched() {
         let existing = json!({
             "hooks": {
-                "Stop": [{"matcher":"","hooks":[{"type":"command","command":"echo other"}]}]
+                "SessionStart": [{"matcher":"","hooks":[{"type":"command","command":"echo other"}]}]
             }
         });
         let merged = merge_into_settings(existing, &hooks_snippet(&spec()));
         let merged = merge_into_settings(merged, &hooks_snippet(&spec()));
 
-        let stop = hook_commands(&merged, "Stop");
+        let start = hook_commands(&merged, "SessionStart");
         assert_eq!(
-            stop,
+            start,
             vec![
                 "echo other".to_string(),
-                "/opt/mailbox harness arm --max-block-ms 3300000 --timeout-secs 3600".to_string(),
+                "/opt/mailbox harness session-start".to_string(),
             ],
             "a foreign hook survives every re-merge, and ours is not duplicated"
         );
@@ -1250,9 +1337,12 @@ mod tests {
 
     #[test]
     fn our_commands_are_recognised_whatever_the_binary_path_or_flags() {
+        assert!(is_our_command("/opt/mailbox harness session-start"));
+        assert!(is_our_command("mailbox harness wake"));
+        assert!(is_our_command("/a/b/c/mailbox harness cleanup"));
+        // The retired `arm` is still recognised, so an upgrade sweeps it.
         assert!(is_our_command("/opt/mailbox harness arm --max-block-ms 1"));
-        assert!(is_our_command("mailbox harness cleanup"));
-        assert!(is_our_command("/a/b/c/mailbox harness arm"));
+        assert!(is_our_command("mailbox harness watch --session x"));
         // Not ours: another tool, and our own non-hook commands.
         assert!(!is_our_command("echo other"));
         assert!(!is_our_command("/opt/mailbox read --session x"));

@@ -16,6 +16,7 @@ pub mod bus;
 pub mod clock;
 pub mod host;
 pub mod resolver;
+pub mod sentinel;
 pub mod storage;
 pub mod supervisor;
 pub mod wake;

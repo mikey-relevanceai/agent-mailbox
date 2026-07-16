@@ -1,7 +1,16 @@
 # ADR-0006: Harness wake loop — re-arm exit, waiter-owned pidfile, arm-iff-subscribed
 
-- Status: Accepted
-- Date: 2026-07-11 (revised 2026-07-14: self-respawn REPLACED by the re-arm exit)
+- Status: **Partially superseded by [ADR-0008](0008-on-demand-wake-filechanged.md).**
+  The **periodic re-arm** (the `Stop` → `arm` → exit-2-at-`max_block` loop) is
+  replaced by the ADR-0008 detached watcher + `FileChanged` wake, which eliminates the
+  per-`max_block` re-arm model turn. Everything ELSE decided here still stands and is
+  reused by ADR-0008: the single-waiter advisory lock, the waiter-owned pidfile written
+  after the lock, arm-iff-subscribed (the waiter's self-validation), stale-pidfile
+  compare-and-delete reaping, `SessionEnd` reaping, and the publish rules. `mailbox
+  wait` / `mailbox harness arm` are retained as primitives but are no longer wired into
+  the installed hooks.
+- Date: 2026-07-11 (revised 2026-07-14: self-respawn REPLACED by the re-arm exit;
+  2026-07-16: periodic re-arm superseded by ADR-0008)
 
 ## Context
 

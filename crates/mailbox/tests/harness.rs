@@ -213,6 +213,13 @@ impl Daemon {
         let mut child = mailbox_command()
             .args(["harness", "cleanup"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            // A tempdir sentinel root so cleanup's ADR-0008 sentinel removal can never
+            // touch the real ~/.mailbox (these tests never create one, but the safety
+            // rule holds regardless).
+            .env(
+                "MAILBOX_SENTINEL_ROOT",
+                self.db_path.parent().unwrap().join("sentinel"),
+            )
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1107,23 +1114,31 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&out, "install-hooks");
     let value = parse_json(&stdout(&out));
 
-    // The three hooks are wired: SessionStart(startup)+Stop as asyncRewake arm,
-    // SessionEnd as cleanup.
+    // The ADR-0008 hooks are wired: SessionStart(startup) → plain session-start,
+    // FileChanged(matcher = the sentinel basename) → asyncRewake wake, SessionEnd →
+    // cleanup. There is NO Stop re-arm hook.
     let hooks = &value["hooks"];
     assert_eq!(hooks["SessionStart"][0]["matcher"], "startup");
-    let arm = &hooks["SessionStart"][0]["hooks"][0];
-    assert_eq!(arm["asyncRewake"], true);
-    // The default timing IS the fix: a 1-hour hook timeout (a large timeout is
-    // honoured — measured), with the waiter yielding for a re-arm 5 minutes inside
-    // it. `timeout` hard-bounds the waiter's life, so a bigger one simply means
-    // fewer benign re-arm wakes.
-    assert_eq!(arm["timeout"], 3600);
+    let session_start = &hooks["SessionStart"][0]["hooks"][0];
     assert!(
-        arm["command"]
+        session_start.get("asyncRewake").is_none(),
+        "session-start must NOT be asyncRewake"
+    );
+    assert!(
+        session_start["command"]
             .as_str()
             .unwrap()
-            .contains("harness arm --max-block-ms 3300000")
+            .contains("harness session-start")
     );
+    assert!(hooks.get("Stop").is_none(), "no periodic re-arm hook");
+
+    let file_changed = &hooks["FileChanged"][0];
+    assert_eq!(file_changed["matcher"], ".mailbox-wake");
+    let wake = &file_changed["hooks"][0];
+    assert_eq!(wake["asyncRewake"], true);
+    assert_eq!(wake["timeout"], 3600);
+    assert!(wake["command"].as_str().unwrap().contains("harness wake"));
+
     assert!(
         hooks["SessionEnd"][0]["hooks"][0]["command"]
             .as_str()
@@ -1143,7 +1158,7 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&merged_out, "install-hooks --settings");
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
-    assert!(merged["hooks"]["Stop"].is_array(), "hooks merged in");
+    assert!(merged["hooks"]["FileChanged"].is_array(), "hooks merged in");
 }
 
 /// A `max_block` at or above the hook `timeout` silently reintroduces the headline
@@ -1227,14 +1242,23 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
 
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
+    // The foreign Stop hook is on an event our snippet does not write, so it is left
+    // untouched (and alone — we never add a Stop hook).
     let stop = merged["hooks"]["Stop"].as_array().unwrap();
-    assert_eq!(stop.len(), 2, "the foreign Stop hook survives beside ours");
+    assert_eq!(stop.len(), 1, "the foreign Stop hook survives untouched");
     assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
+    // Our hooks landed on their own events.
     assert!(
-        stop[1]["hooks"][0]["command"]
+        merged["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("harness arm")
+            .contains("harness session-start")
+    );
+    assert!(
+        merged["hooks"]["FileChanged"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("harness wake")
     );
     assert!(merged["hooks"]["SessionEnd"].is_array());
 
@@ -1321,7 +1345,7 @@ fn install_hooks_json_keeps_stdout_clean_when_it_merges() {
         "the merge note belongs on stderr in --json mode"
     );
     assert!(
-        parse_json(&std::fs::read_to_string(&settings).unwrap())["hooks"]["Stop"].is_array(),
+        parse_json(&std::fs::read_to_string(&settings).unwrap())["hooks"]["FileChanged"].is_array(),
         "--json still merges"
     );
 }
@@ -1433,7 +1457,7 @@ fn install_hooks_writes_through_a_symlinked_settings_file() {
     let written = parse_json(&std::fs::read_to_string(&tracked).unwrap());
     assert_eq!(written["model"], "opus", "unrelated settings preserved");
     assert!(
-        written["hooks"]["Stop"].is_array(),
+        written["hooks"]["FileChanged"].is_array(),
         "the TRACKED file is what received the hooks"
     );
     assert!(
@@ -1484,31 +1508,28 @@ fn install_hooks_re_run_with_a_different_binary_updates_rather_than_appends() {
     );
     let relocated = home.path().join("mailbox");
     std::fs::copy(mailbox_bin(), &relocated).unwrap();
-    let out = install_hooks(
-        home.path(),
-        &[
-            "--mailbox-bin",
-            relocated.to_str().unwrap(),
-            "--max-block-ms",
-            "120000",
-            "--timeout-secs",
-            "300",
-        ],
-    );
+    let out = install_hooks(home.path(), &["--mailbox-bin", relocated.to_str().unwrap()]);
     assert_ok(&out, "second install from a new path");
 
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
-    let stop = merged["hooks"]["Stop"].as_array().unwrap();
+    // Exactly ONE of each of our hooks, pointing at the RELOCATED binary — the first
+    // install's hooks (pointing at the old path) are replaced, not appended.
+    let session_start = merged["hooks"]["SessionStart"].as_array().unwrap();
     assert_eq!(
-        stop.len(),
+        session_start.len(),
         1,
-        "a re-run must leave exactly ONE arm hook, not a stale second one: {stop:?}"
+        "a re-run must leave exactly ONE session-start hook: {session_start:?}"
     );
-    let command = stop[0]["hooks"][0]["command"].as_str().unwrap();
+    let command = session_start[0]["hooks"][0]["command"].as_str().unwrap();
+    // install-hooks canonicalizes the bin path, so compare against the canonical form
+    // (on macOS /var → /private/var).
+    let canonical = std::fs::canonicalize(&relocated).unwrap();
     assert!(
-        command.contains("--max-block-ms 120000"),
-        "the surviving hook is the NEW one: {command}"
+        command.starts_with(canonical.to_str().unwrap())
+            && command.contains("harness session-start"),
+        "the surviving hook points at the relocated binary: {command}"
     );
+    assert_eq!(merged["hooks"]["FileChanged"].as_array().unwrap().len(), 1);
     assert_eq!(merged["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
 }
 
