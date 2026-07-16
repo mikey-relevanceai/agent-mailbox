@@ -74,10 +74,12 @@ hook's group — cannot take it down, and no hook `timeout` applies (it is not a
 child). It reuses the ADR-0006 single-waiter machinery in the same order: acquire the
 per-session lock → write the pidfile under it → open the FIFO → re-check
 `has_subscription` (self-exit `Unsubscribed`, no orphan, if none). Then it primes the
-sentinel from any existing unread and **blocks on the mail FIFO forever**. On a
-real-mail kick it writes the unread topic names into the sentinel (bumping its mtime);
-a kick with nothing unread touches NOTHING (that is what would loop the wake hook).
-There is **no `max_block`, no exit-2 re-arm** — it runs until `SIGTERM`'d at
+sentinel from any existing unread and **blocks on the mail FIFO forever**. On EVERY kick
+it writes the session's current unread topic set into the sentinel **unconditionally**,
+bumping its mtime (`std::fs::write` truncates+rewrites, so the mtime always advances even
+when the content is identical); a kick with nothing unread writes the empty set (a benign
+`FileChanged` the wake hook answers with exit 0). There is **no coalescing** — see the
+unconditional-bump section below. There is **no `max_block`, no exit-2 re-arm** — it runs until `SIGTERM`'d at
 `SessionEnd`. It survives a daemon restart exactly as the ADR-0006 waiter did (the
 FIFO is re-openable; the kick reaches the already-blocked watcher). Single-instance via
 the existing lock; a racing spawn loses and exits 0.
@@ -92,18 +94,34 @@ genuinely unrecoverable error the loop exits and the watcher **removes its pidfi
 EVERY exit path now, not just the `Unsubscribed` one), leaving a clean "no live watcher"
 state for the Stop hook to respawn from.
 
-*Wake coalescing (one mail must not cost several wakes).* `write_topics` truncates and
-rewrites on every call, so a burst of messages on an already-unread topic — or a
-create+modify pair from a single write — fired several `FileChanged` events and therefore
-several exit-2 wakes for the *same* unread, before the agent read a thing. The watcher now
-bumps the sentinel only when a bump is warranted: it compares the unread topic SET to what
-the sentinel already holds and skips an unchanged set, so a second message on an
-already-unread topic does not re-wake. To keep that correct across a read — after the agent
-catches up, a NEW message on the same topic yields the same SET, which set-comparison alone
-would coalesce away forever (permanent deafness) — it also tracks the session's **read
-progress** (the sum of `offset + 1` over its delivery cursors, which advances only on a
-read) and FORCES a bump when the agent has progressed since the last bump. Bursts collapse
-to one wake; a genuine re-notification after a read always wakes.
+*Unconditional bump per kick (no coalescing — correctness over the optimization).* The
+watcher writes the sentinel on **every** kick, unconditionally: it reads
+`topics_with_unread` and writes that set (empty or not) via `write_topics`, which truncates
+and rewrites so the mtime always advances — even when the content is identical. It does NOT
+compare the set to what the sentinel holds, and it tracks no read-progress signal.
+
+Correctness is then immediate and simple: **every kick writes the sentinel → every real
+message (which always kicks a live watcher) advances the sentinel's mtime → `FileChanged`
+fires → the wake hook exits 2 iff there is genuine unread. No message can be coalesced away
+— a lost wake is structurally impossible.** The dead-window case (the watcher dies after a
+read, a message on an already-read topic arrives while it is dead, the Stop-liveness hook
+respawns it) is fixed for free: on respawn, arm writes the current unread set `{T}`
+unconditionally → the mtime advances → the session wakes. An empty kick writes the empty
+set — harmless; the wake hook re-checks the store, finds nothing, and exits 0.
+
+The only cost is that a burst of N messages yields up to N `FileChanged` events. This is
+**accepted and bounded**: the wake hook's anti-loop (exit 0 once the agent is caught up)
+bounds actual *model* wakes to ~1–2 per burst regardless of how many times the sentinel is
+written. That bounded, benign cost buys the elimination of an entire bug class.
+
+**This replaced an earlier coalescing design.** The watcher used to bump only when the
+unread SET changed, plus a read-progress proxy (the sum of `offset + 1` over delivery
+cursors) to force a bump after a read. That optimization — collapsing a same-topic burst to
+one wake — produced **three separate silent-deafness bugs** (multiple-wakes → a lost wake
+from an empty kick consuming the read-progress edge → a lost wake from a dead-window
+respawn seeing an unchanged set). It was removed deliberately: with the anti-loop already
+bounding real wakes, the coalescing bought little and cost correctness. There is no longer
+any coalescing logic that *can* be wrong.
 
 **B) The `SessionStart` hook** (`mailbox harness session-start`). Short-lived, NOT
 `asyncRewake`, no exit-2: read `session_id`; ensure the always-on inbox subscription

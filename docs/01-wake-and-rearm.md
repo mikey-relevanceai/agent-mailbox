@@ -128,13 +128,16 @@ per-session watcher. The one case it cannot cover — documented, not fixed — 
 that goes idle **forever** (fires no `Stop`) whose watcher then dies: nothing can wake a
 session that will neither take a turn nor be poked.
 
-**Wake coalescing (one mail, one wake).** The watcher bumps the sentinel only when a
-bump is warranted, so a burst of messages on an already-unread topic does not fire
-several `FileChanged` wakes for the same unread. It compares the unread topic SET to
-what the sentinel already holds and skips an unchanged set; to keep that correct across
-a read (a new message on the same topic after the agent caught up yields the same SET),
-it also tracks read progress and forces a bump when the agent has read since the last
-bump. Bursts collapse to one wake; a genuine re-notification after a read always wakes.
+**Unconditional bump per kick (no coalescing).** The watcher writes the sentinel on
+**every** kick, unconditionally: it reads the current unread topic set and writes it
+(empty or not), always advancing the mtime. It does not compare sets and tracks no
+read-progress signal. This makes a lost wake structurally impossible — every real message
+kicks a live watcher, every kick writes the sentinel, so `FileChanged` always fires and
+the wake hook exits 2 iff there is genuine unread. The only cost is that a burst of N
+messages can fire up to N `FileChanged` events; the wake hook's anti-loop (exit 0 once the
+agent is caught up) bounds actual model wakes to ~1–2 per burst. This deliberately replaced
+an earlier coalescing design that produced three silent-deafness bugs — correctness over
+the optimization (see ADR-0008).
 
 ### install-hooks
 
@@ -173,14 +176,13 @@ and the daemon logs its kick counts at INFO on its own stderr:
 |---|---|
 | `watcher armed; blocking on the mail FIFO (no re-arm, no timer)` | the watcher is up and blocked |
 | `watcher found no subscriptions; exiting without arming a sentinel` | arm-iff-subscribed said no |
-| `watcher bumped the wake sentinel (unread mail; FileChanged will wake the session)` | a real bump, with the topics |
+| `watcher wrote the wake sentinel (FileChanged will fire; wake hook wakes iff unread)` | the watcher wrote the sentinel on this kick, with the topics |
 | `FileChanged wake: genuine unread mail; exiting 2 to wake the session` | the wake hook fired a real wake |
 | `FileChanged wake: nothing unread (stray sentinel change); exiting 0 (no wake)` | the anti-loop guard held |
 | `kicked subscribed sessions after publish` (`delivered` / `no_reader`) | whether the publish reached a live watcher |
 | `another watcher already holds this session's lock; exiting cleanly (single-instance)` | **benign** — a racing spawn lost the lock |
 | `ensure-watcher: a live watcher already holds the lock; leaving it (no-op)` | the Stop hook found the watcher healthy |
 | `ensure-watcher: no live watcher; respawning the detached watcher` | the Stop hook recovered a died watcher |
-| `watcher kicked but the unread set is unchanged and no read since; coalesced (no extra wake)` | a burst message was coalesced (not a missed wake) |
 
 ## Codex CLI: no equivalent yet
 

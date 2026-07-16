@@ -93,36 +93,6 @@ impl ReadOnlyStore {
         )?;
         Ok(exists)
     }
-
-    /// A monotonic marker of how far `session` has READ: the sum of `offset + 1` over
-    /// its per-topic delivery cursors. It advances only when the agent reads (a cursor
-    /// moves forward, or a first read creates a cursor row), never when new mail is
-    /// merely published — so a change in it between two watcher checks means "the agent
-    /// read since I last looked".
-    ///
-    /// The `+ 1` matters: event offsets start at **0**, so a first read that advances a
-    /// topic's cursor to offset 0 must still register as progress. Summing the raw
-    /// offset would leave a just-read offset-0 cursor contributing 0 — indistinguishable
-    /// from "never read" — and the coalescing below would miss the read.
-    ///
-    /// The watcher uses this to keep the ADR-0008 wake-coalescing correct: coalescing
-    /// suppresses a repeated bump for an unread topic SET that is unchanged, but after
-    /// the agent reads and catches up, a NEW message on that same topic yields the same
-    /// SET — so set-comparison alone would coalesce it away and the session would never
-    /// wake for it. A change in this marker tells the watcher the agent has progressed,
-    /// so it must re-notify (bump) even when the topic set looks identical.
-    ///
-    /// It is a plain `SUM` over an owner-scoped table; monotonicity within a session is
-    /// all the watcher relies on (an unsubscribe that lowers it only ever causes at most
-    /// one extra, harmless bump).
-    pub fn delivery_progress(&self, session: &SessionId) -> Result<i64, StorageError> {
-        let sum: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(offset + 1), 0) FROM delivery_cursor WHERE session_id = ?1",
-            [session.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(sum)
-    }
 }
 
 /// The unread-topics query, factored out so it can run against any
@@ -342,38 +312,6 @@ mod tests {
             None
         );
         assert_eq!(bus.read(session, None).await.unwrap().len(), 1);
-    }
-
-    /// The watcher's coalescing correctness rests on this: a read must ALWAYS advance
-    /// `delivery_progress`, including the first read of an offset-0 event (else the
-    /// coalescing would miss the read and never re-wake). Encodes the `+ 1` assumption.
-    #[test]
-    fn delivery_progress_advances_on_every_read_including_offset_zero() {
-        let conn = migrated();
-        let session = SessionId::new("s");
-        let progress = |conn: &Connection| -> i64 {
-            conn.query_row(
-                "SELECT COALESCE(SUM(offset + 1), 0) FROM delivery_cursor WHERE session_id = 's'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        subscribe(&conn, session.as_str(), "t.a");
-
-        // No cursor row yet: zero progress.
-        assert_eq!(progress(&conn), 0);
-        // Reading the first event (offset 0) creates a cursor at 0 — progress MUST move
-        // (0 → 1), or a just-read offset-0 topic looks identical to "never read".
-        set_cursor(&conn, session.as_str(), "t.a", 0);
-        assert_eq!(
-            progress(&conn),
-            1,
-            "a first read of offset 0 must register as progress"
-        );
-        // A further read advances it again.
-        set_cursor(&conn, session.as_str(), "t.a", 3);
-        assert_eq!(progress(&conn), 4);
     }
 
     #[test]

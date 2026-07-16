@@ -438,63 +438,67 @@ fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
     guard.assert_clean();
 }
 
-// ==== FIX 4: the watcher coalesces repeated same-topic wakes =======================
+// ==== every kick bumps the sentinel; the wake hook's anti-loop bounds wakes ========
 
-/// A second message on an ALREADY-unread topic must NOT re-bump the sentinel (it would
-/// wake the agent again for mail it was already told about); a NEW topic becoming
-/// unread DOES change the set and bumps. Reproduces "3 fires, 3 wakes for the same
-/// unread" and pins it to one.
+/// The post-coalescing contract (ADR-0008, revised): the watcher writes the sentinel
+/// UNCONDITIONALLY on every kick, so a second message on an ALREADY-unread topic DOES
+/// re-bump — there is no coalescing to suppress it. What bounds the number of actual
+/// model wakes is the wake hook's anti-loop (exit 2 while there is genuine unread, exit
+/// 0 once the agent has caught up), NOT any suppression of sentinel writes. This is the
+/// deliberate simplification: with every kick bumping, no message can be lost.
 #[test]
-fn the_watcher_coalesces_a_repeated_unread_topic_but_bumps_a_new_one() {
+fn every_kick_bumps_the_sentinel_and_the_wake_hook_bounds_wakes() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
     guard.track_daemon(daemon.pid());
-    let session = "coalesce";
-    let a = env.pr_topic(7);
-    let b = env.pr_topic(8);
-    env.run_as_ok(session, &["subscribe", &a], "subscribe a");
-    env.run_as_ok(session, &["subscribe", &b], "subscribe b");
+    let session = "every-kick-bumps";
+    let t = env.pr_topic(7);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
     let watcher = env.spawn_watcher(session);
     wait_until_armed(&env, session);
 
-    // First publish on A bumps the sentinel to [A].
-    env.publish(&a);
-    poll_until("sentinel lists A", Duration::from_secs(5), || {
-        (env.sentinel_topics(session) == vec![a.clone()]).then_some(())
+    // First publish bumps the sentinel to [T].
+    env.publish(&t);
+    poll_until("sentinel lists T", Duration::from_secs(5), || {
+        (env.sentinel_topics(session) == vec![t.clone()]).then_some(())
     });
-    let after_a = sentinel_mtime(&env, session);
+    let after_first = sentinel_mtime(&env, session);
 
-    // A SECOND publish on the SAME already-unread topic A is COALESCED: no write, so
-    // the mtime is unchanged (mtime EQUALITY is resolution-independent — a skipped
-    // write cannot advance it). A fixed wait is correct: this proves a non-event.
-    env.publish(&a);
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        sentinel_mtime(&env, session),
-        after_a,
-        "a second message on an already-unread topic must NOT re-bump the sentinel"
-    );
-    assert_eq!(
-        env.unread_total(session),
-        2,
-        "both A events are still unread (the mail is durable; only the WAKE is coalesced)"
-    );
+    // Past a coarse (1s) mtime resolution so the re-bump is observable even though the
+    // sentinel CONTENT is identical ([T] again) — the mtime is the only signal.
+    std::thread::sleep(Duration::from_millis(1100));
 
-    // A publish on a NEW topic B changes the unread SET, so it DOES bump (content grows
-    // to include B — a content change is a resolution-independent proof of a write).
-    env.publish(&b);
-    let topics = poll_until(
-        "the sentinel bumps for the new topic B",
+    // A SECOND publish on the SAME already-unread topic RE-bumps (every kick writes —
+    // there is no coalescing). Both events remain durably unread.
+    env.publish(&t);
+    poll_until(
+        "the sentinel re-bumps on the second same-topic message",
         Duration::from_secs(5),
-        || {
-            let t = env.sentinel_topics(session);
-            t.contains(&b).then_some(t)
-        },
+        || (sentinel_mtime(&env, session) > after_first).then_some(()),
     );
-    assert!(
-        topics.contains(&a) && topics.contains(&b),
-        "the sentinel now lists both topics: {topics:?}"
+    assert_eq!(
+        env.sentinel_topics(session),
+        vec![t.clone()],
+        "the sentinel still lists T"
+    );
+    assert_eq!(env.unread_total(session), 2, "both T events are unread");
+
+    // The wake hook exits 2 while there is genuine unread...
+    let wake = env.wake_hook(session);
+    assert_eq!(wake.status.code(), Some(2), "unread present → wake");
+
+    // ...and 0 once the agent has caught up: the ANTI-LOOP is what bounds wakes, not
+    // any coalescing of sentinel writes.
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+    let wake = env.wake_hook(session);
+    assert_eq!(
+        wake.status.code(),
+        Some(0),
+        "caught up → no wake (anti-loop bounds wakes, not coalescing)"
     );
 
     let out = env.cleanup(session);
@@ -504,10 +508,11 @@ fn the_watcher_coalesces_a_repeated_unread_topic_but_bumps_a_new_one() {
     guard.assert_clean();
 }
 
-/// The correctness guard for coalescing: after the agent READS and catches up, a NEW
-/// message on the SAME topic must re-bump — the unread set is {A} again, identical to
-/// the sentinel's content, so set-comparison ALONE would coalesce it away forever
-/// (permanent deafness). The watcher's read-progress guard forces the re-bump.
+/// Deafness regression (re-notify after a read): after the agent READS and catches up, a
+/// NEW message on the SAME topic must still wake it. Under the old coalescing this was
+/// the permanent-deafness trap (same unread set → suppressed forever); under the
+/// unconditional-bump design it is fixed for free — every kick writes, so the re-bump
+/// always fires.
 #[test]
 fn a_new_message_after_a_read_re_bumps_even_on_the_same_topic() {
     let env = Env::new();
@@ -573,11 +578,12 @@ fn deliver_kick(env: &Env, session: &str) {
     );
 }
 
-/// The reviewer's silent-deafness repro. An EMPTY kick (a message read before the watcher
-/// drained its kick) that finds nothing unread must NOT consume the read-progress edge: it
-/// clears the stale set but leaves `last_progress` alone, so the NEXT genuine message on
-/// the same, already-listed topic still re-bumps. Before the fix, the empty kick advanced
-/// `last_progress` and coalesced msg2 away → the agent went DEAF.
+/// The reviewer's silent-deafness repro (empty-kick-between-read-and-message). An EMPTY
+/// kick (a message read before the watcher drained its kick) that finds nothing unread
+/// writes the empty set; the NEXT genuine message on the same, already-listed topic must
+/// still re-bump and wake. Under the old coalescing an empty kick could consume the
+/// read-progress edge and coalesce msg2 away → DEAF; under the unconditional-bump design
+/// this is structural: every kick writes, so msg2 always re-bumps.
 #[test]
 fn an_empty_kick_between_a_read_and_a_new_message_does_not_deafen_the_agent() {
     let env = Env::new();
@@ -651,11 +657,12 @@ fn an_empty_kick_between_a_read_and_a_new_message_does_not_deafen_the_agent() {
     guard.assert_clean();
 }
 
-/// The restart variant. A watcher that dies after the agent read leaves a STALE non-empty
-/// set in the sentinel. When the Stop-liveness hook respawns it, arm-sync must reconcile
-/// that stale set to the real unread (empty) — otherwise the first post-restart message on
-/// the same topic yields an identical set and is coalesced away (deaf). This proves the
-/// respawned watcher re-bumps.
+/// Deafness regression (restart-after-read). A watcher that dies after the agent read
+/// leaves a STALE non-empty set in the sentinel. When the Stop-liveness hook respawns it,
+/// arm writes the real unread set (empty) unconditionally, and the first post-restart
+/// message on the same topic re-bumps and wakes. Under the old coalescing the identical
+/// set could be suppressed forever (deaf); the unconditional-bump design fixes it for
+/// free.
 #[test]
 fn a_watcher_restart_after_a_read_re_bumps_on_the_same_topic() {
     let env = Env::new();
@@ -742,51 +749,81 @@ fn a_watcher_restart_after_a_read_re_bumps_on_the_same_topic() {
     guard.assert_clean();
 }
 
-/// The coalescing fix must NOT regress: two messages on the SAME already-unread topic with
-/// NO read between them still collapse to exactly ONE bump (one wake), not one per message.
+/// Deafness regression (the dead-window case that motivated removing coalescing): the
+/// watcher dies AFTER the agent read, then a new message on the ALREADY-read topic arrives
+/// WHILE the watcher is dead, then the Stop-liveness hook respawns it. On respawn, arm
+/// writes the current unread set {T} UNCONDITIONALLY → the sentinel bumps → the wake hook
+/// would fire. Under the old coalescing the respawn saw the same {T} set the stale sentinel
+/// held and suppressed the bump → the agent stayed DEAF. This must PASS now.
 #[test]
-fn two_same_topic_publishes_without_a_read_bump_the_sentinel_exactly_once() {
+fn a_message_arriving_while_the_watcher_is_dead_wakes_on_respawn() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
     guard.track_daemon(daemon.pid());
-    let session = "coalesce-once";
+    let session = "dead-window";
     let t = env.pr_topic(22);
     env.run_as_ok(session, &["subscribe", &t], "subscribe");
     let watcher = env.spawn_watcher(session);
     wait_until_armed(&env, session);
 
+    // msg1 → bump [T]; the agent reads and catches up.
     env.publish(&t);
     poll_until("sentinel lists T", Duration::from_secs(5), || {
         (env.sentinel_topics(session) == vec![t.clone()]).then_some(())
     });
-    let after_first = sentinel_mtime(&env, session);
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
 
-    // A second publish on the SAME already-unread topic, NO read between: coalesced away.
-    // No write → the mtime is frozen (a skipped write cannot advance it). A fixed wait is
-    // correct: this proves a NON-event.
+    // Kill the watcher uncleanly (SIGKILL via ArmChild::drop), leaving the STALE [T]
+    // sentinel and a stale pidfile — the exact post-crash state the respawn reconciles.
+    let live_pid = watcher_pid(&env, session).expect("watcher pid");
+    drop(watcher);
+    poll_until("the killed watcher is gone", Duration::from_secs(5), || {
+        (!pid_alive(live_pid)).then_some(())
+    });
+
+    // msg2 on the SAME topic arrives WHILE the watcher is dead — no live watcher to kick,
+    // so nothing touches the (still stale [T]) sentinel yet.
     env.publish(&t);
-    std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        sentinel_mtime(&env, session),
-        after_first,
-        "a second same-topic message with no read must NOT re-bump (coalescing holds)"
+    poll_until("msg2 is durably unread", Duration::from_secs(5), || {
+        (env.unread_total(session) == 1).then_some(())
+    });
+
+    // The Stop-liveness hook respawns the watcher; arm writes the current unread {T}
+    // unconditionally → the wake hook would fire (not deaf).
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    poll_until("a fresh watcher arms", Duration::from_secs(5), || {
+        watcher_pid(&env, session).filter(|&p| p != live_pid && pid_alive(p))
+    });
+    let topics = poll_until(
+        "the respawned watcher bumps the sentinel for the dead-window message",
+        Duration::from_secs(5),
+        || {
+            let seen = env.sentinel_topics(session);
+            seen.contains(&t).then_some(seen)
+        },
     );
+    assert_eq!(topics, vec![t.clone()], "the sentinel lists T (not deaf)");
+    let wake = env.wake_hook(session);
     assert_eq!(
-        env.unread_total(session),
-        2,
-        "both events are durably unread (only the WAKE is coalesced)"
+        wake.status.code(),
+        Some(2),
+        "a message that arrived while the watcher was dead must wake on respawn"
     );
 
     let out = env.cleanup(session);
     assert!(out.status.success());
-    drop(watcher);
     daemon.stop();
     guard.assert_clean();
 }
 
-/// After a read empties the unread set, the next kick with nothing unread CLEARS the
-/// sentinel to empty (rather than leaving a stale set that would defeat set-coalescing).
+/// A kick with nothing unread writes the EMPTY set into the sentinel (every kick writes
+/// unconditionally — there is no coalescing). The result is a benign `FileChanged` the
+/// wake hook answers with exit 0.
 #[test]
 fn an_empty_kick_clears_the_sentinel_after_a_read() {
     let env = Env::new();

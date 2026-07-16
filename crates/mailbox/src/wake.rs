@@ -69,7 +69,7 @@ use nix::sys::stat::{Mode, SFlag};
 
 use mailbox_protocol::Topic;
 
-use crate::sentinel::{Sentinel, SentinelWrite};
+use crate::sentinel::Sentinel;
 use crate::storage::{ReadOnlyStore, SessionId, StorageError};
 
 /// The lone byte a kick writes into a FIFO.
@@ -664,9 +664,11 @@ impl Waiter {
     ///    [`WatchOutcome::Unsubscribed`] (pidfile removed, clean exit) — no orphan.
     /// 4. Prime the sentinel once from any EXISTING unread (a publish that landed
     ///    before the watcher armed — the missed-kick safety), then loop: block for a
-    ///    kick, re-check unread, and bump the sentinel iff there is genuinely unread
-    ///    mail. A kick with nothing unread (a self-authored publish, an already-read
-    ///    topic) touches NOTHING, so it cannot spuriously fire the wake hook.
+    ///    kick and **unconditionally** write the current unread topic set into the
+    ///    sentinel (see [`Waiter::sync_sentinel_to_unread`]). EVERY kick bumps the
+    ///    sentinel's mtime — there is no coalescing — so no real message can ever be
+    ///    suppressed. An empty kick writes the empty set (a benign `FileChanged`; the
+    ///    wake hook re-checks the store, finds nothing, and exits 0).
     ///
     /// The sentinel carries topic NAMES only (payload-free). A sentinel write failure
     /// is logged and the loop continues: losing one wake-trigger is far better than
@@ -726,19 +728,12 @@ impl Waiter {
 
         // Step 4: prime from existing unread, then block-on-kick forever.
         //
-        // `last_progress` tracks how far this session has READ (the sum of its delivery
-        // cursors). It seeds the coalescing so a re-notification after a read is never
-        // suppressed — see `bump_sentinel_if_unread`.
-        //
-        // Priming it to the CURRENT progress before the first bump makes that bump SYNC
-        // the sentinel to the actual unread set (progressed is false, so `sync_topics`
-        // runs; an empty unread set clears it). This matters on a WATCHER RESTART: a
-        // previous watcher may have died leaving a stale set in the sentinel after the
-        // agent read. Arm-sync overwrites that stale set with the real one (or empty), so
-        // the first post-restart message that changes the set re-bumps instead of being
-        // coalesced against a stale identical set (the silent-deafness restart variant).
-        let mut last_progress = store.delivery_progress(&self.session).unwrap_or(0);
-        self.bump_sentinel_if_unread(&store, sentinel, &mut last_progress);
+        // The prime writes the current unread set unconditionally. On a WATCHER RESTART
+        // this overwrites whatever stale set a previous (crashed) watcher left behind
+        // with the real one (or empty), and it bumps the mtime — so if a message arrived
+        // on an already-read topic while the watcher was dead, the respawn wakes the agent
+        // for it (the dead-window case). There is no coalescing to reconcile.
+        self.sync_sentinel_to_unread(&store, sentinel);
         info!(
             session = self.session.as_str(),
             sentinel = %sentinel.path().display(),
@@ -746,13 +741,13 @@ impl Waiter {
         );
         loop {
             // `None` = block indefinitely; the watcher has no max-block and never
-            // times out. Both arms re-check unread (a TimedOut cannot occur with a
-            // None budget, but handling it keeps the match exhaustive and harmless).
+            // times out. Both arms re-write the unread set (a TimedOut cannot occur with
+            // a None budget, but handling it keeps the match exhaustive and harmless).
             // A hard error ends the loop; the wrapper removes the pidfile and the
             // Stop-liveness hook respawns the watcher (ADR-0008 FIX 2/3).
             match self.block_for_kick(&mut fifo, None)? {
                 Blocked::Kicked | Blocked::TimedOut => {
-                    self.bump_sentinel_if_unread(&store, sentinel, &mut last_progress);
+                    self.sync_sentinel_to_unread(&store, sentinel);
                 }
             }
         }
@@ -773,116 +768,47 @@ impl Waiter {
             })
     }
 
-    /// Coalesced sentinel bump: write the session's currently-unread topics into the
-    /// sentinel — bumping its mtime so the `FileChanged` hook fires — but only when a
-    /// bump is genuinely warranted (ADR-0008 FIX 4). Two guards decide that:
+    /// Write the session's currently-unread topic set into the sentinel — bumping its
+    /// mtime so the `FileChanged` hook fires — **unconditionally, on every call**.
     ///
-    /// - **Set coalescing** ([`Sentinel::sync_topics`]): when the agent has NOT read
-    ///   since the last bump, a bump happens only if the unread topic SET changed. A
-    ///   second message on an already-unread topic leaves the set identical, so it does
-    ///   not re-bump and the agent is not woken again for mail it has already been told
-    ///   about; a NEW topic becoming unread does change the set, so it bumps.
-    /// - **Read progress** (`last_progress`): the above is INCORRECT on its own once the
-    ///   agent reads and catches up — a later message on the same topic yields the same
-    ///   SET, which set-coalescing would suppress forever (permanent deafness). So when
-    ///   the delivery progress has advanced since the last EMITTED bump (the agent read),
-    ///   the watcher FORCES a bump for any unread, so the re-notification always wakes.
+    /// There is deliberately NO coalescing (ADR-0008, revised): the watcher does not
+    /// compare the unread set to what the sentinel already holds, and it tracks no
+    /// read-progress signal. It reads `topics_with_unread` and writes it — empty or not.
+    /// [`Sentinel::write_topics`] truncates and rewrites, so the mtime always advances.
     ///
-    /// Two invariants keep those guards from silently deafening the agent (ADR-0008
-    /// silent-deafness fix):
+    /// Correctness follows directly and simply: EVERY kick writes the sentinel, so every
+    /// real message (which always kicks a live watcher) advances the mtime → `FileChanged`
+    /// fires → the wake hook exits 2 iff there is genuine unread. **No message can be
+    /// coalesced away — a lost wake is structurally impossible.** An empty kick writes the
+    /// empty set: a benign `FileChanged` the wake hook answers with exit 0. The only cost
+    /// is that a burst of N messages yields up to N `FileChanged` events; the wake hook's
+    /// anti-loop (exit 0 once caught up) bounds actual model wakes to ~1-2 per burst.
     ///
-    /// - `last_progress` advances ONLY when a bump for unread is actually EMITTED — never
-    ///   in the unconditional prefix. An empty kick, or a coalesced (set-unchanged,
-    ///   not-progressed) no-op, leaves it untouched, so the "the agent read since my last
-    ///   bump" edge SURVIVES intervening empty kicks instead of being silently consumed by
-    ///   one. Otherwise an empty kick between a read and the next message would eat the
-    ///   read edge and the following same-topic message would be coalesced away (deaf).
-    /// - When kicked with NOTHING unread, the sentinel is SYNCED to empty (cleared) rather
-    ///   than left as-is. A stale non-empty set would defeat set-coalescing for the next
-    ///   genuine message on that same topic (same set → no bump → deaf). Clearing is a
-    ///   benign `FileChanged`: the wake hook re-checks the store, finds nothing unread, and
-    ///   exits 0. It is idempotent (an already-empty sentinel is left untouched, no wake).
+    /// The three lost-wake ("silent deafness") bugs this design retired all lived in the
+    /// removed coalescing logic (a set-comparison skip plus a lossy read-progress proxy).
+    /// Removing it removes the whole class: there is no longer any coalescing that CAN be
+    /// wrong.
     ///
     /// A best-effort helper: a store or sentinel failure is logged, never fatal to the
     /// watcher (a dead watcher is the failure this whole design prevents).
-    fn bump_sentinel_if_unread(
-        &self,
-        store: &ReadOnlyStore,
-        sentinel: &Sentinel,
-        last_progress: &mut i64,
-    ) {
+    fn sync_sentinel_to_unread(&self, store: &ReadOnlyStore, sentinel: &Sentinel) {
         let topics = match store.topics_with_unread(&self.session) {
             Ok(topics) => topics,
             Err(err) => {
                 warn!(
                     session = self.session.as_str(),
                     error = %err,
-                    "watcher could not read unread topics; skipping this sentinel bump"
+                    "watcher could not read unread topics; skipping this sentinel write"
                 );
                 return;
             }
         };
-        // The agent's read progress. A change means "the agent read since I last EMITTED a
-        // bump", which must override set-coalescing so a fresh unread re-wakes. NOT written
-        // back here: only an actually-emitted unread bump advances it (below), so an empty
-        // or coalesced kick cannot consume this edge.
-        let progress = store
-            .delivery_progress(&self.session)
-            .unwrap_or(*last_progress);
-        let progressed = progress != *last_progress;
-
-        if topics.is_empty() {
-            // A kick with nothing unread (self-authored publish, an already-read topic, or
-            // a read that raced the kick). Sync the sentinel to EMPTY so no stale set
-            // survives to coalesce away the next genuine message on a since-read topic.
-            // `last_progress` is deliberately NOT advanced — the read edge must outlive this
-            // empty kick. A clear is a benign FileChanged (wake hook sees nothing → exit 0)
-            // and is idempotent when the sentinel is already empty.
-            match sentinel.sync_topics(&[]) {
-                Ok(SentinelWrite::Bumped) => trace!(
-                    session = self.session.as_str(),
-                    "watcher kicked with nothing unread; cleared the stale sentinel set to empty"
-                ),
-                Ok(SentinelWrite::Unchanged) => trace!(
-                    session = self.session.as_str(),
-                    "watcher kicked with nothing unread; sentinel already empty (no wake)"
-                ),
-                Err(err) => warn!(
-                    session = self.session.as_str(),
-                    error = %err,
-                    "watcher could not clear the wake sentinel; a stale set may linger until the next kick"
-                ),
-            }
-            return;
-        }
         let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
-        // If the agent progressed (read) since the last EMITTED bump, FORCE a bump so the
-        // re-notification wakes even when the topic set is unchanged; otherwise coalesce
-        // by set. A forced write is a plain `write_topics` (always bumps the mtime).
-        let outcome = if progressed {
-            sentinel
-                .write_topics(&topics)
-                .map(|()| SentinelWrite::Bumped)
-        } else {
-            sentinel.sync_topics(&topics)
-        };
-        match outcome {
-            Ok(SentinelWrite::Bumped) => {
-                // Advance the read-progress marker ONLY now that a bump was truly emitted,
-                // so the "progress advanced since my last bump" edge is anchored to real
-                // wakes and survives any intervening empty/coalesced kicks.
-                *last_progress = progress;
-                info!(
-                    session = self.session.as_str(),
-                    topics = names.join(","),
-                    progressed,
-                    "watcher bumped the wake sentinel (unread mail; FileChanged will wake the session)"
-                );
-            }
-            Ok(SentinelWrite::Unchanged) => trace!(
+        match sentinel.write_topics(&topics) {
+            Ok(()) => info!(
                 session = self.session.as_str(),
                 topics = names.join(","),
-                "watcher kicked but the unread set is unchanged and no read since; coalesced (no extra wake)"
+                "watcher wrote the wake sentinel (FileChanged will fire; wake hook wakes iff unread)"
             ),
             Err(err) => warn!(
                 session = self.session.as_str(),
