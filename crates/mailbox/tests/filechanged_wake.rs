@@ -558,6 +558,276 @@ fn a_new_message_after_a_read_re_bumps_even_on_the_same_topic() {
     guard.assert_clean();
 }
 
+// ==== silent-deafness: the wake-coalescing must not consume a read-progress edge ====
+
+/// Deliver ONE faithful production wake byte to `session`'s watcher — the exact kick a
+/// publisher sends, via [`mailbox::wake::Waker::kick`]. Asserts it reached the blocked
+/// watcher (a listening reader), so the test drives the REAL kick path, not a stub.
+fn deliver_kick(env: &Env, session: &str) {
+    let waker = mailbox::wake::Waker::new(env.waiters_dir());
+    let outcome = waker.kick(&mailbox::storage::SessionId::new(session));
+    assert_eq!(
+        outcome,
+        mailbox::wake::KickOutcome::Delivered,
+        "a faithful kick must reach the blocked watcher"
+    );
+}
+
+/// The reviewer's silent-deafness repro. An EMPTY kick (a message read before the watcher
+/// drained its kick) that finds nothing unread must NOT consume the read-progress edge: it
+/// clears the stale set but leaves `last_progress` alone, so the NEXT genuine message on
+/// the same, already-listed topic still re-bumps. Before the fix, the empty kick advanced
+/// `last_progress` and coalesced msg2 away → the agent went DEAF.
+#[test]
+fn an_empty_kick_between_a_read_and_a_new_message_does_not_deafen_the_agent() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "empty-kick-interleave";
+    let t = env.pr_topic(20);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    // msg1 → the watcher bumps the sentinel to [T].
+    env.publish(&t);
+    poll_until(
+        "sentinel lists T after msg1",
+        Duration::from_secs(5),
+        || (env.sentinel_topics(session) == vec![t.clone()]).then_some(()),
+    );
+
+    // The agent reads T (delivery progress advances; unread goes empty).
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+
+    // A faithful EMPTY kick: the store now shows nothing unread. It must NOT consume the
+    // read edge; it clears the stale [T] set to empty. Polling until that clear lands ALSO
+    // proves the empty kick was fully processed before msg2 (deterministic ordering).
+    deliver_kick(&env, session);
+    poll_until(
+        "the empty kick clears the sentinel to empty",
+        Duration::from_secs(5),
+        || env.sentinel_topics(session).is_empty().then_some(()),
+    );
+    let after_clear = sentinel_mtime(&env, session);
+
+    // Past a coarse (1s) mtime resolution so a re-bump is observable.
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // msg2 on the SAME topic T → the watcher MUST re-bump (not deaf).
+    env.publish(&t);
+    let topics = poll_until(
+        "the sentinel re-bumps for msg2 on the same topic",
+        Duration::from_secs(5),
+        || {
+            let seen = env.sentinel_topics(session);
+            seen.contains(&t).then_some(seen)
+        },
+    );
+    assert_eq!(
+        topics,
+        vec![t.clone()],
+        "the sentinel lists T again (not deaf)"
+    );
+    assert!(
+        sentinel_mtime(&env, session) > after_clear,
+        "the sentinel mtime advanced for msg2 — the agent is NOT deaf"
+    );
+    let wake = env.wake_hook(session);
+    assert_eq!(
+        wake.status.code(),
+        Some(2),
+        "msg2 on the same topic after an empty kick must still wake the agent"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// The restart variant. A watcher that dies after the agent read leaves a STALE non-empty
+/// set in the sentinel. When the Stop-liveness hook respawns it, arm-sync must reconcile
+/// that stale set to the real unread (empty) — otherwise the first post-restart message on
+/// the same topic yields an identical set and is coalesced away (deaf). This proves the
+/// respawned watcher re-bumps.
+#[test]
+fn a_watcher_restart_after_a_read_re_bumps_on_the_same_topic() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "restart-variant";
+    let t = env.pr_topic(21);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    // msg1 → bump [T].
+    env.publish(&t);
+    poll_until("sentinel lists T", Duration::from_secs(5), || {
+        (env.sentinel_topics(session) == vec![t.clone()]).then_some(())
+    });
+
+    // The agent reads. The sentinel is left STALE at [T] (only a kick clears it, and none
+    // arrives here) — exactly the state a restart must reconcile.
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+    assert_eq!(
+        env.sentinel_topics(session),
+        vec![t.clone()],
+        "the sentinel is stale at [T] after the read (no kick cleared it)"
+    );
+
+    // Kill the watcher uncleanly. `ArmChild::drop` SIGKILLs then reaps it, so it dies
+    // without cleaning up — leaving the STALE [T] sentinel AND a stale pidfile, exactly
+    // the post-crash state the Stop-liveness respawn must reconcile.
+    let live_pid = watcher_pid(&env, session).expect("watcher pid");
+    drop(watcher);
+    poll_until("the killed watcher is gone", Duration::from_secs(5), || {
+        (!pid_alive(live_pid)).then_some(())
+    });
+
+    // Respawn via the Stop-liveness path. Arm-sync must reconcile the stale [T] to empty.
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    let new_pid = poll_until("a fresh watcher arms", Duration::from_secs(5), || {
+        watcher_pid(&env, session).filter(|&p| p != live_pid && pid_alive(p))
+    });
+    poll_until(
+        "arm-sync clears the stale [T] set to empty",
+        Duration::from_secs(5),
+        || env.sentinel_topics(session).is_empty().then_some(()),
+    );
+    let after_arm = sentinel_mtime(&env, session);
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // msg2 on the SAME topic T after the restart → must re-bump (not deaf).
+    env.publish(&t);
+    let topics = poll_until(
+        "the restarted watcher re-bumps for msg2",
+        Duration::from_secs(5),
+        || {
+            let seen = env.sentinel_topics(session);
+            seen.contains(&t).then_some(seen)
+        },
+    );
+    assert_eq!(
+        topics,
+        vec![t.clone()],
+        "the sentinel lists T again after the restart (not deaf)"
+    );
+    assert!(
+        sentinel_mtime(&env, session) > after_arm,
+        "the sentinel mtime advanced for msg2 after the restart"
+    );
+    let wake = env.wake_hook(session);
+    assert_eq!(
+        wake.status.code(),
+        Some(2),
+        "post-restart mail on the same topic must still wake"
+    );
+    assert!(pid_alive(new_pid), "the respawned watcher is still live");
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// The coalescing fix must NOT regress: two messages on the SAME already-unread topic with
+/// NO read between them still collapse to exactly ONE bump (one wake), not one per message.
+#[test]
+fn two_same_topic_publishes_without_a_read_bump_the_sentinel_exactly_once() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "coalesce-once";
+    let t = env.pr_topic(22);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    env.publish(&t);
+    poll_until("sentinel lists T", Duration::from_secs(5), || {
+        (env.sentinel_topics(session) == vec![t.clone()]).then_some(())
+    });
+    let after_first = sentinel_mtime(&env, session);
+
+    // A second publish on the SAME already-unread topic, NO read between: coalesced away.
+    // No write → the mtime is frozen (a skipped write cannot advance it). A fixed wait is
+    // correct: this proves a NON-event.
+    env.publish(&t);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        sentinel_mtime(&env, session),
+        after_first,
+        "a second same-topic message with no read must NOT re-bump (coalescing holds)"
+    );
+    assert_eq!(
+        env.unread_total(session),
+        2,
+        "both events are durably unread (only the WAKE is coalesced)"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// After a read empties the unread set, the next kick with nothing unread CLEARS the
+/// sentinel to empty (rather than leaving a stale set that would defeat set-coalescing).
+#[test]
+fn an_empty_kick_clears_the_sentinel_after_a_read() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "empty-kick-clears";
+    let t = env.pr_topic(23);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    env.publish(&t);
+    poll_until("sentinel lists T", Duration::from_secs(5), || {
+        (env.sentinel_topics(session) == vec![t.clone()]).then_some(())
+    });
+
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+
+    // A faithful kick with nothing unread clears the stale [T] to empty.
+    deliver_kick(&env, session);
+    poll_until(
+        "the empty kick clears the sentinel to empty",
+        Duration::from_secs(5),
+        || env.sentinel_topics(session).is_empty().then_some(()),
+    );
+    assert!(
+        env.sentinel_topics(session).is_empty(),
+        "an empty kick must clear the sentinel to empty"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
 // ==== FIX 5: cross-session isolation — B's sentinel change must not wake A =========
 
 /// When a session's cwd is an ancestor of `~/.mailbox` (e.g. `claude` launched from

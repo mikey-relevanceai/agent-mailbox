@@ -204,6 +204,17 @@ green machinery test surface for no functional gain. A later card may delete the
     not done here because it is cross-cutting (the sweeper lives in the daemon and would
     need the waiters-dir/pidfile scheme) and the Stop hook already covers the realistic
     cases.
+  - **Exit-window respawn transient.** On exit the watcher removes its pidfile while it
+    STILL holds the single-instance lock (deliberate: removing under the lock is what
+    stops it from ever deleting a *different*, freshly-armed watcher's pidfile). In the
+    brief window between that removal and the lock drop, a concurrent `ensure-watcher`
+    sees no pidfile, spawns a replacement, and the replacement then loses the lock and
+    exits without writing a pidfile — leaving zero watchers until the next `Stop`. It is
+    an **accepted transient**: it self-heals at the session's next turn (the Stop-liveness
+    hook respawns), and the mail stays durable meanwhile. The alternative — removing the
+    pidfile *after* releasing the lock — was rejected because it opens a strictly worse
+    race: another watcher could acquire the freed lock and write its own pidfile in the
+    gap, which the exiting watcher would then delete, orphaning a LIVE watcher.
   - **Store-unreadable dropped wake.** The watcher and the wake hook read the store
     read-only (WAL present). A wake that fires during a "bridge down" / store-unreadable
     window exits 0 (anti-loop-safe), and the already-unread mail is NOT re-bumped until

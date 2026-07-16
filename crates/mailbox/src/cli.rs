@@ -2127,9 +2127,11 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
 ///    the [UNDOCUMENTED] risk that a `SessionStart`-registered watchPath lapses over a
 ///    long session.
 ///
-/// It **never exits 2** (it is not an `asyncRewake` hook): it always exits 0, so a Stop
-/// can never itself wake the session. It needs no bridge socket — watcher liveness and
-/// watchPaths are both local — so it is fast and cannot be blocked by a down daemon.
+/// It **never exits 2** (it is not an `asyncRewake` hook), so a Stop can never itself
+/// wake the session — that is the load-bearing invariant. It exits 1 on a config/stdin
+/// error (it could do nothing useful) and 0 otherwise, including every no-op and every
+/// respawn. It needs no bridge socket — watcher liveness and watchPaths are both local —
+/// so it is fast and cannot be blocked by a down daemon.
 ///
 /// The residual it does NOT cover (documented in ADR-0008): a session that goes idle
 /// **forever** — never another Stop — whose watcher then dies stays deaf until it next

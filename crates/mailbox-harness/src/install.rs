@@ -8,8 +8,9 @@
 //!   registering this session's sentinel, and spawns the detached watcher.
 //! - `Stop` (matcher `""`) runs `mailbox harness ensure-watcher`, a plain synchronous
 //!   hook (NEVER asyncRewake): the pessimistic Stop-liveness net — respawn the detached
-//!   watcher iff it is dead, re-print watchPaths. It exits 0 always, so it is the
-//!   primary recovery for a died watcher without ever costing a model turn.
+//!   watcher iff it is dead, re-print watchPaths. It NEVER exits 2 (never wakes) — it
+//!   exits 1 only on a config/stdin error and 0 otherwise — so it is the primary
+//!   recovery for a died watcher without ever costing a model turn.
 //! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
 //!   as an `asyncRewake` hook with a `timeout` (seconds): when the watcher bumps the
 //!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
@@ -327,8 +328,9 @@ impl HookInstallSpec {
 ///   watcher.
 /// - `Stop` runs `ensure-watcher` (plain, synchronous, NEVER asyncRewake): the
 ///   pessimistic Stop-liveness net (ADR-0008 FIX 3) — respawn the detached watcher iff
-///   it is dead, re-print watchPaths. It exits 0 always, so it costs a per-turn process
-///   spawn but NEVER a model turn. This is the primary recovery for a watcher that died.
+///   it is dead, re-print watchPaths. It NEVER exits 2 (never wakes) — it exits 1 only
+///   on a config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
+///   NEVER a model turn. This is the primary recovery for a watcher that died.
 /// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
 ///   basename ([`WAKE_SENTINEL_BASENAME`]): when the watcher bumps the sentinel, this
 ///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
