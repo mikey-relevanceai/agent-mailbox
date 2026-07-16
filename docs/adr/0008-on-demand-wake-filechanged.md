@@ -37,14 +37,30 @@ exactly when there is real mail, and never otherwise.
    touched externally, from a session whose cwd did NOT contain it.
 5. `FileChanged` `change_type` ∈ {create, modify, remove}; watcher latency 100–500 ms.
 
-**Caveat (must be smoke-tested on a real agent).** Each link above was confirmed in
-isolation. The **full chain end-to-end** — `watchPaths`-registered absolute sentinel
-+ `asyncRewake` wake hook + a *truly-idle* session, all together — and **multi-session
-isolation** (touching session A's sentinel wakes ONLY A) were NOT re-confirmed as one
-flow headlessly. The integration tests here prove every link up to "the wake hook
-WOULD exit 2 with the topic"; the harness-level wake itself needs a live agent. It is
-also [UNDOCUMENTED] whether a `SessionStart`-registered `watchPath` persists for the
-whole session or must be refreshed — see the design's defensive stance below.
+**Smoke test: PASSED on real agents (2026-07-16).** Each link above was first
+confirmed in isolation headlessly; the integration tests here prove every link up to
+"the wake hook WOULD exit 2 with the topic." The remaining harness-level properties —
+which need a live Claude Code session — were then confirmed end-to-end on real
+interactive agents:
+
+- **Zero idle cost.** An idle agent sat many minutes and took no turns — no spurious
+  wakes.
+- **Wakes on real mail.** A `mailbox send` to an idle agent woke it promptly with
+  `mail on topic agent.<id>`, and `read` showed the sender's `from`.
+- **Multi-session isolation.** Poking session A woke ONLY A and poking B woke ONLY B;
+  no other session reacted. (A false wake is structurally impossible anyway — each
+  session's wake hook re-checks its OWN store — but this confirms it in practice.)
+
+The first live run also caught a real bug on contact: the `Stop` hook emitted a
+`SessionStart`-shaped `watchPaths` output, which Claude Code rejects (a hook's
+`hookEventName` must match the firing event). Fixed — the `Stop` hook prints nothing
+and only re-ensures watcher liveness; `watchPaths` registration stays in `SessionStart`.
+
+One item remains [UNDOCUMENTED]: whether a `SessionStart`-registered `watchPath`
+persists for the whole session or must be refreshed. Because a `Stop` hook cannot
+re-register it (see the bug above), the design relies on it persisting — an accepted
+residual. If a long-idle session is ever observed going deaf, this is the first
+suspect.
 
 ## Decision
 
@@ -243,12 +259,14 @@ green machinery test surface for no functional gain. A later card may delete the
     fire exit-2 re-arm wakes and contend for the single-waiter lock with the new watcher.
     **After upgrading, re-run `mailbox harness install-hooks`** (it sweeps the retired
     `arm` hooks and installs the ADR-0008 set). Documented in `docs/04-usage.md`.
-  - The full `watchPaths` + `asyncRewake` + idle chain and multi-session isolation are
-    proven only in parts headlessly; they need a real-agent smoke test.
-  - `watchPath` persistence across a long session is [UNDOCUMENTED]; if it lapses, the
-    `Stop`-liveness hook (E′) re-prints `watchPaths` at every turn, so a session that
-    keeps taking turns re-registers; only a truly-idle-forever session is exposed (same
-    residual as the idle-forever watcher death above).
+  - The full `watchPaths` + `asyncRewake` + idle chain and multi-session isolation were
+    **confirmed on real agents (2026-07-16)** — see the smoke-test note under Context.
+  - `watchPath` persistence across a long session is [UNDOCUMENTED], and a `Stop` hook
+    CANNOT re-register it (that is a `SessionStart`-only output — emitting it from a Stop
+    fails Claude Code's event-name check, a bug we hit and fixed). So the design relies on
+    the `SessionStart` registration persisting for the session's life; if it lapses, a
+    long-idle session could go deaf with nothing to re-register it. This is the first
+    suspect if a long-idle session is ever observed missing mail.
 
 ## Alternatives considered
 
