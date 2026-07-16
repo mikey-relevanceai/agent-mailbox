@@ -16,18 +16,33 @@
 
 mod common;
 
+use std::io::Write;
+use std::process::Stdio;
 use std::time::Duration;
 
-use common::{Env, pid_alive, poll_until, wait_within};
+use common::{Env, mailbox_command, pid_alive, poll_until, wait_within};
 
 /// Whether `session`'s watcher is alive per its pidfile (the same probe `cleanup`
 /// and `mailbox agents` use).
 fn watcher_alive(env: &Env, session: &str) -> bool {
+    watcher_pid(env, session).map(pid_alive).unwrap_or(false)
+}
+
+/// The pid recorded in `session`'s watcher pidfile, or `None` if absent/garbage.
+fn watcher_pid(env: &Env, session: &str) -> Option<u32> {
     std::fs::read_to_string(env.waiter_pidfile(session))
+        .ok()?
+        .trim()
+        .parse::<u32>()
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .map(pid_alive)
-        .unwrap_or(false)
+}
+
+/// The mtime of `session`'s sentinel file (panics if it does not exist).
+fn sentinel_mtime(env: &Env, session: &str) -> std::time::SystemTime {
+    std::fs::metadata(env.sentinel_path(session))
+        .unwrap()
+        .modified()
+        .unwrap()
 }
 
 /// Block until `session`'s watcher has armed (written its live pidfile), or panic.
@@ -281,8 +296,10 @@ fn the_watcher_blocks_and_does_not_time_out() {
 
     // With no mail and no re-arm timer, the watcher must STILL be blocking well past
     // any old max-block boundary — it never exits on its own (the whole ADR-0008 win).
-    // Sleep past a generous boundary and confirm it has NOT exited (do not kill it —
-    // that is what teardown is for).
+    // A FIXED sleep is correct HERE — unlike the rest of the suite, which polls for a
+    // state to appear, this test proves a NEGATIVE ("it did NOT exit"), and the only
+    // way to observe a non-event is to wait a generous interval and confirm it still
+    // has not happened. Do not kill it — that is what teardown is for.
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
         watcher.try_wait().expect("try_wait").is_none(),
@@ -341,6 +358,373 @@ fn session_end_reaps_the_watcher_and_removes_the_sentinel_dir() {
         "cleanup must remove the session's sentinel dir"
     );
 
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== FIX 3: the Stop-liveness hook respawns a dead watcher and NEVER wakes ========
+
+/// The pessimistic Stop-liveness net (ADR-0008 FIX 3), the PRIMARY recovery for a
+/// watcher that died. `ensure-watcher`, run at every turn boundary:
+/// (i) respawns the watcher when none is alive; (ii) leaves a LIVE watcher strictly
+/// alone (single-instance — a redundant spawn loses the lock and exits cleanly);
+/// (iii) NEVER exits 2 (it is not asyncRewake, so a Stop can never itself wake).
+#[test]
+fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "stop-liveness";
+    env.run_as_ok(session, &["subscribe", &env.pr_topic(6)], "subscribe");
+
+    // (i) No watcher yet → ensure-watcher respawns one, re-prints watchPaths, exits 0.
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ensure-watcher must exit 0 (never a wake); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("watchPaths JSON");
+    assert_eq!(
+        value["hookSpecificOutput"]["watchPaths"][0],
+        env.sentinel_path(session).display().to_string(),
+        "ensure-watcher re-prints this session's watchPaths"
+    );
+    wait_until_armed(&env, session);
+    let live_pid = watcher_pid(&env, session).expect("a watcher pid");
+
+    // (ii) A live watcher is LEFT ALONE: a second ensure-watcher does not replace it.
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    // Give any (wrongly) spawned replacement time to have taken over, then confirm the
+    // ORIGINAL watcher still owns the pidfile and runs.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        watcher_pid(&env, session),
+        Some(live_pid),
+        "a live watcher must be left untouched (single-instance)"
+    );
+    assert!(pid_alive(live_pid), "the original watcher is still running");
+
+    // (iii) A DEAD watcher is respawned. SIGKILL leaves its pidfile stale (it cannot
+    // clean up on SIGKILL), so ensure-watcher sees a dead pid and respawns.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(live_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .ok();
+    poll_until("the killed watcher is gone", Duration::from_secs(5), || {
+        (!pid_alive(live_pid)).then_some(())
+    });
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ensure-watcher must exit 0 even when it respawns a dead watcher"
+    );
+    let new_pid = poll_until(
+        "a fresh watcher replaces the dead one",
+        Duration::from_secs(5),
+        || watcher_pid(&env, session).filter(|&p| p != live_pid && pid_alive(p)),
+    );
+    assert!(pid_alive(new_pid), "the respawned watcher is live");
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== FIX 4: the watcher coalesces repeated same-topic wakes =======================
+
+/// A second message on an ALREADY-unread topic must NOT re-bump the sentinel (it would
+/// wake the agent again for mail it was already told about); a NEW topic becoming
+/// unread DOES change the set and bumps. Reproduces "3 fires, 3 wakes for the same
+/// unread" and pins it to one.
+#[test]
+fn the_watcher_coalesces_a_repeated_unread_topic_but_bumps_a_new_one() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "coalesce";
+    let a = env.pr_topic(7);
+    let b = env.pr_topic(8);
+    env.run_as_ok(session, &["subscribe", &a], "subscribe a");
+    env.run_as_ok(session, &["subscribe", &b], "subscribe b");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    // First publish on A bumps the sentinel to [A].
+    env.publish(&a);
+    poll_until("sentinel lists A", Duration::from_secs(5), || {
+        (env.sentinel_topics(session) == vec![a.clone()]).then_some(())
+    });
+    let after_a = sentinel_mtime(&env, session);
+
+    // A SECOND publish on the SAME already-unread topic A is COALESCED: no write, so
+    // the mtime is unchanged (mtime EQUALITY is resolution-independent — a skipped
+    // write cannot advance it). A fixed wait is correct: this proves a non-event.
+    env.publish(&a);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        sentinel_mtime(&env, session),
+        after_a,
+        "a second message on an already-unread topic must NOT re-bump the sentinel"
+    );
+    assert_eq!(
+        env.unread_total(session),
+        2,
+        "both A events are still unread (the mail is durable; only the WAKE is coalesced)"
+    );
+
+    // A publish on a NEW topic B changes the unread SET, so it DOES bump (content grows
+    // to include B — a content change is a resolution-independent proof of a write).
+    env.publish(&b);
+    let topics = poll_until(
+        "the sentinel bumps for the new topic B",
+        Duration::from_secs(5),
+        || {
+            let t = env.sentinel_topics(session);
+            t.contains(&b).then_some(t)
+        },
+    );
+    assert!(
+        topics.contains(&a) && topics.contains(&b),
+        "the sentinel now lists both topics: {topics:?}"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// The correctness guard for coalescing: after the agent READS and catches up, a NEW
+/// message on the SAME topic must re-bump — the unread set is {A} again, identical to
+/// the sentinel's content, so set-comparison ALONE would coalesce it away forever
+/// (permanent deafness). The watcher's read-progress guard forces the re-bump.
+#[test]
+fn a_new_message_after_a_read_re_bumps_even_on_the_same_topic() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "re-notify";
+    let a = env.pr_topic(9);
+    env.run_as_ok(session, &["subscribe", &a], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+
+    env.publish(&a);
+    poll_until("sentinel lists A", Duration::from_secs(5), || {
+        (!env.sentinel_topics(session).is_empty()).then_some(())
+    });
+    let after_first = sentinel_mtime(&env, session);
+
+    // The agent READS and catches up.
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+
+    // Wait past a coarse (1s) mtime resolution so a re-bump is observable even though
+    // the sentinel CONTENT is identical ({A} again) — the mtime is the only signal.
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // A NEW message on the SAME topic A must RE-bump (progress advanced on the read).
+    env.publish(&a);
+    poll_until(
+        "the sentinel re-bumps after the read",
+        Duration::from_secs(5),
+        || (sentinel_mtime(&env, session) > after_first).then_some(()),
+    );
+    // And the wake hook wakes on this genuinely-new unread.
+    let wake = env.wake_hook(session);
+    assert_eq!(
+        wake.status.code(),
+        Some(2),
+        "post-read mail on the same topic must still wake (no permanent deafness)"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== FIX 5: cross-session isolation — B's sentinel change must not wake A =========
+
+/// When a session's cwd is an ancestor of `~/.mailbox` (e.g. `claude` launched from
+/// `$HOME`, whose cwd is watched recursively), a change to session B's sentinel fires
+/// session A's `FileChanged` too. There must be NO false wake: A's wake hook re-checks
+/// A's OWN unread from the store, finds none, and exits 0. Isolation comes from that
+/// store re-check, NOT from the sentinel path.
+#[test]
+fn a_change_to_session_bs_sentinel_does_not_wake_session_a() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let a = "iso-a";
+    let b = "iso-b";
+    let topic_b = env.pr_topic(10);
+    // A is subscribed but has NO unread; B has genuine unread mail.
+    env.run_as_ok(a, &["subscribe", &env.pr_topic(11)], "subscribe a");
+    env.run_as_ok(b, &["subscribe", &topic_b], "subscribe b");
+    env.publish(&topic_b);
+
+    // A's wake hook (as if fired by B's sentinel change) must exit 0 — A has no unread.
+    let wake_a = env.wake_hook(a);
+    assert_eq!(
+        wake_a.status.code(),
+        Some(0),
+        "a change to B's sentinel must NOT wake A (A has no unread → exit 0); stderr: {}",
+        String::from_utf8_lossy(&wake_a.stderr)
+    );
+    // Control: B's own wake hook DOES wake, so we know the mail path is live.
+    let wake_b = env.wake_hook(b);
+    assert_eq!(
+        wake_b.status.code(),
+        Some(2),
+        "B has genuine unread and must wake"
+    );
+
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== FIX 6: a wake hook with no store, and the explicit outlive-spawner property ==
+
+/// Before any daemon has ever run there is no store. The `FileChanged` wake hook must
+/// exit 0 (anti-loop on a missing store), never wake over a phantom sentinel.
+#[test]
+fn the_wake_hook_with_no_store_exits_0() {
+    // No daemon started → no db file exists at the env's DB path.
+    let env = Env::new();
+    let wake = env.wake_hook("no-store");
+    assert_eq!(
+        wake.status.code(),
+        Some(0),
+        "a wake hook with no store must exit 0 (no wake); stderr: {}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+}
+
+/// The `setsid` survival property, pinned EXPLICITLY: capture the `session-start`
+/// spawner's pid, confirm IT has exited, and only THEN assert the detached watcher it
+/// spawned is still alive — proving the watcher outlives its spawner rather than
+/// merely relying on `wait_with_output` timing.
+#[test]
+fn the_detached_watcher_outlives_the_session_start_spawner() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "outlive";
+    env.run_as_ok(session, &["subscribe", &env.pr_topic(12)], "subscribe");
+
+    // Spawn session-start ourselves so we hold its pid.
+    let mut spawner = mailbox_command()
+        .args(["harness", "session-start"])
+        .env("AGENT_MAILBOX_DB", env.db_path())
+        .env("MAILBOX_SENTINEL_ROOT", env.sentinel_root())
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn session-start");
+    let spawner_pid = spawner.id();
+    spawner
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            format!(r#"{{"session_id":"{session}","hook_event_name":"SessionStart"}}"#).as_bytes(),
+        )
+        .unwrap();
+    let status = spawner.wait().expect("session-start exits");
+    assert!(status.success(), "session-start must exit 0");
+
+    // The spawner has exited...
+    poll_until(
+        "the session-start spawner exits",
+        Duration::from_secs(5),
+        || (!pid_alive(spawner_pid)).then_some(()),
+    );
+    // ...yet the detached watcher it spawned is armed and ALIVE (setsid survival).
+    wait_until_armed(&env, session);
+    let watcher_pid = watcher_pid(&env, session).expect("a watcher pid");
+    assert!(
+        pid_alive(watcher_pid),
+        "the detached watcher must outlive the (now-exited) session-start spawner"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== FIX 2: the watcher survives a signal (EINTR) and still bumps on a later kick ==
+
+/// A signal delivered while the watcher is blocked in `poll` interrupts it with EINTR.
+/// That is NOT an error — the watcher must retry the wait and keep running, then still
+/// bump on a subsequent real kick. (A broken EINTR path would kill the watcher on the
+/// signal, and the later publish would never bump.)
+#[test]
+fn the_watcher_survives_a_signal_interruption_and_still_bumps() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "eintr";
+    let topic = env.pr_topic(13);
+    env.run_as_ok(session, &["subscribe", &topic], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+    let pid = watcher_pid(&env, session).expect("a watcher pid");
+
+    // Interrupt the blocked poll a few times with a benign signal (SIGCONT: it does not
+    // terminate and is not the reaping SIGTERM). The watcher must survive every one.
+    for _ in 0..3 {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGCONT,
+        )
+        .ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        watcher_alive(&env, session),
+        "the watcher must survive a signal interruption (EINTR is retried, not fatal)"
+    );
+
+    // ...and it still does its job: a real publish bumps the sentinel.
+    env.publish(&topic);
+    let topics = poll_until(
+        "the watcher bumps after the signal",
+        Duration::from_secs(5),
+        || {
+            let t = env.sentinel_topics(session);
+            (!t.is_empty()).then_some(t)
+        },
+    );
+    assert_eq!(
+        topics,
+        vec![topic],
+        "the watcher still bumps on a real kick"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
     daemon.stop();
     guard.assert_clean();
 }

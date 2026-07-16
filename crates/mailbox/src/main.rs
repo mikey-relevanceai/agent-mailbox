@@ -58,6 +58,11 @@ fn main() -> ExitCode {
         Command::Harness(cli::HarnessArgs {
             command: HarnessCommand::Watch(args),
         }) => cli::run_watch_sentinel(&args),
+        // The ADR-0008 Stop-liveness hook: a synchronous liveness poke (re-print
+        // watchPaths, respawn the watcher iff dead) that never wakes.
+        Command::Harness(cli::HarnessArgs {
+            command: HarnessCommand::EnsureWatcher,
+        }) => cli::run_ensure_watcher_hook(),
         // Everything else is async (socket client, or the serve daemon).
         command => {
             let runtime = match tokio::runtime::Runtime::new() {
@@ -103,6 +108,7 @@ fn is_wire_stderr(command: &Command) -> bool {
                     | HarnessCommand::Wake
                     | HarnessCommand::Watch(_)
                     | HarnessCommand::SessionStart
+                    | HarnessCommand::EnsureWatcher
             })
     )
 }

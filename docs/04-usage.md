@@ -188,13 +188,16 @@ mailbox harness install-hooks \
 
 Pass an **absolute** `--mailbox-bin` so the hook works regardless of the
 session's `PATH` (it defaults to the resolved path of the `mailbox` you ran).
-The snippet wires three hooks (ADR-0008 — on-demand wake, no periodic re-arm):
+The snippet wires four hooks (ADR-0008 — on-demand wake, no periodic re-arm *wake*; the
+`Stop` hook is a plain exit-0 liveness poke, never a wake):
 
 ```json
 {
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness session-start" }] }],
+    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
+      "command": "/abs/path/mailbox harness ensure-watcher" }] }],
     "FileChanged": [{ "matcher": ".mailbox-wake", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness wake",
       "asyncRewake": true, "timeout": 3600 }] }],
@@ -203,6 +206,11 @@ The snippet wires three hooks (ADR-0008 — on-demand wake, no periodic re-arm):
   }
 }
 ```
+
+> **After upgrading the `mailbox` binary, re-run `mailbox harness install-hooks`.** An
+> upgrade that skips it leaves the stale ADR-0006 `arm` hooks in your `settings.json`;
+> they still fire exit-2 re-arm wakes and contend for the single-waiter lock with the new
+> watcher. Re-running sweeps them and installs the current set.
 
 What each hook does:
 
@@ -218,6 +226,13 @@ What each hook does:
   under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
   never produces a *wake*; the watcher just blocks, and the first publish after the
   daemon returns kicks it.
+- **`Stop` → `mailbox harness ensure-watcher`** (plain, synchronous). The pessimistic
+  **Stop-liveness** net: at every turn boundary it respawns the detached watcher if it
+  has died (a live watcher is left alone), and re-prints the `watchPaths`. It **always
+  exits 0** — a `Stop` can never itself wake the session. It costs a small per-turn
+  process spawn but **no model turn**, and it is the primary recovery for a watcher that
+  was killed (a crash, an OS/OOM kill). It cannot help a session that goes idle *forever*
+  (which fires no `Stop`) — see the note below.
 - **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
   (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
   idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread
@@ -236,6 +251,20 @@ is real mail**. (`mailbox wait` / `mailbox harness arm` and their timing knobs s
 as retained primitives, but are no longer wired into the hooks.) See
 [01-wake-and-rearm](01-wake-and-rearm.md) and
 [ADR-0008](adr/0008-on-demand-wake-filechanged.md).
+
+**Notes and limits.**
+
+- **Launch `claude` from a project directory, not `$HOME`.** `FileChanged` watches the
+  cwd recursively, so if the cwd is an ancestor of `~/.mailbox`, every *other* session's
+  sentinel bump also fires this session's wake hook. There is **no false wake** (the hook
+  re-checks this session's own unread and exits 0), but it does spawn an extra wake-hook
+  process per unrelated bump. Launching from a project dir avoids the churn.
+- **Idle-forever + watcher death.** A session that goes idle *forever* (never takes
+  another turn, so the `Stop`-liveness hook never fires) whose watcher then dies stays
+  deaf until it next takes a turn or is restarted. This is the accepted limit of a
+  zero-spurious-wake design. The OS user-service supervises the *daemon*; the `Stop` hook
+  supervises the per-session *watcher*; nothing can poke a session that will neither act
+  nor be poked.
 
 ### 2b. Install the skill
 

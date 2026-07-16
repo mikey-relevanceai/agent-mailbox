@@ -42,6 +42,7 @@
 //! The sentinel holds topic NAMES only — never an event body — exactly like the
 //! wake wire it triggers. It records "there is mail on these topics", nothing more.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use mailbox_protocol::{SessionId, Topic};
@@ -90,6 +91,22 @@ pub enum SentinelError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Whether a coalesced [`Sentinel::sync_topics`] actually rewrote the sentinel.
+///
+/// A named two-state result rather than a bare `bool`, so the watcher's log line
+/// (and a test) can say plainly whether this kick bumped the mtime — and therefore
+/// whether a `FileChanged` wake will follow — or was coalesced away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentinelWrite {
+    /// The unread set changed, so the sentinel was rewritten and its mtime bumped;
+    /// a `FileChanged` wake will follow.
+    Bumped,
+    /// The unread set was identical to what the sentinel already held, so nothing
+    /// was written — no redundant `FileChanged`, no extra wake for mail already
+    /// surfaced (the coalescing guard, ADR-0008).
+    Unchanged,
 }
 
 /// A resolved per-session sentinel: its directory and the `.mailbox-wake` file.
@@ -141,8 +158,10 @@ impl Sentinel {
     /// so a reader can split them trivially.
     ///
     /// Creates the directory if needed. Truncates and rewrites every call, so the
-    /// mtime advances even when the topic set is unchanged — it is the *change*
-    /// that wakes, not the content.
+    /// mtime advances even when the topic set is unchanged — it is the *change* that
+    /// wakes, not the content. Callers that must not fire a redundant wake for an
+    /// already-surfaced unread set use [`Self::sync_topics`], which compares first;
+    /// this is the low-level primitive it (and the tests) build on.
     pub fn write_topics(&self, topics: &[Topic]) -> Result<(), SentinelError> {
         std::fs::create_dir_all(&self.dir).map_err(|source| SentinelError::CreateDir {
             path: self.dir.clone(),
@@ -158,6 +177,35 @@ impl Sentinel {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Coalesced write: make the sentinel hold exactly `topics`, but ONLY when that
+    /// set differs from what it currently holds. Returns [`SentinelWrite::Bumped`] if
+    /// it rewrote (mtime advanced, a `FileChanged` wake will follow) or
+    /// [`SentinelWrite::Unchanged`] if the set was identical and nothing was written.
+    ///
+    /// This is the coalescing guard (ADR-0008): `write_topics` truncates and rewrites
+    /// on EVERY call, so a burst of messages on an ALREADY-unread topic — or a
+    /// create+modify pair from a single write — fired several `FileChanged` events and
+    /// therefore several exit-2 wakes for the *same* unread state, before the agent had
+    /// read a thing. Comparing the unread SET first collapses those into one bump: a
+    /// second message on a topic that is already listed changes nothing, so it is
+    /// skipped; a NEW topic becoming unread does change the set, so it bumps.
+    ///
+    /// The comparison is by SET (order-independent), so it never depends on the order
+    /// `topics_with_unread` happens to return. The current content is read best-effort
+    /// (an unreadable/absent sentinel reads as the empty set, so a non-empty `topics`
+    /// still bumps) — the sentinel is only a trigger, and the wake hook re-checks the
+    /// store, so a stale read here can at worst cause one extra (harmless) bump.
+    pub fn sync_topics(&self, topics: &[Topic]) -> Result<SentinelWrite, SentinelError> {
+        let desired: BTreeSet<&str> = topics.iter().map(Topic::as_str).collect();
+        let current = self.read_topics();
+        let current: BTreeSet<&str> = current.iter().map(String::as_str).collect();
+        if desired == current {
+            return Ok(SentinelWrite::Unchanged);
+        }
+        self.write_topics(topics)?;
+        Ok(SentinelWrite::Bumped)
     }
 
     /// The topic names last written into the sentinel, or an empty vec if it does
@@ -272,6 +320,53 @@ mod tests {
         // The body carries topic NAMES only — no braces, no event body.
         let raw = std::fs::read_to_string(s.path()).unwrap();
         assert!(!raw.contains('{'), "sentinel must be payload-free: {raw:?}");
+    }
+
+    #[test]
+    fn sync_topics_coalesces_an_unchanged_set_but_bumps_a_changed_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+        let a = Topic::parse("t.a").unwrap();
+        let b = Topic::parse("t.b").unwrap();
+
+        // First sync of a non-empty set writes (nothing was there).
+        assert_eq!(
+            s.sync_topics(std::slice::from_ref(&a)).unwrap(),
+            SentinelWrite::Bumped
+        );
+        let mtime = |s: &Sentinel| std::fs::metadata(s.path()).unwrap().modified().unwrap();
+        let after_first = mtime(&s);
+
+        // Re-syncing the SAME set is coalesced away — no write, so the mtime is frozen
+        // (this is what stops a second message on an already-unread topic re-waking).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(
+            s.sync_topics(std::slice::from_ref(&a)).unwrap(),
+            SentinelWrite::Unchanged
+        );
+        assert_eq!(
+            mtime(&s),
+            after_first,
+            "an unchanged set must not bump the mtime"
+        );
+
+        // Order does not matter: [a] vs [a] compared as a set, and a NEW topic bumps.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(
+            s.sync_topics(&[b.clone(), a.clone()]).unwrap(),
+            SentinelWrite::Bumped
+        );
+        assert!(mtime(&s) > after_first, "a changed set must bump the mtime");
+        // `write_topics` preserves the given order (here [b, a]); the SET is what the
+        // coalescing compares, so a reordering of the same set is still Unchanged.
+        assert_eq!(s.read_topics(), vec!["t.b", "t.a"]);
+
+        // Reordering the same set is still Unchanged.
+        assert_eq!(s.sync_topics(&[a, b]).unwrap(), SentinelWrite::Unchanged);
+
+        // Shrinking to the empty set is a change (used by the Stop re-sync to reset).
+        assert_eq!(s.sync_topics(&[]).unwrap(), SentinelWrite::Bumped);
+        assert!(s.read_topics().is_empty());
     }
 
     #[test]

@@ -52,7 +52,8 @@ Caveats:
 | Hook | Command | What it does |
 |---|---|---|
 | `SessionStart` (matcher `startup`) | `mailbox harness session-start` (plain, synchronous) | Reads `session_id` from the hook stdin JSON, **registers the agent inbox** (`agent.<session-id>`, always-on — ADR-0007), prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<abs sentinel>"]}}`, and spawns the detached watcher. **Fail-open:** a down bridge does not stop it printing watchPaths or spawning the watcher (which self-validates). Exits 0 — never asyncRewake, never a wake. |
-| `FileChanged` (matcher `.mailbox-wake`) | `mailbox harness wake` (`asyncRewake: true`, `timeout` 1h) | On any change to the sentinel, opens the store **read-only** and checks whether THIS session has genuine unread mail. Exits **2** with `mail on topic X` on stderr iff so; otherwise exits **0** (the anti-loop guard — a `FileChanged` fires on every change, so an unconditional exit 2 would loop the agent). |
+| `Stop` (matcher `""`) | `mailbox harness ensure-watcher` (plain, synchronous) | The **Stop-liveness** net (ADR-0008 FIX 3): on every turn boundary, **respawn the detached watcher iff it is missing/dead** (a live watcher is left alone — the single-instance lock makes a redundant spawn a clean no-op) and **re-print `watchPaths`** (defends watchPath persistence). Exits **0 always** — NEVER asyncRewake, so a Stop can never itself wake. Costs a per-turn process spawn but **no model turn**. This is the primary recovery for a watcher that died. |
+| `FileChanged` (matcher `.mailbox-wake`) | `mailbox harness wake` (`asyncRewake: true`, `timeout` 1h) | On any change to the sentinel, opens the store **read-only** and checks whether THIS session has genuine unread mail. Exits **2** with `mail on topic X` on stderr iff so; otherwise exits **0** (the anti-loop guard — a `FileChanged` fires on every change, so an unconditional exit 2 would loop the agent). Isolation: the store re-check, not the sentinel path, is authoritative — a bump to another session's sentinel (shared-ancestor cwd) exits 0 here. |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the watcher (`SIGTERM` the pidfile PID), **removes the session's sentinel dir**, and calls the bridge to drop this session's subscriptions **and** interests (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` *atomically*, preserving unrelated settings; an upgrade sweeps the retired ADR-0006 `arm` hooks. |
 
@@ -116,13 +117,24 @@ a hook child:
 `max_block`/re-arm-exit logic) still exist and are tested, but are **no longer wired
 into the hooks** — the periodic-re-arm *mechanism* is superseded. See ADR-0008 §F.
 
-**No Stop-liveness hook (assumption to smoke-test).** We do not ship a `Stop` hook to
-re-ensure the watcher, because it fires per turn on working agents and does nothing
-for a truly-idle session (the only case that matters), and the single-instance lock
-already makes re-spawn safe. This assumes a `SessionStart`-registered `watchPath`
-persists for the session (currently [UNDOCUMENTED]); if a real-agent smoke test shows
-it lapses, the additive fix is a cheap `Stop` hook that only re-prints `watchPaths`
-and re-ensures the watcher (no wake).
+**The `Stop`-liveness hook (`ensure-watcher`) is the recovery mechanism.** It fires per
+turn and **never wakes** (always exits 0): it respawns the detached watcher iff it is
+missing/dead (a live one is left alone via the single-instance lock) and re-prints
+`watchPaths`. This is what makes the simple watcher (no elaborate in-loop self-healing)
+safe: a watcher killed by a crash, an OS/OOM kill, or an unrecoverable FIFO error is
+respawned on the session's next turn. **Supervision split:** the OS user-service
+(launchd/systemd) supervises the daemon (`mailbox serve`); the Stop hook supervises the
+per-session watcher. The one case it cannot cover — documented, not fixed — is a session
+that goes idle **forever** (fires no `Stop`) whose watcher then dies: nothing can wake a
+session that will neither take a turn nor be poked.
+
+**Wake coalescing (one mail, one wake).** The watcher bumps the sentinel only when a
+bump is warranted, so a burst of messages on an already-unread topic does not fire
+several `FileChanged` wakes for the same unread. It compares the unread topic SET to
+what the sentinel already holds and skips an unchanged set; to keep that correct across
+a read (a new message on the same topic after the agent caught up yields the same SET),
+it also tracks read progress and forces a bump when the agent has read since the last
+bump. Bursts collapse to one wake; a genuine re-notification after a read always wakes.
 
 ### install-hooks
 
@@ -137,6 +149,8 @@ sweeps them and installs these in their place.
   "hooks": {
     "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness session-start" }] }],
+    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
+      "command": "/abs/path/to/mailbox harness ensure-watcher" }] }],
     "FileChanged": [{ "matcher": ".mailbox-wake", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness wake",
       "asyncRewake": true, "timeout": 3600 }] }],
@@ -145,6 +159,10 @@ sweeps them and installs these in their place.
   }
 }
 ```
+
+> **After upgrading the `mailbox` binary, re-run `mailbox harness install-hooks`.** An
+> upgrade that skips it leaves stale ADR-0006 `arm` hooks that still fire exit-2 re-arm
+> wakes and contend for the single-waiter lock; re-running sweeps them.
 
 ### Diagnosing a wake ("why didn't my agent wake?")
 
@@ -160,6 +178,9 @@ and the daemon logs its kick counts at INFO on its own stderr:
 | `FileChanged wake: nothing unread (stray sentinel change); exiting 0 (no wake)` | the anti-loop guard held |
 | `kicked subscribed sessions after publish` (`delivered` / `no_reader`) | whether the publish reached a live watcher |
 | `another watcher already holds this session's lock; exiting cleanly (single-instance)` | **benign** — a racing spawn lost the lock |
+| `ensure-watcher: a live watcher already holds the lock; leaving it (no-op)` | the Stop hook found the watcher healthy |
+| `ensure-watcher: no live watcher; respawning the detached watcher` | the Stop hook recovered a died watcher |
+| `watcher kicked but the unread set is unchanged and no read since; coalesced (no extra wake)` | a burst message was coalesced (not a missed wake) |
 
 ## Codex CLI: no equivalent yet
 

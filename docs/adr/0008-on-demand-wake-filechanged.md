@@ -82,6 +82,29 @@ There is **no `max_block`, no exit-2 re-arm** — it runs until `SIGTERM`'d at
 FIFO is re-openable; the kick reaches the already-blocked watcher). Single-instance via
 the existing lock; a racing spawn loses and exits 0.
 
+*Resilience.* The block loop is deliberately SIMPLE, not bulletproof — the Stop-liveness
+hook (E′) is the recovery mechanism, so the watcher does not need elaborate self-healing.
+A signal-interrupted `poll` (EINTR) is retried (a signal is not an error). A normal kick
+is a writer that writes and closes its end; because the watcher holds the FIFO `O_RDWR`
+(so it is always its own writer), that close surfaces as a buffered read then `WouldBlock`
+— i.e. a kick, never an EOF (verified: the watcher survives kick after kick). On a
+genuinely unrecoverable error the loop exits and the watcher **removes its pidfile** (on
+EVERY exit path now, not just the `Unsubscribed` one), leaving a clean "no live watcher"
+state for the Stop hook to respawn from.
+
+*Wake coalescing (one mail must not cost several wakes).* `write_topics` truncates and
+rewrites on every call, so a burst of messages on an already-unread topic — or a
+create+modify pair from a single write — fired several `FileChanged` events and therefore
+several exit-2 wakes for the *same* unread, before the agent read a thing. The watcher now
+bumps the sentinel only when a bump is warranted: it compares the unread topic SET to what
+the sentinel already holds and skips an unchanged set, so a second message on an
+already-unread topic does not re-wake. To keep that correct across a read — after the agent
+catches up, a NEW message on the same topic yields the same SET, which set-comparison alone
+would coalesce away forever (permanent deafness) — it also tracks the session's **read
+progress** (the sum of `offset + 1` over its delivery cursors, which advances only on a
+read) and FORCES a bump when the agent has progressed since the last bump. Bursts collapse
+to one wake; a genuine re-notification after a read always wakes.
+
 **B) The `SessionStart` hook** (`mailbox harness session-start`). Short-lived, NOT
 `asyncRewake`, no exit-2: read `session_id`; ensure the always-on inbox subscription
 (card 16); print the `watchPaths` registering this session's absolute sentinel; spawn
@@ -103,23 +126,44 @@ sentinel's contents, so a wake can never fire for mail that is not really there
 its pidfile — the same `<session>.waiter.pid` the watcher writes), remove the session's
 sentinel directory, and drop subscriptions/interests (unchanged).
 
-**E) `install-hooks`.** Emits `SessionStart` (session-start), `FileChanged` (wake,
-`asyncRewake`, matcher `.mailbox-wake`), and `SessionEnd` (cleanup). It no longer emits
-the `SessionStart`/`Stop` → `arm` re-arm hooks, and an upgrade SWEEPS a stale `arm` hook
-(the merge recognises the retired subcommand and removes it from every event, including
-the `Stop` event the new snippet does not otherwise touch).
+**Isolation: the sentinel is a TRIGGER, never authority.** When a session's cwd is an
+ancestor of `~/.mailbox` (e.g. `claude` launched from `$HOME`, whose cwd is watched
+recursively), a bump to session B's `.mailbox-wake` fires session A's `FileChanged` too.
+There is **no false wake**: A's wake hook (C) re-checks A's OWN unread from the store,
+finds none, and exits 0. Isolation therefore comes from that **per-session store
+re-check**, not from the sentinel path — a load-bearing property a future change must
+preserve: it MUST NOT start trusting the sentinel's contents in place of the store
+check, or B's mail could wake A. The only cost of the shared-ancestor case is efficiency
+(A's wake hook process runs for an unrelated bump); launching `claude` from a project
+directory rather than `$HOME` avoids it.
 
-**No Stop-liveness hook.** We considered a minimal `Stop` hook that only re-ensures the
-watcher is alive (cheap re-spawn, no wake, no model turn) as a safety net against a
-watcher that died, and to re-register `watchPaths` in case they do not persist. We did
-NOT ship it: a `Stop` hook fires on every turn boundary, which is a per-turn process
-spawn on a working agent for a failure mode (watcher death) that the single-instance
-lock already makes safe to recover from — and, more importantly, it does nothing for a
-*truly idle* session (which fires no `Stop`), which is the only case that matters.
-**Assumption, stated for the smoke test:** we assume a `SessionStart`-registered
-`watchPath` persists for the session. If a real-agent smoke test shows it does not, the
-right fix is a cheap `Stop` hook that only re-prints `watchPaths` and re-ensures the
-watcher (no wake) — the design is structured so adding it is additive.
+**E) `install-hooks`.** Emits `SessionStart` (session-start), `Stop` (ensure-watcher,
+plain — the Stop-liveness hook E′), `FileChanged` (wake, `asyncRewake`, matcher
+`.mailbox-wake`), and `SessionEnd` (cleanup). It no longer emits the ADR-0006
+exit-2 `arm` re-arm hooks, and an upgrade SWEEPS a stale `arm` hook (the merge recognises
+the retired subcommand and removes it from every event — so an old `Stop → arm` re-arm is
+replaced by `Stop → ensure-watcher`, never left firing exit-2 alongside it). **Upgrading
+the binary WITHOUT re-running `install-hooks` leaves the stale ADR-0006 `arm` hooks in
+place** — see the residuals.
+
+**E′) The `Stop`-liveness hook** (`mailbox harness ensure-watcher`). This is the
+PRIMARY recovery mechanism and the pessimistic safety net. Plain, synchronous, **NEVER
+`asyncRewake`** — it exits **0 always**, so a `Stop` can never itself wake the session.
+On every turn boundary it (a) **respawns the detached watcher iff it is missing or
+dead** — a live watcher is left strictly alone (even a redundant spawn is free: the
+loser loses the single-instance lock and exits `AlreadyWaiting`), and (b) **re-prints
+the `watchPaths` registration**, defending the [UNDOCUMENTED] risk that a
+`SessionStart`-registered watchPath lapses over a long session. It needs no bridge
+socket (watcher liveness and watchPaths are both local), so it is fast and fail-open.
+
+The cost is a per-turn process spawn on a working agent — but **no model turn**, since
+it never wakes. That trade is deliberately accepted here (it was the reason ADR-0008
+originally omitted a `Stop` hook): making the watcher recoverable from the one place
+that also covers an OS/OOM kill is worth a cheap exit-0 hook, and it lets the watcher
+itself stay simple (A). The **supervision split** is: the OS user-service (launchd /
+systemd) supervises the **daemon** (`mailbox serve`); this Stop hook supervises the
+**per-session watcher**. It does NOT help a session that goes idle *forever* (fires no
+`Stop`) whose watcher then dies — that residual is stated below.
 
 **F) Retained primitives.** `mailbox wait` and `mailbox harness arm` (and their
 `max_block`/re-arm code) remain as working, tested primitives — they are simply no
@@ -139,15 +183,43 @@ green machinery test surface for no functional gain. A later card may delete the
   is still a hook exit-2 (only a hook can wake an idle session — ADR-0006's rejected
   "bridge-side waiter" reasoning still holds); we simply trigger it on a file change
   instead of a timer.
+- **New per-turn cost:** the `Stop`-liveness hook (E′) spawns a short process at every
+  turn boundary on a working agent. It costs **no model turn** (it always exits 0), and
+  it is what makes a died watcher recoverable — an accepted trade.
 - **Residual risk (be honest — the adversarial gate will probe this):**
+  - **Idle-forever watcher death.** A session that goes idle FOREVER (never another
+    `Stop`) whose watcher THEN dies stays deaf until it next takes a turn or is
+    restarted — the Stop-liveness hook (E′) is what would respawn it, and a truly-idle
+    session fires no `Stop`. This is the accepted limit of a zero-spurious-wake design:
+    nothing can wake a session that will neither take a turn nor be poked. The
+    supervision split (OS service supervises the daemon; the Stop hook supervises the
+    watcher) covers every case except this one.
+  - **Orphan window at cleanup.** `cleanup`'s reap can miss a watcher that has not yet
+    written its pidfile if the session's subscription survives a bridge-down teardown.
+    It is an **accepted residual**: the Stop-liveness hook reconciles it on the session's
+    next turn (a live watcher is left alone, a dead/absent one is respawned under the
+    lock), and the card-08 TTL sweeper ages out the stale subscription. The future fix,
+    if the window ever bites in practice, is to extend the TTL sweeper to ALSO reap the
+    orphaned watcher via its pidfile when it sweeps that session's stale subscription —
+    not done here because it is cross-cutting (the sweeper lives in the daemon and would
+    need the waiters-dir/pidfile scheme) and the Stop hook already covers the realistic
+    cases.
+  - **Store-unreadable dropped wake.** The watcher and the wake hook read the store
+    read-only (WAL present). A wake that fires during a "bridge down" / store-unreadable
+    window exits 0 (anti-loop-safe), and the already-unread mail is NOT re-bumped until
+    the next publish kicks the watcher — a degraded-state residual, never a wrong wake.
+    The mail stays durable and surfaces on the next kick or the next `Stop` respawn.
+  - **Half-upgraded install.** Upgrading the `mailbox` binary WITHOUT re-running
+    `install-hooks` leaves the stale ADR-0006 `arm` hooks in `settings.json`; they still
+    fire exit-2 re-arm wakes and contend for the single-waiter lock with the new watcher.
+    **After upgrading, re-run `mailbox harness install-hooks`** (it sweeps the retired
+    `arm` hooks and installs the ADR-0008 set). Documented in `docs/04-usage.md`.
   - The full `watchPaths` + `asyncRewake` + idle chain and multi-session isolation are
     proven only in parts headlessly; they need a real-agent smoke test.
-  - `watchPath` persistence across a long session is [UNDOCUMENTED]; if it lapses, an
-    idle session could stop waking until its next `SessionStart`. Mitigation is the
-    additive `Stop`-liveness hook described above.
-  - The watcher relies on the read-only store (WAL present) to name unread topics; the
-    "bridge down" window degrades to "no bump" (the mail is still durable and surfaces
-    on the next kick), never to a wrong wake.
+  - `watchPath` persistence across a long session is [UNDOCUMENTED]; if it lapses, the
+    `Stop`-liveness hook (E′) re-prints `watchPaths` at every turn, so a session that
+    keeps taking turns re-registers; only a truly-idle-forever session is exposed (same
+    residual as the idle-forever watcher death above).
 
 ## Alternatives considered
 
@@ -155,9 +227,17 @@ green machinery test surface for no functional gain. A later card may delete the
   of idle forever. The cost this ADR exists to remove.
 - **A bare `wake` basename.** Simpler matcher, but a stray `wake` file in a repo's cwd
   (recursively watched) would fire the hook. Rejected for `.mailbox-wake`.
-- **A `Stop`-liveness re-spawn hook.** Useful only if `watchPaths` do not persist or the
-  watcher dies; costs a per-turn spawn on working agents and does nothing for a truly
-  idle session. Deferred (additive) pending the smoke test.
+- **No `Stop`-liveness hook (the original ADR-0008 stance).** We first omitted it to
+  avoid a per-turn spawn on working agents, reasoning it does nothing for a truly-idle
+  session. **Revised: we SHIP it** (E′) as the PRIMARY recovery for a died watcher — the
+  per-turn spawn costs no model turn, and pushing recovery to the one place that also
+  covers an OS/OOM kill lets the watcher itself stay simple (no elaborate in-loop
+  self-healing). The truly-idle-forever case remains uncovered and is documented as an
+  accepted residual.
+- **A bulletproof, never-die watcher** (reopen the FIFO on any error and loop forever).
+  Rejected as gold-plating: with the Stop-liveness hook as the recovery path, the watcher
+  only needs EINTR-retry and a clean pidfile-removing exit; an elaborate reopen loop adds
+  risk (hot-spin modes) for a case the Stop hook already handles.
 - **Daemonize via double-fork.** Robust against re-acquiring a controlling terminal, but
   requires `unsafe`/`pre_exec` (the workspace denies `unsafe`). The watcher never opens
   a terminal, so `setsid`-on-startup (a safe `nix` call, no fork) is sufficient to

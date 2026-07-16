@@ -22,9 +22,12 @@ read the two hard rules below.
 
 1. **NEVER re-arm.** Do not run any arm/listen command after a wake. The
    `SessionStart` Claude Code hook (`mailbox harness session-start`) starts a
-   detached watcher that keeps you wakeable for the whole session. If you catch
-   yourself about to "re-arm listening," stop — it is already armed, and it stays
-   armed with no action from you.
+   detached watcher that keeps you wakeable for the whole session, and a `Stop`
+   hook (`mailbox harness ensure-watcher`) silently re-ensures it at every turn
+   boundary — so **just ending your turn is the correct, complete action**; it
+   keeps you armed. Ending your turn NEVER wakes you (the Stop hook exits 0, never
+   a wake). If you catch yourself about to "re-arm listening," stop — it is already
+   armed, and it stays armed with no action from you.
 2. **NEVER spawn a background poller.** Do not run `gh-watch.sh`, and do not
    background a `while true; gh …; sleep` loop or anything like it. To watch a
    PR, declare a `watch` — the bridge daemon owns and supervises the poller (one

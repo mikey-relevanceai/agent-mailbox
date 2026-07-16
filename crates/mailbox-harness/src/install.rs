@@ -1,11 +1,15 @@
 //! Emitting (and merging) the Claude Code `settings.json` hooks snippet.
 //!
-//! `install-hooks` wires the ADR-0008 on-demand wake loop with three hooks and NO
-//! periodic re-arm:
+//! `install-hooks` wires the ADR-0008 on-demand wake loop with four hooks and NO
+//! periodic re-arm WAKE (the `Stop` hook is a plain exit-0 liveness poke, never a wake):
 //!
 //! - `SessionStart` (matcher `startup`) runs `mailbox harness session-start`, a
 //!   plain synchronous hook: it registers the inbox, prints the `watchPaths`
 //!   registering this session's sentinel, and spawns the detached watcher.
+//! - `Stop` (matcher `""`) runs `mailbox harness ensure-watcher`, a plain synchronous
+//!   hook (NEVER asyncRewake): the pessimistic Stop-liveness net — respawn the detached
+//!   watcher iff it is dead, re-print watchPaths. It exits 0 always, so it is the
+//!   primary recovery for a died watcher without ever costing a model turn.
 //! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
 //!   as an `asyncRewake` hook with a `timeout` (seconds): when the watcher bumps the
 //!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
@@ -298,6 +302,14 @@ impl HookInstallSpec {
         format!("{} harness wake", self.mailbox_bin)
     }
 
+    /// The `ensure-watcher` hook command (`<bin> harness ensure-watcher`). The
+    /// `Stop`-liveness hook (ADR-0008): a plain, synchronous hook that respawns the
+    /// detached watcher iff it is dead and re-prints watchPaths. NOT asyncRewake — it
+    /// never wakes the session.
+    fn ensure_watcher_command(&self) -> String {
+        format!("{} harness ensure-watcher", self.mailbox_bin)
+    }
+
     /// The `cleanup` hook command string (`<bin> harness cleanup`).
     fn cleanup_command(&self) -> String {
         format!("{} harness cleanup", self.mailbox_bin)
@@ -306,12 +318,17 @@ impl HookInstallSpec {
 
 /// Build the `{ "hooks": { … } }` snippet for the ADR-0008 on-demand wake loop.
 ///
-/// Three hooks, and NO periodic re-arm (that is the whole point — it eliminates the
-/// spurious re-arm model turns of ADR-0006):
+/// Four hooks, and NO periodic re-arm WAKE (that is the whole point — it eliminates the
+/// spurious re-arm model turns of ADR-0006). The `Stop` hook is NOT a re-arm wake: it
+/// is a plain, exit-0 liveness poke.
 ///
 /// - `SessionStart` runs `session-start` (plain, synchronous): register the inbox,
 ///   print the `watchPaths` registering this session's sentinel, spawn the detached
-///   watcher. There is no `Stop` hook — an idle session needs no periodic re-arm.
+///   watcher.
+/// - `Stop` runs `ensure-watcher` (plain, synchronous, NEVER asyncRewake): the
+///   pessimistic Stop-liveness net (ADR-0008 FIX 3) — respawn the detached watcher iff
+///   it is dead, re-print watchPaths. It exits 0 always, so it costs a per-turn process
+///   spawn but NEVER a model turn. This is the primary recovery for a watcher that died.
 /// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
 ///   basename ([`WAKE_SENTINEL_BASENAME`]): when the watcher bumps the sentinel, this
 ///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
@@ -328,6 +345,16 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                 "hooks": [{
                     "type": "command",
                     "command": spec.session_start_command(),
+                }],
+            })],
+            // Stop fires at every turn boundary: a plain (NOT asyncRewake) liveness poke
+            // that respawns a dead watcher and re-prints watchPaths, exiting 0 always so
+            // it can never itself wake the session (ADR-0008 Stop-liveness).
+            "Stop": [json!({
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": spec.ensure_watcher_command(),
                 }],
             })],
             // FileChanged fires when the watcher bumps the sentinel. The matcher is
@@ -396,10 +423,11 @@ pub fn merge_into_settings(mut existing: Value, snippet: &Value) -> Value {
     let hooks = hooks.as_object_mut().expect("hooks is an object");
 
     // Pre-sweep: drop OUR hook groups from EVERY existing event, including ones the
-    // incoming snippet no longer writes. This is what makes an UPGRADE clean — the
-    // retired ADR-0006 `Stop` → arm hook lives on an event the ADR-0008 snippet does
-    // not touch, so without this pass the old exit-2 re-arm would keep firing. Only
-    // OUR groups are removed (foreign hooks are left exactly as they were).
+    // incoming snippet no longer writes. This is what makes an UPGRADE clean — a retired
+    // ADR-0006 `arm` hook on an event the current snippet writes differently (e.g. the
+    // `Stop` event now carries `ensure-watcher`, not the exit-2 `arm` re-arm) is removed
+    // here, so the old re-arm can never survive. Only OUR groups are removed (foreign
+    // hooks are left exactly as they were).
     for groups in hooks.values_mut() {
         if let Some(array) = groups.as_array_mut() {
             array.retain(|group| !is_our_group(group));
@@ -445,7 +473,12 @@ fn is_our_command(command: &str) -> bool {
             tokens.next(),
             // Current (ADR-0008) hooks, plus the retired `arm` so it is swept on
             // upgrade, plus `watch` for symmetry (never installed as a hook, but ours).
-            Some("session-start") | Some("wake") | Some("watch") | Some("arm") | Some("cleanup")
+            Some("session-start")
+                | Some("wake")
+                | Some("ensure-watcher")
+                | Some("watch")
+                | Some("arm")
+                | Some("cleanup")
         )
 }
 
@@ -755,10 +788,15 @@ mod tests {
             "session-start must NOT be asyncRewake"
         );
 
-        // There is NO periodic re-arm hook any more: the Stop → arm loop is gone.
+        // The Stop hook is the ADR-0008 Stop-liveness poke: `ensure-watcher`, plain
+        // (NOT asyncRewake, no timeout), so it can never itself wake the session.
+        let stop = &hooks["Stop"][0];
+        assert_eq!(stop["matcher"], "");
+        let ew = &stop["hooks"][0];
+        assert_eq!(ew["command"], "/opt/mailbox harness ensure-watcher");
         assert!(
-            hooks.get("Stop").is_none(),
-            "the ADR-0008 loop has no Stop re-arm hook"
+            ew.get("asyncRewake").is_none(),
+            "the Stop-liveness hook must NOT be asyncRewake (it never wakes)"
         );
 
         // FileChanged: matcher = the sentinel basename, asyncRewake wake with timeout.
@@ -1297,11 +1335,17 @@ mod tests {
         });
         let merged = merge_into_settings(old, &hooks_snippet(&spec()));
 
-        // The stale Stop → arm hook is swept (Stop is left empty, not carrying arm).
+        // The stale Stop → arm hook is swept and REPLACED by the Stop-liveness hook
+        // (ensure-watcher) — the retired exit-2 re-arm must not survive.
         let stop = hook_commands(&merged, "Stop");
         assert!(
             !stop.iter().any(|c| c.contains("harness arm")),
             "the retired arm hook must not survive an upgrade: {stop:?}"
+        );
+        assert_eq!(
+            stop,
+            vec!["/opt/mailbox harness ensure-watcher"],
+            "the Stop event now carries the ADR-0008 Stop-liveness hook: {stop:?}"
         );
         // SessionStart now runs session-start, FileChanged runs wake — the new loop.
         assert_eq!(
@@ -1339,6 +1383,7 @@ mod tests {
     fn our_commands_are_recognised_whatever_the_binary_path_or_flags() {
         assert!(is_our_command("/opt/mailbox harness session-start"));
         assert!(is_our_command("mailbox harness wake"));
+        assert!(is_our_command("mailbox harness ensure-watcher"));
         assert!(is_our_command("/a/b/c/mailbox harness cleanup"));
         // The retired `arm` is still recognised, so an upgrade sweeps it.
         assert!(is_our_command("/opt/mailbox harness arm --max-block-ms 1"));

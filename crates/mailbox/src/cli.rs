@@ -266,6 +266,9 @@ pub enum HarnessCommand {
     /// The detached per-session mail watcher (ADR-0008). Spawned by `session-start`;
     /// blocks on the FIFO and bumps the wake sentinel on real mail. Not run by hand.
     Watch(WatchSentinelArgs),
+    /// Stop hook (ADR-0008 Stop-liveness): re-print this session's `watchPaths` and
+    /// respawn the detached watcher IFF it is missing/dead. NEVER wakes (exit 0 always).
+    EnsureWatcher,
     /// SessionStart / Stop hook: launch a waiter IFF the session is subscribed.
     /// SUPERSEDED by `session-start` (ADR-0008); retained as a primitive.
     Arm(ArmArgs),
@@ -1145,12 +1148,15 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
         HarnessCommand::Cleanup => run_harness_cleanup().await,
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
         HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
-        // `wake` and `watch` are dispatched synchronously by `main` (they need no
-        // tokio runtime — `wake` is a read-only peek, `watch` is a blocking loop) and
-        // never reach here.
+        // `wake`, `watch`, and `ensure-watcher` are dispatched synchronously by `main`
+        // (they need no tokio runtime — `wake` is a read-only peek, `watch` is a
+        // blocking loop, `ensure-watcher` is a liveness poke) and never reach here.
         HarnessCommand::Wake => unreachable!("harness wake is handled synchronously in main"),
         HarnessCommand::Watch(_) => {
             unreachable!("harness watch is handled synchronously in main")
+        }
+        HarnessCommand::EnsureWatcher => {
+            unreachable!("harness ensure-watcher is handled synchronously in main")
         }
     }
 }
@@ -1949,6 +1955,16 @@ fn wait_debug_enabled() -> bool {
 /// The unread check is the read-only store, NOT the sentinel's contents: the store
 /// is authoritative (it also excludes the session's own authored events), so a wake
 /// can never fire for mail that is not really there.
+///
+/// **The store re-check is load-bearing for cross-session ISOLATION, not just
+/// anti-loop (ADR-0008 §Isolation).** The sentinel is a TRIGGER, never authority. When
+/// a session's cwd is an ancestor of `~/.mailbox` (e.g. `claude` launched from `$HOME`,
+/// which recursively watches the cwd), a bump to ANOTHER session's `.mailbox-wake`
+/// fires THIS session's `FileChanged` too — but this hook then re-checks THIS session's
+/// own unread from the store and finds none, so it exits 0 (no false wake). Isolation
+/// therefore comes from the per-session store re-check here, NOT from the sentinel
+/// path — a future change MUST NOT start trusting the sentinel's contents in place of
+/// this check, or session B's mail could wake session A.
 pub fn run_wake_hook() -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
@@ -2094,6 +2110,80 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `Stop` hook (ADR-0008 Stop-liveness): the pessimistic safety net that keeps a
+/// session's detached watcher alive across turns, and NEVER wakes.
+///
+/// It is the recovery mechanism for the two failure modes the detached watcher cannot
+/// self-heal:
+///
+/// 1. **A dead watcher.** If the watcher died (a crash, an OS/OOM kill, an
+///    unrecoverable FIFO error), a session that keeps taking turns re-spawns it here.
+///    It respawns only when the pidfile is missing or names a dead pid; a LIVE watcher
+///    is left untouched — and even a redundant spawn is free, because the loser loses
+///    the single-instance lock and exits `AlreadyWaiting` (exit 0).
+/// 2. **watchPath persistence.** It re-prints the `watchPaths` registration, defending
+///    the [UNDOCUMENTED] risk that a `SessionStart`-registered watchPath lapses over a
+///    long session.
+///
+/// It **never exits 2** (it is not an `asyncRewake` hook): it always exits 0, so a Stop
+/// can never itself wake the session. It needs no bridge socket — watcher liveness and
+/// watchPaths are both local — so it is fast and cannot be blocked by a down daemon.
+///
+/// The residual it does NOT cover (documented in ADR-0008): a session that goes idle
+/// **forever** — never another Stop — whose watcher then dies stays deaf until it next
+/// takes a turn or is restarted. That is the accepted limit of a zero-spurious-wake
+/// design; the OS service supervises the daemon, this hook supervises the watcher.
+pub fn run_ensure_watcher_hook() -> ExitCode {
+    let config = match StorageConfig::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("mailbox harness ensure-watcher: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let session = match HookInput::from_reader(std::io::stdin().lock()) {
+        Ok(input) => input.session_id,
+        Err(err) => {
+            eprintln!(
+                "mailbox harness ensure-watcher: could not read the Stop hook payload: {err}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Re-print the watchPaths registration (defends watchPath persistence across idle).
+    // A failure to resolve the sentinel root is logged but never fatal — the hook must
+    // still exit 0, and the watcher liveness check below is independent of it.
+    match Sentinel::for_session(&session) {
+        Ok(sentinel) => print_watch_paths(sentinel.path()),
+        Err(err) => error!(
+            session = %session.as_str(),
+            error = %err,
+            "ensure-watcher could not resolve the wake sentinel path; not re-printing watchPaths \
+             (the session still receives mail durably; set MAILBOX_SENTINEL_ROOT or a home)"
+        ),
+    }
+
+    // Ensure a detached watcher is alive; respawn only when it is missing or dead. A
+    // live watcher is left strictly alone (the respawn would lose the single-instance
+    // lock anyway, but skipping it avoids a needless per-turn process spawn).
+    if mailbox::wake::waiter_alive(&config.waiters_dir(), &session) {
+        info!(
+            session = %session.as_str(),
+            "ensure-watcher: a live watcher already holds the lock; leaving it (no-op)"
+        );
+    } else {
+        info!(
+            session = %session.as_str(),
+            "ensure-watcher: no live watcher; respawning the detached watcher"
+        );
+        spawn_detached_watcher(&session);
+    }
+
+    // ALWAYS exit 0 — a Stop-liveness hook must never wake the session.
+    ExitCode::SUCCESS
 }
 
 /// Convenience for `main`: turn the `--json` flag into an [`OutputFormat`].

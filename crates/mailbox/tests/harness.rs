@@ -1,11 +1,20 @@
 //! Claude Code harness integration tests (card 11), driving the REAL `mailbox`
 //! binary end to end WITHOUT a live Claude Code.
 //!
+//! **Scope note (ADR-0008).** A fresh `install-hooks` no longer installs the
+//! ADR-0006 `arm`/`Stop`-re-arm wake path — the on-demand detached watcher +
+//! `FileChanged` wake is the live default, and its end-to-end tests live in
+//! `tests/filechanged_wake.rs`. This file now covers the **retained manual `arm`
+//! primitive** (`mailbox harness arm` / `mailbox wait`, still tested but no longer
+//! wired into the snippet) plus the `install-hooks`/`cleanup` behaviour shared by
+//! both. The snippet assertions here therefore also pin the ADR-0008 hook set
+//! (`session-start` / `ensure-watcher` / `wake` / `cleanup`).
+//!
 //! Each test simulates the hook environment: it feeds the hook payload JSON on
 //! `mailbox harness arm` / `cleanup`'s stdin (exactly as Claude Code would) and
 //! runs everything against a real `mailbox serve` daemon in a tempdir. No agent
-//! ever runs an arm command — the hook launches the waiter, and the waiter's exit-2
-//! is what drives the next re-arm.
+//! ever runs an arm command — the hook launches the waiter, and (in the retained
+//! `arm` primitive) the waiter's exit-2 is what drives the next re-arm.
 //!
 //! Covered (the four acceptance criteria):
 //! - **AC1**: an idle *subscribed* session wakes (exit 2) on a publish, with no
@@ -699,6 +708,13 @@ fn cleanup_with_bridge_down_still_exits_zero() {
     let mut child = mailbox_command()
         .args(["harness", "cleanup"])
         .env("AGENT_MAILBOX_DB", &db_path)
+        // HERMETICITY: cleanup resolves + `remove_dir_all`s the session's ADR-0008
+        // sentinel dir. Without a tempdir root (and home) it would fall back to the REAL
+        // `$HOME/.mailbox/by-agent/s-cd` and delete it. Both env vars are pinned to the
+        // tempdir so a test can NEVER touch a real `~/.mailbox` (this spawns cleanup
+        // directly, bypassing the `Daemon::cleanup` helper that already sets these).
+        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+        .env("AGENT_MAILBOX_HOME", dir.path())
         .env("RUST_LOG", "error")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1130,7 +1146,21 @@ fn install_hooks_emits_valid_settings_snippet() {
             .unwrap()
             .contains("harness session-start")
     );
-    assert!(hooks.get("Stop").is_none(), "no periodic re-arm hook");
+    // The Stop hook is the ADR-0008 Stop-liveness poke (`ensure-watcher`): plain, NOT
+    // asyncRewake, so it re-ensures the watcher without ever waking the session. It is
+    // NOT the retired periodic re-arm.
+    let stop = &hooks["Stop"][0]["hooks"][0];
+    assert!(
+        stop["command"]
+            .as_str()
+            .unwrap()
+            .contains("harness ensure-watcher"),
+        "Stop must run the ensure-watcher liveness hook"
+    );
+    assert!(
+        stop.get("asyncRewake").is_none(),
+        "the Stop-liveness hook must NOT be asyncRewake (it never wakes)"
+    );
 
     let file_changed = &hooks["FileChanged"][0];
     assert_eq!(file_changed["matcher"], ".mailbox-wake");
@@ -1242,11 +1272,23 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
 
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
-    // The foreign Stop hook is on an event our snippet does not write, so it is left
-    // untouched (and alone — we never add a Stop hook).
+    // The foreign Stop hook survives, AND our Stop-liveness hook (ensure-watcher) is
+    // appended alongside it — the ADR-0008 snippet now writes a Stop hook (FIX 3), but
+    // it must never clobber a foreign one.
     let stop = merged["hooks"]["Stop"].as_array().unwrap();
-    assert_eq!(stop.len(), 1, "the foreign Stop hook survives untouched");
+    assert_eq!(
+        stop.len(),
+        2,
+        "the foreign Stop hook survives; ours is appended"
+    );
     assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
+    assert!(
+        stop[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("harness ensure-watcher"),
+        "our Stop-liveness hook is appended after the foreign one"
+    );
     // Our hooks landed on their own events.
     assert!(
         merged["hooks"]["SessionStart"][0]["hooks"][0]["command"]

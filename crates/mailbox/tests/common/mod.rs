@@ -443,6 +443,29 @@ impl Env {
         child.wait_with_output().expect("session-start output")
     }
 
+    /// Run `mailbox harness ensure-watcher` (the ADR-0008 Stop-liveness hook) for a
+    /// session, feeding the Stop hook JSON on stdin exactly as Claude Code would. As a
+    /// side effect it may spawn a DETACHED watcher (tracked by the [`LeakGuard`] via its
+    /// pidfile); reap it with `cleanup`. Returns its Output — stdout carries the
+    /// re-printed `watchPaths` registration; it must ALWAYS exit 0 (never a wake).
+    pub fn ensure_watcher(&self, session: &str) -> Output {
+        let mut child = mailbox_command()
+            .args(["harness", "ensure-watcher"])
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mailbox harness ensure-watcher");
+        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"Stop"}}"#);
+        let mut stdin = child.stdin.take().expect("ensure-watcher stdin");
+        stdin.write_all(payload.as_bytes()).expect("write payload");
+        drop(stdin);
+        child.wait_with_output().expect("ensure-watcher output")
+    }
+
     /// Spawn the detached watcher directly (`mailbox harness watch --session <id>`), for
     /// tests that exercise the watcher in isolation. Wrapped in [`ArmChild`] so a test
     /// panic can never leak the live watcher (its Drop kills + reaps it).
