@@ -49,14 +49,20 @@ in-place replacement, not a bug in the binary: the file is byte-identical and
 `codesign -v` reports it valid, yet the kernel kills it until the signature is
 refreshed.
 
-Fixes (any one works):
+**Best: use the install helper**, which does the safe thing every time (removes the
+old file for a fresh inode, then re-signs ad-hoc), so this never recurs:
 
 ```bash
-# refresh the ad-hoc signature in place (the reliable fix once it happens)
-codesign --force -s - ~/.local/bin/mailbox
+scripts/install-local.sh              # build --release + install to ~/.local/bin, safely
+SKIP_BUILD=1 scripts/install-local.sh # install an already-built target/release
+DEST=/usr/local/bin scripts/install-local.sh
+```
 
-# or install to a fresh inode so it can't happen (remove first, then copy)
-rm -f ~/.local/bin/mailbox && cp target/release/mailbox ~/.local/bin/mailbox
+If you already hit it with a hand-installed binary, either fix works on its own:
+
+```bash
+codesign --force -s - ~/.local/bin/mailbox                # re-sign in place
+rm -f ~/.local/bin/mailbox && cp target/release/mailbox ~/.local/bin/mailbox  # fresh inode
 ```
 
 Once we ship through the Homebrew tap, releases are properly signed and this does
