@@ -176,13 +176,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     let waker = Waker::new(config.waiters_dir());
     let bus = Bus::with_waker(storage.clone(), waker);
 
-    // 4. Fail-safe on restart: mark previously-running watches stopped and clear
-    //    their pids. We do NOT resume them — until a session-liveness probe
-    //    exists, a resumed poller could outlive every session that wanted it
-    //    (design/01 rule 6). A live session must re-`watch` to restart a poller.
-    reconcile_startup(&storage).await?;
-
-    // 5. Build the watch supervisor with the default resolver: a `stub` watch
+    // 4. Build the watch supervisor with the default resolver: a `stub` watch
     //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the
     //    real PR poller (card 10). The supervisor injects each watch's persisted
     //    baseline into the adapter's spawn config and relays the adapter's
@@ -193,6 +187,13 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         Arc::new(DefaultResolver::default()),
         RestartPolicy::default(),
     );
+
+    // 5. Reconcile the previous daemon's watches: resume the ones an alive session
+    //    still wants (proved by its watcher pidfile — ADR-0009's probe), stop the
+    //    rest. Must run AFTER the supervisor exists, since resuming spawns through
+    //    it. Under ADR-0008 an idle session takes zero turns and can never
+    //    re-`watch`, so a watch not resumed here stays dead for that session's life.
+    reconcile_startup(&storage, &supervisor, &config.waiters_dir()).await?;
 
     // 6. We hold the lock, so any leftover socket node is provably stale.
     let socket_path = config.socket_path();

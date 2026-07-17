@@ -496,6 +496,16 @@ impl Storage {
             .await
     }
 
+    /// The sessions holding an interest in `watch` — the startup reconcile's
+    /// liveness-probe candidates for that one watch (design/01 rule 6).
+    pub async fn list_watch_interest_sessions(
+        &self,
+        watch: WatchId,
+    ) -> Result<Vec<SessionId>, StorageError> {
+        self.call(|reply| Command::ListWatchInterestSessions { watch, reply })
+            .await
+    }
+
     /// Drop every interest whose `last_seen` is strictly older than `cutoff`
     /// (Unix millis), returning the watches whose interest thereby reached zero —
     /// the ones whose adapter the caller should now stop (design/01 reconcile /

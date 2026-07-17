@@ -837,6 +837,45 @@ async fn list_interest_sessions_is_distinct() {
     );
 }
 
+/// `list_watch_interest_sessions` returns the sessions interested in ONE watch,
+/// excluding sessions interested only in a different watch — the filter the
+/// startup reconcile and the Failed-retry rely on (ADR-0010/0011).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_watch_interest_sessions_filters_by_watch() {
+    let (storage, _dir) = fresh_store().await;
+    let (a, b) = (
+        storage.upsert_watch(watch_spec(41)).await.unwrap(),
+        storage.upsert_watch(watch_spec(42)).await.unwrap(),
+    );
+    let (only_a, both, only_b) = (
+        SessionId::new("only_a"),
+        SessionId::new("both"),
+        SessionId::new("only_b"),
+    );
+    storage
+        .add_interest(a, only_a.clone(), 1_000)
+        .await
+        .unwrap();
+    storage.add_interest(a, both.clone(), 1_000).await.unwrap();
+    storage.add_interest(b, both.clone(), 1_000).await.unwrap();
+    storage
+        .add_interest(b, only_b.clone(), 1_000)
+        .await
+        .unwrap();
+
+    let mut for_a = storage.list_watch_interest_sessions(a).await.unwrap();
+    for_a.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+    assert_eq!(
+        for_a,
+        vec![both.clone(), only_a],
+        "watch a's sessions only — `only_b` is excluded"
+    );
+
+    let mut for_b = storage.list_watch_interest_sessions(b).await.unwrap();
+    for_b.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+    assert_eq!(for_b, vec![both, only_b], "watch b's sessions only");
+}
+
 /// The TTL sweep drops interests older than the cutoff and reports the watches
 /// whose interest thereby reached zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

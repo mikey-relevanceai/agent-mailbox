@@ -15,7 +15,8 @@
 //! - AC3 last session leaves → child gone; zero further activity.
 //! - AC4 kill the adapter with interest > 0 → exactly one restart; N crashes →
 //!   give up + error event; interest 0 → stays stopped.
-//! - AC5 bridge restart with no live interested session → not resumed.
+//! - AC5 bridge restart: resumed iff an interested session's watcher is alive;
+//!   not resumed (and the stale pid cleared) when none is.
 //! - TTL sweeper drops a stale interest and stops the adapter.
 //!
 //! Flakiness discipline: poll with bounded timeouts (never fixed sleeps waiting
@@ -635,14 +636,15 @@ async fn clean_finite_exit_is_terminal_not_restarted() {
     supervisor.shutdown().await.unwrap();
 }
 
-// ---- AC5: bridge restart, no resume -------------------------------------------
+// ---- AC5: bridge restart, resume iff a live session wants it ------------------
 
-/// On bridge restart a previously-running watch is NOT resumed: reconcile marks
-/// it stopped and clears the pid, even though an interest row survives (there is
-/// no session-liveness probe yet, so the fail-safe is "do not resume").
+/// On bridge restart a previously-running watch whose interested session has NO
+/// live waiter is not resumed: reconcile marks it stopped and clears the pid, even
+/// though the interest row survives. The fail-safe half of design/01 rule 6 — an
+/// interest we cannot prove belongs to a live session gets no poller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ac5_bridge_restart_does_not_resume_watch() {
-    let (storage, dir) = fresh_storage().await;
+async fn ac5_bridge_restart_does_not_resume_watch_of_a_dead_session() {
+    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
 
     // Simulate the pre-restart state: a running watch with a surviving interest.
     let watch_id = storage
@@ -669,13 +671,15 @@ async fn ac5_bridge_restart_does_not_resume_watch() {
         .await
         .unwrap();
 
-    // Bridge restart.
-    reconcile_startup(&storage).await.unwrap();
+    // Bridge restart. `s1` has no pidfile in `dir`, so its waiter is not alive.
+    reconcile_startup(&storage, &supervisor, dir.path())
+        .await
+        .unwrap();
 
     assert_eq!(
         watch_state(&storage, watch_id).await,
         WatchState::Stopped,
-        "a previously-running watch is marked stopped, not resumed"
+        "a previously-running watch whose session has no live waiter is stopped, not resumed"
     );
     // The stored child_pid column is cleared to NULL (a Stopped watch carries no
     // pid — the storage model would reject a Stopped row that still had one).
@@ -689,12 +693,13 @@ async fn ac5_bridge_restart_does_not_resume_watch() {
     assert_eq!(storage.interest_count(watch_id).await.unwrap(), 1);
 }
 
-/// `reconcile_startup` touches ONLY previously-running watches: a mix of
-/// Desired/Running/Stopped leaves Desired and Stopped untouched and marks the
-/// Running one Stopped.
+/// With no live waiter to resume anything, `reconcile_startup` touches ONLY
+/// previously-running watches: a mix of Desired/Running/Stopped leaves Desired and
+/// Stopped untouched and marks the Running one Stopped. Desired carries no stale
+/// pid, so demoting it would be pure churn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconcile_startup_only_touches_running_watches() {
-    let (storage, _dir) = fresh_storage().await;
+    let (_bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
 
     let mk = |n: u64| mailbox::storage::WatchSpec {
         target: mailbox::storage::WatchTarget::GithubPr {
@@ -720,7 +725,9 @@ async fn reconcile_startup_only_touches_running_watches() {
         .await
         .unwrap();
 
-    reconcile_startup(&storage).await.unwrap();
+    reconcile_startup(&storage, &supervisor, _dir.path())
+        .await
+        .unwrap();
 
     assert_eq!(
         watch_state(&storage, desired).await,
@@ -737,6 +744,248 @@ async fn reconcile_startup_only_touches_running_watches() {
         WatchState::Stopped,
         "Stopped untouched"
     );
+}
+
+/// The regression: a daemon restart must RESUME the watch of a session whose
+/// watcher is still alive, rather than stopping it and waiting for a re-`watch`
+/// that ADR-0008 guarantees will never come.
+///
+/// Without the fix this fails at the final assert — reconcile marks the watch
+/// `Stopped` and no adapter is spawned, which is exactly the production failure of
+/// 2026-07-17: a restart stopped every PR poller, and the idle sessions holding
+/// those interests could not notice or recover, because the only event that would
+/// have given them a turn was the one the stopped poller would have published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_startup_resumes_a_watch_whose_session_has_a_live_waiter() {
+    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let s1 = SessionId::new("s1");
+
+    // The pre-restart state: a watch the previous daemon had running under a pid
+    // that died with it, and an interest that outlived it.
+    let watch_id = storage
+        .upsert_watch(mailbox::storage::WatchSpec {
+            target: mailbox::storage::WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 5,
+            },
+            interval: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+    storage
+        .set_watch_state(
+            watch_id,
+            WatchState::Running {
+                pid: mailbox::storage::Pid::new(999_999),
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch_id, s1.clone(), 1_000)
+        .await
+        .unwrap();
+
+    // A live watcher for s1: a pidfile naming THIS process, which `kill(pid, 0)`
+    // finds — the same probe ADR-0009 gave the TTL sweeper.
+    std::fs::write(
+        dir.path()
+            .join(format!("{}.waiter.pid", s1.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    reconcile_startup(&storage, &supervisor, dir.path())
+        .await
+        .unwrap();
+
+    let pid = poll_until("adapter resumed on restart", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    assert_ne!(
+        pid, 999_999,
+        "the resumed adapter must be a fresh child, not the previous daemon's dead pid"
+    );
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Running {
+            pid: mailbox::storage::Pid::new(pid)
+        },
+        "a watch whose interested session has a live waiter is resumed on restart"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The old no-resume path could leave a watch `Stopped` while an interest row
+/// survived — a state the model says cannot happen ("torn down, last interest
+/// gone"). `reconcile_startup`'s doc claims it HEALS that: a `Stopped` watch whose
+/// interested session is alive is resumed, not left in the contradictory state.
+/// This pins that heal path, which the Running-start tests do not exercise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_startup_resumes_a_stopped_watch_with_a_live_waiter() {
+    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let s1 = SessionId::new("s1");
+
+    // The inconsistent pre-restart state the old path itself created: Stopped, yet
+    // still holding a live interest.
+    let watch_id = storage
+        .upsert_watch(mailbox::storage::WatchSpec {
+            target: mailbox::storage::WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 5,
+            },
+            interval: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+    storage
+        .set_watch_state(watch_id, WatchState::Stopped)
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch_id, s1.clone(), 1_000)
+        .await
+        .unwrap();
+    std::fs::write(
+        dir.path()
+            .join(format!("{}.waiter.pid", s1.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    reconcile_startup(&storage, &supervisor, dir.path())
+        .await
+        .unwrap();
+
+    let pid = poll_until("stopped-with-interest watch resumed on restart", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Running {
+            pid: mailbox::storage::Pid::new(pid)
+        },
+        "a Stopped watch whose session is alive is healed back to Running, not left contradictory"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// design/01 rule 6 is "at least ONE interested session is still alive". A watch
+/// with two interested sessions — one dead, one alive — must still resume, so a
+/// future refactor to `.all(...)` or a first-match-only check is caught.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_startup_resumes_when_only_one_of_several_sessions_is_alive() {
+    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let dead = SessionId::new("dead");
+    let alive = SessionId::new("alive");
+
+    let watch_id = storage
+        .upsert_watch(mailbox::storage::WatchSpec {
+            target: mailbox::storage::WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 5,
+            },
+            interval: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+    storage
+        .set_watch_state(
+            watch_id,
+            WatchState::Running {
+                pid: mailbox::storage::Pid::new(999_999),
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch_id, dead.clone(), 1_000)
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch_id, alive.clone(), 1_000)
+        .await
+        .unwrap();
+    // Only `alive` has a live waiter pidfile; `dead` has none.
+    std::fs::write(
+        dir.path()
+            .join(format!("{}.waiter.pid", alive.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    reconcile_startup(&storage, &supervisor, dir.path())
+        .await
+        .unwrap();
+
+    poll_until("resumed because one of two sessions is alive", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    assert!(
+        matches!(
+            watch_state(&storage, watch_id).await,
+            WatchState::Running { .. }
+        ),
+        "one live session among several is enough to resume (design/01 rule 6)"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A `Failed` watch is left alone by `reconcile_startup` even when an interested
+/// session is alive: a restart is not evidence the adapter stopped crashing, so
+/// the give-up stands until the sweep retries it (ADR-0011) or a re-`watch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconcile_startup_leaves_a_failed_watch_alone() {
+    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let s1 = SessionId::new("s1");
+
+    let watch_id = storage
+        .upsert_watch(mailbox::storage::WatchSpec {
+            target: mailbox::storage::WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 5,
+            },
+            interval: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+    storage
+        .set_watch_state(watch_id, WatchState::Failed)
+        .await
+        .unwrap();
+    storage
+        .add_interest(watch_id, s1.clone(), 1_000)
+        .await
+        .unwrap();
+    // A live waiter — to prove liveness does NOT override the Failed skip.
+    std::fs::write(
+        dir.path()
+            .join(format!("{}.waiter.pid", s1.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    reconcile_startup(&storage, &supervisor, dir.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Failed,
+        "reconcile leaves a Failed watch alone even with a live interested session"
+    );
+    assert_eq!(supervisor.running_pid(watch_id).await, None);
+
+    supervisor.shutdown().await.unwrap();
 }
 
 /// Read the raw `child_pid` column for a watch straight from the DB file.

@@ -208,6 +208,12 @@ pub(crate) enum Command {
     ListInterestSessions {
         reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
     },
+    /// The sessions holding an interest in ONE watch — the startup reconcile's
+    /// liveness-probe candidates for that watch (design/01 rule 6).
+    ListWatchInterestSessions {
+        watch: WatchId,
+        reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
+    },
     /// Drop every interest whose `last_seen` is strictly older than `cutoff`,
     /// returning the watches whose interest thereby reached zero (the sweeper
     /// stops those adapters).
@@ -503,6 +509,13 @@ fn handle(conn: &mut Connection, cmd: Command) {
         Command::ListInterestSessions { reply } => {
             let result = do_list_interest_sessions(conn);
             log_on_err(&result, "list_interest_sessions", String::new);
+            let _ = reply.send(result);
+        }
+        Command::ListWatchInterestSessions { watch, reply } => {
+            let result = do_list_watch_interest_sessions(conn, watch);
+            log_on_err(&result, "list_watch_interest_sessions", || {
+                watch.get().to_string()
+            });
             let _ = reply.send(result);
         }
         Command::SweepStaleInterests { cutoff, reply } => {
@@ -1702,6 +1715,21 @@ fn do_touch_session_interests(
 fn do_list_interest_sessions(conn: &Connection) -> Result<Vec<SessionId>, StorageError> {
     let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM watch_interest")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(SessionId::new)
+        .collect())
+}
+
+/// The sessions holding an interest in one watch. The startup reconcile probes
+/// these for liveness to decide whether to resume that watch's adapter.
+fn do_list_watch_interest_sessions(
+    conn: &Connection,
+    watch: WatchId,
+) -> Result<Vec<SessionId>, StorageError> {
+    let mut stmt = conn.prepare("SELECT session_id FROM watch_interest WHERE watch_id = ?1")?;
+    let rows = stmt.query_map([watch.get()], |row| row.get::<_, String>(0))?;
     Ok(rows
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()

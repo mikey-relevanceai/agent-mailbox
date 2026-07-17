@@ -16,6 +16,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0007](0007-always-on-agent-inboxes.md) | Always-on agent inboxes (`agent.<session-id>`), discovery, and why `send` to an unregistered agent is an error | Accepted |
 | [0008](0008-on-demand-wake-filechanged.md) | On-demand wake: a detached per-session watcher bumps a central sentinel, a `FileChanged` hook wakes only on genuine mail — no periodic re-arm | Accepted; deaf-session "first suspect" **corrected by 0009** |
 | [0009](0009-interest-liveness-from-the-waiter-pidfile.md) | Interest liveness comes from the waiter pidfile, not a TTL clock — an idle session is silent by design, so silence cannot mean death | Accepted |
+| [0010](0010-resume-watches-on-restart.md) | A daemon restart resumes the watches of live sessions — "never resume" stopped being fail-safe once an idle session could no longer re-`watch` | Accepted |
 
 ## When to write one
 

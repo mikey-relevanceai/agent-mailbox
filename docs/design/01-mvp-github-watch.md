@@ -124,9 +124,13 @@ MVP rules:
    (explicit unwatch or SessionEnd), tear down the child and mark the watch
    stopped.
 6. **Bridge restart.** Resume a watch only if at least one interested session is
-   still alive; otherwise mark stopped. Exact session-liveness probe is
-   harness-specific; until we have one, default to **do not resume orphan
-   watches** (fail safe: missed events > zombie API load).
+   still alive; otherwise mark stopped (fail safe: missed events > zombie API
+   load). The session-liveness probe is the session's **watcher pidfile**
+   ([ADR-0009](../adr/0009-interest-liveness-from-the-waiter-pidfile.md)) — the
+   same signal the TTL sweeper trusts. **Resolved (ADR-0010):** this rule
+   originally deferred the probe and defaulted to "do not resume orphan watches";
+   that default stopped being fail-safe once ADR-0008 made an idle session take
+   zero turns, because the re-`watch` it assumed can never happen.
 7. **Adapter crash.** Bridge restarts with backoff **only while interest count
    > 0**; give up and surface an error event after N failures.
 8. **No agent-owned infinite bash.** Agents declare intent; they do not hold the
@@ -198,7 +202,8 @@ No `ipc-arm.sh` step.
    still woken on new edges.
 4. Last session unwatch / SessionEnd → child gone; no further API calls.
 5. Kill adapter process → one restart while interest > 0; stop when interest is 0.
-6. Bridge restart with no live interested sessions → watch not resumed (no zombie).
+6. Bridge restart with no live interested sessions → watch not resumed (no zombie);
+   with a live interested session (its watcher pidfile alive) → watch resumed.
 
 > **Card 12 status note — AUTOMATED.** All six scenarios above are now encoded as
 > the cross-component suite `crates/mailbox/tests/e2e.rs` (`scenario_1…6_*`),

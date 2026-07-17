@@ -32,12 +32,15 @@
 //! an error event on the entity's topic and marks the watch [`WatchState::Failed`].
 //! While interest is 0 an exit is just a clean stop.
 //!
-//! # Fail-safe on bridge restart (no orphan resume)
+//! # Bridge restart (resume iff a live session wants it)
 //!
-//! [`reconcile_startup`] marks every previously-`Running` watch `Stopped` and
-//! clears its pid on daemon start. It deliberately does **not** resume watches:
-//! until a session-liveness probe exists, missing some events beats resurrecting
-//! a poller nothing is listening to (design/01 rule 6).
+//! [`reconcile_startup`] restores the invariant on daemon start: it resumes a
+//! watch iff some session holding an interest in it has a live watcher pidfile
+//! (ADR-0009's probe), and marks the rest `Stopped`, clearing their stale pids.
+//! That is design/01 rule 6 as written — the rule always wanted this and only
+//! defaulted to "never resume" for want of a liveness probe. Resuming nothing is
+//! not a fail-safe under ADR-0008: an idle session takes zero turns, so it can
+//! never re-`watch`, and a restart left it deaf forever.
 //!
 //! # Dependencies (one-way)
 //!
@@ -298,24 +301,109 @@ impl Supervisor {
     }
 }
 
-/// On daemon startup, mark every previously-`Running` watch `Stopped` and clear
-/// its child pid. **Does not resume** watches (design/01 rule 6): until a
-/// session-liveness probe exists, a resumed poller could outlive every session
-/// that wanted it, so the fail-safe is to require a live session to re-`watch`.
-pub async fn reconcile_startup(storage: &Storage) -> Result<(), StorageError> {
+/// On daemon startup, restore the invariant *an adapter runs iff a live session
+/// wants it* — resuming the watches whose interest belongs to a session that is
+/// still alive, and stopping the rest.
+///
+/// # Why this resumes at all (design/01 rule 6, unblocked)
+///
+/// Rule 6 is "resume a watch only if at least one interested session is still
+/// alive", but it deferred: "exact session-liveness probe is harness-specific;
+/// until we have one, default to do not resume orphan watches". So this used to
+/// mark EVERY previously-running watch `Stopped` and resume nothing, on the
+/// reasoning that a live session would simply re-`watch`.
+///
+/// ADR-0008 removed that escape hatch. An idle session takes **zero** turns until
+/// real mail arrives, so it will never re-`watch` — and the only event that could
+/// make it take a turn is the one the stopped poller would have published. A
+/// daemon restart therefore left every idle watcher permanently deaf, holding a
+/// live `interest` against a dead adapter, with nothing in the system able to
+/// notice. Observed in production (2026-07-17): a restart stopped all four PR
+/// pollers; three had live sessions still waiting on them.
+///
+/// [ADR-0009](../../docs/adr/0009-interest-liveness-from-the-waiter-pidfile.md)
+/// supplies the probe rule 6 was waiting for: a session is alive iff its detached
+/// watcher's pidfile names a live process ([`waiter_alive`]) — the same signal the
+/// TTL sweeper now trusts, and the same one that is reaped at `SessionEnd`. Rule
+/// 6's condition is therefore now decidable, and this implements it as written.
+///
+/// # What it does
+///
+/// A watch is resumed iff some session holding an interest in it has a live
+/// waiter. That covers both a watch left `Running` by the previous daemon and one
+/// left `Stopped` **with interest still attached** — an inconsistent state that
+/// the old no-resume path itself created, and which would otherwise never heal,
+/// since `Stopped` means "torn down, last interest gone" and this contradicts it.
+///
+/// A watch left `Running` that is NOT resumed is marked `Stopped`, clearing the
+/// previous daemon's stale pid — the unchanged fail-safe: an interest whose
+/// session cannot be proven alive gets no poller, so a dead session's watch cannot
+/// resurrect a zombie API-poller. The TTL sweeper reclaims the leftover interest.
+/// A `Desired` watch is left alone when it is not resumed: it carries no stale pid
+/// to clear, so demoting it would be churn.
+///
+/// [`WatchState::Failed`] is left alone: it means the supervisor exhausted its
+/// restart budget and gave up, and a daemon restart is not evidence the adapter
+/// stopped crashing. Re-`watch` is the deliberate way back.
+///
+/// A false positive from `waiter_alive` (PID reuse — see its docs) costs one
+/// adapter that the TTL sweep then reclaims once the pidfile ages out. That is
+/// strictly the cheaper error: the failure this replaces was silent, permanent
+/// deafness.
+pub async fn reconcile_startup(
+    storage: &Storage,
+    supervisor: &Supervisor,
+    waiters_dir: &Path,
+) -> Result<(), SupervisorError> {
     for watch in storage.list_watches().await? {
-        if let WatchState::Running { pid } = watch.state {
+        if matches!(watch.state, WatchState::Failed) {
+            // Left alone by design (a restart is not evidence the adapter stopped
+            // crashing). Logged so "what did reconcile do to watch X" is answerable.
+            debug!(
+                watch = watch.id.get(),
+                "left a failed watch alone during startup reconcile"
+            );
+            continue;
+        }
+
+        let sessions = storage.list_watch_interest_sessions(watch.id).await?;
+        let live = sessions.iter().any(|s| waiter_alive(waiters_dir, s));
+
+        if live {
+            // `ensure_running` owns the state transition (and is idempotent), so
+            // the stale pid is replaced by the new child's rather than cleared.
+            supervisor.ensure_running(watch.id).await?;
+            info!(
+                watch = watch.id.get(),
+                kind = watch.target.kind().as_str(),
+                repo = %watch.target.repo_column(),
+                pr = watch.target.pr_column(),
+                interested = sessions.len(),
+                "resumed watch on startup; an interested session's watcher is alive (design/01 rule 6)"
+            );
+        } else if let WatchState::Running { pid } = watch.state {
+            // Write the state first, then log what happened — never log the write
+            // as if it had already succeeded.
+            storage
+                .set_watch_state(watch.id, WatchState::Stopped)
+                .await?;
             warn!(
                 watch = watch.id.get(),
                 kind = watch.target.kind().as_str(),
                 repo = %watch.target.repo_column(),
                 pr = watch.target.pr_column(),
                 pid = pid.get(),
-                "did not resume previously-running watch on startup (no session-liveness probe); marking stopped"
+                interested = sessions.len(),
+                "stopped a watch on startup; no interested session has a live watcher (cleared its stale pid)"
             );
-            storage
-                .set_watch_state(watch.id, WatchState::Stopped)
-                .await?;
+        } else {
+            // Desired / already-Stopped and not live: carries no stale pid, so it is
+            // left alone. Logged so the no-op is not a blind spot.
+            debug!(
+                watch = watch.id.get(),
+                state = ?watch.state,
+                "left watch alone during startup reconcile (not resumed; no stale pid to clear)"
+            );
         }
     }
     Ok(())
