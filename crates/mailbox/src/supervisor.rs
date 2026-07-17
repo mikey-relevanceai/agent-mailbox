@@ -49,6 +49,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +69,7 @@ use crate::host::{AdapterConfig, AdapterExit, AdapterHost, BaselineSink};
 use crate::storage::{
     Pid, Storage, StorageError, Watch, WatchId, WatchKind, WatchState, WatchTarget,
 };
+use crate::wake::waiter_alive;
 
 /// Capacity of the supervisor command channel. Commands are small; a modest
 /// buffer absorbs a burst of watch/unwatch ops plus monitor exit reports without
@@ -235,13 +237,22 @@ impl Supervisor {
         .await
     }
 
-    /// Run one TTL sweep: drop interests whose last-seen is older than `ttl` and
+    /// Run one TTL sweep: refresh the interests of every session with a live
+    /// waiter under `waiters_dir`, drop the interests left older than `ttl`, and
     /// stop any adapter whose interest thereby reached zero. Returns the watches
     /// that were swept to zero.
-    pub async fn sweep(&self, ttl: Duration) -> Result<Vec<WatchId>, SupervisorError> {
+    pub async fn sweep(
+        &self,
+        ttl: Duration,
+        waiters_dir: impl Into<PathBuf>,
+    ) -> Result<Vec<WatchId>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Sweep { ttl, reply })
+            .send(Command::Sweep {
+                ttl,
+                waiters_dir: waiters_dir.into(),
+                reply,
+            })
             .await
             .map_err(|_| SupervisorError::Gone)?;
         rx.await.map_err(|_| SupervisorError::Gone)?
@@ -387,6 +398,10 @@ enum Command {
     },
     Sweep {
         ttl: Duration,
+        /// Where the per-session waiter pidfiles live — the sweep's liveness
+        /// evidence. Passed per-call for the same reason `ttl` is: it is the
+        /// caller's policy input, not supervisor state.
+        waiters_dir: PathBuf,
         reply: oneshot::Sender<Result<Vec<WatchId>, SupervisorError>>,
     },
     RunningPid {
@@ -470,8 +485,12 @@ impl Actor {
                         error!(watch = watch_id.get(), error = %err, "supervisor restart failed");
                     }
                 }
-                Command::Sweep { ttl, reply } => {
-                    let result = self.sweep(ttl).await;
+                Command::Sweep {
+                    ttl,
+                    waiters_dir,
+                    reply,
+                } => {
+                    let result = self.sweep(ttl, &waiters_dir).await;
                     let _ = reply.send(result);
                 }
                 Command::RunningPid { watch_id, reply } => {
@@ -908,10 +927,49 @@ impl Actor {
         Ok(())
     }
 
-    /// Sweep stale interests and stop the adapter of any watch swept to zero.
-    async fn sweep(&mut self, ttl: Duration) -> Result<Vec<WatchId>, SupervisorError> {
+    /// Refresh the interests of every session whose waiter is still alive, then
+    /// sweep what is left stale and stop the adapter of any watch swept to zero.
+    ///
+    /// The refresh pass is what makes the TTL safe (ADR-0009). Under ADR-0008 an
+    /// idle session is SILENT by design — zero turns, zero requests — so silence
+    /// carries no information about whether it is alive, and a TTL keyed on the
+    /// session's own traffic reaps exactly the healthy idle sessions ADR-0008
+    /// exists to enable. Liveness therefore comes from the one artefact that
+    /// tracks the session rather than its chatter: the detached watcher's pidfile,
+    /// which exists for as long as the session is wakeable and is reaped at
+    /// `SessionEnd`. Probing it here (a `kill(pid, 0)` — no agent cooperation, no
+    /// timer in the harness, no model turn) makes the invariant *an interest lives
+    /// iff its session's watcher lives*, and leaves the TTL as what it was always
+    /// documented to be: the backstop for a session that hard-died without a
+    /// `SessionEnd`.
+    ///
+    /// The TTL doubles as the grace period for a transiently-absent pidfile — the
+    /// spawn race, and ADR-0008's exit-window respawn transient. Because the sweep
+    /// interval is far shorter than the TTL, a session gets many probes before it
+    /// can age out, so a single missed probe can never reap a live watch.
+    async fn sweep(
+        &mut self,
+        ttl: Duration,
+        waiters_dir: &Path,
+    ) -> Result<Vec<WatchId>, SupervisorError> {
+        let now = now_millis();
+        for session in self.storage.list_interest_sessions().await? {
+            if waiter_alive(waiters_dir, &session) {
+                let refreshed = self
+                    .storage
+                    .touch_session_interests(session.clone(), now)
+                    .await?;
+                debug!(
+                    session = session.as_str(),
+                    refreshed, "refreshed a live session's interests"
+                );
+            }
+        }
+
+        // Cutoff from the same `now` the refresh stamped, so a just-refreshed
+        // interest can never be older than it.
         let ttl_millis = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
-        let cutoff = now_millis().saturating_sub(ttl_millis);
+        let cutoff = now.saturating_sub(ttl_millis);
         let emptied = self.storage.sweep_stale_interests(cutoff).await?;
         for &watch_id in &emptied {
             info!(

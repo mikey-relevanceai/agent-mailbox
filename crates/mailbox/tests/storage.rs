@@ -770,6 +770,73 @@ async fn touch_interest_is_a_no_op_without_a_row() {
     );
 }
 
+/// `touch_session_interests` refreshes ALL of a session's interests in one call
+/// (the sweeper's per-session heartbeat, ADR-0009) and, like `touch_interest`,
+/// never resurrects a dropped one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn touch_session_interests_refreshes_every_watch_the_session_holds() {
+    let (storage, _dir) = fresh_store().await;
+    let (a, b) = (
+        storage.upsert_watch(watch_spec(21)).await.unwrap(),
+        storage.upsert_watch(watch_spec(22)).await.unwrap(),
+    );
+    let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+
+    // s1 holds two interests; s2 holds one on the same watch as s1.
+    storage.add_interest(a, s1.clone(), 1_000).await.unwrap();
+    storage.add_interest(b, s1.clone(), 1_000).await.unwrap();
+    storage.add_interest(b, s2.clone(), 1_000).await.unwrap();
+
+    let refreshed = storage
+        .touch_session_interests(s1.clone(), 9_000)
+        .await
+        .unwrap();
+    assert_eq!(refreshed, 2, "both of s1's interests are refreshed at once");
+
+    // A cutoff above the original stamp sweeps only s2's un-refreshed interest —
+    // and watch `a` survives because s1's refresh spared it.
+    let emptied = storage.sweep_stale_interests(5_000).await.unwrap();
+    assert_eq!(emptied, vec![], "no watch is emptied: s1 still holds both");
+    assert_eq!(storage.interest_count(a).await.unwrap(), 1);
+    assert_eq!(
+        storage.interest_count(b).await.unwrap(),
+        1,
+        "s2's stale interest is gone; s1's refreshed one remains"
+    );
+
+    // A session holding nothing is a no-op, not an error or a resurrection.
+    let refreshed = storage
+        .touch_session_interests(SessionId::new("ghost"), 9_000)
+        .await
+        .unwrap();
+    assert_eq!(refreshed, 0);
+}
+
+/// `list_interest_sessions` reports each interested session once, however many
+/// watches it holds — the sweeper probes a session's waiter, not its watches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_interest_sessions_is_distinct() {
+    let (storage, _dir) = fresh_store().await;
+    let (a, b) = (
+        storage.upsert_watch(watch_spec(31)).await.unwrap(),
+        storage.upsert_watch(watch_spec(32)).await.unwrap(),
+    );
+    assert!(storage.list_interest_sessions().await.unwrap().is_empty());
+
+    let (s1, s2) = (SessionId::new("s1"), SessionId::new("s2"));
+    storage.add_interest(a, s1.clone(), 1_000).await.unwrap();
+    storage.add_interest(b, s1.clone(), 1_000).await.unwrap();
+    storage.add_interest(b, s2.clone(), 1_000).await.unwrap();
+
+    let mut sessions = storage.list_interest_sessions().await.unwrap();
+    sessions.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+    assert_eq!(
+        sessions,
+        vec![s1, s2],
+        "s1 appears once despite two watches"
+    );
+}
+
 /// The TTL sweep drops interests older than the cutoff and reports the watches
 /// whose interest thereby reached zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

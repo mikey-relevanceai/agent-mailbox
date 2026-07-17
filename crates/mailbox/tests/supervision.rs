@@ -755,9 +755,12 @@ fn raw_child_pid(db_dir: &std::path::Path, watch_id: WatchId) -> Option<i64> {
 /// A fresh interest is not swept; a stale one is, and its adapter is stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
-    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let (bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(6);
     let s1 = SessionId::new("s1");
+    // An empty waiters dir: s1 has no pidfile, so the sweep's liveness probe finds
+    // no live waiter and the TTL alone decides — which is what this test drives.
+    let waiters = dir.path();
 
     record(
         &bus,
@@ -777,7 +780,10 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     .await;
 
     // A fresh interest (last-seen stamped at `record`) is NOT stale under a 1s TTL.
-    let swept = supervisor.sweep(Duration::from_secs(1)).await.unwrap();
+    let swept = supervisor
+        .sweep(Duration::from_secs(1), waiters)
+        .await
+        .unwrap();
     assert!(swept.is_empty(), "a fresh interest must not be swept");
     assert_eq!(supervisor.running_pid(watch_id).await, Some(pid));
     assert!(pid_alive(pid));
@@ -785,7 +791,10 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     // Backdate the interest's last-seen so it is now stale, then sweep.
     let old = mailbox::clock::now_millis() - 10_000;
     storage.touch_interest(watch_id, s1, old).await.unwrap();
-    let swept = supervisor.sweep(Duration::from_secs(1)).await.unwrap();
+    let swept = supervisor
+        .sweep(Duration::from_secs(1), waiters)
+        .await
+        .unwrap();
     assert_eq!(swept, vec![watch_id], "the stale interest's watch is swept");
 
     assert_pid_reaped(pid).await;
@@ -795,6 +804,96 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     })
     .await;
     assert_eq!(supervisor.running_pid(watch_id).await, None);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// REGRESSION (ADR-0009). A session whose watcher is ALIVE must survive a sweep no
+/// matter how long ago it last spoke to the bridge.
+///
+/// Under ADR-0008 an idle session is silent by design — it takes zero turns and
+/// makes zero requests until real mail arrives — so its `last_seen` never advances
+/// on its own. A TTL keyed on the session's own traffic therefore reaped exactly
+/// the healthy idle sessions ADR-0008 exists to enable, killing the adapter under a
+/// live watcher and leaving the session silently deaf (its bus subscription
+/// survived, so `subscribe` still answered "already subscribed" while no adapter
+/// existed to produce events). The sweep now probes the waiter pidfile, so liveness
+/// comes from the watcher's existence rather than the agent's chatter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ttl_sweeper_spares_a_live_waiter_however_stale_its_last_seen() {
+    let (bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(7);
+    let s1 = SessionId::new("s1");
+    let waiters = dir.path();
+
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let pid = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+
+    // A live watcher: a pidfile naming THIS process, which `kill(pid, 0)` finds.
+    std::fs::write(
+        waiters.join(format!("{}.waiter.pid", s1.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    // Backdate last-seen far past the TTL — the exact state an idle-but-live
+    // session reaches on its own, since nothing but `watch` ever stamps it.
+    let ancient = mailbox::clock::now_millis() - 10_000;
+    storage
+        .touch_interest(watch_id, s1.clone(), ancient)
+        .await
+        .unwrap();
+
+    let swept = supervisor
+        .sweep(Duration::from_secs(1), waiters)
+        .await
+        .unwrap();
+    assert!(
+        swept.is_empty(),
+        "a session with a live waiter must never be swept, however stale its last-seen"
+    );
+    assert_eq!(
+        supervisor.running_pid(watch_id).await,
+        Some(pid),
+        "the adapter must still be running under a live watcher"
+    );
+    assert!(pid_alive(pid));
+
+    // The sweep refreshed it rather than merely skipping it, so the next sweep is
+    // decided by fresh evidence and not by the stale stamp we planted.
+    let swept = supervisor
+        .sweep(Duration::from_secs(1), waiters)
+        .await
+        .unwrap();
+    assert!(swept.is_empty(), "the refresh must persist across sweeps");
+
+    // Once the watcher is gone, the TTL backstop reclaims the watch as before.
+    std::fs::remove_file(waiters.join(format!("{}.waiter.pid", s1.encode_filename()))).unwrap();
+    storage.touch_interest(watch_id, s1, ancient).await.unwrap();
+    let swept = supervisor
+        .sweep(Duration::from_secs(1), waiters)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept,
+        vec![watch_id],
+        "with the watcher gone the stale interest is swept"
+    );
+    assert_pid_reaped(pid).await;
 
     supervisor.shutdown().await.unwrap();
 }

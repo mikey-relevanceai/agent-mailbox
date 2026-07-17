@@ -451,10 +451,11 @@ impl Storage {
         .await
     }
 
-    /// Refresh an existing interest's `last_seen` (the heartbeat/touch path for
-    /// card 08's TTL sweeper; card 11 wires the harness heartbeat). A no-op if
-    /// `session` is not interested in `watch` — the heartbeat must not resurrect a
-    /// dropped interest.
+    /// Refresh one interest's `last_seen`. A no-op if `session` is not interested
+    /// in `watch` — a heartbeat must not resurrect a dropped interest.
+    ///
+    /// The sweeper heartbeats whole sessions via [`Self::touch_session_interests`];
+    /// this single-watch variant is for callers that hold one specific interest.
     pub async fn touch_interest(
         &self,
         watch: WatchId,
@@ -468,6 +469,31 @@ impl Storage {
             reply,
         })
         .await
+    }
+
+    /// Refresh every interest held by `session`, returning how many were
+    /// refreshed. The daemon-side liveness heartbeat (ADR-0009): the sweeper
+    /// calls this for each session whose waiter pidfile it finds alive, which is
+    /// what keeps a live-but-silent session's watch out of the TTL sweep. A no-op
+    /// for a session holding no interests.
+    pub async fn touch_session_interests(
+        &self,
+        session: SessionId,
+        last_seen: i64,
+    ) -> Result<u64, StorageError> {
+        self.call(|reply| Command::TouchSessionInterests {
+            session,
+            last_seen,
+            reply,
+        })
+        .await
+    }
+
+    /// Every distinct session holding at least one interest — the sweeper's
+    /// liveness-probe candidates.
+    pub async fn list_interest_sessions(&self) -> Result<Vec<SessionId>, StorageError> {
+        self.call(|reply| Command::ListInterestSessions { reply })
+            .await
     }
 
     /// Drop every interest whose `last_seen` is strictly older than `cutoff`

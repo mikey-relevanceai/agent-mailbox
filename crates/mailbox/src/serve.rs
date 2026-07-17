@@ -105,10 +105,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// without a `SessionEnd`/`unwatch` (design/01 reconcile row).
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Interests older than this are swept. Generous by default: a live session
-/// refreshes its last-seen on `watch` and (card 11) via the harness heartbeat, so
-/// an interest only ages out once a session has genuinely gone away without
-/// saying so. Missing a slow cleanup beats dropping a live session's watch.
+/// Interests older than this are swept. The sweeper refreshes the last-seen of
+/// every session whose waiter pidfile is alive (ADR-0009), so an interest only
+/// ages out once the session's watcher has been gone for the whole TTL — i.e.
+/// once the session has genuinely died without a `SessionEnd`. Generous by
+/// design: it doubles as the grace period for a transiently-absent pidfile, and
+/// missing a slow cleanup beats dropping a live session's watch.
 const DEFAULT_INTEREST_TTL: Duration = Duration::from_secs(3600);
 
 /// Runtime-tunable daemon limits. Defaults are the constants above; each may be
@@ -207,8 +209,10 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     );
 
     // 7. Periodically sweep stale interests so a hard-killed session's watch is
-    //    reconciled and its adapter stopped when its interest hits zero.
-    let sweeper = spawn_sweeper(supervisor.clone());
+    //    reconciled and its adapter stopped when its interest hits zero. The
+    //    sweep probes waiter pidfiles for liveness first, so a live-but-silent
+    //    session is never swept out from under itself (ADR-0009).
+    let sweeper = spawn_sweeper(supervisor.clone(), config.waiters_dir());
 
     // 8. Serve until a shutdown signal, capping concurrent handlers.
     let ctx = Ctx {
@@ -240,7 +244,11 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 /// Spawn the periodic TTL sweeper. Env overrides (`MAILBOX_SWEEP_INTERVAL_MS`,
 /// `MAILBOX_INTEREST_TTL_MS`) let tests drive it fast; production uses the
 /// generous defaults so a live session's watch is never swept out from under it.
-fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
+///
+/// The interval must stay well below the TTL: the sweep is also the liveness
+/// refresh, so a session needs several probes inside one TTL window for a single
+/// missed probe to be harmless.
+fn spawn_sweeper(supervisor: Supervisor, waiters_dir: PathBuf) -> tokio::task::JoinHandle<()> {
     let interval = env_var("MAILBOX_SWEEP_INTERVAL_MS")
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_SWEEP_INTERVAL);
@@ -250,7 +258,7 @@ fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match supervisor.sweep(ttl).await {
+            match supervisor.sweep(ttl, waiters_dir.clone()).await {
                 Ok(swept) if !swept.is_empty() => {
                     info!(
                         count = swept.len(),

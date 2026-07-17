@@ -14,7 +14,8 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0005](0005-baseline-via-protocol.md) | Edge-triggered adapter baseline persists via the protocol (config in, `Baseline` out) | Accepted |
 | [0006](0006-harness-self-respawn.md) | Harness wake loop: the re-arm exit (execv does NOT reset the hook timeout), waiter-owned pidfile after the lock, stale-pidfile reap, arm-iff-subscribed | Accepted; periodic re-arm **superseded by 0008** |
 | [0007](0007-always-on-agent-inboxes.md) | Always-on agent inboxes (`agent.<session-id>`), discovery, and why `send` to an unregistered agent is an error | Accepted |
-| [0008](0008-on-demand-wake-filechanged.md) | On-demand wake: a detached per-session watcher bumps a central sentinel, a `FileChanged` hook wakes only on genuine mail — no periodic re-arm | Accepted |
+| [0008](0008-on-demand-wake-filechanged.md) | On-demand wake: a detached per-session watcher bumps a central sentinel, a `FileChanged` hook wakes only on genuine mail — no periodic re-arm | Accepted; deaf-session "first suspect" **corrected by 0009** |
+| [0009](0009-interest-liveness-from-the-waiter-pidfile.md) | Interest liveness comes from the waiter pidfile, not a TTL clock — an idle session is silent by design, so silence cannot mean death | Accepted |
 
 ## When to write one
 

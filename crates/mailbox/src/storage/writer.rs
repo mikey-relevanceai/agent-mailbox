@@ -188,13 +188,25 @@ pub(crate) enum Command {
         last_seen: i64,
         reply: oneshot::Sender<Result<u64, StorageError>>,
     },
-    /// Refresh an existing interest's `last_seen` (the heartbeat/touch path, card
-    /// 08/11). A no-op if the interest row does not exist.
+    /// Refresh one interest's `last_seen`. A no-op if the interest row does not
+    /// exist.
     TouchInterest {
         watch: WatchId,
         session: SessionId,
         last_seen: i64,
         reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Refresh every interest held by `session` (the daemon-side liveness
+    /// heartbeat, ADR-0009). Returns the number of interests refreshed.
+    TouchSessionInterests {
+        session: SessionId,
+        last_seen: i64,
+        reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    /// Every distinct session holding at least one interest — the sweeper's
+    /// liveness-probe candidates.
+    ListInterestSessions {
+        reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
     },
     /// Drop every interest whose `last_seen` is strictly older than `cutoff`,
     /// returning the watches whose interest thereby reached zero (the sweeper
@@ -475,6 +487,22 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "touch_interest", || {
                 format!("watch={} session={}", watch.get(), session.as_str())
             });
+            let _ = reply.send(result);
+        }
+        Command::TouchSessionInterests {
+            session,
+            last_seen,
+            reply,
+        } => {
+            let result = do_touch_session_interests(conn, &session, last_seen);
+            log_on_err(&result, "touch_session_interests", || {
+                format!("session={}", session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::ListInterestSessions { reply } => {
+            let result = do_list_interest_sessions(conn);
+            log_on_err(&result, "list_interest_sessions", String::new);
             let _ = reply.send(result);
         }
         Command::SweepStaleInterests { cutoff, reply } => {
@@ -1649,6 +1677,36 @@ fn do_touch_interest(
         params![watch.get(), session.as_str(), last_seen],
     )?;
     Ok(())
+}
+
+/// Refresh every interest held by `session`, returning how many were refreshed.
+/// The daemon's liveness heartbeat (ADR-0009): the sweeper probes each session's
+/// waiter pidfile and calls this for the ones it finds alive, so `last_seen`
+/// means "when the daemon last had evidence this session existed" rather than
+/// "when the session last spoke to us". Like [`do_touch_interest`] it only ever
+/// UPDATEs — a heartbeat must not resurrect a dropped interest.
+fn do_touch_session_interests(
+    conn: &Connection,
+    session: &SessionId,
+    last_seen: i64,
+) -> Result<u64, StorageError> {
+    let refreshed = conn.execute(
+        "UPDATE watch_interest SET last_seen = ?2 WHERE session_id = ?1",
+        params![session.as_str(), last_seen],
+    )?;
+    Ok(refreshed as u64)
+}
+
+/// Every distinct session holding at least one interest. The sweeper probes these
+/// for liveness; a session with no interests needs no probe.
+fn do_list_interest_sessions(conn: &Connection) -> Result<Vec<SessionId>, StorageError> {
+    let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM watch_interest")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(SessionId::new)
+        .collect())
 }
 
 /// Drop every interest older than `cutoff`, returning the watches whose interest

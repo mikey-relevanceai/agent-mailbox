@@ -59,8 +59,17 @@ and only re-ensures watcher liveness; `watchPaths` registration stays in `Sessio
 One item remains [UNDOCUMENTED]: whether a `SessionStart`-registered `watchPath`
 persists for the whole session or must be refreshed. Because a `Stop` hook cannot
 re-register it (see the bug above), the design relies on it persisting — an accepted
-residual. If a long-idle session is ever observed going deaf, this is the first
-suspect.
+residual.
+
+> **Correction (2026-07-17, [ADR-0009](0009-interest-liveness-from-the-waiter-pidfile.md)).**
+> This section used to name the `watchPath` residual as "the first suspect" if a
+> long-idle session went deaf. The first real case of a session going deaf was NOT
+> this: it was the card-08 TTL sweeper reaping a LIVE session's watch interest,
+> because nothing ever refreshed `last_seen` and this ADR's zero-idle-turn design
+> guarantees an idle session never would. The sweeper logs `swept stale watch
+> interests` when it acts — **check the bridge log for that line before suspecting
+> `watchPath`.** ADR-0009 fixes the sweeper; the `watchPath` residual above stands
+> but is unproven and no longer the leading suspect.
 
 ## Decision
 
@@ -237,7 +246,9 @@ green machinery test surface for no functional gain. A later card may delete the
     orphaned watcher via its pidfile when it sweeps that session's stale subscription —
     not done here because it is cross-cutting (the sweeper lives in the daemon and would
     need the waiters-dir/pidfile scheme) and the Stop hook already covers the realistic
-    cases.
+    cases. **(Update, ADR-0009: the sweeper now HAS the waiters-dir/pidfile scheme — it
+    probes those pidfiles for liveness on every pass — so the cross-cutting objection is
+    gone and this fix is now a small step if the window is ever observed biting.)**
   - **Exit-window respawn transient.** On exit the watcher removes its pidfile while it
     STILL holds the single-instance lock (deliberate: removing under the lock is what
     stops it from ever deleting a *different*, freshly-armed watcher's pidfile). In the
@@ -265,8 +276,10 @@ green machinery test surface for no functional gain. A later card may delete the
     CANNOT re-register it (that is a `SessionStart`-only output — emitting it from a Stop
     fails Claude Code's event-name check, a bug we hit and fixed). So the design relies on
     the `SessionStart` registration persisting for the session's life; if it lapses, a
-    long-idle session could go deaf with nothing to re-register it. This is the first
-    suspect if a long-idle session is ever observed missing mail.
+    long-idle session could go deaf with nothing to re-register it. **This was originally
+    called the first suspect for a deaf session; ADR-0009 corrects that** — the first
+    observed deafness was the TTL sweeper reaping a live interest. Check the bridge log
+    for `swept stale watch interests` before suspecting this.
 
 ## Alternatives considered
 
