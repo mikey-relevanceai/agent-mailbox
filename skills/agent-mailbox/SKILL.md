@@ -2,7 +2,7 @@
 name: agent-mailbox
 description: >-
   Wake this idle Claude Code agent when the world changes — a watched GitHub PR
-  gains a merge conflict, a review, or a CI failure — or message a PEER AGENT
+  is merged, gains a merge conflict, a review, or a CI failure — or message a PEER AGENT
   directly and wake it in its own session (`mailbox agents` to find it, `mailbox
   send` to poke it). Replaces the older agent-ipc / agent-ipc-github skills. Use
   when the agent should go idle (or do other work) and be nudged to react to an
@@ -69,8 +69,9 @@ mailbox watch github-pr OWNER/REPO#NUMBER
 
 This records your interest, subscribes you to the PR topic, and (via the daemon)
 starts the shared edge-triggered poller. It baselines on its first poll and then
-publishes only **transitions**: merge conflict, new review / review-thread / PR
-comment, or CI rollup going red. Then **go idle or do other work** — do not poll.
+publishes only **transitions**: the PR being merged, a merge conflict, a new
+review / review-thread / PR comment, or CI rollup going red. Then **go idle or do
+other work** — do not poll.
 
 ### Subscribe to a custom topic
 

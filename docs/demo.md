@@ -161,6 +161,8 @@ local stack can stand in for.
    arm command — that is the whole point.
 
 4. **Trigger an edge** on the PR (any one of these):
+   - **Merge** — merge the PR, so GitHub flips its state to `MERGED` (the edge
+     fires once and is terminal).
    - **Merge conflict** — push a commit to the PR's base branch that conflicts
      with the PR, so GitHub flips it to `CONFLICTING`.
    - **Review** — request changes / leave a review or a review-thread comment.
@@ -179,11 +181,12 @@ local stack can stand in for.
    ```
 
    The body is a small, opaque label plus the deltas that fired it — e.g.
-   `"edge":"mergeable_conflicting"` for a conflict, `"edge":"new_reviews"` with
-   `previous_max_id`/`current_max_id` for a review, or `"edge":"ci_failure"`
-   with `"rollup":"failure"` and a `newly_failed` list of check names for CI.
+   `"edge":"pr_merged"` when the PR merges, `"edge":"mergeable_conflicting"` for a
+   conflict, `"edge":"new_reviews"` with `previous_max_id`/`current_max_id` for a
+   review, or `"edge":"ci_failure"` with `"rollup":"failure"` and a `newly_failed`
+   list of check names for CI.
 
-   and reacts (fix the conflict, address the review, fix CI).
+   and reacts (react to the merge, fix the conflict, address the review, fix CI).
 
 6. **Done — clean up:**
 

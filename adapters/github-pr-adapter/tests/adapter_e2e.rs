@@ -244,16 +244,20 @@ fn config(max_polls: u64, baseline: Value) -> Value {
     })
 }
 
-// pr-view fixtures (mergeable + statusCheckRollup only — reviews/comments come
-// from the REST endpoints now).
+// pr-view fixtures (state + mergeable + statusCheckRollup — reviews/comments come
+// from the REST endpoints now). All OPEN unless a test drives a merge.
 fn pr_mergeable_ci_success() -> &'static str {
-    r#"{"mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
+    r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
 fn pr_conflicting_ci_success() -> &'static str {
-    r#"{"mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
+    r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
 fn pr_conflicting_ci_failure() -> &'static str {
-    r#"{"mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}]}"#
+    r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}]}"#
+}
+/// A merged PR as `gh` reports it: `state` MERGED, `mergeable` gone UNKNOWN.
+fn pr_merged() -> &'static str {
+    r#"{"state":"MERGED","mergeable":"UNKNOWN","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
 
 // ==== ac-10-1: baseline first, then conflict / review / CI each fire once =======
@@ -359,13 +363,61 @@ fn ac10_2_restart_with_persisted_baseline_refires_nothing() {
     );
 }
 
+// ==== merge: fires exactly once, and a restart re-fires nothing =================
+
+#[test]
+fn merge_fires_once_and_does_not_refire_on_restart() {
+    let fake = FakeGh::new();
+    // open → open → merged (poll3+ clamp to the merged state → no further edge).
+    fake.pr(0, pr_mergeable_ci_success());
+    fake.pr(1, pr_mergeable_ci_success());
+    fake.pr(2, pr_merged());
+
+    let result = run_adapter(&fake, config(4, Value::Null), &[]);
+    assert_eq!(
+        result.code,
+        Some(0),
+        "clean exit; stderr: {}",
+        result.stderr
+    );
+    assert_eq!(
+        result.edge_count("pr_merged"),
+        1,
+        "a merge fires exactly once across repeated merged polls"
+    );
+
+    let merged = result
+        .messages()
+        .into_iter()
+        .find(|m| m["body"]["edge"] == "pr_merged")
+        .expect("a pr_merged event");
+    assert_eq!(merged["body"]["source"], "github-pr");
+    assert_eq!(merged["body"]["pr"], 42);
+
+    let baseline = result.last_baseline().expect("a persisted baseline");
+    assert_eq!(baseline["merged"], true, "the baseline latches merged");
+
+    // Restart: a fresh fake whose first poll is already merged, with the persisted
+    // baseline injected. The latched `merged` flag suppresses a duplicate.
+    let second = FakeGh::new();
+    second.pr(0, pr_merged());
+    second.pr(1, pr_merged());
+    let run2 = run_adapter(&second, config(2, baseline), &[]);
+    assert_eq!(run2.code, Some(0), "stderr: {}", run2.stderr);
+    assert_eq!(
+        run2.edge_count("pr_merged"),
+        0,
+        "a restart from a merged baseline must not re-fire the merge"
+    );
+}
+
 // ==== ac-10-3: UNKNOWN mergeable flapping → zero events ==========================
 
 #[test]
 fn ac10_3_unknown_flapping_produces_zero_events() {
     let fake = FakeGh::new();
-    let unknown = r#"{"mergeable":"UNKNOWN","statusCheckRollup":[]}"#;
-    let mergeable = r#"{"mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
+    let unknown = r#"{"state":"OPEN","mergeable":"UNKNOWN","statusCheckRollup":[]}"#;
+    let mergeable = r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
     fake.pr(0, mergeable);
     fake.pr(1, unknown);
     fake.pr(2, unknown);
@@ -447,7 +499,7 @@ fn partial_gh_response_is_transient_and_preserves_baseline() {
     let fake = FakeGh::new();
     // poll0: a structurally-valid-but-INCOMPLETE pr view (missing statusCheckRollup)
     // → strict parse rejects it → transient skip. poll1: a real conflicting state.
-    fake.pr(0, r#"{"mergeable":"MERGEABLE"}"#);
+    fake.pr(0, r#"{"state":"OPEN","mergeable":"MERGEABLE"}"#);
     fake.pr(1, pr_conflicting_ci_success());
     // A new review is present from the start (id 9), so the successful poll's diff
     // runs against the INJECTED cursor (5), not a reset-to-zero one.
@@ -481,7 +533,7 @@ fn partial_gh_response_is_transient_and_preserves_baseline() {
 fn persistent_partial_gh_response_eventually_exits_non_zero() {
     let fake = FakeGh::new();
     // Every pr poll is incomplete (clamped) → persistent transient failures.
-    fake.pr(0, r#"{"mergeable":"MERGEABLE"}"#);
+    fake.pr(0, r#"{"state":"OPEN","mergeable":"MERGEABLE"}"#);
 
     let result = run_adapter(
         &fake,

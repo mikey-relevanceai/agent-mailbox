@@ -145,14 +145,17 @@ cat "$f"
 /// need the poller ALIVE (the lifecycle scenarios 2–6) baseline on this and never
 /// fire an edge, so a manual `publish` is the only thing that reaches subscribers
 /// — keeping their delivery assertions independent of `gh`-transition timing.
-pub const PR_MERGEABLE_CI_SUCCESS: &str = r#"{"mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+pub const PR_MERGEABLE_CI_SUCCESS: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
 /// A conflicting PR whose one check has flipped to failure — used by scenario 1 to
 /// fire a conflict edge AND a CI-failure edge from a single transition poll.
-pub const PR_CONFLICTING_CI_FAILURE: &str = r#"{"mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}]}"#;
+pub const PR_CONFLICTING_CI_FAILURE: &str = r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}]}"#;
 /// A conflicting PR whose check still passes — a single-edge transition (only
 /// `mergeable_conflicting` fires), used by the mid-turn wake test to publish
 /// EXACTLY ONE supervised edge deterministically.
-pub const PR_CONFLICTING_CI_SUCCESS: &str = r#"{"mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+pub const PR_CONFLICTING_CI_SUCCESS: &str = r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+/// A merged PR as `gh` reports it — `state` MERGED, `mergeable` gone UNKNOWN.
+/// Fires a single `pr_merged` edge from a transition poll.
+pub const PR_MERGED: &str = r#"{"state":"MERGED","mergeable":"UNKNOWN","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
 
 // ---- the test environment (tempdir + fake gh, survives a daemon restart) -------
 

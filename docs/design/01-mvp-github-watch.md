@@ -20,7 +20,8 @@
 > (`mailbox-github-pr-adapter`) now ships and `serve`'s `DefaultResolver` spawns it
 > for `github-pr` watches. It polls a PR via `gh` (injectable via `MAILBOX_GH_BIN`
 > for tests) and is **edge-triggered**: it baselines on the first poll and fires
-> only on transitions — mergeable → `CONFLICTING` (ignoring transient `UNKNOWN`),
+> only on transitions — the PR being **merged** (`state` → `MERGED`, a terminal
+> one-shot edge), mergeable → `CONFLICTING` (ignoring transient `UNKNOWN`),
 > new reviews / review threads / PR comments (diffed by highest-seen **id**, not a
 > bare count, so an add is never missed when a concurrent delete cancels the
 > count), and whole-PR **CI rollup** transitions **into failure** (event body lists
@@ -45,6 +46,7 @@ without the agent re-arming, and **without zombie GitHub pollers**.
 Parity with `agent-ipc-github`, plus CI:
 
 - Edge-triggered (baseline on first poll; fire on transitions only)
+- Watch the PR being **merged** (`state` → `MERGED`; a terminal one-shot edge)
 - Watch mergeable → `CONFLICTING` (ignore transient `UNKNOWN`)
 - Watch new reviews / review threads / PR comments
 - Watch **CI / check-run status** transitions (e.g. pending → failure, or newly

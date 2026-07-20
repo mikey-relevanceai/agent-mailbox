@@ -66,6 +66,19 @@ impl MergeableObserved {
     }
 }
 
+/// The PR lifecycle state a single poll observed. Only `Merged` drives an edge
+/// today; the others are carried so the merge check is explicit and a future
+/// closed-without-merge edge has an obvious home. An unmodelled state string
+/// (a value GitHub adds later) folds to `Other`, which never fires — the same
+/// fail-safe stance as `mergeable`'s `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStateObserved {
+    Open,
+    Closed,
+    Merged,
+    Other,
+}
+
 /// Whole-PR CI rollup (card-10 decision 3). We fire on the ROLLUP transition, not
 /// per individual check, and carry the newly-failed check *names* in the event
 /// body — so an agent learns "CI went red, because of build+test" from one edge
@@ -96,6 +109,11 @@ pub enum CiRollup {
 /// as "nothing seen yet" and re-baselines on the next poll.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Baseline {
+    /// Whether the PR has been observed merged. Monotonic and terminal: once a
+    /// poll sees `MERGED` this stays `true`, so the merge edge fires exactly once
+    /// and a restart from this baseline never re-fires it.
+    #[serde(default)]
+    pub merged: bool,
     /// Last KNOWN mergeable state, or `None` if never yet known (UNKNOWN-only so
     /// far). Never `Unknown` — that is the UNKNOWN-ignore rule.
     #[serde(default)]
@@ -125,6 +143,7 @@ impl Baseline {
     /// UNKNOWN mergeability baselines to `None` (not yet known), never to UNKNOWN.
     pub fn from_observation(obs: &Observation) -> Self {
         Baseline {
+            merged: obs.state == PrStateObserved::Merged,
             mergeable: obs.mergeable.known(),
             max_review_id: obs.max_review_id,
             max_review_thread_id: obs.max_review_thread_id,
@@ -147,6 +166,7 @@ fn capped(mut checks: Vec<String>) -> Vec<String> {
 /// and the id fields are the *max id seen this poll* (not a running cursor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
+    pub state: PrStateObserved,
     pub mergeable: MergeableObserved,
     pub max_review_id: u64,
     pub max_review_thread_id: u64,
@@ -159,6 +179,9 @@ pub struct Observation {
 /// published event; the bodies are small opaque content (never a full gh dump).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edge {
+    /// The PR was merged (observed `MERGED` for the first time). Terminal: fires
+    /// exactly once, never re-fires from a restart, and is not undone.
+    Merged,
     /// Mergeability transitioned into CONFLICTING (from a known non-conflicting
     /// state, or from never-known). Never fired off a transient UNKNOWN.
     Conflicting,
@@ -182,6 +205,7 @@ impl Edge {
     /// in logs).
     pub fn kind(&self) -> &'static str {
         match self {
+            Edge::Merged => "pr_merged",
             Edge::Conflicting => "mergeable_conflicting",
             Edge::NewReviews { .. } => "new_reviews",
             Edge::NewReviewThreads { .. } => "new_review_threads",
@@ -194,6 +218,7 @@ impl Edge {
     /// per-edge `info!` log (review item J) without dumping gh JSON.
     pub fn describe(&self) -> String {
         match self {
+            Edge::Merged => "pr merged".to_string(),
             Edge::Conflicting => "mergeable→conflicting".to_string(),
             Edge::NewReviews { from, to } => format!("reviews max id {from}→{to}"),
             Edge::NewReviewThreads { from, to } => format!("review-thread max id {from}→{to}"),
@@ -214,7 +239,7 @@ impl Edge {
             .as_object_mut()
             .expect("json! object literal is always an object");
         match self {
-            Edge::Conflicting => {}
+            Edge::Merged | Edge::Conflicting => {}
             Edge::NewReviews { from, to }
             | Edge::NewReviewThreads { from, to }
             | Edge::NewComments { from, to } => {
@@ -234,6 +259,9 @@ impl Edge {
 /// Fold `obs` into `prior`, returning the new baseline plus the edges that fired.
 ///
 /// The heart of the adapter. Rules:
+/// - **merged** fires once, the first poll that observes `MERGED`; the baseline's
+///   `merged` flag is monotonic so it never re-fires (a restart resumes with it
+///   set).
 /// - **mergeable → CONFLICTING** fires only on a genuine transition into
 ///   conflicting from a known non-conflicting (or never-known) state; a transient
 ///   `Unknown` keeps the prior known state and fires nothing (UNKNOWN-ignore).
@@ -244,6 +272,13 @@ impl Edge {
 ///   already failing — never on a transition to pending/success (review item H).
 pub fn apply(prior: &Baseline, obs: &Observation) -> (Baseline, Vec<Edge>) {
     let mut edges = Vec::new();
+
+    // Merged: terminal and monotonic — fire once on the first MERGED observation,
+    // then latch so a restart from this baseline never re-fires it.
+    let merged = prior.merged || obs.state == PrStateObserved::Merged;
+    if !prior.merged && obs.state == PrStateObserved::Merged {
+        edges.push(Edge::Merged);
+    }
 
     // Mergeable: keep the last known state on UNKNOWN, so a flap does not baseline
     // away the real state nor fire a spurious conflict.
@@ -278,6 +313,7 @@ pub fn apply(prior: &Baseline, obs: &Observation) -> (Baseline, Vec<Edge>) {
     }
 
     let new = Baseline {
+        merged,
         mergeable,
         max_review_id,
         max_review_thread_id,
@@ -340,6 +376,7 @@ mod tests {
 
     fn obs(mergeable: MergeableObserved, max_review_id: u64, ci: CiRollup) -> Observation {
         Observation {
+            state: PrStateObserved::Open,
             mergeable,
             max_review_id,
             max_review_thread_id: 0,
@@ -347,6 +384,50 @@ mod tests {
             ci,
             failed_checks: Vec::new(),
         }
+    }
+
+    /// An observation in a given lifecycle state, everything else quiescent.
+    fn obs_state(state: PrStateObserved) -> Observation {
+        Observation {
+            state,
+            ..obs(MergeableObserved::Mergeable, 0, CiRollup::None)
+        }
+    }
+
+    #[test]
+    fn merge_fires_once_then_latches() {
+        // Baseline open, then a poll sees MERGED → fires once.
+        let base = Baseline::from_observation(&obs_state(PrStateObserved::Open));
+        assert!(!base.merged);
+        let (base, edges) = apply(&base, &obs_state(PrStateObserved::Merged));
+        assert_eq!(edges, vec![Edge::Merged]);
+        assert!(base.merged, "the baseline latches merged");
+
+        // A subsequent MERGED poll does not re-fire.
+        let (base, edges) = apply(&base, &obs_state(PrStateObserved::Merged));
+        assert!(edges.is_empty(), "merged is terminal, never re-fired");
+        assert!(base.merged);
+    }
+
+    #[test]
+    fn first_poll_on_an_already_merged_pr_baselines_without_firing() {
+        // Watching a PR that is already merged: first poll baselines merged=true
+        // and fires nothing (edge-triggered — the merge predates the watch).
+        let base = Baseline::from_observation(&obs_state(PrStateObserved::Merged));
+        assert!(base.merged);
+        let (_b, edges) = apply(&base, &obs_state(PrStateObserved::Merged));
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn closed_without_merge_does_not_fire_merged() {
+        let base = Baseline::from_observation(&obs_state(PrStateObserved::Open));
+        let (base, edges) = apply(&base, &obs_state(PrStateObserved::Closed));
+        assert!(edges.is_empty(), "a plain close is not a merge");
+        assert!(!base.merged);
+        // If it later merges (reopened → merged), the edge still fires.
+        let (_b, edges) = apply(&base, &obs_state(PrStateObserved::Merged));
+        assert_eq!(edges, vec![Edge::Merged]);
     }
 
     #[test]
@@ -532,6 +613,7 @@ mod tests {
     #[test]
     fn baseline_serde_round_trips() {
         let base = Baseline {
+            merged: true,
             mergeable: Some(Mergeable::Conflicting),
             max_review_id: 40,
             max_review_thread_id: 12,
@@ -542,5 +624,21 @@ mod tests {
         let json = serde_json::to_value(&base).unwrap();
         let back: Baseline = serde_json::from_value(json).unwrap();
         assert_eq!(base, back);
+    }
+
+    /// A baseline persisted by an older adapter (no `merged` field) still
+    /// deserializes — the missing flag reads as `false`, and a later MERGED poll
+    /// fires the edge once. Guards the `#[serde(default)]` forward-compat contract.
+    #[test]
+    fn baseline_without_merged_field_defaults_false_and_can_still_fire() {
+        let legacy = serde_json::json!({
+            "mergeable": "mergeable",
+            "max_review_id": 5,
+            "ci": "success"
+        });
+        let base: Baseline = serde_json::from_value(legacy).unwrap();
+        assert!(!base.merged, "a missing merged field defaults to false");
+        let (_b, edges) = apply(&base, &obs_state(PrStateObserved::Merged));
+        assert_eq!(edges, vec![Edge::Merged]);
     }
 }

@@ -33,7 +33,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    Env, LeakGuard, PR_CONFLICTING_CI_FAILURE, PR_CONFLICTING_CI_SUCCESS, count_edges,
+    Env, LeakGuard, PR_CONFLICTING_CI_FAILURE, PR_CONFLICTING_CI_SUCCESS, PR_MERGED, count_edges,
     descendant_pids, drain_stderr, pid_alive, poll_until, wait_within,
 };
 
@@ -113,6 +113,72 @@ fn scenario_1_conflict_review_ci_each_publish_exactly_once() {
     );
 
     // Teardown: the last interest leaves → the poller is torn down (no zombie).
+    env.run_ok(
+        &["unwatch", "github-pr", &spec, "--session", s],
+        "unwatch github-pr",
+    );
+    poll_until("adapter reaped after unwatch", SETTLE, || {
+        (!pid_alive(pid)).then_some(())
+    });
+    guard.assert_clean();
+}
+
+// ===== Scenario 1b — a merge surfaces exactly once end to end ===================
+
+/// A transition poll flips the PR to MERGED, so the poller fires exactly one
+/// `pr_merged` edge, and the clamped merged state re-fires nothing — proving the
+/// merge notification flows serve → supervisor → github-pr adapter → bridge →
+/// `read`, and is terminal (edge-triggered exactly-once) end to end.
+#[test]
+fn scenario_1b_merge_surfaces_exactly_once() {
+    let env = Env::new();
+    env.set_pr_fixture(1, PR_MERGED);
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let s = "s1";
+    let spec = env.pr_spec(1);
+    env.run_ok(
+        &[
+            "watch",
+            "github-pr",
+            &spec,
+            "--interval",
+            "1",
+            "--session",
+            s,
+        ],
+        "watch github-pr",
+    );
+    let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
+
+    let mut merged = 0usize;
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        merged += count_edges(&env.read_events(s), "pr_merged");
+        if merged >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pr_merged edge never surfaced"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    assert_eq!(merged, 1, "the merge publishes exactly once");
+
+    // Keep polling across the clamped merged state: nothing re-fires (terminal).
+    let more = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < more {
+        merged += count_edges(&env.read_events(s), "pr_merged");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(
+        merged, 1,
+        "a merged PR re-fires nothing — the merge edge is terminal end to end"
+    );
+
     env.run_ok(
         &["unwatch", "github-pr", &spec, "--session", s],
         "unwatch github-pr",

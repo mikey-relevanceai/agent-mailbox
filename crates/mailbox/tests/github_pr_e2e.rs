@@ -106,12 +106,12 @@ fn write_fake_gh(dir: &Path) -> PathBuf {
     }
     std::fs::write(
         dir.join("pr.0"),
-        r#"{"mergeable":"MERGEABLE","statusCheckRollup":[]}"#,
+        r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#,
     )
     .unwrap();
     std::fs::write(
         dir.join("pr.1"),
-        r#"{"mergeable":"CONFLICTING","statusCheckRollup":[]}"#,
+        r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[]}"#,
     )
     .unwrap();
     script

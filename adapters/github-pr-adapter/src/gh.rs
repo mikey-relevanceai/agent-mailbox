@@ -38,7 +38,7 @@
 
 use serde_json::Value;
 
-use crate::snapshot::{CiRollup, MergeableObserved, Observation};
+use crate::snapshot::{CiRollup, MergeableObserved, Observation, PrStateObserved};
 
 /// Env var overriding the `gh` binary (card-10 decision 2: injectable for tests).
 pub const ENV_GH_BIN: &str = "MAILBOX_GH_BIN";
@@ -138,22 +138,23 @@ impl GhClient {
                 "--repo".to_string(),
                 self.slug(),
                 "--json".to_string(),
-                "mergeable,statusCheckRollup".to_string(),
+                "state,mergeable,statusCheckRollup".to_string(),
             ])
             .await?;
-        let (mergeable, ci, failed_checks) = parse_pr_view(&view)?;
+        let pr = parse_pr_view(&view)?;
 
         let max_review_id = self.max_id("reviews", "pulls", "reviews").await?;
         let max_comment_id = self.max_id("comments", "issues", "comments").await?;
         let max_review_thread_id = self.max_id("review threads", "pulls", "comments").await?;
 
         Ok(Observation {
-            mergeable,
+            state: pr.state,
+            mergeable: pr.mergeable,
             max_review_id,
             max_review_thread_id,
             max_comment_id,
-            ci,
-            failed_checks,
+            ci: pr.ci,
+            failed_checks: pr.failed_checks,
         })
     }
 
@@ -197,14 +198,34 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-/// Parse the `gh pr view` payload into mergeability + CI rollup + failed check
-/// names. Fail-CLOSED (review item A): a missing/null `mergeable` or
-/// `statusCheckRollup` is a [`GhError::Parse`], not a silent default.
-fn parse_pr_view(view: &str) -> Result<(MergeableObserved, CiRollup, Vec<String>), GhError> {
+/// The signals one `gh pr view` call yields. Named (not a positional tuple) so
+/// `observe` reads each field at the boundary where it is produced.
+#[derive(Debug)]
+struct PrView {
+    state: PrStateObserved,
+    mergeable: MergeableObserved,
+    ci: CiRollup,
+    failed_checks: Vec<String>,
+}
+
+/// Parse the `gh pr view` payload into lifecycle state, mergeability, the CI
+/// rollup, and the failed-check names. Fail-CLOSED (review item A): a missing/null
+/// `state`, `mergeable`, or `statusCheckRollup` is a [`GhError::Parse`], not a
+/// silent default.
+fn parse_pr_view(view: &str) -> Result<PrView, GhError> {
     let view: Value = serde_json::from_str(view)
         .map_err(|err| GhError::Parse(format!("pr view was not JSON: {err}")))?;
 
     // A present, non-null string is required; missing/null is an unexpected shape.
+    let state = match required(&view, "state")? {
+        Value::String(s) => parse_state(s),
+        other => {
+            return Err(GhError::Parse(format!(
+                "pr view `state` was not a string: {other}"
+            )));
+        }
+    };
+
     let mergeable = match required(&view, "mergeable")? {
         Value::String(s) => parse_mergeable(s),
         other => {
@@ -220,7 +241,12 @@ fn parse_pr_view(view: &str) -> Result<(MergeableObserved, CiRollup, Vec<String>
     })?;
     let (ci, failed_checks) = reduce_ci(checks);
 
-    Ok((mergeable, ci, failed_checks))
+    Ok(PrView {
+        state,
+        mergeable,
+        ci,
+        failed_checks,
+    })
 }
 
 /// Fetch a required, non-null field, or a [`GhError::Parse`] (review item A: a
@@ -231,6 +257,19 @@ fn required<'a>(object: &'a Value, field: &str) -> Result<&'a Value, GhError> {
             "required field `{field}` was missing or null"
         ))),
         Some(value) => Ok(value),
+    }
+}
+
+/// GitHub's `state` string → the observed lifecycle state. `OPEN`/`CLOSED`/
+/// `MERGED` are the states `gh` returns; anything else folds to `Other`, which
+/// never fires a merge edge — the same fail-safe stance as [`parse_mergeable`]'s
+/// UNKNOWN, so an unmodelled future value cannot spuriously report a merge.
+fn parse_state(value: &str) -> PrStateObserved {
+    match value {
+        "OPEN" => PrStateObserved::Open,
+        "CLOSED" => PrStateObserved::Closed,
+        "MERGED" => PrStateObserved::Merged,
+        _ => PrStateObserved::Other,
     }
 }
 
@@ -364,20 +403,23 @@ mod tests {
     #[test]
     fn parses_a_clean_mergeable_pr() {
         let view = r#"{
+            "state": "OPEN",
             "mergeable": "MERGEABLE",
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
             ]
         }"#;
-        let (mergeable, ci, failed) = parse_pr_view(view).unwrap();
-        assert_eq!(mergeable, MergeableObserved::Mergeable);
-        assert_eq!(ci, CiRollup::Success);
-        assert!(failed.is_empty());
+        let pr = parse_pr_view(view).unwrap();
+        assert_eq!(pr.state, PrStateObserved::Open);
+        assert_eq!(pr.mergeable, MergeableObserved::Mergeable);
+        assert_eq!(pr.ci, CiRollup::Success);
+        assert!(pr.failed_checks.is_empty());
     }
 
     #[test]
     fn parses_conflicting_with_failing_and_pending_checks() {
         let view = r#"{
+            "state": "OPEN",
             "mergeable": "CONFLICTING",
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE"},
@@ -385,37 +427,74 @@ mod tests {
                 {"__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS"}
             ]
         }"#;
-        let (mergeable, ci, failed) = parse_pr_view(view).unwrap();
-        assert_eq!(mergeable, MergeableObserved::Conflicting);
-        assert_eq!(ci, CiRollup::Failure);
-        assert_eq!(failed, vec!["build".to_string()]);
+        let pr = parse_pr_view(view).unwrap();
+        assert_eq!(pr.mergeable, MergeableObserved::Conflicting);
+        assert_eq!(pr.ci, CiRollup::Failure);
+        assert_eq!(pr.failed_checks, vec!["build".to_string()]);
     }
 
     #[test]
     fn empty_rollup_is_ci_none() {
-        let view = r#"{"mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
-        let (_m, ci, _f) = parse_pr_view(view).unwrap();
-        assert_eq!(ci, CiRollup::None);
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#;
+        assert_eq!(parse_pr_view(view).unwrap().ci, CiRollup::None);
+    }
+
+    /// A merged PR: `state` is MERGED, and `mergeable` is typically UNKNOWN once
+    /// GitHub stops recomputing it — the merge signal must not depend on
+    /// mergeability still being known.
+    #[test]
+    fn parses_a_merged_pr_even_with_unknown_mergeable() {
+        let view = r#"{
+            "state": "MERGED",
+            "mergeable": "UNKNOWN",
+            "statusCheckRollup": []
+        }"#;
+        let pr = parse_pr_view(view).unwrap();
+        assert_eq!(pr.state, PrStateObserved::Merged);
+        assert_eq!(pr.mergeable, MergeableObserved::Unknown);
+    }
+
+    #[test]
+    fn parses_state_variants_and_folds_unknown_to_other() {
+        assert_eq!(parse_state("OPEN"), PrStateObserved::Open);
+        assert_eq!(parse_state("CLOSED"), PrStateObserved::Closed);
+        assert_eq!(parse_state("MERGED"), PrStateObserved::Merged);
+        assert_eq!(parse_state("SOMETHING_NEW"), PrStateObserved::Other);
+    }
+
+    /// Review item A applies to `state` too: a missing/null state is a transient
+    /// Parse error, never a silent default (which could mask a merge either way).
+    #[test]
+    fn missing_state_is_a_parse_error() {
+        let err = parse_pr_view(r#"{"mergeable":"MERGEABLE","statusCheckRollup":[]}"#).unwrap_err();
+        assert!(matches!(err, GhError::Parse(_)), "missing state");
+        let err = parse_pr_view(r#"{"state":null,"mergeable":"MERGEABLE","statusCheckRollup":[]}"#)
+            .unwrap_err();
+        assert!(matches!(err, GhError::Parse(_)), "null state");
     }
 
     /// Review item A: a missing/null required field is a Parse error (transient),
     /// NOT a silent fail-open to a default.
     #[test]
     fn missing_mergeable_is_a_parse_error() {
-        let err = parse_pr_view(r#"{"statusCheckRollup":[]}"#).unwrap_err();
+        let err = parse_pr_view(r#"{"state":"OPEN","statusCheckRollup":[]}"#).unwrap_err();
         assert!(matches!(err, GhError::Parse(_)), "missing mergeable");
-        let err = parse_pr_view(r#"{"mergeable":null,"statusCheckRollup":[]}"#).unwrap_err();
+        let err = parse_pr_view(r#"{"state":"OPEN","mergeable":null,"statusCheckRollup":[]}"#)
+            .unwrap_err();
         assert!(matches!(err, GhError::Parse(_)), "null mergeable");
     }
 
     #[test]
     fn missing_or_null_rollup_is_a_parse_error() {
-        let err = parse_pr_view(r#"{"mergeable":"MERGEABLE"}"#).unwrap_err();
+        let err = parse_pr_view(r#"{"state":"OPEN","mergeable":"MERGEABLE"}"#).unwrap_err();
         assert!(matches!(err, GhError::Parse(_)), "missing rollup");
         let err =
-            parse_pr_view(r#"{"mergeable":"MERGEABLE","statusCheckRollup":null}"#).unwrap_err();
+            parse_pr_view(r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":null}"#)
+                .unwrap_err();
         assert!(matches!(err, GhError::Parse(_)), "null rollup");
-        let err = parse_pr_view(r#"{"mergeable":"MERGEABLE","statusCheckRollup":{}}"#).unwrap_err();
+        let err =
+            parse_pr_view(r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":{}}"#)
+                .unwrap_err();
         assert!(matches!(err, GhError::Parse(_)), "non-array rollup");
     }
 
