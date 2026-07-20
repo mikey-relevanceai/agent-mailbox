@@ -17,6 +17,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0008](0008-on-demand-wake-filechanged.md) | On-demand wake: a detached per-session watcher bumps a central sentinel, a `FileChanged` hook wakes only on genuine mail — no periodic re-arm | Accepted; deaf-session "first suspect" **corrected by 0009** |
 | [0009](0009-interest-liveness-from-the-waiter-pidfile.md) | Interest liveness comes from the waiter pidfile, not a TTL clock — an idle session is silent by design, so silence cannot mean death | Accepted |
 | [0010](0010-resume-watches-on-restart.md) | A daemon restart resumes the watches of live sessions — "never resume" stopped being fail-safe once an idle session could no longer re-`watch` | Accepted |
+| [0011](0011-retry-failed-watches-on-sweep.md) | A give-up is not permanent — the sweep retries a `Failed` watch once per interval while its session lives, so a transient upstream outage self-heals | Accepted |
 
 ## When to write one
 

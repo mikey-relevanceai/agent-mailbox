@@ -132,7 +132,11 @@ MVP rules:
    that default stopped being fail-safe once ADR-0008 made an idle session take
    zero turns, because the re-`watch` it assumed can never happen.
 7. **Adapter crash.** Bridge restarts with backoff **only while interest count
-   > 0**; give up and surface an error event after N failures.
+   > 0**; give up and surface an error event after N failures. Give-up is not
+   permanent: the periodic sweep retries a `Failed` watch once per interval while
+   an interested session is still alive
+   ([ADR-0011](../adr/0011-retry-failed-watches-on-sweep.md)), so a give-up caused
+   by a transient upstream outage self-heals instead of needing a manual re-`watch`.
 8. **No agent-owned infinite bash.** Agents declare intent; they do not hold the
    poll loop in a tool background task.
 
