@@ -25,6 +25,7 @@
 //! its adapters are reaped before the test ends.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mailbox::bus::Bus;
@@ -230,6 +231,43 @@ impl AdapterResolver for StubResolverFixture {
         });
         Ok(ResolvedAdapter {
             spec: AdapterSpec::new(self.program.clone(), AdapterId("stub-fixture".to_string())),
+            config: AdapterConfig::new(config),
+        })
+    }
+}
+
+/// A resolver that fails every spawn while "unhealthy" (a nonexistent program, so
+/// `start` fails and the streak climbs to give-up) and serves the REAL stub once
+/// flipped "healthy". Models a transient upstream outage: broken during the crash
+/// streak that drives a watch to `Failed`, recovered by the time the sweeper
+/// retries it (ADR-0011).
+struct FlakyResolver {
+    healthy: Arc<AtomicBool>,
+    program: String,
+}
+
+impl FlakyResolver {
+    fn new(healthy: Arc<AtomicBool>) -> Self {
+        Self {
+            healthy,
+            program: stub_program(),
+        }
+    }
+}
+
+impl AdapterResolver for FlakyResolver {
+    fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
+        let topic = topic_for_watch(watch).ok_or_else(|| {
+            ResolveError::Invalid(format!("bad repo {:?}", watch.target.repo_column()))
+        })?;
+        let program = if self.healthy.load(Ordering::SeqCst) {
+            self.program.clone()
+        } else {
+            "/nonexistent/mailbox-adapter-transient-outage".to_string()
+        };
+        let config = json!({ "topic": topic.as_str(), "interval_ms": 20, "count": 0 });
+        Ok(ResolvedAdapter {
+            spec: AdapterSpec::new(program, AdapterId("flaky".to_string())),
             config: AdapterConfig::new(config),
         })
     }
@@ -1260,6 +1298,118 @@ async fn repeated_start_failures_give_up() {
             .any(|e| e.body.get("event").and_then(|v| v.as_str()) == Some("adapter_gave_up")),
         "a repeated start-failure must still publish the give-up event"
     );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+// ---- ADR-0011: slow retry of failed watches -----------------------------------
+
+/// The regression for ADR-0011: a watch that gave up (`Failed`) during a transient
+/// outage is retried by the sweep and comes back `Running` once upstream recovers,
+/// as long as an interested session is still alive — no manual re-`watch`.
+///
+/// Without the retry pass this hangs at the final poll: the watch stays `Failed`
+/// forever, which is the exact production trap — a GitHub API blip during a daemon
+/// restart parked three healthy PR watches until they were re-watched by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
+    let healthy = Arc::new(AtomicBool::new(false));
+    let (bus, storage, supervisor, dir) = fresh(FlakyResolver::new(healthy.clone())).await;
+    let watched = pr(9);
+    let s1 = SessionId::new("s1");
+
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+
+    // The transient outage drives the watch to give-up.
+    poll_until("watch failed during the outage", || {
+        let storage = storage.clone();
+        async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
+    })
+    .await;
+
+    // Upstream recovers, and s1 is still alive — a waiter pidfile naming THIS
+    // process, which `kill(pid, 0)` finds (ADR-0009's probe, the sweep's liveness
+    // signal).
+    healthy.store(true, Ordering::SeqCst);
+    std::fs::write(
+        dir.path()
+            .join(format!("{}.waiter.pid", s1.encode_filename())),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    // One sweep retries the failed watch; it comes back Running under a fresh pid.
+    supervisor
+        .sweep(Duration::from_secs(3600), dir.path())
+        .await
+        .unwrap();
+    let pid = poll_until("failed watch retried to running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Running {
+            pid: mailbox::storage::Pid::new(pid)
+        },
+        "a sweep retries a Failed watch whose interested session is alive"
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The fail-safe half: a `Failed` watch whose session has NO live waiter is left
+/// `Failed` by the sweep — no zombie retries hammering an upstream nobody is
+/// waiting on. Same liveness invariant as the TTL sweep and the startup reconcile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_does_not_retry_a_failed_watch_of_a_dead_session() {
+    // Nonexistent program: every spawn fails, so the watch gives up to Failed and
+    // would stay there unless something retries it.
+    let (bus, storage, supervisor, dir) = fresh(FixtureResolver::nonexistent()).await;
+    let watched = pr(10);
+    let s1 = SessionId::new("s1");
+
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1,
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    poll_until("watch failed", || {
+        let storage = storage.clone();
+        async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
+    })
+    .await;
+
+    // No waiter pidfile for s1: the sweep cannot prove the session alive. A long
+    // TTL keeps the interest from being reaped, isolating the retry decision.
+    supervisor
+        .sweep(Duration::from_secs(3600), dir.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Failed,
+        "a Failed watch with no live interested session is not retried"
+    );
+    assert_eq!(supervisor.running_pid(watch_id).await, None);
 
     supervisor.shutdown().await.unwrap();
 }

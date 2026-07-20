@@ -30,7 +30,10 @@
 //! If interest is still > 0 that is a crash: the supervisor backoff-restarts (the
 //! [`RestartPolicy`]) and, after N consecutive failures, gives up — it publishes
 //! an error event on the entity's topic and marks the watch [`WatchState::Failed`].
-//! While interest is 0 an exit is just a clean stop.
+//! While interest is 0 an exit is just a clean stop. A `Failed` watch is not dead
+//! forever: the periodic sweep retries it once per interval while an interested
+//! session is still alive (ADR-0011), so a give-up caused by a transient upstream
+//! outage self-heals rather than needing a manual re-`watch`.
 //!
 //! # Bridge restart (resume iff a live session wants it)
 //!
@@ -1066,7 +1069,55 @@ impl Actor {
             );
             self.stop_watch(watch_id).await?;
         }
+
+        // After reclaiming dead interests, give the still-wanted `Failed` watches
+        // another chance. Runs last so a watch whose only session just aged out
+        // above is not retried.
+        self.retry_failed_watches(waiters_dir).await?;
         Ok(emptied)
+    }
+
+    /// Retry the watches that gave up (`Failed`) but whose session is still here.
+    ///
+    /// A give-up is meant to be terminal for a genuinely broken adapter (design/01
+    /// rule 7 — surface an error rather than restart forever). But a crash streak
+    /// caused by a *transient* upstream outage — the GitHub API failing during a
+    /// daemon restart is the case that motivated this (ADR-0011) — would otherwise
+    /// park a healthy watch in `Failed` until a human re-`watch`ed it. That is the
+    /// silent, manual-recovery failure ADR-0010 set out to kill, re-entering
+    /// through the one state ADR-0010 deliberately does not resume.
+    ///
+    /// The sweeper already proves session liveness from the watcher pidfile, so it
+    /// is the natural owner of a slow retry: once per sweep it re-attempts each
+    /// `Failed` watch that still has a live interested session. [`ensure_running`]
+    /// starts a fresh attempt — the failure streak was cleared at give-up — so a
+    /// transient failure recovers within one sweep, while a genuinely broken
+    /// adapter simply crash-loops back to `Failed` and waits for the next sweep.
+    /// Retries are therefore bounded to one backoff burst per (slow) sweep
+    /// interval, and stop entirely the moment the session ends and its interest is
+    /// reclaimed. A `Failed` watch with no live interested session is left alone —
+    /// no zombie retries, the same liveness invariant as the TTL sweep itself.
+    async fn retry_failed_watches(&mut self, waiters_dir: &Path) -> Result<(), SupervisorError> {
+        for watch in self.storage.list_watches().await? {
+            if !matches!(watch.state, WatchState::Failed) {
+                continue;
+            }
+            let sessions = self.storage.list_watch_interest_sessions(watch.id).await?;
+            if sessions.iter().any(|s| waiter_alive(waiters_dir, s)) {
+                // Log after the retry is issued, not before — never claim a retry
+                // that a propagated error would abort (mirrors `reconcile_startup`).
+                self.ensure_running(watch.id).await?;
+                info!(
+                    watch = watch.id.get(),
+                    kind = watch.target.kind().as_str(),
+                    repo = %watch.target.repo_column(),
+                    pr = watch.target.pr_column(),
+                    interested = sessions.len(),
+                    "retried a failed watch; an interested session is still alive (slow background retry)"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Tear down every running adapter on shutdown — GRACEFULLY (review item D).
