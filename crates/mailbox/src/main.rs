@@ -59,7 +59,7 @@ fn main() -> ExitCode {
             command: HarnessCommand::Watch(args),
         }) => cli::run_watch_sentinel(&args),
         // The ADR-0008 Stop-liveness hook (ensure-watcher) is NOT matched here: it
-        // re-registers the inbox over the socket (ADR-0012), so it needs the async
+        // re-registers the inbox over the socket (ADR-0013), so it needs the async
         // runtime and is dispatched via the async path below like the other socket hooks.
         // Everything else is async (socket client, or the serve daemon).
         command => {

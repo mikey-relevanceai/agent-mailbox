@@ -439,9 +439,9 @@ fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
     guard.assert_clean();
 }
 
-// ==== ADR-0012: ensure-watcher re-registers the inbox on every Stop ================
+// ==== ADR-0013: ensure-watcher re-registers the inbox on every Stop ================
 
-/// ADR-0012: the Stop-liveness hook re-registers the session's inbox, restoring the
+/// ADR-0013: the Stop-liveness hook re-registers the session's inbox, restoring the
 /// ADR-0007 invariant (register on every SessionStart AND every Stop) that ADR-0008
 /// dropped. Here NO `session-start` ran, so the inbox is unregistered; a single
 /// `ensure-watcher` must make the session addressable.
@@ -488,7 +488,7 @@ fn ensure_watcher_registers_the_inbox() {
     guard.assert_clean();
 }
 
-/// ADR-0012 fail-open: `ensure-watcher` makes its first bridge socket call
+/// ADR-0013 fail-open: `ensure-watcher` makes its first bridge socket call
 /// (`register_inbox`) as of this change, so the "a Stop hook must NEVER fail or wake, even
 /// with the bridge down" guarantee needs its own coverage — the mirror of
 /// `session_start_fails_open_when_the_bridge_is_down`. With NO daemon, the socket call
@@ -513,7 +513,7 @@ fn ensure_watcher_fails_open_when_the_bridge_is_down() {
     );
 }
 
-/// ADR-0012: `session-start` fires on every SessionStart source, so it runs again on a
+/// ADR-0013: `session-start` fires on every SessionStart source, so it runs again on a
 /// resume. Running it twice (startup, then resume) must be idempotent — exactly ONE
 /// inbox subscription and the SAME single watcher after each — never a duplicate
 /// subscription or a leaked second watcher.
@@ -1155,6 +1155,213 @@ fn the_watcher_survives_a_signal_interruption_and_still_bumps() {
         topics,
         vec![topic],
         "the watcher still bumps on a real kick"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+// ==== ADR-0012: the turn-boundary re-trigger rescues mail that arrived while BUSY ====
+
+/// The re-trigger record's contents, or `None` if the Stop hook has never re-triggered
+/// this session (the fail-safe state).
+fn retrigger_record(env: &Env, session: &str) -> Option<String> {
+    let path = env
+        .sentinel_path(session)
+        .parent()
+        .unwrap()
+        .join(".mailbox-retriggered");
+    std::fs::read_to_string(path).ok()
+}
+
+/// Deafness regression (the BUSY-window case, ADR-0012 — observed in the wild on a
+/// watched PR): the ADR-0008 wake is a pure EDGE, and the `FileChanged` → exit-2 wake
+/// only reaches an IDLE session. Mail published while the agent is mid-turn bumps the
+/// sentinel to no effect — the edge is spent against a busy session — and under the old
+/// design NOTHING ever bumped it again, so the agent went idle deaf on top of unread
+/// mail and stayed that way until the next publish.
+///
+/// The fix is level-triggered arming at the one signal that says a turn ENDED: `Stop`
+/// re-bumps the sentinel iff the session is sitting on mail newer than any it has
+/// already been re-triggered for. This test drives exactly that sequence, modelling
+/// "the wake was spent while busy" as "the wake hook never ran for that bump".
+///
+/// The watcher is kept ALIVE throughout, so `ensure-watcher` cannot respawn it — which
+/// means the only thing that can possibly bump the sentinel here is the re-trigger.
+#[test]
+fn mail_that_arrived_while_busy_is_re_triggered_at_the_turn_boundary() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "busy-window";
+    let t = env.pr_topic(30);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+    let live_pid = watcher_pid(&env, session).expect("a watcher pid");
+
+    // Mail arrives while the agent is BUSY mid-turn: the watcher kicks and bumps the
+    // sentinel, but the FileChanged wake that bump triggers reaches a busy session and
+    // is spent (modelled by never running the wake hook for it).
+    env.publish(&t);
+    poll_until(
+        "the watcher bumps for the busy-window mail",
+        Duration::from_secs(5),
+        || (env.sentinel_topics(session) == vec![t.clone()]).then_some(()),
+    );
+    let after_publish = sentinel_mtime(&env, session);
+    assert_eq!(
+        retrigger_record(&env, session),
+        None,
+        "nothing has been re-triggered yet"
+    );
+
+    // Past a coarse (1s) mtime resolution, so the re-bump is observable even though the
+    // sentinel CONTENT is identical ([T] again) — the mtime is the only signal.
+    std::thread::sleep(Duration::from_millis(1100));
+
+    // The turn ends. Stop must notice the unread mail and re-bump, so a FileChanged
+    // fires against the now-idle session.
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Stop hook must still never wake the session itself; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "the Stop hook must still print nothing to stdout"
+    );
+    assert_eq!(
+        watcher_pid(&env, session),
+        Some(live_pid),
+        "the live watcher was left alone, so ONLY the re-trigger can have bumped"
+    );
+    assert!(
+        sentinel_mtime(&env, session) > after_publish,
+        "the turn boundary must re-bump the sentinel for mail that arrived while busy"
+    );
+    assert_eq!(
+        env.sentinel_topics(session),
+        vec![t.clone()],
+        "the re-bump names the unread topic (payload-free)"
+    );
+    let after_stop = sentinel_mtime(&env, session);
+
+    // And that re-bump is a REAL wake: the hook the FileChanged fires exits 2.
+    let wake = env.wake_hook(session);
+    assert_eq!(
+        wake.status.code(),
+        Some(2),
+        "the re-triggered FileChanged must wake the now-idle session"
+    );
+
+    // ANTI-LOOP: a second turn boundary over the SAME mail must NOT re-bump. Without
+    // this an agent that wakes and does not read would be nudged every turn, forever.
+    std::thread::sleep(Duration::from_millis(1100));
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    assert_eq!(
+        sentinel_mtime(&env, session),
+        after_stop,
+        "already-re-triggered mail must not be re-bumped again (anti-loop)"
+    );
+
+    // But the bound is per-message, not permanent: after the agent catches up, the NEXT
+    // message to arrive while busy is re-triggered on its own turn boundary.
+    env.run_as_ok(session, &["read"], "read");
+    poll_until("caught up", Duration::from_secs(5), || {
+        (env.unread_total(session) == 0).then_some(())
+    });
+    env.publish(&t);
+    poll_until(
+        "the watcher bumps for the second busy-window message",
+        Duration::from_secs(5),
+        || (env.unread_total(session) == 1).then_some(()),
+    );
+    let after_second = sentinel_mtime(&env, session);
+    std::thread::sleep(Duration::from_millis(1100));
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    assert!(
+        sentinel_mtime(&env, session) > after_second,
+        "newer mail must be re-triggered again — the watermark bounds repeats, not new messages"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    assert_eq!(
+        retrigger_record(&env, session),
+        None,
+        "SessionEnd removes the sentinel directory, taking the re-trigger record with it"
+    );
+    drop(watcher);
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// The re-trigger is a SAFETY NET on a hook that runs at every single turn boundary,
+/// so it must degrade quietly: with no store at all (hooks installed, `mailbox serve`
+/// never started) the Stop hook must still exit 0 promptly, print nothing, and create
+/// no sentinel. A safety net that fails loudly — or wakes — would break every turn on
+/// every session.
+#[test]
+fn the_turn_boundary_re_trigger_is_a_quiet_no_op_with_no_store() {
+    // No daemon and no database file: nothing for the re-trigger to read.
+    let env = Env::new();
+    let session = "no-store-turn";
+
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the Stop hook must exit 0 with no store; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "the Stop hook must print nothing to stdout"
+    );
+    assert!(
+        !env.sentinel_path(session).exists(),
+        "no store means no sentinel was invented"
+    );
+    assert_eq!(retrigger_record(&env, session), None);
+}
+
+/// The re-trigger must not fire for a session that is CAUGHT UP: an ordinary turn
+/// boundary on an agent with no mail must leave the sentinel completely untouched, or
+/// every Stop on every working agent would spawn a `FileChanged` for nothing.
+#[test]
+fn a_caught_up_session_is_never_re_triggered_at_the_turn_boundary() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "quiet-turn";
+    let t = env.pr_topic(31);
+    env.run_as_ok(session, &["subscribe", &t], "subscribe");
+    let watcher = env.spawn_watcher(session);
+    wait_until_armed(&env, session);
+    let armed_mtime = sentinel_mtime(&env, session);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let out = env.ensure_watcher(session);
+    assert_eq!(out.status.code(), Some(0), "ensure-watcher must exit 0");
+    assert_eq!(
+        sentinel_mtime(&env, session),
+        armed_mtime,
+        "a turn boundary with nothing unread must not touch the sentinel"
+    );
+    assert_eq!(
+        retrigger_record(&env, session),
+        None,
+        "and must record nothing"
     );
 
     let out = env.cleanup(session);

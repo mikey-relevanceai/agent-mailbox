@@ -69,8 +69,8 @@ use nix::sys::stat::{Mode, SFlag};
 
 use mailbox_protocol::Topic;
 
-use crate::sentinel::Sentinel;
-use crate::storage::{ReadOnlyStore, SessionId, StorageError};
+use crate::sentinel::{RetriggerRecord, Sentinel, SentinelError};
+use crate::storage::{ReadOnlyStore, SessionId, StorageError, Unread, WakeWatermark};
 
 /// The lone byte a kick writes into a FIFO.
 ///
@@ -267,6 +267,55 @@ pub enum WatchOutcome {
 /// and stay obviously distinct. Payload-free, like every other wake.
 pub const REARM_NOTICE: &str = "mailbox: re-arming the waiter (no new mail) — nothing to read; \
                                 just end your turn and the Stop hook will re-arm it";
+
+/// How one [`Waiter::retrigger_if_unread`] ended (ADR-0012).
+///
+/// Returned rather than logged in place so the `Stop` hook can report it in one
+/// exhaustive `match` — and so a test can assert the ANTI-LOOP branch directly
+/// instead of inferring it from a file mtime. Every variant carries what a reader
+/// needs to explain the decision.
+#[derive(Debug)]
+pub enum RetriggerOutcome {
+    /// Nothing unread: the ordinary quiet turn. The sentinel was not touched.
+    CaughtUp,
+    /// This mail already earned its one nudge — the anti-loop bound holding.
+    AlreadyRetriggered {
+        last: RetriggerRecord,
+        high_water: WakeWatermark,
+    },
+    /// The sentinel was re-bumped and the watermark recorded: a `FileChanged` will
+    /// fire against the now-idle session.
+    Retriggered {
+        topics: Vec<Topic>,
+        high_water: WakeWatermark,
+    },
+    /// The sentinel was re-bumped but the watermark could not be recorded. The wake
+    /// still fires (the bump landed); a later turn may simply nudge again.
+    RetriggeredUnrecorded {
+        topics: Vec<Topic>,
+        high_water: WakeWatermark,
+        error: SentinelError,
+    },
+    /// The sentinel could not be written, so no wake will fire from this turn. The
+    /// mail stays durable and surfaces on the next kick.
+    BumpFailed { error: SentinelError },
+}
+
+/// Whether mail at `high_water` has earned a turn-boundary nudge, given what the
+/// re-trigger record says.
+///
+/// The whole anti-loop rule, isolated as a pure function so its boundaries can be
+/// unit-tested in microseconds rather than inferred from file mtimes in an
+/// integration test. A missing OR unreadable record re-triggers: that is the
+/// fail-safe direction — a redundant wake, never a swallowed one.
+pub fn needs_retrigger(record: RetriggerRecord, high_water: WakeWatermark) -> bool {
+    match record {
+        RetriggerRecord::Missing | RetriggerRecord::Unreadable => true,
+        // Strictly newer only. Equal means "this exact mail already earned its nudge",
+        // which is what stops an agent that never reads from being nudged forever.
+        RetriggerRecord::At(last) => last < high_water,
+    }
+}
 
 /// The result of a completed [`Waiter::wait`]: the session has mail and should
 /// be woken.
@@ -642,6 +691,80 @@ impl Waiter {
         Ok(store.topics_with_unread(&self.session)?)
     }
 
+    /// The same non-blocking peek, carrying the [`WakeWatermark`] as well — the read
+    /// the ADR-0012 turn-boundary re-trigger makes to decide whether the session is
+    /// sitting on mail it has NOT yet been re-triggered for.
+    ///
+    /// Kept beside [`Waiter::peek_unread`] because they must never disagree: both are
+    /// the one read-only unread predicate, asked with and without the watermark.
+    pub fn peek_unread_state(&self) -> Result<Unread, WakeError> {
+        let store = ReadOnlyStore::open(&self.db_path)?;
+        Ok(store.unread(&self.session)?)
+    }
+
+    /// The ADR-0012 TURN-BOUNDARY re-trigger: re-bump `sentinel` if this session is
+    /// sitting on mail it has not already been re-triggered for.
+    ///
+    /// # Why this exists
+    ///
+    /// The steady-state wake is an EDGE (publish → kick → [`Waiter::watch_sentinel`]
+    /// bumps → `FileChanged` → the wake hook exits 2), and an edge only reaches an
+    /// IDLE session. Mail published while the agent is mid-turn bumps the sentinel to
+    /// no effect — the hook does not even run — and nothing bumps it again, so the
+    /// session goes idle DEAF on top of unread mail. This is the level check that
+    /// closes that window, run from the `Stop` hook because a turn boundary is the
+    /// only moment the bridge learns a turn ended.
+    ///
+    /// It lives here, next to [`Waiter::sync_sentinel_to_unread`], because "read the
+    /// unread state, then bump the sentinel" is this type's job — the hook layer
+    /// should only decide WHEN to ask and how to report the answer. Both bump paths
+    /// therefore share one choke point.
+    ///
+    /// # Bounded, so it cannot loop
+    ///
+    /// An agent that wakes and does not read would otherwise be nudged every turn
+    /// forever. So the bump is gated on [`needs_retrigger`]: only mail strictly newer
+    /// than the recorded watermark earns one, i.e. **at most one turn-boundary wake
+    /// per message**.
+    ///
+    /// Ordering is load-bearing: **bump first, record second.** A crash between them
+    /// costs a duplicate nudge (harmless — the wake hook re-checks the store), while
+    /// recording first would lose the wake outright. That is also why a failed record
+    /// is its own outcome rather than an error: the bump already landed, so the wake
+    /// still fires.
+    ///
+    /// Returns the decision rather than logging it, so the caller can report it and a
+    /// test can assert it. Only the store read is an `Err` — a sentinel failure is a
+    /// reported outcome, never fatal to a per-turn hook.
+    pub fn retrigger_if_unread(&self, sentinel: &Sentinel) -> Result<RetriggerOutcome, WakeError> {
+        let Unread::Pending(mail) = self.peek_unread_state()? else {
+            return Ok(RetriggerOutcome::CaughtUp);
+        };
+        let high_water = mail.high_water();
+
+        let record = sentinel.last_retriggered();
+        if !needs_retrigger(record, high_water) {
+            return Ok(RetriggerOutcome::AlreadyRetriggered {
+                last: record,
+                high_water,
+            });
+        }
+
+        let topics = mail.topics().to_vec();
+        if let Err(error) = sentinel.write_topics(&topics) {
+            return Ok(RetriggerOutcome::BumpFailed { error });
+        }
+        // The bump landed: from here the wake WILL fire regardless of what follows.
+        match sentinel.record_retriggered(high_water) {
+            Ok(()) => Ok(RetriggerOutcome::Retriggered { topics, high_water }),
+            Err(error) => Ok(RetriggerOutcome::RetriggeredUnrecorded {
+                topics,
+                high_water,
+                error,
+            }),
+        }
+    }
+
     /// Run the DETACHED WATCHER loop (ADR-0008): block on the FIFO forever and, on
     /// every real-mail kick, write the unread topic name(s) into `sentinel` so its
     /// mtime changes and the session's `FileChanged` hook fires. This is what
@@ -1004,6 +1127,32 @@ impl Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ADR-0012 anti-loop rule, at its boundaries. This is the whole bound on
+    /// "how many times can one message wake an agent", so every case is pinned here
+    /// rather than inferred from mtimes in a slow integration test.
+    #[test]
+    fn the_anti_loop_re_triggers_only_for_strictly_newer_mail() {
+        let mark = |n: i64| WakeWatermark::parse(&n.to_string()).unwrap();
+
+        // Never re-triggered: the first turn boundary after mail arrives must nudge.
+        assert!(needs_retrigger(RetriggerRecord::Missing, mark(5)));
+
+        // Already nudged for exactly this mail: the loop stops here. This is the case
+        // that keeps an agent which wakes and never reads from being nudged forever.
+        assert!(!needs_retrigger(RetriggerRecord::At(mark(5)), mark(5)));
+
+        // Older mail than we have already nudged for cannot re-nudge either.
+        assert!(!needs_retrigger(RetriggerRecord::At(mark(9)), mark(5)));
+
+        // But NEWER mail always earns its own nudge — the bound is per-message, not a
+        // permanent silence.
+        assert!(needs_retrigger(RetriggerRecord::At(mark(5)), mark(6)));
+
+        // A broken record fails SAFE: re-trigger (a redundant wake) rather than
+        // assume delivery (a swallowed one).
+        assert!(needs_retrigger(RetriggerRecord::Unreadable, mark(1)));
+    }
 
     // The session-id filename encoding is now shared and authoritatively tested in
     // `mailbox_protocol::session`; here we only assert the per-session file paths

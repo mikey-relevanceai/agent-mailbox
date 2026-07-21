@@ -1,10 +1,18 @@
-# ADR-0012: Re-register the inbox and watchPaths on session resume
+# ADR-0013: Re-register the inbox and watchPaths on session resume
 
 - Status: Accepted
 - Date: 2026-07-21
 - Relates to: [ADR-0007](0007-always-on-agent-inboxes.md) (always-on inbox),
   [ADR-0008](0008-on-demand-wake-filechanged.md) (on-demand wake). Resolves the
   `watchPath`-persistence residual left [UNDOCUMENTED] in ADR-0008.
+- Sibling: [ADR-0012](0012-level-triggered-wake-at-the-turn-boundary.md) also makes
+  `ensure-watcher` do more at the turn boundary (re-bumping the sentinel for unread
+  mail). The two compose and are independent: 0012 makes sure mail that arrived while
+  the session was BUSY still wakes it; this one makes sure the session is *registered
+  and watched at all* after a resume. Both landed as the same `Stop` hook grew from a
+  pure watcher-liveness poke into the session's per-turn self-healing point — so
+  `ensure-watcher` now registers the inbox (here) **before** it checks watcher liveness
+  and then re-triggers (0012). That order is load-bearing; see below.
 
 ## Context
 

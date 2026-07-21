@@ -7,7 +7,7 @@
 //!   a plain synchronous hook: it registers the inbox, prints the `watchPaths`
 //!   registering this session's sentinel, and spawns the detached watcher. It fires on
 //!   `startup` AND on `resume`/`clear`/`compact`, so a resumed session (a fresh process)
-//!   re-establishes all three — the gap ADR-0012 closes.
+//!   re-establishes all three — the gap ADR-0013 closes.
 //! - `Stop` (matcher `""`) runs `mailbox harness ensure-watcher`, a plain synchronous
 //!   hook (NEVER asyncRewake): the pessimistic Stop-liveness net — respawn the detached
 //!   watcher iff it is dead, and re-register the inbox (best-effort). It NEVER exits 2
@@ -307,7 +307,7 @@ impl HookInstallSpec {
 
     /// The `ensure-watcher` hook command (`<bin> harness ensure-watcher`). The
     /// `Stop`-liveness hook (ADR-0008): a plain hook that respawns the detached watcher
-    /// iff it is dead and re-registers the inbox (best-effort, ADR-0012). NOT
+    /// iff it is dead and re-registers the inbox (best-effort, ADR-0013). NOT
     /// asyncRewake — it never wakes the session.
     fn ensure_watcher_command(&self) -> String {
         format!("{} harness ensure-watcher", self.mailbox_bin)
@@ -328,7 +328,7 @@ impl HookInstallSpec {
 /// - `SessionStart` (matcher `""`, all sources) runs `session-start` (plain,
 ///   synchronous): register the inbox, print the `watchPaths` registering this session's
 ///   sentinel, spawn the detached watcher. Firing on every source (not just `startup`)
-///   is what re-establishes all three on a resume (ADR-0012).
+///   is what re-establishes all three on a resume (ADR-0013).
 /// - `Stop` runs `ensure-watcher` (plain, synchronous, NEVER asyncRewake): the
 ///   pessimistic Stop-liveness net (ADR-0008 FIX 3) — respawn the detached watcher iff
 ///   it is dead, and re-register the inbox (best-effort, restoring ADR-0007's
@@ -350,7 +350,7 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
             // must re-register its inbox, re-print its watchPaths, and re-spawn its
             // watcher — none of which the Stop hook can do for it (a Stop cannot emit a
             // SessionStart watchPaths registration). Gating this to "startup" left every
-            // resumed session unaddressable and unwakeable (ADR-0012). session-start is
+            // resumed session unaddressable and unwakeable (ADR-0013). session-start is
             // idempotent, so firing on every source is safe.
             "SessionStart": [json!({
                 "matcher": "",
@@ -788,7 +788,7 @@ mod tests {
         let snippet = hooks_snippet(&spec());
         let hooks = &snippet["hooks"];
 
-        // SessionStart: matcher "" (all sources, so it re-fires on resume — ADR-0012),
+        // SessionStart: matcher "" (all sources, so it re-fires on resume — ADR-0013),
         // a PLAIN session-start command (NOT asyncRewake — it never wakes the session).
         let start = &hooks["SessionStart"][0];
         assert_eq!(start["matcher"], "");

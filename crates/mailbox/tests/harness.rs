@@ -1131,7 +1131,7 @@ fn install_hooks_emits_valid_settings_snippet() {
     let value = parse_json(&stdout(&out));
 
     // The ADR-0008 hooks are wired: SessionStart(matcher "" — all sources, so it
-    // re-fires on resume per ADR-0012) → plain session-start, FileChanged(matcher = the
+    // re-fires on resume per ADR-0013) → plain session-start, FileChanged(matcher = the
     // sentinel basename) → asyncRewake wake, SessionEnd → cleanup. There is NO Stop
     // re-arm hook.
     let hooks = &value["hooks"];

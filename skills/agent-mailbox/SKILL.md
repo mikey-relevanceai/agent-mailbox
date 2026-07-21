@@ -132,6 +132,12 @@ something to `mailbox read`. (Behind the scenes a detached watcher wakes you the
 moment mail arrives and stays silent otherwise, so an idle session costs nothing and
 never sees a spurious wake.)
 
+**Mail that arrives while you are BUSY reaches you at the end of that turn**, not
+mid-turn — you cannot be woken while already awake. So you may finish a turn and
+immediately be woken with mail that landed during it. That is working as intended;
+just `mailbox read` as usual. You still never re-arm, and you never need to poll
+"just in case" — if there is mail, you will be told.
+
 ### Check state (read-only)
 
 ```bash

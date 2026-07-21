@@ -221,7 +221,7 @@ What each hook does:
   and spawns a **detached watcher** that outlives the hook and blocks on the mail FIFO for
   the whole session. The matcher is `""` (all sources), so it re-fires on
   **resume**/clear/compact — a resumed session is a fresh process that must re-establish
-  all three, and this is the only hook that can re-print watchPaths (ADR-0012). Every step
+  all three, and this is the only hook that can re-print watchPaths (ADR-0013). Every step
   is idempotent. It never wakes the session itself (it is not `asyncRewake`).
 
   If the bridge is **down or erroring**, it still prints the watchPaths and spawns the
@@ -229,16 +229,25 @@ What each hook does:
   under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
   never produces a *wake*; the watcher just blocks, and the first publish after the
   daemon returns kicks it.
-- **`Stop` → `mailbox harness ensure-watcher`**. The pessimistic **Stop-liveness** net:
-  at every turn boundary it respawns the detached watcher if it has died (a live watcher
-  is left alone), and **re-registers the session's inbox** (best-effort, fail-open —
-  ADR-0012, restoring the register-on-every-`Stop` invariant; this is what self-heals a
-  resume that raced the 10s tombstone). It does **not** re-print `watchPaths` (a `Stop`
-  cannot emit a SessionStart registration — that is `session-start`'s job). It **always
-  exits 0** — a `Stop` can never itself wake the session. It costs a small per-turn
-  process spawn plus one fail-open socket call but **no model turn**, and it is the
-  primary recovery for a watcher that was killed (a crash, an OS/OOM kill). It cannot help
-  a session that goes idle *forever* (which fires no `Stop`) — see the note below.
+- **`Stop` → `mailbox harness ensure-watcher`**. The turn-boundary net — the session's
+  per-turn self-healing point, with three jobs, **in this order**. **(1) Re-register the
+  inbox** (best-effort, fail-open — ADR-0013, restoring the register-on-every-`Stop`
+  invariant; this is what self-heals a resume that raced the 10s tombstone). It runs
+  first on purpose: a watcher spawned while the inbox is unregistered self-exits
+  `Unsubscribed`, so registering after the spawn would cost a turn. **(2) Stop-liveness:**
+  it respawns the detached watcher if it has died (a live watcher is left alone) — the
+  primary recovery for a watcher killed by a crash or an OS/OOM kill. **(3) The
+  level-triggered re-trigger (ADR-0012):** if the session is sitting on unread mail, it
+  re-bumps the sentinel so the `FileChanged` wake fires against the now-idle session.
+  That is what delivers mail which arrived while the agent was **busy** — a wake edge
+  spent mid-turn reaches nothing, and without this the agent would go idle deaf on top of
+  unread mail (a real bug, seen on a watched PR). It is bounded: each message earns at
+  most one turn-boundary nudge, so an agent that wakes and does not read is not looped.
+  It does **not** re-print `watchPaths` (a `Stop` cannot emit a SessionStart registration
+  — that is `session-start`'s job). It **always exits 0** — a `Stop` can never itself
+  wake the session; it only re-triggers the ordinary wake path. It costs a small per-turn
+  process spawn plus one fail-open socket call but **no model turn**. It cannot help a
+  session that goes idle *forever* (which fires no `Stop`) — see the note below.
 - **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
   (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
   idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread
@@ -276,7 +285,7 @@ as retained primitives, but are no longer wired into the hooks.) See
 
 Symptom: `mailbox status` reports `inbox: agent.<id> (NOT registered)` and
 `subscriptions: none`, peers' `mailbox send` to you fails, and you never wake. Since
-[ADR-0012](adr/0012-re-register-inbox-and-watchpaths-on-resume.md) this should heal
+[ADR-0013](adr/0013-re-register-inbox-and-watchpaths-on-resume.md) this should heal
 itself on your next `SessionStart` **or** turn boundary — so first just **take a
 turn**. If you are on an older binary (or need it back immediately), re-run the
 `SessionStart` handler by hand with a synthetic payload:
