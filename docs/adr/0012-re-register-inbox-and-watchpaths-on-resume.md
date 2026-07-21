@@ -51,6 +51,21 @@ A secondary interaction: the ADR-0007 tombstone guard (`SUBSCRIBE_TOMBSTONE_GUAR
 comment says a genuine resume "re-registers on its next arm once the guard lapses" — but
 after ADR-0008 there was no per-turn re-registration left to do so.
 
+### The missing inbox was the SINGLE upstream blocker (observed, then confirmed)
+
+On the live broken session it looked as though `ensure-watcher` never spawned a watcher
+at all. It did. `ensure-watcher` does **not** gate the spawn on subscriptions — it spawns
+whenever no live watcher exists — but the watcher it spawns re-checks `has_subscription`
+after taking its lock and, finding none (the inbox was unregistered), self-exits
+`Unsubscribed` and removes its own pidfile. From outside, "spawned then instantly
+self-exited" is indistinguishable from "never spawned"; `harness.log` shows
+`watcher found no subscriptions; exiting without arming a sentinel`.
+
+So the deafness was **one** bug, not two: the unregistered inbox starved the watcher too.
+That makes the ordering inside `ensure-watcher` load-bearing — **`register_inbox` must run
+BEFORE the watcher-liveness check**, or the watcher spawned on that same turn would still
+self-exit and the session would not recover until the following turn.
+
 ## Decision
 
 Restore the ADR-0007 invariant — the inbox (and, on resume, the watchPaths) are
@@ -88,6 +103,28 @@ re-established on every lifecycle hook — with two changes:
   `SessionStart` matcher from `startup` to `""` (the install merge recognises and
   replaces our own hook groups), so an existing install is healed by the documented
   upgrade step.
+- **A resumed orchestrator is no longer a silent black hole.** `send` to an unregistered
+  inbox DROPS rather than queues (baseline-on-subscribe — ADR-0007 §3), so every peer a
+  resumed coordinator had told to "report back" lost its report. One peer burned ~20
+  minutes retrying and only got through out-of-band. This ADR removes the common cause;
+  the residual is now surfaced honestly rather than silently, via the reworded `send`
+  error below.
+- **The `send` refusal no longer reads as an identity error.** It was
+  `SendError::UnknownAgent` — "unknown agent {id}" — which framed a *registration*
+  failure as a *stale id*, and demonstrably misled a peer agent into concluding the
+  coordinator had resumed with a new session id (it had not; the id is stable across a
+  resume). Renamed `SendError::InboxNotRegistered`, and the text now leads with the
+  registration, states outright that the id may be correct, and says the message was
+  dropped rather than queued.
+- **Hook handlers run by hand say so.** An empty stdin now yields a named
+  `HookError::NoPayload` naming the exact `echo '{"session_id":…}' | mailbox harness
+  session-start` incantation, instead of serde's "EOF while parsing a value at line 1
+  column 0" — which is what an operator hit while hand-recovering a lapsed session.
+  Manual recovery restores addressability and the watcher, but **not** the `watchPaths`
+  registration (Claude Code only consumes that from a real `SessionStart` hook), so the
+  recovered session does not auto-wake until a genuine `SessionStart` fires. That is
+  documented in `docs/04-usage.md` and is a further argument for fix 1 being the real
+  remedy rather than manual recovery.
 
 ## Alternatives considered
 

@@ -21,6 +21,24 @@ const MAX_HOOK_PAYLOAD_BYTES: u64 = 1024 * 1024;
 /// A hook could not be understood from its stdin payload.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
+    /// stdin was empty (or all whitespace) — almost always a human running a hook
+    /// handler by hand from a shell, where stdin is an immediately-closed TTY.
+    ///
+    /// Kept apart from [`Self::Parse`] because the raw serde message for this case
+    /// ("EOF while parsing a value at line 1 column 0") tells an operator nothing
+    /// about what they did wrong. These commands are hook targets, not interactive
+    /// commands, and the one time that matters most is manual recovery of a session
+    /// whose registration lapsed — so the error names the incantation instead.
+    #[error(
+        "no hook payload on stdin. `mailbox harness <command>` is a Claude Code HOOK \
+         handler, not an interactive command: it reads the hook's JSON (including \
+         `session_id`) from stdin. To run one by hand — e.g. to re-register a session \
+         whose inbox lapsed — pipe it a payload:\n    \
+         echo '{{\"session_id\":\"<your-session-id>\"}}' | mailbox harness session-start\n\
+         (`mailbox whoami` prints your session id.)"
+    )]
+    NoPayload,
+
     /// The stdin bytes were not valid JSON, or lacked a `session_id`.
     #[error("could not parse hook stdin JSON: {0}")]
     Parse(#[from] serde_json::Error),
@@ -76,6 +94,10 @@ impl HookInput {
         if buf.len() as u64 > MAX_HOOK_PAYLOAD_BYTES {
             return Err(HookError::TooLarge);
         }
+        // Empty stdin is its own error: it means "run by hand", not "malformed JSON".
+        if buf.trim().is_empty() {
+            return Err(HookError::NoPayload);
+        }
         Self::parse(&buf)
     }
 }
@@ -111,6 +133,22 @@ mod tests {
     fn rejects_empty_session_id() {
         let err = HookInput::parse(r#"{"session_id":"   "}"#).unwrap_err();
         assert!(matches!(err, HookError::EmptySessionId));
+    }
+
+    /// Running a hook handler bare from a shell gives it an empty stdin. That must
+    /// produce the actionable "this is a hook handler, pipe it a payload" error, not
+    /// serde's "EOF while parsing a value", which told a real operator nothing while
+    /// they were trying to hand-recover a session whose inbox had lapsed.
+    #[test]
+    fn empty_stdin_is_a_named_error_not_a_raw_parse_failure() {
+        for empty in ["", "   ", "\n\t "] {
+            let err = HookInput::from_reader(empty.as_bytes()).unwrap_err();
+            assert!(matches!(err, HookError::NoPayload), "{empty:?} -> {err:?}");
+            // The message must carry the way out, not just the diagnosis.
+            let text = err.to_string();
+            assert!(text.contains("harness session-start"), "{text}");
+            assert!(text.contains("session_id"), "{text}");
+        }
     }
 
     #[test]

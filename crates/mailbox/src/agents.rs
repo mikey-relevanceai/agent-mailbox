@@ -21,7 +21,7 @@
 //! registered an inbox is **guaranteed undeliverable** — if that session later
 //! registers, its baseline skips exactly the message we just wrote. Publishing it
 //! anyway would durably store a message no one can ever read while telling the
-//! sender it succeeded. [`send`] therefore refuses ([`SendError::UnknownAgent`])
+//! sender it succeeded. [`send`] therefore refuses ([`SendError::InboxNotRegistered`])
 //! rather than write into a void, and there is deliberately no `--force`.
 //!
 //! # Trust
@@ -59,12 +59,27 @@ pub enum SendError {
     /// The target has no registered inbox, so the message could never be
     /// delivered (see the module docs). Names the target so the error is
     /// actionable.
+    ///
+    /// # The wording is load-bearing: this is NOT "the id is wrong"
+    ///
+    /// This used to read "unknown agent {id}", and the variant was named
+    /// `UnknownAgent`. Both framed a *registration* failure as an *identity*
+    /// failure, and it actively misled a real agent: a peer that could not reach a
+    /// resumed coordinator concluded the coordinator "came back with a NEW session
+    /// id" and spent ~20 minutes retrying against that false theory. The id was
+    /// stable the whole time; only the registration was missing. So the message now
+    /// leads with the registration, says outright that the id may well be correct,
+    /// and states plainly that the message was DROPPED rather than queued.
     #[error(
-        "unknown agent {session:?}: it has no registered inbox, so nothing was published \
-         (a message to an unregistered agent can never be delivered — it would be baselined \
-         away if that agent later registered). Check `mailbox agents` for who is addressable."
+        "agent {session:?} has no registered inbox, so nothing was published. This does NOT \
+         mean the session id is wrong or stale — a live session can have an unregistered \
+         inbox (it registers on its SessionStart hook and re-registers at each turn \
+         boundary, so one that was resumed may not have re-registered yet). The message was \
+         DROPPED, not queued: baseline-on-subscribe means anything published now would be \
+         baselined away when that agent does register, so sending it later is the only way \
+         it arrives. Check `mailbox agents` for who is addressable right now."
     )]
-    UnknownAgent { session: String },
+    InboxNotRegistered { session: String },
 
     /// The target's session id cannot form an inbox topic at all.
     #[error("cannot address that agent: {0}")]
@@ -132,7 +147,7 @@ pub async fn send(
             to = to.as_str(),
             "rejected a send: target has no registered inbox"
         );
-        return Err(SendError::UnknownAgent {
+        return Err(SendError::InboxNotRegistered {
             session: to.as_str().to_string(),
         });
     }
@@ -286,7 +301,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, SendError::UnknownAgent { .. }));
+        assert!(matches!(err, SendError::InboxNotRegistered { .. }));
 
         // Nothing was written: were the ghost to register later, its baseline
         // would have skipped the message anyway — so the durable log stays clean.
@@ -310,7 +325,7 @@ mod tests {
         let err = send(&bus, &storage, SessionId::new("s-a"), b.clone(), Map::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, SendError::UnknownAgent { .. }));
+        assert!(matches!(err, SendError::InboxNotRegistered { .. }));
     }
 
     #[tokio::test]
