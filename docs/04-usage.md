@@ -226,13 +226,20 @@ What each hook does:
   under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
   never produces a *wake*; the watcher just blocks, and the first publish after the
   daemon returns kicks it.
-- **`Stop` → `mailbox harness ensure-watcher`** (plain, synchronous). The pessimistic
-  **Stop-liveness** net: at every turn boundary it respawns the detached watcher if it
-  has died (a live watcher is left alone), and re-prints the `watchPaths`. It **always
-  exits 0** — a `Stop` can never itself wake the session. It costs a small per-turn
-  process spawn but **no model turn**, and it is the primary recovery for a watcher that
-  was killed (a crash, an OS/OOM kill). It cannot help a session that goes idle *forever*
-  (which fires no `Stop`) — see the note below.
+- **`Stop` → `mailbox harness ensure-watcher`** (plain, synchronous). The turn-boundary
+  net, with two jobs. **(1) Stop-liveness:** it respawns the detached watcher if it has
+  died (a live watcher is left alone) and re-prints the `watchPaths` — the primary
+  recovery for a watcher killed by a crash or an OS/OOM kill. **(2) The level-triggered
+  re-trigger (ADR-0012):** if the session is sitting on unread mail, it re-bumps the
+  sentinel so the `FileChanged` wake fires against the now-idle session. That is what
+  delivers mail which arrived while the agent was **busy** — a wake edge spent mid-turn
+  reaches nothing, and without this the agent would go idle deaf on top of unread mail
+  (a real bug, seen on a watched PR). It is bounded: each message earns at most one
+  turn-boundary nudge, so an agent that wakes and does not read is not looped. It
+  **always exits 0** — a `Stop` can never itself wake the session; it only re-triggers
+  the ordinary wake path. It costs a small per-turn process spawn but **no model turn**.
+  It cannot help a session that goes idle *forever* (which fires no `Stop`) — see the
+  note below.
 - **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
   (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
   idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread

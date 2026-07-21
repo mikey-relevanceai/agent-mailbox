@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags};
 use mailbox_protocol::Topic;
 
 use super::error::StorageError;
-use super::model::SessionId;
+use super::model::{SessionId, Unread, WakeWatermark};
 
 /// A read-only view of the durable store, opened as a side connection.
 ///
@@ -74,7 +74,20 @@ impl ReadOnlyStore {
     /// topics for the reminder from this one call, so a separate `has_unread`
     /// boolean would be redundant.
     pub fn topics_with_unread(&self, session: &SessionId) -> Result<Vec<Topic>, StorageError> {
-        query_topics_with_unread(&self.conn, session.as_str())
+        Ok(query_unread(&self.conn, session.as_str())?
+            .topics()
+            .to_vec())
+    }
+
+    /// The same unread check, plus how far the unread mail extends
+    /// ([`WakeWatermark`]) — read in ONE statement, so the topics and the watermark
+    /// can never come from two different snapshots (which would let a publish land
+    /// between them and be recorded as already-seen).
+    ///
+    /// Used by the ADR-0012 turn-boundary re-trigger, which must distinguish "mail I
+    /// have already re-triggered a wake for" from "mail newer than that".
+    pub fn unread(&self, session: &SessionId) -> Result<Unread, StorageError> {
+        query_unread(&self.conn, session.as_str())
     }
 
     /// Whether `session` currently has at least one subscription.
@@ -95,9 +108,18 @@ impl ReadOnlyStore {
     }
 }
 
-/// The unread-topics query, factored out so it can run against any
-/// [`Connection`] — the read-only side connection in production, and an
-/// in-memory connection in unit tests — without opening a file.
+/// The ONE unread predicate, factored out so it can run against any [`Connection`]
+/// — the read-only side connection in production, and an in-memory connection in
+/// unit tests — without opening a file.
+///
+/// Both public reads ([`ReadOnlyStore::topics_with_unread`] and
+/// [`ReadOnlyStore::unread`]) go through here on purpose: two hand-written copies of
+/// this predicate would be free to drift, and a wake that disagrees with itself
+/// about what "unread" means is the exact bug class this module exists to prevent.
+///
+/// `MAX(e.event_row_id)` per topic is the newest unread event on it; the overall
+/// [`WakeWatermark`] is the max across topics. `event_row_id` is the store's global
+/// monotonic sequence, so that comparison is meaningful across topics.
 ///
 /// Events the session AUTHORED itself are excluded: you are never woken by your own
 /// message (the durable half of the no-self-kick — the kick filter alone would only
@@ -109,42 +131,62 @@ impl ReadOnlyStore {
 /// A subscription row can only hold a topic the bridge accepted, so a stored
 /// value that fails the grammar is corrupt storage, not user input (mirrors
 /// `read_topic_unread`).
-fn query_topics_with_unread(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Vec<Topic>, StorageError> {
+fn query_unread(conn: &Connection, session_id: &str) -> Result<Unread, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT s.topic
+        "SELECT s.topic, MAX(e.event_row_id)
          FROM subscription s
+         JOIN event e ON e.topic = s.topic
          WHERE s.session_id = ?1
-           AND EXISTS (
-               SELECT 1 FROM event e
-               WHERE e.topic = s.topic
-                 AND (e.author_session IS NULL OR e.author_session <> s.session_id)
-                 AND e.offset > COALESCE(
-                     (SELECT dc.offset FROM delivery_cursor dc
-                      WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
-                     -1)
-           )
+           AND (e.author_session IS NULL OR e.author_session <> s.session_id)
+           AND e.offset > COALESCE(
+               (SELECT dc.offset FROM delivery_cursor dc
+                WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
+               -1)
+         GROUP BY s.topic
          ORDER BY s.topic ASC",
     )?;
-    let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
 
     let mut topics = Vec::new();
+    let mut high_water: Option<i64> = None;
     for row in rows {
-        let topic_str = row?;
+        let (topic_str, newest) = row?;
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
         topics.push(topic);
+        high_water = Some(high_water.map_or(newest, |seen: i64| seen.max(newest)));
     }
-    Ok(topics)
+
+    Ok(Unread::from_parts(
+        topics,
+        high_water.map(WakeWatermark::new),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    /// The topic-only view most of these tests assert on.
+    fn query_topics_with_unread(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Vec<Topic>, StorageError> {
+        Ok(query_unread(conn, session_id)?.topics().to_vec())
+    }
+
+    /// The pending mail for a session, panicking if it is caught up — the shape the
+    /// watermark tests all want.
+    fn pending(conn: &Connection, session_id: &str) -> super::super::model::PendingMail {
+        match query_unread(conn, session_id).unwrap() {
+            Unread::Pending(mail) => mail,
+            Unread::CaughtUp => panic!("expected pending mail for {session_id}"),
+        }
+    }
 
     /// A fresh in-memory DB with the schema applied, for exercising the query
     /// predicate directly (fast; no file, no read-only open required).
@@ -312,6 +354,123 @@ mod tests {
             None
         );
         assert_eq!(bus.read(session, None).await.unwrap().len(), 1);
+    }
+
+    /// The watermark is what lets the turn-boundary re-trigger (ADR-0012) tell
+    /// "mail I already re-triggered for" from "mail newer than that". It must
+    /// therefore advance on a NEW event even when the unread topic SET is unchanged
+    /// — the exact case the busy-window bug lived in (a second event on an
+    /// already-unread topic).
+    #[test]
+    fn the_watermark_advances_on_new_mail_even_when_the_topic_set_is_unchanged() {
+        let conn = migrated();
+        subscribe(&conn, "s", "t.a");
+        assert_eq!(query_unread(&conn, "s").unwrap(), Unread::CaughtUp);
+
+        insert_event(&conn, "t.a", 0);
+        let first = pending(&conn, "s");
+        assert_eq!(first.topics().len(), 1);
+
+        // A second event on the SAME topic: identical topic set, HIGHER watermark.
+        insert_event(&conn, "t.a", 1);
+        let second = pending(&conn, "s");
+        assert_eq!(
+            second.topics(),
+            first.topics(),
+            "the topic set is unchanged..."
+        );
+        assert!(
+            second.high_water() > first.high_water(),
+            "...but the watermark must advance"
+        );
+
+        // Reading it all returns to caught-up, so nothing is re-triggered.
+        set_cursor(&conn, "s", "t.a", 1);
+        assert_eq!(query_unread(&conn, "s").unwrap(), Unread::CaughtUp);
+    }
+
+    /// The watermark spans topics: it is the store's GLOBAL row-id sequence, not a
+    /// per-topic offset, so mail arriving on a second topic advances it too.
+    #[test]
+    fn the_watermark_is_global_across_topics() {
+        let conn = migrated();
+        subscribe(&conn, "s", "t.a");
+        subscribe(&conn, "s", "t.b");
+        insert_event(&conn, "t.a", 0);
+        let first = pending(&conn, "s").high_water();
+
+        // A fresh topic whose per-topic OFFSET is 0 — lower than nothing, but its row
+        // id is newer, which is what the watermark must reflect.
+        insert_event(&conn, "t.b", 0);
+        let second = pending(&conn, "s");
+        assert_eq!(second.topics().len(), 2);
+        assert!(
+            second.high_water() > first,
+            "a newer event on another topic must advance the watermark, despite its offset 0"
+        );
+    }
+
+    /// An event the session authored is not mail for it — and must not drag the
+    /// watermark either, or a self-publish would suppress the re-trigger for genuine
+    /// mail that arrived before it.
+    #[test]
+    fn a_self_authored_event_moves_neither_the_topics_nor_the_watermark() {
+        let conn = migrated();
+        subscribe(&conn, "s", "t.a");
+        insert_event_by(&conn, "t.a", 0, "peer");
+        let before = pending(&conn, "s").high_water();
+
+        insert_event_by(&conn, "t.a", 1, "s");
+        assert_eq!(
+            pending(&conn, "s").high_water(),
+            before,
+            "your own event is not mail, so it cannot advance your watermark"
+        );
+    }
+
+    #[test]
+    fn a_watermark_round_trips_through_its_persisted_form() {
+        let w = WakeWatermark::new(42);
+        assert_eq!(WakeWatermark::parse(&w.get().to_string()), Some(w));
+        // Whitespace (a file read back with its trailing newline) is tolerated.
+        assert_eq!(WakeWatermark::parse(" 42\n"), Some(w));
+
+        // Everything outside the domain a store can mint is rejected, so no value
+        // inhabiting this type is a row id SQLite never assigned. `AUTOINCREMENT`
+        // starts at 1, so 0 and negatives are corruption, not watermarks.
+        for corrupt in ["not a number", "", "0", "-1", "99999999999999999999999"] {
+            assert_eq!(
+                WakeWatermark::parse(corrupt),
+                None,
+                "expected {corrupt:?} to be rejected"
+            );
+        }
+    }
+
+    /// The pairing invariant, enforced by the constructor rather than a comment: an
+    /// empty topic set is `CaughtUp`, never `Pending` with nothing to name. Without
+    /// this the re-trigger could bump a sentinel with no topics and then record a
+    /// watermark for mail it never named — silencing the real nudge.
+    #[test]
+    fn pending_mail_cannot_be_built_with_no_topics() {
+        assert_eq!(
+            Unread::from_parts(vec![], Some(WakeWatermark::new(9))),
+            Unread::CaughtUp
+        );
+        assert_eq!(
+            Unread::from_parts(vec![Topic::parse("t.a").unwrap()], None),
+            Unread::CaughtUp
+        );
+
+        let pending = Unread::from_parts(
+            vec![Topic::parse("t.a").unwrap()],
+            Some(WakeWatermark::new(9)),
+        );
+        let Unread::Pending(mail) = &pending else {
+            panic!("expected pending mail");
+        };
+        assert!(!mail.topics().is_empty());
+        assert_eq!(mail.high_water(), WakeWatermark::new(9));
     }
 
     #[test]
