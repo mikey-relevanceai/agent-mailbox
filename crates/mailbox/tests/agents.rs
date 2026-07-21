@@ -150,6 +150,23 @@ fn send_to_an_unregistered_agent_fails_loudly_and_publishes_nothing() {
         stderr.contains("no registered inbox"),
         "the error says WHY it failed: {stderr}"
     );
+    // Regression guard: the message must NOT frame a registration failure as an
+    // IDENTITY failure. The old "unknown agent" wording led a real peer agent to
+    // conclude a resumed coordinator had come back with a new session id (it had
+    // not — only its registration had lapsed) and to waste ~20 minutes on that
+    // false theory. The id may be perfectly correct, and the text must say so.
+    assert!(
+        !stderr.to_lowercase().contains("unknown agent"),
+        "the error must not imply the session id is unknown/stale: {stderr}"
+    );
+    assert!(
+        stderr.contains("does NOT mean the session id is wrong"),
+        "the error must rule out the stale-id misreading explicitly: {stderr}"
+    );
+    assert!(
+        stderr.contains("DROPPED, not queued"),
+        "the error must say the message was dropped rather than queued: {stderr}"
+    );
 
     // The refused send created no topic at all — so if the ghost ever registers,
     // there is no baselined-away message sitting in the log pretending to exist.

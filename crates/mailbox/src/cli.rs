@@ -268,8 +268,9 @@ pub enum HarnessCommand {
     /// The detached per-session mail watcher (ADR-0008). Spawned by `session-start`;
     /// blocks on the FIFO and bumps the wake sentinel on real mail. Not run by hand.
     Watch(WatchSentinelArgs),
-    /// Stop hook (ADR-0008 Stop-liveness): re-print this session's `watchPaths` and
-    /// respawn the detached watcher IFF it is missing/dead. NEVER wakes (exit 0 always).
+    /// Stop hook (ADR-0008 Stop-liveness): re-register this session's inbox (best-effort,
+    /// ADR-0013) and respawn the detached watcher IFF it is missing/dead. NEVER wakes
+    /// (exit 0 always).
     EnsureWatcher,
     /// SessionStart / Stop hook: launch a waiter IFF the session is subscribed.
     /// SUPERSEDED by `session-start` (ADR-0008); retained as a primitive.
@@ -1141,30 +1142,36 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     Ok(label.to_string())
 }
 
-/// Dispatch a `harness` subcommand. `arm`/`cleanup` are socket clients; the two
-/// `install-*` setup commands touch no bridge.
+/// Dispatch a `harness` subcommand. `session-start`, `arm`, `cleanup`, and
+/// `ensure-watcher` are socket clients (the last re-registers the inbox — ADR-0013);
+/// the two `install-*` setup commands touch no bridge.
 async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<ExitCode> {
     match args.command {
         HarnessCommand::SessionStart => run_harness_session_start().await,
         HarnessCommand::Arm(args) => run_harness_arm(args).await,
         HarnessCommand::Cleanup => run_harness_cleanup().await,
+        HarnessCommand::EnsureWatcher => Ok(run_ensure_watcher_hook().await),
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
         HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
-        // `wake`, `watch`, and `ensure-watcher` are dispatched synchronously by `main`
-        // (they need no tokio runtime — `wake` is a read-only peek, `watch` is a
-        // blocking loop, `ensure-watcher` is a liveness poke) and never reach here.
+        // `wake` and `watch` are dispatched synchronously by `main` (they need no tokio
+        // runtime — `wake` is a read-only peek, `watch` is a blocking loop) and never
+        // reach here. `ensure-watcher` is async now (it re-registers the inbox over the
+        // socket — ADR-0013), so it IS dispatched here.
         HarnessCommand::Wake => unreachable!("harness wake is handled synchronously in main"),
         HarnessCommand::Watch(_) => {
             unreachable!("harness watch is handled synchronously in main")
-        }
-        HarnessCommand::EnsureWatcher => {
-            unreachable!("harness ensure-watcher is handled synchronously in main")
         }
     }
 }
 
 /// The `SessionStart` hook (ADR-0008): the short-lived, non-asyncRewake setup that
-/// arms on-demand wake for this session. It:
+/// arms on-demand wake for this session.
+///
+/// It is wired with matcher `""`, so it fires on EVERY SessionStart source — `startup`
+/// AND `resume`/`clear`/`compact` (ADR-0013). A resume is a fresh process that has lost
+/// its predecessor's inbox registration, watchPaths, and watcher; running this on resume
+/// re-establishes all three. Every step below is idempotent, so re-running it on a live
+/// session (e.g. a `compact` mid-session) is a safe no-op. It:
 ///
 /// 1. reads `session_id` from the hook's stdin JSON;
 /// 2. ensures the always-on agent inbox subscription (card 16 / ADR-0007);
@@ -1188,7 +1195,7 @@ async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
         .session_id;
 
     // Always-on inbox first (best-effort; a down bridge does not fail the hook).
-    register_inbox(&config, &session).await;
+    register_inbox(&config, &session, "session-start").await;
 
     // Print the watchPaths registration (stdout is this hook's contract) and spawn
     // the detached watcher. Both are best-effort-but-loud: a failure to resolve the
@@ -1307,7 +1314,7 @@ async fn run_harness_arm(args: ArmArgs) -> anyhow::Result<ExitCode> {
 
     let max_block_ms = resolve_arm_max_block(&session, &args);
 
-    register_inbox(&config, &session).await;
+    register_inbox(&config, &session, "arm").await;
     let decision = mailbox_harness::arm::decide(probe_subscription(&config, &session).await);
     match decision {
         ArmDecision::Skip => {
@@ -1406,16 +1413,23 @@ fn resolve_arm_max_block(session: &SessionId, args: &ArmArgs) -> u64 {
 /// Ensure `session` is subscribed to its own inbox topic, over the socket
 /// (always-on agent inboxes, ADR-0007).
 ///
-/// Idempotent by construction: `arm` runs on every `Stop`, and `subscribe` is an
-/// idempotent no-op that leaves an existing delivery cursor untouched — so a
-/// re-arm can neither duplicate the subscription nor skip mail the agent has not
-/// read yet. Baseline-on-subscribe applies on the FIRST registration, which is
-/// exactly right: an agent is not shown messages sent before it existed.
+/// `source` names the hook that called us (`"session-start"`, `"ensure-watcher"`,
+/// `"arm"`) and rides every log line: since ADR-0013 both `session-start` (on a
+/// resume) and `ensure-watcher` (every `Stop`) re-register the inbox, and an
+/// operator diagnosing "why didn't my resumed agent wake?" needs to tell a
+/// resume's SessionStart re-registration apart from a Stop healing a lapsed one.
+///
+/// Idempotent by construction: `ensure-watcher` runs on every `Stop`, and
+/// `subscribe` is an idempotent no-op that leaves an existing delivery cursor
+/// untouched — so a re-registration can neither duplicate the subscription nor
+/// skip mail the agent has not read yet. Baseline-on-subscribe applies on the
+/// FIRST registration, which is exactly right: an agent is not shown messages sent
+/// before it existed.
 ///
 /// Best-effort and silent on failure by design: this must never fail the hook. If
 /// the bridge is down or errors, the probe that follows sees the same thing and
 /// takes the fail-safe path (skip arming, no wake).
-async fn register_inbox(config: &StorageConfig, session: &SessionId) {
+async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'static str) {
     let topic = match inbox_topic(session) {
         Ok(topic) => topic,
         Err(err) => {
@@ -1424,6 +1438,7 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
             // harness.log default filter (there is no transient retry that fixes it).
             error!(
                 session = %session.as_str(),
+                source,
                 error = %err,
                 "session id cannot form an inbox topic; not registering an inbox (peers cannot address this session)"
             );
@@ -1448,28 +1463,33 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId) {
             ..
         }) => warn!(
             session = %session.as_str(),
+            source,
             topic = %topic.as_str(),
             "did not register the agent inbox: session recently ended (tombstone guard); \
-             it will re-register on a later arm if the session genuinely resumes"
+             the next Stop's ensure-watcher re-registers it once the guard lapses (ADR-0013)"
         ),
         Ok(Response::Subscribed { outcome, .. }) => info!(
             session = %session.as_str(),
+            source,
             topic = %topic.as_str(),
             outcome = %describe_sub(&outcome),
             "registered the session's agent inbox"
         ),
         Ok(Response::Error { message }) => warn!(
             session = %session.as_str(),
+            source,
             error = %message,
             "bridge could not register the agent inbox; continuing (arming stays fail-safe)"
         ),
         Ok(other) => warn!(
             session = %session.as_str(),
+            source,
             reply = ?other,
             "unexpected bridge reply while registering the agent inbox; continuing"
         ),
         Err(err) => warn!(
             session = %session.as_str(),
+            source,
             error = %err,
             "bridge unreachable while registering the agent inbox; continuing (arming stays fail-safe)"
         ),
@@ -2131,44 +2151,66 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
 ///
 /// It **prints nothing to stdout**: a Stop hook cannot register `watchPaths` (that is a
 /// `SessionStart`-only output — emitting it from a Stop fails Claude Code's event-name
-/// check), so watchPath registration lives solely in the `SessionStart` hook and is
-/// assumed to persist for the session (an accepted residual, ADR-0008).
+/// check), so watchPath registration lives solely in the `SessionStart` hook. That hook
+/// now fires on resume too (matcher `""`, ADR-0013), so a resumed process re-registers
+/// its own watchPaths rather than relying on this one — which it never could.
+///
+/// It **also re-registers the session's inbox** on every turn boundary (best-effort,
+/// fail-open — ADR-0013), restoring the ADR-0007 invariant that the inbox is registered
+/// on every `SessionStart` AND every `Stop`. ADR-0008 moved registration into
+/// `session-start` alone and dropped it here; the consequence was that a session whose
+/// inbox lapsed (a resume within the tombstone guard, an unsubscribe) had no per-turn
+/// path to re-register. The socket call fails safe: a down/erroring bridge is logged and
+/// skipped, exactly like `session-start`'s registration.
 ///
 /// It **never exits 2** (it is not an `asyncRewake` hook), so a Stop can never itself
 /// wake the session — that is the load-bearing invariant. It exits 1 on a config/stdin
 /// error (it could do nothing useful) and 0 otherwise, including every no-op and every
-/// respawn. It needs no bridge socket — watcher liveness is local — so it is fast and
-/// cannot be blocked by a down daemon.
+/// respawn. The inbox re-registration is the one bridge socket call it makes; watcher
+/// liveness stays local, and a down daemon cannot block it (the client fails fast).
 ///
 /// The residual it does NOT cover (documented in ADR-0008): a session that goes idle
 /// **forever** — never another Stop — whose watcher then dies stays deaf until it next
 /// takes a turn or is restarted. That is the accepted limit of a zero-spurious-wake
 /// design; the OS service supervises the daemon, this hook supervises the watcher.
-pub fn run_ensure_watcher_hook() -> ExitCode {
+pub async fn run_ensure_watcher_hook() -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("mailbox harness ensure-watcher: {err}");
+            // Logged, not just eprintln'd: a total ensure-watcher failure now ALSO means
+            // the per-turn inbox re-registration (ADR-0013) never ran, so it must leave a
+            // trace where an operator diagnosing an unreachable session looks (harness.log
+            // when resolvable, else stderr). Same reasoning for the stdin branch below.
+            error!(error = %err, "mailbox harness ensure-watcher: could not resolve storage config; \
+                did not re-register the inbox or ensure the watcher");
             return ExitCode::FAILURE;
         }
     };
     let session = match HookInput::from_reader(std::io::stdin().lock()) {
         Ok(input) => input.session_id,
         Err(err) => {
-            eprintln!(
-                "mailbox harness ensure-watcher: could not read the Stop hook payload: {err}"
-            );
+            error!(error = %err, "mailbox harness ensure-watcher: could not read the Stop hook \
+                payload; did not re-register the inbox or ensure the watcher");
             return ExitCode::FAILURE;
         }
     };
+
+    // Re-register the inbox on EVERY Stop (ADR-0007's invariant, restored — ADR-0013).
+    // Best-effort and fail-open: a down bridge is logged and skipped, never fatal to the
+    // hook (a Stop must never wake or fail). This is what heals a session whose inbox was
+    // dropped and whose SessionStart re-registration was refused by the tombstone guard:
+    // once the 10s guard lapses, the next Stop re-subscribes it. Idempotent — an existing
+    // subscription's cursor is left untouched.
+    register_inbox(&config, &session, "ensure-watcher").await;
 
     // A Stop hook must NOT print a `watchPaths` registration: Claude Code validates that
     // a hook's `hookSpecificOutput.hookEventName` matches the firing event, and watchPath
     // registration is a `SessionStart`-only output — emitting it here fails the Stop hook
     // ("expected 'Stop' but got 'SessionStart'"). So this hook stays silent on stdout and
-    // only ensures watcher liveness. (Consequence: a `SessionStart`-registered watchPath
-    // cannot be re-registered mid-session; we rely on it persisting for the session — an
-    // accepted residual documented in ADR-0008.)
+    // only ensures watcher liveness. (Consequence: this hook cannot re-register the
+    // watchPath mid-session — but `session-start` now re-registers it on every resume via
+    // its wider matcher (ADR-0013), so a fresh process is not left relying on the previous
+    // process's registration persisting.)
 
     // Ensure a detached watcher is alive; respawn only when it is missing or dead. A
     // live watcher is left strictly alone (the respawn would lose the single-instance

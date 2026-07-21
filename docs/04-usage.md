@@ -194,7 +194,7 @@ The snippet wires four hooks (ADR-0008 — on-demand wake, no periodic re-arm *w
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness session-start" }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness ensure-watcher" }] }],
@@ -214,32 +214,40 @@ The snippet wires four hooks (ADR-0008 — on-demand wake, no periodic re-arm *w
 
 What each hook does:
 
-- **`SessionStart` → `mailbox harness session-start`** (plain, synchronous). Reads the
-  `session_id` from the hook's stdin JSON, **registers the session's agent inbox**
-  (`agent.<session-id>` — this is what makes it reachable by peer agents, see §4),
-  prints a `watchPaths` registration for this session's sentinel file, and spawns a
-  **detached watcher** that outlives the hook and blocks on the mail FIFO for the whole
-  session. It never wakes the session itself (it is not `asyncRewake`).
+- **`SessionStart` (matcher `""`) → `mailbox harness session-start`** (plain,
+  synchronous). Reads the `session_id` from the hook's stdin JSON, **registers the
+  session's agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
+  agents, see §4), prints a `watchPaths` registration for this session's sentinel file,
+  and spawns a **detached watcher** that outlives the hook and blocks on the mail FIFO for
+  the whole session. The matcher is `""` (all sources), so it re-fires on
+  **resume**/clear/compact — a resumed session is a fresh process that must re-establish
+  all three, and this is the only hook that can re-print watchPaths (ADR-0013). Every step
+  is idempotent. It never wakes the session itself (it is not `asyncRewake`).
 
   If the bridge is **down or erroring**, it still prints the watchPaths and spawns the
   watcher (fail-open): the watcher needs no daemon and re-checks subscriptions itself
   under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
   never produces a *wake*; the watcher just blocks, and the first publish after the
   daemon returns kicks it.
-- **`Stop` → `mailbox harness ensure-watcher`** (plain, synchronous). The turn-boundary
-  net, with two jobs. **(1) Stop-liveness:** it respawns the detached watcher if it has
-  died (a live watcher is left alone) and re-prints the `watchPaths` — the primary
-  recovery for a watcher killed by a crash or an OS/OOM kill. **(2) The level-triggered
-  re-trigger (ADR-0012):** if the session is sitting on unread mail, it re-bumps the
-  sentinel so the `FileChanged` wake fires against the now-idle session. That is what
-  delivers mail which arrived while the agent was **busy** — a wake edge spent mid-turn
-  reaches nothing, and without this the agent would go idle deaf on top of unread mail
-  (a real bug, seen on a watched PR). It is bounded: each message earns at most one
-  turn-boundary nudge, so an agent that wakes and does not read is not looped. It
-  **always exits 0** — a `Stop` can never itself wake the session; it only re-triggers
-  the ordinary wake path. It costs a small per-turn process spawn but **no model turn**.
-  It cannot help a session that goes idle *forever* (which fires no `Stop`) — see the
-  note below.
+- **`Stop` → `mailbox harness ensure-watcher`**. The turn-boundary net — the session's
+  per-turn self-healing point, with three jobs, **in this order**. **(1) Re-register the
+  inbox** (best-effort, fail-open — ADR-0013, restoring the register-on-every-`Stop`
+  invariant; this is what self-heals a resume that raced the 10s tombstone). It runs
+  first on purpose: a watcher spawned while the inbox is unregistered self-exits
+  `Unsubscribed`, so registering after the spawn would cost a turn. **(2) Stop-liveness:**
+  it respawns the detached watcher if it has died (a live watcher is left alone) — the
+  primary recovery for a watcher killed by a crash or an OS/OOM kill. **(3) The
+  level-triggered re-trigger (ADR-0012):** if the session is sitting on unread mail, it
+  re-bumps the sentinel so the `FileChanged` wake fires against the now-idle session.
+  That is what delivers mail which arrived while the agent was **busy** — a wake edge
+  spent mid-turn reaches nothing, and without this the agent would go idle deaf on top of
+  unread mail (a real bug, seen on a watched PR). It is bounded: each message earns at
+  most one turn-boundary nudge, so an agent that wakes and does not read is not looped.
+  It does **not** re-print `watchPaths` (a `Stop` cannot emit a SessionStart registration
+  — that is `session-start`'s job). It **always exits 0** — a `Stop` can never itself
+  wake the session; it only re-triggers the ordinary wake path. It costs a small per-turn
+  process spawn plus one fail-open socket call but **no model turn**. It cannot help a
+  session that goes idle *forever* (which fires no `Stop`) — see the note below.
 - **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
   (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
   idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread
@@ -272,6 +280,37 @@ as retained primitives, but are no longer wired into the hooks.) See
   zero-spurious-wake design. The OS user-service supervises the *daemon*; the `Stop` hook
   supervises the per-session *watcher*; nothing can poke a session that will neither act
   nor be poked.
+
+#### Recovering a session whose inbox lapsed
+
+Symptom: `mailbox status` reports `inbox: agent.<id> (NOT registered)` and
+`subscriptions: none`, peers' `mailbox send` to you fails, and you never wake. Since
+[ADR-0013](adr/0013-re-register-inbox-and-watchpaths-on-resume.md) this should heal
+itself on your next `SessionStart` **or** turn boundary — so first just **take a
+turn**. If you are on an older binary (or need it back immediately), re-run the
+`SessionStart` handler by hand with a synthetic payload:
+
+```bash
+# Claude Code exports CLAUDE_CODE_SESSION_ID into every tool call; `mailbox whoami`
+# prints the same id if you want to eyeball it first.
+echo "{\"session_id\":\"$CLAUDE_CODE_SESSION_ID\"}" | mailbox harness session-start
+```
+
+Two things to know about that manual path:
+
+- **The inbox and the watcher come back, but the wake does not (yet).** The handler
+  prints a `watchPaths` registration on stdout, and that only means anything when
+  **Claude Code** is the one reading it — i.e. when it runs as a real `SessionStart`
+  hook. Run from a shell, the registration goes to your terminal and is discarded, so
+  the `FileChanged` sentinel is not re-armed for the current process. You become
+  *addressable* (peers can `send`, and you will see mail on your next `mailbox read`)
+  but not *auto-wakeable* until a genuine `SessionStart` fires. **No `Stop` hook can
+  fix this** — `ensure-watcher` cannot emit a `SessionStart`-shaped registration.
+- **Diagnosing a watcher that will not stay up.** A watcher spawned while the inbox is
+  unregistered self-exits immediately (`watcher found no subscriptions; exiting without
+  arming a sentinel` in `harness.log`) and removes its pidfile — so it *looks* like no
+  watcher was ever spawned. Register the inbox first; the watcher then stays up. This
+  is why `ensure-watcher` registers the inbox *before* it checks watcher liveness.
 
 ### 2b. Install the skill
 
@@ -515,11 +554,23 @@ subscription baselines to the topic head, a message to a session with no inbox
 could never be delivered — so `send` refuses rather than dropping it into a void:
 
 ```text
-mailbox: unknown agent "s-ghost": it has no registered inbox, so nothing was published …
+mailbox: agent "s-ghost" has no registered inbox, so nothing was published. This does
+NOT mean the session id is wrong or stale — a live session can have an unregistered
+inbox … The message was DROPPED, not queued …
 ```
 
 Check `mailbox agents` for who is actually addressable. There is no `--force`: the
 only thing it could do is lose your message silently.
+
+> **This error does not mean the id is wrong.** It says the *inbox* is
+> unregistered, which a live session with a perfectly valid id can be. Do not
+> conclude the peer "restarted with a new session id" — a resumed session keeps its
+> id (`mailbox whoami`), and only its registration lapses. The earlier wording here
+> read "unknown agent", and a real agent took it as an identity problem and burned
+> ~20 minutes retrying a wrong theory while its report never arrived. If a peer is
+> unreachable, the fix is on *their* side (their next `SessionStart`/`Stop` hook
+> re-registers them — see the recovery note below), and you should re-send after
+> that rather than assume a new address.
 
 **What liveness means (and doesn't).** `agents` reports `idle (waiter appears
 blocked)` when the peer has a live waiter — a best-effort `kill(pid, 0)` probe, so
