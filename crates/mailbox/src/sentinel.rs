@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 
 use mailbox_protocol::{SessionId, Topic};
 
+use crate::storage::WakeWatermark;
+
 /// The fixed sentinel basename, and the static `FileChanged` matcher — re-exported
 /// from `mailbox-protocol` so the bridge (which writes the sentinel) and the
 /// harness-installer (which writes the matcher) share ONE definition and can never
@@ -54,6 +56,15 @@ pub use mailbox_protocol::WAKE_SENTINEL_BASENAME as SENTINEL_BASENAME;
 
 /// The `by-agent/<session>` grandparent directory name.
 const BY_AGENT_DIR: &str = "by-agent";
+
+/// The basename of the sibling file recording the newest mail the TURN-BOUNDARY
+/// re-trigger (ADR-0012) has already bumped the sentinel for.
+///
+/// Deliberately NOT a `.mailbox-wake…` name: the `FileChanged` matcher is the
+/// sentinel's basename, and this file must never be mistaken for — or accidentally
+/// matched alongside — the sentinel itself. It lives in the same per-session
+/// directory so `SessionEnd`'s [`Sentinel::remove_dir`] cleans it up for free.
+const RETRIGGER_BASENAME: &str = ".mailbox-retriggered";
 
 /// Env var overriding the sentinel root (defaults to `~/.mailbox`). Tests point it
 /// at a tempdir so a test can NEVER touch a real `~/.mailbox`.
@@ -90,6 +101,22 @@ pub enum SentinelError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// What the per-session re-trigger record says (ADR-0012).
+///
+/// `Missing` and `Unreadable` both mean "re-trigger" to the caller — the fail-safe
+/// direction, costing at most one redundant wake — but they are kept apart so the log
+/// can distinguish a normal first turn from a broken bookkeeping file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetriggerRecord {
+    /// No record yet: nothing has been re-triggered for this session.
+    Missing,
+    /// The record names the newest mail already re-triggered for.
+    At(WakeWatermark),
+    /// A record exists but could not be read or parsed (permissions, truncation,
+    /// garbage). Treated as `Missing` for the decision, and logged as a fault.
+    Unreadable,
 }
 
 /// A resolved per-session sentinel: its directory and the `.mailbox-wake` file.
@@ -177,6 +204,48 @@ impl Sentinel {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The newest mail a TURN-BOUNDARY re-trigger has already bumped this sentinel
+    /// for (ADR-0012).
+    ///
+    /// Three-way, not `Option`, because [`RetriggerRecord::Missing`] and
+    /// [`RetriggerRecord::Unreadable`] mean the same thing to the DECISION (re-trigger
+    /// — the fail-safe direction) but very different things to a human reading the
+    /// log. "No record yet" is the normal first turn; "I cannot read my own
+    /// bookkeeping, every turn" is a fault worth seeing. Collapsing them to a silent
+    /// `None` is how the previous generation of lost-wake bugs stayed invisible
+    /// (ADR-0008/0009), so the caller is given enough to say which it was.
+    pub fn last_retriggered(&self) -> RetriggerRecord {
+        match std::fs::read_to_string(self.retrigger_path()) {
+            Ok(text) => match WakeWatermark::parse(&text) {
+                Some(watermark) => RetriggerRecord::At(watermark),
+                // Present but not a watermark: truncated or garbled, i.e. a fault.
+                None => RetriggerRecord::Unreadable,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => RetriggerRecord::Missing,
+            Err(_) => RetriggerRecord::Unreadable,
+        }
+    }
+
+    /// Record that the sentinel has been re-triggered for mail up to `watermark`.
+    ///
+    /// Call this only AFTER the sentinel bump it describes: a crash between the two
+    /// then costs a duplicate re-trigger (harmless — the wake hook re-checks the
+    /// store), whereas recording first would lose the wake outright.
+    pub fn record_retriggered(&self, watermark: WakeWatermark) -> Result<(), SentinelError> {
+        std::fs::create_dir_all(&self.dir).map_err(|source| SentinelError::CreateDir {
+            path: self.dir.clone(),
+            source,
+        })?;
+        let path = self.retrigger_path();
+        std::fs::write(&path, watermark.get().to_string())
+            .map_err(|source| SentinelError::Write { path, source })
+    }
+
+    /// `<dir>/.mailbox-retriggered` — the re-trigger record's path.
+    fn retrigger_path(&self) -> PathBuf {
+        self.dir.join(RETRIGGER_BASENAME)
     }
 
     /// Remove the session's sentinel directory (and the file within), idempotently
@@ -302,6 +371,49 @@ mod tests {
         // wake hook answers with exit 0).
         s.write_topics(&[]).unwrap();
         assert!(s.read_topics().is_empty());
+    }
+
+    #[test]
+    fn the_retrigger_record_round_trips_and_reports_absent_apart_from_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+
+        // Nothing recorded yet — the normal first turn.
+        assert_eq!(s.last_retriggered(), RetriggerRecord::Missing);
+
+        let w = crate::storage::WakeWatermark::parse("7").unwrap();
+        s.record_retriggered(w).unwrap();
+        assert_eq!(s.last_retriggered(), RetriggerRecord::At(w));
+
+        // A corrupt record is reported as its OWN state, not silently as "missing":
+        // both re-trigger (fail-safe), but only one of them is a fault worth logging.
+        std::fs::write(s.dir().join(".mailbox-retriggered"), "garbage").unwrap();
+        assert_eq!(s.last_retriggered(), RetriggerRecord::Unreadable);
+
+        // An out-of-range row id is corruption too — no store ever minted it.
+        std::fs::write(s.dir().join(".mailbox-retriggered"), "0").unwrap();
+        assert_eq!(s.last_retriggered(), RetriggerRecord::Unreadable);
+    }
+
+    /// The record must never be mistaken for the sentinel: the `FileChanged` matcher
+    /// IS the sentinel's basename, so a name that collided with it would turn a
+    /// bookkeeping write into a wake trigger.
+    #[test]
+    fn the_retrigger_record_is_a_distinct_file_from_the_sentinel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+        s.record_retriggered(crate::storage::WakeWatermark::parse("1").unwrap())
+            .unwrap();
+
+        assert_ne!(s.retrigger_path(), s.path());
+        assert_ne!(
+            s.retrigger_path().file_name().unwrap().to_str().unwrap(),
+            SENTINEL_BASENAME
+        );
+        // It lives inside the per-session dir, so SessionEnd's teardown removes it.
+        assert_eq!(s.retrigger_path().parent(), Some(s.dir()));
+        s.remove_dir().unwrap();
+        assert!(!s.retrigger_path().exists());
     }
 
     #[test]

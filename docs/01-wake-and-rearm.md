@@ -52,7 +52,7 @@ Caveats:
 | Hook | Command | What it does |
 |---|---|---|
 | `SessionStart` (matcher `startup`) | `mailbox harness session-start` (plain, synchronous) | Reads `session_id` from the hook stdin JSON, **registers the agent inbox** (`agent.<session-id>`, always-on — ADR-0007), prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<abs sentinel>"]}}`, and spawns the detached watcher. **Fail-open:** a down bridge does not stop it printing watchPaths or spawning the watcher (which self-validates). Exits 0 — never asyncRewake, never a wake. |
-| `Stop` (matcher `""`) | `mailbox harness ensure-watcher` (plain, synchronous) | The **Stop-liveness** net (ADR-0008 FIX 3): on every turn boundary, **respawn the detached watcher iff it is missing/dead** (a live watcher is left alone — the single-instance lock makes a redundant spawn a clean no-op) and **re-print `watchPaths`** (defends watchPath persistence). Exits **0 always** — NEVER asyncRewake, so a Stop can never itself wake. Costs a per-turn process spawn but **no model turn**. This is the primary recovery for a watcher that died. |
+| `Stop` (matcher `""`) | `mailbox harness ensure-watcher` (plain, synchronous) | The turn-boundary net, two jobs. (1) **Stop-liveness** (ADR-0008 FIX 3): **respawn the detached watcher iff it is missing/dead** (a live watcher is left alone — the single-instance lock makes a redundant spawn a clean no-op) and **re-print `watchPaths`** (defends watchPath persistence). (2) **The level-triggered re-trigger** (ADR-0012): if the session is sitting on unread mail newer than any it has already been re-triggered for, **re-bump the sentinel** so a `FileChanged` fires against the now-idle session — this is what rescues mail published while the agent was BUSY, whose wake edge was spent on a mid-turn session. Exits **0 always** — NEVER asyncRewake, so a Stop can never itself wake. Costs a per-turn process spawn but **no model turn**. |
 | `FileChanged` (matcher `.mailbox-wake`) | `mailbox harness wake` (`asyncRewake: true`, `timeout` 1h) | On any change to the sentinel, opens the store **read-only** and checks whether THIS session has genuine unread mail. Exits **2** with `mail on topic X` on stderr iff so; otherwise exits **0** (the anti-loop guard — a `FileChanged` fires on every change, so an unconditional exit 2 would loop the agent). Isolation: the store re-check, not the sentinel path, is authoritative — a bump to another session's sentinel (shared-ancestor cwd) exits 0 here. |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the watcher (`SIGTERM` the pidfile PID), **removes the session's sentinel dir**, and calls the bridge to drop this session's subscriptions **and** interests (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` *atomically*, preserving unrelated settings; an upgrade sweeps the retired ADR-0006 `arm` hooks. |
@@ -116,6 +116,19 @@ a hook child:
 **Retained primitives.** `mailbox wait` and `mailbox harness arm` (with the
 `max_block`/re-arm-exit logic) still exist and are tested, but are **no longer wired
 into the hooks** — the periodic-re-arm *mechanism* is superseded. See ADR-0008 §F.
+
+**The wake edge only reaches an IDLE session, so the turn boundary re-arms it
+level-triggered (ADR-0012).** `FileChanged` → exit 2 does nothing for a session that is
+mid-turn: the hook does not even run, the bump is spent, and under the pure-edge design
+nothing ever bumped again — so mail published while the agent was busy was never
+delivered, and the agent went idle deaf on top of it (observed in the wild, 2026-07-21).
+`ensure-watcher` therefore also checks, at every turn boundary, whether the session has
+unread mail NEWER than the last it re-triggered for, and re-bumps the sentinel if so.
+The re-trigger is recorded by an `event_row_id` watermark in
+`<sentinel-dir>/.mailbox-retriggered`, so each message buys **at most one**
+turn-boundary wake — an agent that wakes and does not read is nudged once, not every
+turn forever. The hook still never wakes the session itself, and the sentinel is still
+never authority: the wake hook's store re-check decides, as always.
 
 **The `Stop`-liveness hook (`ensure-watcher`) is the recovery mechanism.** It fires per
 turn and **never wakes** (always exits 0): it respawns the detached watcher iff it is
@@ -183,6 +196,9 @@ and the daemon logs its kick counts at INFO on its own stderr:
 | `another watcher already holds this session's lock; exiting cleanly (single-instance)` | **benign** — a racing spawn lost the lock |
 | `ensure-watcher: a live watcher already holds the lock; leaving it (no-op)` | the Stop hook found the watcher healthy |
 | `ensure-watcher: no live watcher; respawning the detached watcher` | the Stop hook recovered a died watcher |
+| `turn boundary: unread mail arrived while busy; re-bumped the wake sentinel` | the ADR-0012 re-trigger rescued mail whose wake edge was spent mid-turn |
+| `turn boundary: this mail was already re-triggered; not nudging again (anti-loop)` | **benign** — the watermark bound one nudge per message |
+| `turn boundary: session is caught up; nothing to re-trigger` | the ordinary quiet turn (no sentinel write) |
 
 ## Codex CLI: no equivalent yet
 

@@ -196,7 +196,16 @@ On every turn boundary it (a) **respawns the detached watcher iff it is missing 
 dead** — a live watcher is left strictly alone (even a redundant spawn is free: the
 loser loses the single-instance lock and exits `AlreadyWaiting`), and (b) **re-prints
 the `watchPaths` registration**, defending the [UNDOCUMENTED] risk that a
-`SessionStart`-registered watchPath lapses over a long session. It needs no bridge
+`SessionStart`-registered watchPath lapses over a long session.
+
+> **Amendment ([ADR-0012](0012-level-triggered-wake-at-the-turn-boundary.md),
+> 2026-07-21).** This hook now has a THIRD job: **re-bump the sentinel if the session is
+> sitting on unread mail it has not already been re-triggered for.** Everything below —
+> including "it never wakes" — still holds; it triggers the existing wake wire rather
+> than becoming one. The reason is a real deafness bug this ADR's pure-edge design left
+> open: a bump that fires `FileChanged` while the session is BUSY is spent (the hook
+> does not even run), and nothing here ever bumped again, so mail published mid-turn
+> was never delivered. See ADR-0012 for the log evidence and the anti-loop watermark. It needs no bridge
 socket (watcher liveness and watchPaths are both local), so it is fast and fail-open.
 
 The cost is a per-turn process spawn on a working agent — but **no model turn**, since

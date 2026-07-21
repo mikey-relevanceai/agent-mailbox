@@ -15,7 +15,9 @@ use tracing::{error, info, warn};
 
 use mailbox::sentinel::Sentinel;
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
-use mailbox::wake::{REARM_NOTICE, WaitOutcome, Waiter, WakeError, WakeOutcome, WatchOutcome};
+use mailbox::wake::{
+    REARM_NOTICE, RetriggerOutcome, WaitOutcome, Waiter, WakeError, WakeOutcome, WatchOutcome,
+};
 use mailbox_harness::arm::{ArmDecision, StalePidfile, SubscriptionProbe};
 use mailbox_harness::hook::HookInput;
 use mailbox_harness::install::{
@@ -2112,8 +2114,14 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
     }
 }
 
-/// The `Stop` hook (ADR-0008 Stop-liveness): the pessimistic safety net that keeps a
-/// session's detached watcher alive across turns, and NEVER wakes.
+/// The `Stop` hook: the turn-boundary safety net. It does two things and NEVER wakes
+/// the session itself.
+///
+/// 1. **Watcher liveness** (ADR-0008): respawn the detached watcher if it died.
+/// 2. **The level-triggered re-trigger** (ADR-0012): if the session is sitting on
+///    unread mail it has not been re-triggered for, re-bump the wake sentinel — see
+///    [`retrigger_wake_if_unread`] for why an edge-only wake goes deaf on a BUSY
+///    session, which is the bug that motivates it.
 ///
 /// It is the recovery mechanism for **a dead watcher**: if the watcher died (a crash, an
 /// OS/OOM kill, an unrecoverable FIFO error), a session that keeps taking turns re-spawns
@@ -2178,8 +2186,95 @@ pub fn run_ensure_watcher_hook() -> ExitCode {
         spawn_detached_watcher(&session);
     }
 
+    // The ADR-0012 turn-boundary re-trigger: level-triggered here, edge-triggered
+    // thereafter. This is what rescues mail that arrived while the session was BUSY.
+    retrigger_wake_if_unread(&config, &session);
+
     // ALWAYS exit 0 — a Stop-liveness hook must never wake the session.
     ExitCode::SUCCESS
+}
+
+/// Run the ADR-0012 turn-boundary re-trigger and log what it decided.
+///
+/// The decision itself lives in [`Waiter::retrigger_if_unread`] (the wake domain owns
+/// "read unread, bump the sentinel"); this is the hook-layer half — resolve the
+/// config edges, then report the outcome. It is a safety net on a per-turn hook, so
+/// every failure is a logged no-op: a `Stop` that failed loudly, or slowly, would
+/// cost every turn on every session.
+fn retrigger_wake_if_unread(config: &StorageConfig, session: &SessionId) {
+    // No store: the bridge has never run here, so there is nothing to re-trigger.
+    if !config.path().exists() {
+        info!(session = %session.as_str(), "turn boundary: no mailbox store; nothing to re-trigger");
+        return;
+    }
+    let sentinel = match Sentinel::for_session(session) {
+        Ok(sentinel) => sentinel,
+        Err(err) => {
+            warn!(session = %session.as_str(), error = %err, "turn boundary: no sentinel path; skipping the re-trigger");
+            return;
+        }
+    };
+
+    let waiter = Waiter::new(
+        config.waiters_dir(),
+        config.path().to_path_buf(),
+        session.clone(),
+    );
+    match waiter.retrigger_if_unread(&sentinel) {
+        Ok(outcome) => log_retrigger(session, &outcome),
+        Err(err) => {
+            warn!(session = %session.as_str(), error = %err, "turn boundary: could not check unread; skipping the re-trigger")
+        }
+    }
+}
+
+/// Log one [`RetriggerOutcome`]. Exhaustive by construction, so a new outcome cannot
+/// be added and silently go unreported — the last generation of lost-wake bugs was
+/// invisible precisely because the deciding lines were not in the log
+/// (ADR-0008/0009).
+fn log_retrigger(session: &SessionId, outcome: &RetriggerOutcome) {
+    let names = |topics: &[Topic]| {
+        topics
+            .iter()
+            .map(Topic::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match outcome {
+        RetriggerOutcome::CaughtUp => {
+            info!(session = %session.as_str(), "turn boundary: session is caught up; nothing to re-trigger")
+        }
+        RetriggerOutcome::AlreadyRetriggered { last, high_water } => info!(
+            session = %session.as_str(),
+            // Both sides of the comparison, or the log cannot show WHY this mail was
+            // judged already-nudged.
+            last = ?last,
+            watermark = high_water.get(),
+            "turn boundary: this mail was already re-triggered; not nudging again (anti-loop)"
+        ),
+        RetriggerOutcome::Retriggered { topics, high_water } => info!(
+            session = %session.as_str(),
+            topics = names(topics),
+            watermark = high_water.get(),
+            "turn boundary: unread mail arrived while busy; re-bumped the wake sentinel (FileChanged will fire against the now-idle session)"
+        ),
+        RetriggerOutcome::RetriggeredUnrecorded {
+            topics,
+            high_water,
+            error,
+        } => warn!(
+            session = %session.as_str(),
+            topics = names(topics),
+            watermark = high_water.get(),
+            error = %error,
+            "turn boundary: re-bumped the sentinel but could not record the watermark (a later turn may nudge again)"
+        ),
+        RetriggerOutcome::BumpFailed { error } => warn!(
+            session = %session.as_str(),
+            error = %error,
+            "turn boundary: could not re-bump the wake sentinel; this mail waits for the next kick"
+        ),
+    }
 }
 
 /// Convenience for `main`: turn the `--json` flag into an [`OutputFormat`].
