@@ -194,7 +194,7 @@ The snippet wires four hooks (ADR-0008 — on-demand wake, no periodic re-arm *w
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness session-start" }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness ensure-watcher" }] }],
@@ -214,25 +214,31 @@ The snippet wires four hooks (ADR-0008 — on-demand wake, no periodic re-arm *w
 
 What each hook does:
 
-- **`SessionStart` → `mailbox harness session-start`** (plain, synchronous). Reads the
-  `session_id` from the hook's stdin JSON, **registers the session's agent inbox**
-  (`agent.<session-id>` — this is what makes it reachable by peer agents, see §4),
-  prints a `watchPaths` registration for this session's sentinel file, and spawns a
-  **detached watcher** that outlives the hook and blocks on the mail FIFO for the whole
-  session. It never wakes the session itself (it is not `asyncRewake`).
+- **`SessionStart` (matcher `""`) → `mailbox harness session-start`** (plain,
+  synchronous). Reads the `session_id` from the hook's stdin JSON, **registers the
+  session's agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
+  agents, see §4), prints a `watchPaths` registration for this session's sentinel file,
+  and spawns a **detached watcher** that outlives the hook and blocks on the mail FIFO for
+  the whole session. The matcher is `""` (all sources), so it re-fires on
+  **resume**/clear/compact — a resumed session is a fresh process that must re-establish
+  all three, and this is the only hook that can re-print watchPaths (ADR-0012). Every step
+  is idempotent. It never wakes the session itself (it is not `asyncRewake`).
 
   If the bridge is **down or erroring**, it still prints the watchPaths and spawns the
   watcher (fail-open): the watcher needs no daemon and re-checks subscriptions itself
   under its lock, so an unsubscribed session's watcher simply self-exits. A down bridge
   never produces a *wake*; the watcher just blocks, and the first publish after the
   daemon returns kicks it.
-- **`Stop` → `mailbox harness ensure-watcher`** (plain, synchronous). The pessimistic
-  **Stop-liveness** net: at every turn boundary it respawns the detached watcher if it
-  has died (a live watcher is left alone), and re-prints the `watchPaths`. It **always
+- **`Stop` → `mailbox harness ensure-watcher`**. The pessimistic **Stop-liveness** net:
+  at every turn boundary it respawns the detached watcher if it has died (a live watcher
+  is left alone), and **re-registers the session's inbox** (best-effort, fail-open —
+  ADR-0012, restoring the register-on-every-`Stop` invariant; this is what self-heals a
+  resume that raced the 10s tombstone). It does **not** re-print `watchPaths` (a `Stop`
+  cannot emit a SessionStart registration — that is `session-start`'s job). It **always
   exits 0** — a `Stop` can never itself wake the session. It costs a small per-turn
-  process spawn but **no model turn**, and it is the primary recovery for a watcher that
-  was killed (a crash, an OS/OOM kill). It cannot help a session that goes idle *forever*
-  (which fires no `Stop`) — see the note below.
+  process spawn plus one fail-open socket call but **no model turn**, and it is the
+  primary recovery for a watcher that was killed (a crash, an OS/OOM kill). It cannot help
+  a session that goes idle *forever* (which fires no `Stop`) — see the note below.
 - **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
   (`asyncRewake: true`). When the watcher bumps the sentinel, this fires — even on an
   idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread

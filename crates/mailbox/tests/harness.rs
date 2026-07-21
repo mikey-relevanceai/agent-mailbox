@@ -1130,11 +1130,15 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&out, "install-hooks");
     let value = parse_json(&stdout(&out));
 
-    // The ADR-0008 hooks are wired: SessionStart(startup) → plain session-start,
-    // FileChanged(matcher = the sentinel basename) → asyncRewake wake, SessionEnd →
-    // cleanup. There is NO Stop re-arm hook.
+    // The ADR-0008 hooks are wired: SessionStart(matcher "" — all sources, so it
+    // re-fires on resume per ADR-0012) → plain session-start, FileChanged(matcher = the
+    // sentinel basename) → asyncRewake wake, SessionEnd → cleanup. There is NO Stop
+    // re-arm hook.
     let hooks = &value["hooks"];
-    assert_eq!(hooks["SessionStart"][0]["matcher"], "startup");
+    assert_eq!(
+        hooks["SessionStart"][0]["matcher"], "",
+        "SessionStart must fire on every source (incl. resume), not just startup"
+    );
     let session_start = &hooks["SessionStart"][0]["hooks"][0];
     assert!(
         session_start.get("asyncRewake").is_none(),

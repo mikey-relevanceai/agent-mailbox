@@ -59,7 +59,10 @@ and only re-ensures watcher liveness; `watchPaths` registration stays in `Sessio
 One item remains [UNDOCUMENTED]: whether a `SessionStart`-registered `watchPath`
 persists for the whole session or must be refreshed. Because a `Stop` hook cannot
 re-register it (see the bug above), the design relies on it persisting — an accepted
-residual.
+residual. **(Update, [ADR-0012](0012-re-register-inbox-and-watchpaths-on-resume.md):**
+this residual bit on **resume** — a resumed session is a fresh process that never
+re-registered its watchPaths, because `session-start` was gated to the `startup` matcher.
+ADR-0012 widens the matcher so `session-start` re-fires on resume and re-prints them.)
 
 > **Correction (2026-07-17, [ADR-0009](0009-interest-liveness-from-the-waiter-pidfile.md)).**
 > This section used to name the `watchPath` residual as "the first suspect" if a
@@ -190,14 +193,22 @@ the binary WITHOUT re-running `install-hooks` leaves the stale ADR-0006 `arm` ho
 place** — see the residuals.
 
 **E′) The `Stop`-liveness hook** (`mailbox harness ensure-watcher`). This is the
-PRIMARY recovery mechanism and the pessimistic safety net. Plain, synchronous, **NEVER
-`asyncRewake`** — it exits **0 always**, so a `Stop` can never itself wake the session.
-On every turn boundary it (a) **respawns the detached watcher iff it is missing or
-dead** — a live watcher is left strictly alone (even a redundant spawn is free: the
-loser loses the single-instance lock and exits `AlreadyWaiting`), and (b) **re-prints
-the `watchPaths` registration**, defending the [UNDOCUMENTED] risk that a
-`SessionStart`-registered watchPath lapses over a long session. It needs no bridge
-socket (watcher liveness and watchPaths are both local), so it is fast and fail-open.
+PRIMARY recovery mechanism and the pessimistic safety net. **NEVER `asyncRewake`** — it
+exits **0 always**, so a `Stop` can never itself wake the session. On every turn boundary
+it (a) **respawns the detached watcher iff it is missing or dead** — a live watcher is
+left strictly alone (even a redundant spawn is free: the loser loses the single-instance
+lock and exits `AlreadyWaiting`), and (b) **re-registers the inbox** (best-effort,
+fail-open — ADR-0012). It does **not** re-print `watchPaths`: a `Stop` hook cannot emit a
+`SessionStart`-shaped registration (Claude Code rejects the mismatched `hookEventName`).
+
+> **Correction (ADR-0012).** This paragraph originally claimed (b) re-printed the
+> `watchPaths` — it never could, and never did. The real gap was that neither the inbox
+> nor the watchPaths were re-established on a **resume** (a fresh `SessionStart` whose
+> `source: "resume"` the `startup` matcher excluded). ADR-0012 fixes both: `session-start`
+> now fires on every `SessionStart` source (so a resumed process re-prints its own
+> watchPaths), and `ensure-watcher` re-registers the inbox on every `Stop` (restoring the
+> ADR-0007 invariant). The one bridge socket call `ensure-watcher` makes is that inbox
+> re-registration; a down daemon still cannot block it (the client fails fast).
 
 The cost is a per-turn process spawn on a working agent — but **no model turn**, since
 it never wakes. That trade is deliberately accepted here (it was the reason ADR-0008
@@ -274,12 +285,16 @@ green machinery test surface for no functional gain. A later card may delete the
     **confirmed on real agents (2026-07-16)** — see the smoke-test note under Context.
   - `watchPath` persistence across a long session is [UNDOCUMENTED], and a `Stop` hook
     CANNOT re-register it (that is a `SessionStart`-only output — emitting it from a Stop
-    fails Claude Code's event-name check, a bug we hit and fixed). So the design relies on
-    the `SessionStart` registration persisting for the session's life; if it lapses, a
-    long-idle session could go deaf with nothing to re-register it. **This was originally
-    called the first suspect for a deaf session; ADR-0009 corrects that** — the first
-    observed deafness was the TTL sweeper reaping a live interest. Check the bridge log
-    for `swept stale watch interests` before suspecting this.
+    fails Claude Code's event-name check, a bug we hit and fixed). **RESOLVED for the
+    resume case by [ADR-0012](0012-re-register-inbox-and-watchpaths-on-resume.md):** the
+    concrete failure was a *resumed* session (a fresh process) that never re-registered
+    its watchPaths or inbox, because `session-start` was gated to the `startup` matcher
+    and so did not fire on `source: "resume"`. ADR-0012 widens that matcher to `""` (all
+    sources), so a resumed process re-prints its own watchPaths and re-registers its
+    inbox; `ensure-watcher` also re-registers the inbox every `Stop`. The design no longer
+    relies on a `SessionStart` registration persisting across a resume — each fresh process
+    re-establishes it. (For a deaf session that was NOT resumed, ADR-0009 still applies —
+    check the bridge log for `swept stale watch interests` first.)
 
 ## Alternatives considered
 

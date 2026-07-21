@@ -439,6 +439,133 @@ fn ensure_watcher_respawns_a_dead_watcher_leaves_a_live_one_and_never_wakes() {
     guard.assert_clean();
 }
 
+// ==== ADR-0012: ensure-watcher re-registers the inbox on every Stop ================
+
+/// ADR-0012: the Stop-liveness hook re-registers the session's inbox, restoring the
+/// ADR-0007 invariant (register on every SessionStart AND every Stop) that ADR-0008
+/// dropped. Here NO `session-start` ran, so the inbox is unregistered; a single
+/// `ensure-watcher` must make the session addressable.
+///
+/// This proves the *mechanism* (a Stop re-registers via `register_inbox`). The tombstone
+/// **self-heal** it enables — a resume whose SessionStart registration was refused inside
+/// the 10s guard, re-subscribing once the guard lapses — is proved at the writer layer,
+/// instantly, by `subscribe_after_aged_tombstone_succeeds_and_clears_it` in
+/// `storage/writer.rs` (which drives an aged tombstone via `now_ms`). The end-to-end
+/// composition is those two facts; we deliberately do NOT re-prove it with a >10s
+/// process-level wait (an inverted-pyramid test).
+#[test]
+fn ensure_watcher_registers_the_inbox() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "ew-registers-inbox";
+
+    // Precondition: with no session-start, the session subscribes to nothing.
+    assert!(
+        env.subscriptions(session).is_empty(),
+        "no inbox should exist before any hook registers it"
+    );
+
+    // A single Stop hook must register the inbox (and exit 0, never a wake).
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ensure-watcher must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let subs = env.subscriptions(session);
+    assert_eq!(
+        subs,
+        vec![format!("agent.{session}")],
+        "ensure-watcher must register the agent inbox; got {subs:?}"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// ADR-0012 fail-open: `ensure-watcher` makes its first bridge socket call
+/// (`register_inbox`) as of this change, so the "a Stop hook must NEVER fail or wake, even
+/// with the bridge down" guarantee needs its own coverage — the mirror of
+/// `session_start_fails_open_when_the_bridge_is_down`. With NO daemon, the socket call
+/// fails; the hook must still exit 0 and leak nothing.
+#[test]
+fn ensure_watcher_fails_open_when_the_bridge_is_down() {
+    // No daemon started: the register_inbox socket call cannot connect.
+    let env = Env::new();
+    let session = "ew-failopen";
+
+    let out = env.ensure_watcher(session);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ensure-watcher must exit 0 even with the bridge down; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A Stop hook prints nothing on stdout (no watchPaths / hookEventName).
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "the Stop hook must print nothing to stdout"
+    );
+}
+
+/// ADR-0012: `session-start` fires on every SessionStart source, so it runs again on a
+/// resume. Running it twice (startup, then resume) must be idempotent — exactly ONE
+/// inbox subscription and the SAME single watcher after each — never a duplicate
+/// subscription or a leaked second watcher.
+#[test]
+fn session_start_is_idempotent_across_a_resume() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "ss-resume";
+
+    // First SessionStart (source: startup).
+    let out = env.session_start(session);
+    assert!(out.status.success(), "session-start (startup) must exit 0");
+    wait_until_armed(&env, session);
+    assert_eq!(
+        env.subscriptions(session),
+        vec![format!("agent.{session}")],
+        "startup registers exactly the inbox"
+    );
+    let first_pid = watcher_pid(&env, session).expect("a watcher pid after startup");
+
+    // Second SessionStart (source: resume — a fresh process re-establishing itself).
+    // The matcher is "" so this fires; it must be a clean idempotent no-op.
+    let out = env.session_start(session);
+    assert!(out.status.success(), "session-start (resume) must exit 0");
+    wait_until_armed(&env, session);
+    assert_eq!(
+        env.subscriptions(session),
+        vec![format!("agent.{session}")],
+        "resume must not duplicate the inbox subscription"
+    );
+    // The single-instance lock means the resume's spawn loses and exits: the ORIGINAL
+    // watcher still owns the pidfile. Assert it locally rather than leaning on the leak
+    // guard, so "no leaked second watcher" is proved by this test.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        watcher_pid(&env, session),
+        Some(first_pid),
+        "resume must not leak a second watcher — the original still owns the pidfile"
+    );
+    assert!(
+        pid_alive(first_pid),
+        "the original watcher is still running"
+    );
+
+    let out = env.cleanup(session);
+    assert!(out.status.success());
+    daemon.stop();
+    guard.assert_clean();
+}
+
 // ==== every kick bumps the sentinel; the wake hook's anti-loop bounds wakes ========
 
 /// The post-coalescing contract (ADR-0008, revised): the watcher writes the sentinel

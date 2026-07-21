@@ -51,8 +51,8 @@ Caveats:
 
 | Hook | Command | What it does |
 |---|---|---|
-| `SessionStart` (matcher `startup`) | `mailbox harness session-start` (plain, synchronous) | Reads `session_id` from the hook stdin JSON, **registers the agent inbox** (`agent.<session-id>`, always-on — ADR-0007), prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<abs sentinel>"]}}`, and spawns the detached watcher. **Fail-open:** a down bridge does not stop it printing watchPaths or spawning the watcher (which self-validates). Exits 0 — never asyncRewake, never a wake. |
-| `Stop` (matcher `""`) | `mailbox harness ensure-watcher` (plain, synchronous) | The **Stop-liveness** net (ADR-0008 FIX 3): on every turn boundary, **respawn the detached watcher iff it is missing/dead** (a live watcher is left alone — the single-instance lock makes a redundant spawn a clean no-op) and **re-print `watchPaths`** (defends watchPath persistence). Exits **0 always** — NEVER asyncRewake, so a Stop can never itself wake. Costs a per-turn process spawn but **no model turn**. This is the primary recovery for a watcher that died. |
+| `SessionStart` (matcher `""` — all sources) | `mailbox harness session-start` (plain, synchronous) | Reads `session_id` from the hook stdin JSON, **registers the agent inbox** (`agent.<session-id>`, always-on — ADR-0007), prints `{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<abs sentinel>"]}}`, and spawns the detached watcher. Matcher `""` (not `startup`) so it **re-fires on resume/clear/compact** — a resumed process re-establishes its inbox, watchPaths, and watcher (ADR-0012); every step is idempotent. **Fail-open:** a down bridge does not stop it printing watchPaths or spawning the watcher (which self-validates). Exits 0 — never asyncRewake, never a wake. |
+| `Stop` (matcher `""`) | `mailbox harness ensure-watcher` | The **Stop-liveness** net (ADR-0008 FIX 3): on every turn boundary, **respawn the detached watcher iff it is missing/dead** (a live watcher is left alone — the single-instance lock makes a redundant spawn a clean no-op) and **re-register the inbox** (best-effort, fail-open — ADR-0012, restoring ADR-0007's register-on-every-`Stop` invariant). It does **not** re-print `watchPaths` (a Stop hook cannot emit a SessionStart registration). Exits **0 always** — NEVER asyncRewake, so a Stop can never itself wake. Costs a per-turn process spawn + one fail-open socket call but **no model turn**. Primary recovery for a watcher that died. |
 | `FileChanged` (matcher `.mailbox-wake`) | `mailbox harness wake` (`asyncRewake: true`, `timeout` 1h) | On any change to the sentinel, opens the store **read-only** and checks whether THIS session has genuine unread mail. Exits **2** with `mail on topic X` on stderr iff so; otherwise exits **0** (the anti-loop guard — a `FileChanged` fires on every change, so an unconditional exit 2 would loop the agent). Isolation: the store re-check, not the sentinel path, is authoritative — a bump to another session's sentinel (shared-ancestor cwd) exits 0 here. |
 | `SessionEnd` | `mailbox harness cleanup` | Reaps the watcher (`SIGTERM` the pidfile PID), **removes the session's sentinel dir**, and calls the bridge to drop this session's subscriptions **and** interests (feeds the card-08 refcount — no zombie poller outlives the session). |
 | install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` *atomically*, preserving unrelated settings; an upgrade sweeps the retired ADR-0006 `arm` hooks. |
@@ -119,14 +119,28 @@ into the hooks** — the periodic-re-arm *mechanism* is superseded. See ADR-0008
 
 **The `Stop`-liveness hook (`ensure-watcher`) is the recovery mechanism.** It fires per
 turn and **never wakes** (always exits 0): it respawns the detached watcher iff it is
-missing/dead (a live one is left alone via the single-instance lock) and re-prints
-`watchPaths`. This is what makes the simple watcher (no elaborate in-loop self-healing)
+missing/dead (a live one is left alone via the single-instance lock) and re-registers the
+inbox (best-effort — ADR-0012). This is what makes the simple watcher (no elaborate in-loop self-healing)
 safe: a watcher killed by a crash, an OS/OOM kill, or an unrecoverable FIFO error is
 respawned on the session's next turn. **Supervision split:** the OS user-service
 (launchd/systemd) supervises the daemon (`mailbox serve`); the Stop hook supervises the
 per-session watcher. The one case it cannot cover — documented, not fixed — is a session
 that goes idle **forever** (fires no `Stop`) whose watcher then dies: nothing can wake a
 session that will neither take a turn nor be poked.
+
+**Resuming a session (ADR-0012).** A resume (Claude Code `--resume`/`--continue`, or an
+app relaunching the CLI) is a **fresh process** that has lost its predecessor's inbox
+registration, its `watchPaths` (per-process, not persisted across a resume), and its
+watcher. Claude Code fires `SessionStart` again on resume, but with `source: "resume"` —
+which the old `startup` matcher excluded, leaving a resumed orchestrator session both
+unaddressable (peers' `send` failed) and unwakeable (no watchPaths in the new process),
+mail discoverable only by polling `mailbox status`. The fix is two-part: (1) the
+`SessionStart` hook matcher is `""` (all sources), so `session-start` re-fires on resume
+and re-establishes inbox + watchPaths + watcher — the only hook that CAN re-print
+watchPaths; (2) `ensure-watcher` re-registers the inbox every `Stop`, so a resume that
+raced the 10s ADR-0007 tombstone self-heals on the next turn once the guard lapses.
+**After upgrading the binary, re-run `mailbox harness install-hooks`** to rewrite the
+matcher from `startup` to `""`.
 
 **Unconditional bump per kick (no coalescing).** The watcher writes the sentinel on
 **every** kick, unconditionally: it reads the current unread topic set and writes it
@@ -150,7 +164,7 @@ sweeps them and installs these in their place.
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command",
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness session-start" }] }],
     "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/to/mailbox harness ensure-watcher" }] }],
