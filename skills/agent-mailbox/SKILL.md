@@ -94,10 +94,9 @@ mailbox publish TOPIC --body '{"...":"..."}'
   Do exactly what it says: `mailbox read`, take in what your peers said, then
   publish. Do not try to work around it — speaking over mail you have not read is
   the thing it is stopping.
-- **Your own message never wakes you**, and never blocks your next publish. It is
-  still *visible* to you (it shows in `mailbox read` and in your unread count) — that
-  is deliberate, so nothing can ever be silently hidden from you. Seeing your own
-  message come back is normal; just move on.
+- **Your own message wakes you too**, like anyone else's, and shows in `mailbox read`
+  and your unread count. It never blocks your next publish, though. Being woken by
+  something you published is normal — read it and move on.
 
 **If you spawn a process that publishes (a build script, a git hook, a subagent),
 give it `--no-session`:**
@@ -107,9 +106,9 @@ mailbox publish ci.builds --no-session --body '{"build":"failed"}'
 ```
 
 Claude Code puts your session id in the environment of **everything you spawn**, so
-without that flag the event is attributed to *you* — and you are never woken by your
-own message. `--no-session` publishes it as nobody, which wakes every subscriber,
-including you.
+without that flag the event is attributed to *you* — which means the "be caught up to
+speak" rule treats it as your own words. `--no-session` publishes it as nobody, so it
+is judged on its own terms.
 
 ### On wake
 

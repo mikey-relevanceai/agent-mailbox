@@ -60,11 +60,11 @@ pub enum Request {
     /// `session` is the CALLER, when there is one — an agent's `mailbox publish`
     /// resolves it from the environment like every other session-scoped command. It
     /// is `Option` because the original publisher, an **adapter**, genuinely has no
-    /// session, and its contract must not change: no session → no unread rule, and
-    /// every subscriber is kicked. With a session, two rules apply (see
-    /// [`crate::serve`]): the publish is REFUSED if that session has unread events
-    /// on the topic ("be caught up to speak"), and the publisher is never kicked for
-    /// its own event (no self-wake).
+    /// session, and its contract must not change: no session → no unread rule. With a
+    /// session, one rule applies (see [`crate::serve`]): the publish is REFUSED if
+    /// that session has unread events on the topic that it did not itself write
+    /// ("be caught up to speak"). Either way every subscriber is kicked, the publisher
+    /// included (ADR-0014).
     ///
     /// `#[serde(default)]` so a frame from an older client (which had no such field)
     /// still decodes as the session-less adapter publish it was.

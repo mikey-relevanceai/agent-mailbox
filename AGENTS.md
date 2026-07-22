@@ -71,7 +71,7 @@ other command (except `wait`) is a one-shot Unix-socket client of it.
 | Command | What it does |
 |---|---|
 | `mailbox serve` | Long-lived daemon: owns the single writer + waker, binds `<db-dir>/mailbox.sock` (0600). |
-| `mailbox publish <topic> [--body <json>] [--adapter <id>] [--session <id>]` | Publish an event (daemon stamps the timestamp). The caller's session is **auto-resolved** like every other session-scoped command, and when there is one two rules apply on a topic that session subscribes to: the publish is **refused** (nothing written) if it has unread events there ("be caught up to speak"), and it is **never kicked for its own event** (its own cursor advances past it, so it also cannot block its next publish). An **adapter** has no session: no unread rule, every subscriber kicked — unchanged. |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>] [--session <id>]` | Publish an event (daemon stamps the timestamp). The caller's session is **auto-resolved** like every other session-scoped command, and when there is one the publish is **refused** (nothing written) if it has unread events on that topic that it did not itself write ("be caught up to speak"). Every subscriber is kicked, **the publisher included** ([ADR-0014](docs/adr/0014-self-authored-events-wake-their-author.md)) — its own event is mail like any other, though it never blocks its next publish. An **adapter** has no session: no unread rule. |
 | `mailbox subscribe <topic> --session <id>` | Subscribe this session (baseline-on-subscribe). |
 | `mailbox unsubscribe <topic> --session <id>` | Unsubscribe this session. |
 | `mailbox read --session <id> [--limit <n>]` | Return unread events, advancing the cursor. |

@@ -20,6 +20,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0011](0011-retry-failed-watches-on-sweep.md) | A give-up is not permanent — the sweep retries a `Failed` watch once per interval while its session lives, so a transient upstream outage self-heals | Accepted |
 | [0012](0012-level-triggered-wake-at-the-turn-boundary.md) | Level-triggered wake at the turn boundary: `Stop` re-bumps the sentinel for unread mail, because a wake edge spent while the session was BUSY is lost forever | Accepted |
 | [0013](0013-re-register-inbox-and-watchpaths-on-resume.md) | Re-register the inbox and watchPaths on resume: `session-start` fires on every `SessionStart` source (matcher `""`), and `ensure-watcher` re-registers the inbox on every `Stop` — restoring ADR-0007's register-on-every-hook invariant that ADR-0008 dropped | Accepted |
+| [0014](0014-self-authored-events-wake-their-author.md) | A self-authored event wakes its author: authorship is provenance, not evidence of knowledge, so it no longer suppresses a wake — reversing ADR-0006's "no self-wake" and giving `status` and the wake path one definition of "unread" | Accepted |
 
 ## When to write one
 

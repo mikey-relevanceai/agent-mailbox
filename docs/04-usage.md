@@ -452,17 +452,21 @@ agent is attributed to that agent's session — the event carries your session i
    failure (a bridge that is down is still exit 1). It is never exit 2 — that is the
    wake code.
 
-2. **You are never woken by your own message.** The publish kicks every *other*
-   subscriber, and your own event never wakes you.
+2. **Your own message wakes you too.** The publish kicks every subscriber to the
+   topic, you included ([ADR-0014](adr/0014-self-authored-events-wake-their-author.md)).
+   Authorship records *who published*, not *what you already know*: the same PR
+   transition arriving from a `github-pr` watch has no author at all and has always
+   woken you, even when you caused it by pushing the commit. Waking on one and not the
+   other was the inconsistency.
 
-   Your own event is **not hidden from you**, though: it stays unread, `mailbox read`
-   returns it, and `mailbox status` counts it. It simply does not *gag* you (rule 1
-   ignores what you wrote) and does not *wake* you.
+   Your own event is ordinary mail: it stays unread, `mailbox read` returns it, and
+   `mailbox status` counts it — all three now agree. The one thing it does not do is
+   *gag* you: rule 1 ignores what you wrote, so your own message can never block your
+   next publish.
 
-**Adapters are exempt from both.** An adapter has no session, so its publish behaves
-exactly as it always has: no unread rule, and every subscriber is kicked. That is the
-point of a mailbox — a poller must be able to publish into a topic whose subscribers
-are far behind.
+**Adapters are exempt from rule 1.** An adapter has no session, so no unread rule
+applies to its publishes. That is the point of a mailbox — a poller must be able to
+publish into a topic whose subscribers are far behind.
 
 ### `--no-session`: publishing from a script the agent spawned
 
