@@ -9,10 +9,12 @@
 //! - [`control`] — the request/response types client and server share;
 //! - [`cli`] — the clap command layer, argument parsing, and output formatting.
 //!
-//! Two commands do not use the socket. `serve` *is* the daemon. `wait` is the
-//! sole read-only exception (ADR-0003): it opens the store read-only and blocks
-//! on its wake FIFO, so it runs synchronously with no tokio runtime — its
-//! blocking `poll` would otherwise idle a runtime worker for no benefit.
+//! Three commands do not use the socket. `serve` *is* the daemon. `wait` opens the
+//! store read-only and blocks on its wake FIFO, so it runs synchronously with no
+//! tokio runtime — its blocking `poll` would otherwise idle a runtime worker for no
+//! benefit. `dashboard` is the second read-only reader (ADR-0015): a health view has
+//! to render when the daemon is down, which is exactly when a socket client cannot.
+//! Both read-only opens are permitted by ADR-0003 and neither can mutate.
 //!
 //! [`Storage`]: mailbox::storage::Storage
 //! [`Waker`]: mailbox::wake::Waker
@@ -48,6 +50,10 @@ fn main() -> ExitCode {
         // 2 = wake the session (mail, or the benign re-arm boundary), 1 = waiter
         // error, 0 = nothing to wake about (no subscriptions).
         Command::Wait(args) => cli::run_wait(&args),
+        // `dashboard` is the second read-only, socket-free command (ADR-0015): it
+        // reads the store directly so it still renders when the daemon is down, and
+        // it drives the terminal itself, so no async runtime is involved.
+        Command::Dashboard(args) => cli::run_dashboard(cli::output_format(cli.json), &args),
         // The ADR-0008 FileChanged wake hook (a read-only peek) and the detached
         // watcher (a blocking FIFO loop) also run synchronously — no runtime — and
         // own their own exit codes (see their handlers). Matched here so they never
@@ -171,12 +177,11 @@ fn init_tracing(command: &Command) {
 /// preferable to failing the hook.
 fn wire_log_file() -> Option<std::fs::File> {
     let config = mailbox::storage::StorageConfig::from_env().ok()?;
-    let dir = config.dir();
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(config.dir()).ok()?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("harness.log"))
+        .open(config.harness_log_path())
         .ok()
 }
 

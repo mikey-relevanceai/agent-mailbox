@@ -126,6 +126,8 @@ pub enum Command {
     Agents(SessionOpt),
     /// List known topics with their subscriber and event counts.
     Topics(TopicsArgs),
+    /// Live fleet health: which sessions can actually be woken, and who is behind.
+    Dashboard(DashboardArgs),
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
     Wait(WaitArgs),
     /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
@@ -420,6 +422,23 @@ pub struct TopicsArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct DashboardArgs {
+    /// Print one plain-text snapshot and exit, instead of the live view. What you
+    /// paste into an issue — and the only mode that works when stdout is not a TTY.
+    #[arg(long)]
+    pub once: bool,
+    /// Show only the sessions with no observed wake.
+    #[arg(long)]
+    pub deaf_only: bool,
+    /// Include sessions with no live watcher. Subscriptions outlive a session that
+    /// never ran `SessionEnd`, so the store knows about many more sessions than are
+    /// running; they are hidden by default because a dead session cannot be woken and
+    /// is not a fault.
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct ReadArgs {
     /// Maximum events per topic to return (bridge default if omitted).
     #[arg(long)]
@@ -516,8 +535,10 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitC
         Command::Send(args) => run_send(format, args).await,
         Command::Agents(args) => run_agents(format, args).await,
         Command::Topics(args) => run_topics(format, args).await,
-        // `wait` is dispatched synchronously by `main` and never reaches here.
+        // `wait` and `dashboard` are dispatched synchronously by `main` (both are
+        // socket-free read-only commands) and never reach here.
         Command::Wait(_) => unreachable!("wait is handled synchronously in main"),
+        Command::Dashboard(_) => unreachable!("dashboard is handled synchronously in main"),
         Command::Harness(args) => run_harness(format, args).await,
     }
 }
@@ -1871,6 +1892,75 @@ fn render_skill_report(
 /// killed waiter would never be re-armed. Waking *before* the deadline is what
 /// guarantees a `Stop`, and therefore a fresh `arm` with a fresh timeout. Without
 /// `--max-block-ms`, `wait` blocks indefinitely (the card-05 contract).
+/// `mailbox dashboard`: the live fleet health view (ADR-0015).
+///
+/// Synchronous and socket-free, like `wait`: it opens the store READ-ONLY, so it
+/// still renders when the `serve` daemon is down — the state it reports as
+/// `daemon DOWN` rather than refusing to draw.
+///
+/// `--once` prints a plain-text snapshot instead of taking over the terminal. It is
+/// also the automatic fallback when the terminal cannot be driven (piped output, no
+/// TTY, CI): a health view that fails because it is being piped to a file would be
+/// useless in exactly the situation where someone is capturing evidence.
+pub fn run_dashboard(format: OutputFormat, args: &DashboardArgs) -> ExitCode {
+    let config = match StorageConfig::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("mailbox dashboard: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let filters = mailbox::dashboard::ui::Filters {
+        deaf_only: args.deaf_only,
+        include_dead: args.all,
+    };
+    let print_once = || match mailbox::dashboard::Snapshot::gather(&config) {
+        Ok(snapshot) => {
+            match format {
+                // The whole snapshot, unfiltered: a script that wants only the failing
+                // sessions can select on `health.state`, and one that wants a fleet
+                // ratio needs the rows the human view hides. Filtering here would make
+                // `--json --deaf-only` silently unable to answer "how many of how many".
+                OutputFormat::Json => match serde_json::to_string_pretty(&snapshot) {
+                    Ok(json) => println!("{json}"),
+                    Err(err) => {
+                        eprintln!("mailbox dashboard: could not serialize snapshot: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                OutputFormat::Human => print!(
+                    "{}",
+                    mailbox::dashboard::ui::render_text_filtered(&snapshot, filters)
+                ),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("mailbox dashboard: {err}");
+            ExitCode::FAILURE
+        }
+    };
+
+    // `--json` is a snapshot format, so it implies `--once`: there is no sensible
+    // streaming-JSON form of a full-screen TUI, and silently ignoring the flag would
+    // make it a lie.
+    if args.once || matches!(format, OutputFormat::Json) {
+        return print_once();
+    }
+
+    match mailbox::dashboard::ui::run(&config) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A terminal we cannot drive is not a failure of the diagnosis — fall back to
+        // the text snapshot so the user still gets the answer they came for.
+        Err(mailbox::dashboard::DashboardError::Terminal(_)) => print_once(),
+        Err(err) => {
+            eprintln!("mailbox dashboard: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 pub fn run_wait(args: &WaitArgs) -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
