@@ -16,6 +16,15 @@
 //! advances a cursor. Advancing a session's cursor is the exclusive job of the
 //! agent's later `read` through the single writer — checking unread here is
 //! deliberately non-destructive so the waiter can peek without consuming.
+//!
+//! # The second reader: `mailbox dashboard` (ADR-0015)
+//!
+//! The waiter is no longer the only actor with that shape. `mailbox dashboard` is a
+//! health view whose whole job is to be readable when things are broken — including
+//! when the `serve` daemon is the broken thing — so routing it through the socket
+//! would take the view away in one of the failure modes it exists to diagnose. It
+//! reads through [`ReadOnlyStore::fleet`] under the same rule: read-only open, no
+//! create, no mutation, no cursor ever advanced.
 
 use std::path::Path;
 
@@ -25,6 +34,46 @@ use mailbox_protocol::Topic;
 
 use super::error::StorageError;
 use super::model::{SessionId, Unread, WakeWatermark};
+
+/// One instant's view of the whole bus, as [`ReadOnlyStore::fleet`] returns it.
+///
+/// Deliberately plain data with no behaviour: the dashboard layer decides how to
+/// rank, filter and render it, and storage stays a data layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fleet {
+    /// Every session with at least one subscription, in session-id order.
+    pub sessions: Vec<FleetSession>,
+    /// Every watch the bridge knows about, with its interest refcount.
+    pub watches: Vec<FleetWatch>,
+    /// Total events in the durable log.
+    pub events: u64,
+}
+
+/// One session's row in a [`Fleet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetSession {
+    pub session: String,
+    /// How many topics it subscribes to.
+    pub subscriptions: u64,
+    /// Whether `agent.<session-id>` is among them — i.e. whether peers can `send`
+    /// to it at all.
+    pub inbox_registered: bool,
+    /// Total unread across those topics, on the `status` definition.
+    pub unread: u64,
+    /// How many watches it holds interest in.
+    pub watch_interest: u64,
+}
+
+/// One watch's row in a [`Fleet`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FleetWatch {
+    pub kind: String,
+    pub repo: String,
+    pub pr: u64,
+    pub state: String,
+    pub child_pid: Option<u32>,
+    pub interest: u64,
+}
 
 /// A read-only view of the durable store, opened as a side connection.
 ///
@@ -88,6 +137,116 @@ impl ReadOnlyStore {
     /// have already re-triggered a wake for" from "mail newer than that".
     pub fn unread(&self, session: &SessionId) -> Result<Unread, StorageError> {
         query_unread(&self.conn, session.as_str())
+    }
+
+    /// Every session the store knows about, with its subscription count, total
+    /// unread, and whether its agent inbox is registered — plus every watch and its
+    /// interest count. The one read behind `mailbox dashboard` (ADR-0015).
+    ///
+    /// # One snapshot, not four
+    ///
+    /// The parts are gathered inside a single DEFERRED transaction so they describe
+    /// one instant. Assembled from separate statements, a fleet view could show a
+    /// session's unread count from before a publish and its watch state from after —
+    /// and a dashboard whose rows disagree with each other is worse than no dashboard,
+    /// because the disagreement looks like a bug in the thing being diagnosed.
+    ///
+    /// "Unread" here is the `status` predicate — every event past the delivery cursor,
+    /// including ones the session published itself — so the dashboard's number is the
+    /// one an agent sees in `mailbox status`.
+    pub fn fleet(&self) -> Result<Fleet, StorageError> {
+        // Read-only, so this can never block a writer; it exists purely to pin one
+        // consistent read view across the statements below.
+        let tx = self.conn.unchecked_transaction()?;
+
+        let mut sessions: std::collections::BTreeMap<String, FleetSession> = tx
+            .prepare(
+                "SELECT session_id,
+                        COUNT(*),
+                        MAX(topic = 'agent.' || session_id)
+                 FROM subscription
+                 GROUP BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok(FleetSession {
+                    session: row.get::<_, String>(0)?,
+                    subscriptions: row.get::<_, i64>(1)?.max(0) as u64,
+                    inbox_registered: row.get::<_, i64>(2)? != 0,
+                    unread: 0,
+                    watch_interest: 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|s| (s.session.clone(), s))
+            .collect();
+
+        for (session, unread) in tx
+            .prepare(
+                "SELECT s.session_id, COUNT(*)
+                 FROM subscription s
+                 JOIN event e ON e.topic = s.topic
+                 WHERE e.offset > COALESCE(
+                     (SELECT dc.offset FROM delivery_cursor dc
+                      WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
+                     -1)
+                 GROUP BY s.session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            if let Some(entry) = sessions.get_mut(&session) {
+                entry.unread = unread;
+            }
+        }
+
+        for (session, count) in tx
+            .prepare("SELECT session_id, COUNT(*) FROM watch_interest GROUP BY session_id")?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            if let Some(entry) = sessions.get_mut(&session) {
+                entry.watch_interest = count;
+            }
+        }
+
+        let watches = tx
+            .prepare(
+                "SELECT w.kind, w.repo, w.pr, w.state, w.child_pid, COUNT(wi.session_id)
+                 FROM watch w
+                 LEFT JOIN watch_interest wi ON wi.watch_id = w.id
+                 GROUP BY w.id
+                 ORDER BY w.kind, w.repo, w.pr",
+            )?
+            .query_map([], |row| {
+                Ok(FleetWatch {
+                    kind: row.get(0)?,
+                    repo: row.get(1)?,
+                    pr: row.get::<_, i64>(2)?.max(0) as u64,
+                    state: row.get(3)?,
+                    child_pid: row.get::<_, Option<i64>>(4)?.map(|p| p as u32),
+                    interest: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let events: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))?;
+
+        Ok(Fleet {
+            sessions: sessions.into_values().collect(),
+            watches,
+            events: events.max(0) as u64,
+        })
     }
 
     /// Whether `session` currently has at least one subscription.

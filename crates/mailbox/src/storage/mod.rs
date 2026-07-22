@@ -52,6 +52,7 @@ pub use model::{
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
 // `wake` module.
 pub(crate) use reader::ReadOnlyStore;
+pub use reader::{Fleet, FleetSession, FleetWatch};
 
 use writer::Command;
 
@@ -80,6 +81,12 @@ const SOCKET_FILE: &str = "mailbox.sock";
 /// opens the writer, so two `serve` processes on one DB cannot both become
 /// writers (the real cross-process single-writer guard — ADR-0003/0004).
 const LOCK_FILE: &str = "mailbox.lock";
+
+/// The append-only log every detached/hook-run command writes to, beside the
+/// database. It is the only durable record of the wake path's decisions, which is
+/// why `mailbox dashboard` reads it back to tell a session whose wake works from
+/// one that is silently deaf ([`crate::dashboard`]).
+const HARNESS_LOG_FILE: &str = "harness.log";
 
 /// Capacity of the writer command channel.
 ///
@@ -151,6 +158,14 @@ impl StorageConfig {
     /// path has no parent, matching how [`Storage::open`] treats an empty parent.
     pub fn socket_path(&self) -> PathBuf {
         self.sibling(SOCKET_FILE)
+    }
+
+    /// The harness log (`<db-parent>/harness.log`), where every hook-run and
+    /// detached command records what the wake path decided. Derived from the DB path
+    /// like the socket and the lock, so a test pointing storage at a tempdir gets an
+    /// isolated log rather than appending to the developer's real one.
+    pub fn harness_log_path(&self) -> PathBuf {
+        self.sibling(HARNESS_LOG_FILE)
     }
 
     /// The daemon's exclusive lockfile (`<db-parent>/mailbox.lock`). Derived from

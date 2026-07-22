@@ -632,6 +632,50 @@ unread:
 - **unread** — per-topic count of events past this session's cursor. `read`
   drains these.
 
+### `mailbox dashboard` — is the wake path actually working?
+
+`status` answers "what does this session have?". It cannot answer "will this session
+ever be told?", because the last hop of the wake — Claude Code noticing the sentinel
+file and running the `FileChanged` hook — happens outside the bridge. A session can
+have a registered inbox, a live watcher, and a sentinel being bumped on every kick,
+and still never wake.
+
+`mailbox dashboard` is the fleet-wide view of exactly that
+([ADR-0015](adr/0015-dashboard-reads-the-store-read-only.md)):
+
+```bash
+mailbox dashboard              # live view; [q]uit [r]efresh [d] no-wake only [a] incl. dead
+mailbox dashboard --once       # one plain-text snapshot (what you paste into an issue)
+mailbox dashboard --deaf-only  # just the sessions with no observed wake
+```
+
+```text
+MAILBOX  daemon up  59 live / 306 known sessions  31 watches  250 events
+WAKE     28 verified, 98 with no wake observed
+
+SESSION    UNREAD   WAITER   INBOX   WATCH   WAKE
+3800bebb   7        live     reg     1       NO WAKE OBSERVED (8 sentinel bumps, 0 hook runs)
+5fd46282   0        live     reg     1       wake verified (12 hook runs, 8 wakes)
+```
+
+- **WAKE** is *evidence*, not a verdict, reconstructed from `harness.log`:
+  - `wake verified` — a `FileChanged` hook demonstrably ran for this session, so the
+    harness IS watching its sentinel. Positive proof; any hook run counts, including
+    the ones that found nothing.
+  - `NO WAKE OBSERVED` — its sentinel has been bumped and no hook has ever run. Very
+    likely unwakeable. It is not called *deaf* because the log cannot prove that: it
+    may have rotated, or every bump may have landed mid-turn (a lost edge —
+    [ADR-0012](adr/0012-level-triggered-wake-at-the-turn-boundary.md)). The bump count
+    is shown so you can check the claim.
+  - `no evidence yet` — never bumped. A new session sits here.
+- Rows sort **worst-first**: a session sitting on unread mail it cannot be woken for
+  is the first thing on screen.
+- **live / known** — subscriptions outlive a session whose `SessionEnd` never ran, so
+  the store knows about many more sessions than exist. Dead ones are hidden (they
+  cannot be woken and are not a fault); `--all` shows them.
+- It reads the store **read-only**, so it still renders when the bridge is down —
+  headed `daemon DOWN`, which is precisely when you want to look at it.
+
 ---
 
 ## 6. Try it now (no network)
