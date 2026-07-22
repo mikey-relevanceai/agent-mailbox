@@ -35,6 +35,27 @@ use mailbox_protocol::Topic;
 use super::error::StorageError;
 use super::model::{SessionId, Unread, WakeWatermark};
 
+/// The ONE unread condition, as a SQL fragment.
+///
+/// "Unread" is exactly the bus definition: an event past this session's delivery
+/// cursor on that topic, or — with no cursor row yet — any event (cursor treated as
+/// `-1`, since offsets start at 0). Authorship does not enter it: an event is mail to
+/// every subscriber including the one that published it (ADR-0014).
+///
+/// It is a shared constant rather than typed out per query because this module's
+/// stated failure mode is two hand-written copies drifting apart — "a wake that
+/// disagrees with itself about what 'unread' means is the exact bug class this module
+/// exists to prevent". The `dashboard` fleet aggregate cannot reuse `query_unread`'s
+/// whole statement (it counts per SESSION, not per topic), so without this it would be
+/// a second copy of the predicate, free to drift from the one the wake path uses.
+///
+/// Assumes the enclosing query has `subscription s` and `event e` in scope. Contains
+/// no interpolated caller data — it is a fixed fragment, not a query built from input.
+const UNREAD_PREDICATE: &str = "e.offset > COALESCE(
+    (SELECT dc.offset FROM delivery_cursor dc
+     WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
+    -1)";
+
 /// One instant's view of the whole bus, as [`ReadOnlyStore::fleet`] returns it.
 ///
 /// Deliberately plain data with no behaviour: the dashboard layer decides how to
@@ -151,9 +172,9 @@ impl ReadOnlyStore {
     /// and a dashboard whose rows disagree with each other is worse than no dashboard,
     /// because the disagreement looks like a bug in the thing being diagnosed.
     ///
-    /// "Unread" here is the `status` predicate — every event past the delivery cursor,
-    /// including ones the session published itself — so the dashboard's number is the
-    /// one an agent sees in `mailbox status`.
+    /// "Unread" is [`UNREAD_PREDICATE`], the same condition the wake path and `status`
+    /// use, so the dashboard's number is the one the agent sees and the one it will be
+    /// woken for — three views that used to be able to disagree (ADR-0014).
     pub fn fleet(&self) -> Result<Fleet, StorageError> {
         // Read-only, so this can never block a writer; it exists purely to pin one
         // consistent read view across the statements below.
@@ -182,16 +203,13 @@ impl ReadOnlyStore {
             .collect();
 
         for (session, unread) in tx
-            .prepare(
+            .prepare(&format!(
                 "SELECT s.session_id, COUNT(*)
                  FROM subscription s
                  JOIN event e ON e.topic = s.topic
-                 WHERE e.offset > COALESCE(
-                     (SELECT dc.offset FROM delivery_cursor dc
-                      WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
-                     -1)
+                 WHERE {UNREAD_PREDICATE}
                  GROUP BY s.session_id",
-            )?
+            ))?
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -293,18 +311,15 @@ impl ReadOnlyStore {
 /// value that fails the grammar is corrupt storage, not user input (mirrors
 /// `read_topic_unread`).
 fn query_unread(conn: &Connection, session_id: &str) -> Result<Unread, StorageError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT s.topic, MAX(e.event_row_id)
          FROM subscription s
          JOIN event e ON e.topic = s.topic
          WHERE s.session_id = ?1
-           AND e.offset > COALESCE(
-               (SELECT dc.offset FROM delivery_cursor dc
-                WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
-               -1)
+           AND {UNREAD_PREDICATE}
          GROUP BY s.topic
          ORDER BY s.topic ASC",
-    )?;
+    ))?;
     let rows = stmt.query_map([session_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
