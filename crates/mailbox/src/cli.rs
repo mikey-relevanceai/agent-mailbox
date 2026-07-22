@@ -375,9 +375,9 @@ pub struct PublishArgs {
     pub adapter: String,
     /// Publish with NO authoring session, ignoring `--session` and the ambient
     /// `$CLAUDE_CODE_SESSION_ID` / `$MAILBOX_SESSION_ID`. The event then belongs to
-    /// nobody: no unread rule applies to it, and it wakes EVERY subscriber — including
-    /// the agent whose session id this process happened to inherit. Use it from any
-    /// script/hook/subagent an agent spawns.
+    /// nobody, so the "be caught up to speak" rule does not apply to it. Use it from
+    /// any script/hook/subagent an agent spawns, so that process's work is not
+    /// attributed to whichever session id it happened to inherit.
     #[arg(long, conflicts_with = "session")]
     pub no_session: bool,
     #[command(flatten)]

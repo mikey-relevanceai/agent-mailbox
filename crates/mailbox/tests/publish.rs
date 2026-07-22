@@ -1,28 +1,26 @@
 //! Caller-aware publish: the rules that apply when the publisher is an AGENT, and
 //! the rules that must NOT apply when it is an adapter.
 //!
-//! `publish` used to be session-less: it fanned a wake kick out to every subscriber,
-//! including the publisher itself, so an agent subscribed to a topic it published to
-//! **woke itself on its own message**. Threading the caller's session through makes
-//! these rules expressible, and this file is where they are held:
+//! Threading the caller's session through `publish` makes these rules expressible,
+//! and this file is where they are held:
 //!
 //! 1. **Be caught up to speak.** A publish is REFUSED (its own exit code, nothing
 //!    written) if the caller is subscribed to the topic and has unread events on it
 //!    **that someone else wrote**.
-//! 2. **No self-wake.** The publisher is never kicked for its own event; a PEER
-//!    subscriber is.
-//! 3. **Its own event does not block its next publish** — the rule counts only what it
-//!    did not author — **but it is never hidden from it either**: it stays unread, and
-//!    `read` returns it. The publish used to advance the publisher's own cursor
-//!    instead, and that was silent mail loss, because the "publisher" is inferred from
-//!    `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into every process an agent
-//!    spawns. `--no-session` is the explicit way for such a process to publish as
-//!    nobody (no author → no rules, and it wakes EVERY subscriber).
+//! 2. **Every subscriber is woken, the publisher included** (ADR-0014). Authorship is
+//!    provenance, not evidence of what the agent knows — the same transition arriving
+//!    from `github-pr` has no author and has always woken it.
+//! 3. **Its own event does not block its next publish** — rule 1 counts only what it
+//!    did not author, or a first publish would be an agent's last — **and it is never
+//!    hidden from it either**: it stays unread, and `read` returns it. The publish used
+//!    to advance the publisher's own cursor instead, and that was silent mail loss,
+//!    because the "publisher" is inferred from `$CLAUDE_CODE_SESSION_ID`, which Claude
+//!    Code exports into every process an agent spawns. `--no-session` publishes as
+//!    nobody, which additionally exempts the event from rule 1.
 //!
 //! And the two contracts that must be untouched: an **adapter** publish (no session
-//! anywhere) still kicks everyone and is exempt from rule 1, and **`send`** — which
-//! writes to a *peer's* inbox, a topic the sender does not subscribe to — is
-//! unaffected.
+//! anywhere) is exempt from rule 1, and **`send`** — which writes to a *peer's* inbox,
+//! a topic the sender does not subscribe to — is unaffected.
 //!
 //! Every test that spawns a waiter holds a [`LeakGuard`], so a leaked process fails
 //! the test loudly rather than escaping into the runner.
@@ -35,10 +33,6 @@ use common::{Env, drain_stderr, poll_until, wait_within};
 
 /// How long to wait for a wake that SHOULD happen.
 const WAKE: Duration = Duration::from_secs(10);
-/// How long to watch a waiter that must NOT wake. A negative can only ever be
-/// bounded — this is long enough that a kick (which is a synchronous FIFO write
-/// inside the publish) would have landed many times over.
-const NO_WAKE_GRACE: Duration = Duration::from_millis(1500);
 
 /// Arm `session` (the `Stop` hook) and block until its waiter is really listening.
 fn arm(env: &Env, session: &str) -> common::ArmChild {
@@ -49,13 +43,14 @@ fn arm(env: &Env, session: &str) -> common::ArmChild {
     child
 }
 
-// ==== rule 2: no self-wake; a peer IS woken ====================================
+// ==== rule 2: every subscriber is woken, publisher included ====================
 
-/// The headline publish bug: an agent subscribed to a topic it publishes to woke
-/// ITSELF on its own message. The publisher must not be kicked — while a peer
-/// subscribed to the same topic must be.
+/// An event wakes EVERY subscriber to its topic, including the session that published
+/// it (ADR-0014). Authorship is provenance, not evidence the agent already knows: the
+/// same transition arriving via `github-pr` carries no author and has always woken it,
+/// so suppressing the attributable case only made the rule inconsistent.
 #[test]
-fn a_publisher_is_not_woken_by_its_own_event_but_a_peer_subscriber_is() {
+fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
@@ -86,20 +81,25 @@ fn a_publisher_is_not_woken_by_its_own_event_but_a_peer_subscriber_is() {
         "the peer's wake must name the topic it has mail on"
     );
 
-    // The PUBLISHER does not. It is mid-turn and knows what it just said.
+    // ...and so does the PUBLISHER, on the same wire.
+    let status =
+        wait_within(&mut publisher_waiter, WAKE).expect("the publisher's waiter must wake");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "the publisher must be kicked for its own event too"
+    );
     assert!(
-        wait_within(&mut publisher_waiter, NO_WAKE_GRACE).is_none(),
-        "the publisher must NOT be woken by its own event (no self-wake)"
+        drain_stderr(&mut publisher_waiter).contains(&format!("mail on topic {topic}")),
+        "the publisher's wake must name the topic, exactly like a peer's"
     );
 
-    // But its own event is NOT hidden from it. It used to be — the publish advanced the
-    // publisher's own cursor — and that was silent mail loss, because the "publisher" is
-    // inferred from an ambient env var that Claude Code exports into every process an
-    // agent spawns. Nothing may mark an event read except a `read`.
+    // Its own event is visible to it, as it always has been. Nothing may mark an event
+    // read except a `read` — the publisher's cursor is NOT advanced by publishing.
     assert_eq!(
         env.unread_on(publisher, topic),
         1,
-        "a publisher's own event stays VISIBLE to it (it just never wakes or blocks it)"
+        "a publisher's own event stays VISIBLE to it (publishing never advances its cursor)"
     );
     assert_eq!(
         env.unread_on(peer, topic),

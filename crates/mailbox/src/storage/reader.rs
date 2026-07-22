@@ -121,12 +121,14 @@ impl ReadOnlyStore {
 /// [`WakeWatermark`] is the max across topics. `event_row_id` is the store's global
 /// monotonic sequence, so that comparison is meaningful across topics.
 ///
-/// Events the session AUTHORED itself are excluded: you are never woken by your own
-/// message (the durable half of the no-self-kick — the kick filter alone would only
-/// hold for a waiter that was already blocked, while a waiter armed *after* the
-/// publish would find its own event unread and wake on it). Nothing is hidden by
-/// this: the event is still returned by `read` and still counted by `status` — it
-/// simply is not a reason to wake the session that wrote it.
+/// Authorship is NOT considered here: an event wakes every subscriber, including the
+/// session that published it (ADR-0014). Authorship is a label, not a reliable signal
+/// of what the agent already knows — the overwhelmingly common wake is a `github-pr`
+/// transition the agent itself caused (it opened the PR, it pushed the commit), and
+/// that has no author session to attribute it to, so it wakes the agent regardless.
+/// Suppressing only the one case we happen to be able to attribute made the rule
+/// inconsistent, and made this predicate disagree with `status`, which has always
+/// counted a session's own events. One definition of "unread", used everywhere.
 ///
 /// A subscription row can only hold a topic the bridge accepted, so a stored
 /// value that fails the grammar is corrupt storage, not user input (mirrors
@@ -137,7 +139,6 @@ fn query_unread(conn: &Connection, session_id: &str) -> Result<Unread, StorageEr
          FROM subscription s
          JOIN event e ON e.topic = s.topic
          WHERE s.session_id = ?1
-           AND (e.author_session IS NULL OR e.author_session <> s.session_id)
            AND e.offset > COALESCE(
                (SELECT dc.offset FROM delivery_cursor dc
                 WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
@@ -231,25 +232,25 @@ mod tests {
         .unwrap();
     }
 
-    /// You are never woken by your own message — the durable half of the no-self-kick
-    /// (a waiter armed *after* your publish must not wake on it either). A PEER's
-    /// event on the same topic still wakes you, and an anonymous (adapter /
-    /// `--no-session`) event wakes everyone.
+    /// Authorship does not enter the unread predicate (ADR-0014): your own event is
+    /// mail to you exactly as a peer's is, so the wake path and `status` agree on one
+    /// definition of "unread". Only the delivery cursor makes mail go quiet.
     #[test]
-    fn an_event_you_authored_does_not_wake_you_but_a_peers_does() {
+    fn an_event_you_authored_wakes_you_just_like_a_peers_does() {
         let conn = migrated();
         subscribe(&conn, "s", "t.a");
         subscribe(&conn, "peer", "t.a");
 
         insert_event_by(&conn, "t.a", 0, "s");
-        assert!(
-            query_topics_with_unread(&conn, "s").unwrap().is_empty(),
-            "your own event must not wake you"
+        assert_eq!(
+            query_topics_with_unread(&conn, "s").unwrap().len(),
+            1,
+            "your own event is mail to you too"
         );
         assert_eq!(
             query_topics_with_unread(&conn, "peer").unwrap().len(),
             1,
-            "but it IS mail for the peer"
+            "and it IS mail for the peer"
         );
 
         // A peer's event wakes you.
@@ -410,21 +411,20 @@ mod tests {
         );
     }
 
-    /// An event the session authored is not mail for it — and must not drag the
-    /// watermark either, or a self-publish would suppress the re-trigger for genuine
-    /// mail that arrived before it.
+    /// A self-authored event advances the watermark like any other (ADR-0014), so the
+    /// ADR-0012 turn-boundary re-trigger treats it as genuinely new mail and nudges
+    /// the session once for it.
     #[test]
-    fn a_self_authored_event_moves_neither_the_topics_nor_the_watermark() {
+    fn a_self_authored_event_advances_the_watermark_like_any_other() {
         let conn = migrated();
         subscribe(&conn, "s", "t.a");
         insert_event_by(&conn, "t.a", 0, "peer");
         let before = pending(&conn, "s").high_water();
 
         insert_event_by(&conn, "t.a", 1, "s");
-        assert_eq!(
-            pending(&conn, "s").high_water(),
-            before,
-            "your own event is not mail, so it cannot advance your watermark"
+        assert!(
+            pending(&conn, "s").high_water() > before,
+            "your own event is mail, so it advances your watermark"
         );
     }
 
