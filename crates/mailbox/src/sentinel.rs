@@ -66,6 +66,23 @@ const BY_AGENT_DIR: &str = "by-agent";
 /// directory so `SessionEnd`'s [`Sentinel::remove_dir`] cleans it up for free.
 const RETRIGGER_BASENAME: &str = ".mailbox-retriggered";
 
+/// The basename of the sibling file the `FileChanged` wake hook stamps on EVERY
+/// run, whatever it decides to do (ADR-0016).
+///
+/// This is the *ack* half of the wake path. The bridge can see that it bumped a
+/// sentinel, but it has never been able to see whether Claude Code noticed —
+/// that last hop is another process and, until now, only `harness.log` recorded
+/// it. Log archaeology turned out to be wrong in BOTH directions (a quiet session
+/// looks identical to an unwatched one, and a session that woke last week looks
+/// healthy today), so the hook now leaves a machine-readable mark instead.
+///
+/// Like [`RETRIGGER_BASENAME`], deliberately NOT a `.mailbox-wake…` name: the
+/// `FileChanged` matcher IS the sentinel's basename, so a colliding name would
+/// turn this bookkeeping write into a wake trigger and the hook would feed itself
+/// forever. It lives in the same per-session directory, so `SessionEnd`'s
+/// [`Sentinel::remove_dir`] cleans it up for free.
+const HOOK_RAN_BASENAME: &str = ".mailbox-hook-ran";
+
 /// Env var overriding the sentinel root (defaults to `~/.mailbox`). Tests point it
 /// at a tempdir so a test can NEVER touch a real `~/.mailbox`.
 pub const ENV_SENTINEL_ROOT: &str = "MAILBOX_SENTINEL_ROOT";
@@ -117,6 +134,55 @@ pub enum RetriggerRecord {
     /// A record exists but could not be read or parsed (permissions, truncation,
     /// garbage). Treated as `Missing` for the decision, and logged as a fault.
     Unreadable,
+}
+
+/// Proof that the `FileChanged` wake hook ran, as an opaque stamp.
+///
+/// Deliberately not a timestamp in the type system: a caller must never be tempted
+/// to do arithmetic on it or to trust it as a clock. The ONLY meaningful operation
+/// is inequality — "this differs from the stamp I read before I bumped the
+/// sentinel", which is exactly what proves a fresh hook run rather than an old one.
+/// Nanosecond resolution is what makes back-to-back probes distinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookRun(u128);
+
+impl HookRun {
+    /// Mint a stamp directly. Test-only on purpose: production code obtains a
+    /// `HookRun` only by reading what the hook actually wrote, so there is no way to
+    /// fabricate proof that a session was reached.
+    #[cfg(test)]
+    pub fn for_test(stamp: u128) -> Self {
+        Self(stamp)
+    }
+}
+
+/// What the per-session hook-ran record says.
+///
+/// Three-way for the same reason as [`RetriggerRecord`]: `Never` and `Unreadable`
+/// both mean "no usable proof", but one is a brand-new session and the other is a
+/// fault, and a health check that cannot tell them apart is how silent deafness
+/// stayed invisible in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRunRecord {
+    /// The hook has never run for this session (or the record was cleaned up).
+    Never,
+    /// The hook last ran at this stamp.
+    At(HookRun),
+    /// A record exists but could not be read or parsed.
+    Unreadable,
+}
+
+/// What bumping a sentinel actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BumpOutcome {
+    /// The file was rewritten with its existing content: mtime advanced, topic set
+    /// untouched. This is what a health probe wants — a change the watch must see,
+    /// with no effect on what the agent will be told is unread.
+    Bumped,
+    /// There is no sentinel to bump: nothing has ever written one for this session,
+    /// so there is no watched file and nothing to prove. Distinct from a failure —
+    /// a brand-new session sits here legitimately.
+    NothingToBump,
 }
 
 /// A resolved per-session sentinel: its directory and the `.mailbox-wake` file.
@@ -246,6 +312,80 @@ impl Sentinel {
     /// `<dir>/.mailbox-retriggered` — the re-trigger record's path.
     fn retrigger_path(&self) -> PathBuf {
         self.dir.join(RETRIGGER_BASENAME)
+    }
+
+    /// Stamp that the `FileChanged` wake hook ran (ADR-0016).
+    ///
+    /// Called on EVERY exit path of the hook, before it decides anything: the value
+    /// of this record is that it proves Claude Code delivered the file-change event
+    /// at all. Whether the hook then woke the agent, found nothing unread, or could
+    /// not reach the store is a separate question the log already answers.
+    ///
+    /// Writes into the per-session directory, which is created if needed — the hook
+    /// can legitimately run before any watcher has written a sentinel.
+    pub fn record_hook_ran(&self, at: std::time::SystemTime) -> Result<(), SentinelError> {
+        std::fs::create_dir_all(&self.dir).map_err(|source| SentinelError::CreateDir {
+            path: self.dir.clone(),
+            source,
+        })?;
+        let stamp = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = self.hook_ran_path();
+        std::fs::write(&path, stamp.to_string())
+            .map_err(|source| SentinelError::Write { path, source })
+    }
+
+    /// The stamp of the last `FileChanged` hook run, if any.
+    pub fn hook_ran(&self) -> HookRunRecord {
+        match std::fs::read_to_string(self.hook_ran_path()) {
+            Ok(text) => match text.trim().parse::<u128>() {
+                Ok(stamp) => HookRunRecord::At(HookRun(stamp)),
+                Err(_) => HookRunRecord::Unreadable,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HookRunRecord::Never,
+            Err(_) => HookRunRecord::Unreadable,
+        }
+    }
+
+    /// Rewrite the sentinel with the content it already has, advancing its mtime
+    /// without changing what it says (ADR-0016).
+    ///
+    /// This is the health probe's bump. It must be content-preserving: the sentinel
+    /// is the agent-facing statement of which topics have mail, and a probe that
+    /// rewrote it with a freshly-computed set would be a probe that could CHANGE
+    /// what the agent is told — an observation that alters the thing observed. The
+    /// watcher's [`Self::write_topics`] is the only writer allowed to decide content.
+    ///
+    /// Returns [`BumpOutcome::NothingToBump`] rather than creating the file when it
+    /// is absent: creating it would be a different event from modifying it (and on
+    /// some watch implementations, one the watch would not even see), so a probe
+    /// must not silently turn "never armed" into a bump that proves nothing.
+    pub fn bump_in_place(&self) -> Result<BumpOutcome, SentinelError> {
+        let body = match std::fs::read(&self.path) {
+            Ok(body) => body,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BumpOutcome::NothingToBump);
+            }
+            Err(source) => {
+                return Err(SentinelError::Write {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        std::fs::write(&self.path, body)
+            .map(|()| BumpOutcome::Bumped)
+            .map_err(|source| SentinelError::Write {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// `<dir>/.mailbox-hook-ran` — the wake hook's ack record.
+    fn hook_ran_path(&self) -> PathBuf {
+        self.dir.join(HOOK_RAN_BASENAME)
     }
 
     /// Remove the session's sentinel directory (and the file within), idempotently
@@ -414,6 +554,90 @@ mod tests {
         assert_eq!(s.retrigger_path().parent(), Some(s.dir()));
         s.remove_dir().unwrap();
         assert!(!s.retrigger_path().exists());
+    }
+
+    #[test]
+    fn the_hook_ran_record_round_trips_and_distinguishes_never_from_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+
+        assert_eq!(s.hook_ran(), HookRunRecord::Never);
+
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_890);
+        s.record_hook_ran(at).unwrap();
+        let HookRunRecord::At(first) = s.hook_ran() else {
+            panic!("expected a stamp");
+        };
+
+        // A later run yields a DIFFERENT stamp — that difference is the only thing a
+        // health probe is allowed to conclude anything from.
+        s.record_hook_ran(at + std::time::Duration::from_nanos(1))
+            .unwrap();
+        let HookRunRecord::At(second) = s.hook_ran() else {
+            panic!("expected a stamp");
+        };
+        assert_ne!(first, second);
+
+        std::fs::write(s.hook_ran_path(), "garbage").unwrap();
+        assert_eq!(s.hook_ran(), HookRunRecord::Unreadable);
+    }
+
+    /// The hook's ack must never be mistaken for the sentinel: the `FileChanged`
+    /// matcher IS the sentinel's basename, so a colliding name would make the hook
+    /// re-trigger itself on every run — an infinite wake loop.
+    #[test]
+    fn the_hook_ran_record_is_a_distinct_file_from_the_sentinel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+        s.record_hook_ran(std::time::SystemTime::now()).unwrap();
+
+        assert_ne!(s.hook_ran_path(), s.path());
+        assert_ne!(
+            s.hook_ran_path().file_name().unwrap().to_str().unwrap(),
+            SENTINEL_BASENAME
+        );
+        assert_ne!(s.hook_ran_path(), s.retrigger_path());
+        // Inside the per-session dir, so SessionEnd's teardown removes it.
+        assert_eq!(s.hook_ran_path().parent(), Some(s.dir()));
+        s.remove_dir().unwrap();
+        assert!(!s.hook_ran_path().exists());
+    }
+
+    #[test]
+    fn bumping_in_place_advances_the_mtime_without_changing_the_topics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+        let topics = [
+            Topic::parse("agent.s1").unwrap(),
+            Topic::parse("github.pr.o/r#1").unwrap(),
+        ];
+        s.write_topics(&topics).unwrap();
+        let before_mtime = std::fs::metadata(s.path()).unwrap().modified().unwrap();
+        let before_body = std::fs::read(s.path()).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(s.bump_in_place().unwrap(), BumpOutcome::Bumped);
+
+        assert!(
+            std::fs::metadata(s.path()).unwrap().modified().unwrap() > before_mtime,
+            "a bump must advance the mtime or the watch has nothing to notice"
+        );
+        assert_eq!(
+            std::fs::read(s.path()).unwrap(),
+            before_body,
+            "a bump must not change what the sentinel says"
+        );
+    }
+
+    /// A probe must not conjure a sentinel that no watcher has ever written: file
+    /// CREATION is a different event from modification, and reporting it as a bump
+    /// would claim to have tested something that was never tested.
+    #[test]
+    fn bumping_a_sentinel_that_does_not_exist_reports_nothing_to_bump() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
+        assert_eq!(s.bump_in_place().unwrap(), BumpOutcome::NothingToBump);
+        assert!(!s.path().exists(), "the probe must not create the sentinel");
     }
 
     #[test]

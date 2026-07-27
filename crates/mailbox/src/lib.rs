@@ -15,6 +15,7 @@ pub mod agents;
 pub mod bus;
 pub mod clock;
 pub mod dashboard;
+pub mod doctor;
 pub mod host;
 pub mod resolver;
 pub mod sentinel;

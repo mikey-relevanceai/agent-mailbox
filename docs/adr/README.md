@@ -22,6 +22,7 @@ They are not a substitute for design docs (see [`../design/`](../design/)).
 | [0013](0013-re-register-inbox-and-watchpaths-on-resume.md) | Re-register the inbox and watchPaths on resume: `session-start` fires on every `SessionStart` source (matcher `""`), and `ensure-watcher` re-registers the inbox on every `Stop` — restoring ADR-0007's register-on-every-hook invariant that ADR-0008 dropped | Accepted |
 | [0014](0014-self-authored-events-wake-their-author.md) | A self-authored event wakes its author: authorship is provenance, not evidence of knowledge, so it no longer suppresses a wake — reversing ADR-0006's "no self-wake" and giving `status` and the wake path one definition of "unread" | Accepted |
 | [0015](0015-dashboard-reads-the-store-read-only.md) | `mailbox dashboard` reads the store READ-ONLY (2nd exception to the socket-client rule) so a fleet health view still renders when the daemon is down; wake health is reported as three-valued evidence, never as a "deaf" verdict | Accepted |
+| [0016](0016-prove-wakeability-with-an-active-probe.md) | Prove wakeability with an ACTIVE probe (`mailbox doctor`) plus a hook-ran ack, because log-derived wake health was wrong in both directions and wakeability turns out to be perishable; a session with no live process is `gone`, not a fault | Accepted |
 
 ## When to write one
 

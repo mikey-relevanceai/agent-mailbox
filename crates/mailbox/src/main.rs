@@ -54,6 +54,10 @@ fn main() -> ExitCode {
         // reads the store directly so it still renders when the daemon is down, and
         // it drives the terminal itself, so no async runtime is involved.
         Command::Dashboard(args) => cli::run_dashboard(cli::output_format(cli.json), &args),
+        // `doctor` is read-only and socket-free for the same reason (ADR-0016): it
+        // proves wakeability from sentinel files and the process table, and a health
+        // check must still work when the daemon is the thing that is broken.
+        Command::Doctor(args) => cli::run_doctor(cli::output_format(cli.json), &args),
         // The ADR-0008 FileChanged wake hook (a read-only peek) and the detached
         // watcher (a blocking FIFO loop) also run synchronously — no runtime — and
         // own their own exit codes (see their handlers). Matched here so they never

@@ -216,6 +216,90 @@ fn the_wake_hook_exits_2_on_unread_and_0_when_caught_up() {
     guard.assert_clean();
 }
 
+// ==== the wake hook's ack: proof the harness ran it at all (ADR-0016) ============
+
+/// The ack record for `session` (the file `mailbox doctor` reads).
+fn hook_ran_record(env: &Env, session: &str) -> Option<String> {
+    std::fs::read_to_string(
+        env.sentinel_root()
+            .join("by-agent")
+            .join(session)
+            .join(".mailbox-hook-ran"),
+    )
+    .ok()
+}
+
+/// The ack must be stamped on EVERY run of the hook, including the no-op ones.
+///
+/// This is the whole basis of `mailbox doctor`: an agent that is simply caught up
+/// looks, from the outside, exactly like an agent whose watch is dead. Only a record
+/// written on the exit-0 path can tell them apart — so if this regressed to stamping
+/// only on wakes, every healthy idle session would start reporting as deaf.
+#[test]
+fn the_wake_hook_records_that_it_ran_on_every_exit_path() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "wake-ack";
+    let topic = env.pr_topic(3);
+
+    env.run_as_ok(session, &["subscribe", &topic], "subscribe");
+
+    // Nothing has run the hook yet, so there is no ack to find.
+    assert_eq!(
+        hook_ran_record(&env, session),
+        None,
+        "no ack may exist before the hook has ever run"
+    );
+
+    // The anti-loop path (nothing unread, exit 0) MUST still stamp the ack.
+    let wake = env.wake_hook(session);
+    assert_eq!(wake.status.code(), Some(0), "nothing unread yet");
+    let after_noop = hook_ran_record(&env, session)
+        .expect("the exit-0 path must still record that the hook ran");
+
+    // And so must the wake path (unread, exit 2), with a DIFFERENT stamp — it is the
+    // change that proves a fresh run rather than an old one.
+    env.publish(&topic);
+    let wake = env.wake_hook(session);
+    assert_eq!(wake.status.code(), Some(2), "unread mail must wake");
+    let after_wake = hook_ran_record(&env, session).expect("the exit-2 path must record too");
+    assert_ne!(
+        after_noop, after_wake,
+        "each run must leave a distinguishable stamp, or a probe cannot tell a fresh \
+         answer from a stale one"
+    );
+
+    daemon.stop();
+    guard.assert_clean();
+}
+
+/// `SessionEnd` must take the ack away with the rest of the session's state, so a
+/// stale stamp cannot make a departed session look like it answered.
+#[test]
+fn session_end_removes_the_hook_ran_ack_with_the_sentinel_dir() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "wake-ack-cleanup";
+
+    env.run_as_ok(session, &["subscribe", &env.pr_topic(4)], "subscribe");
+    env.wake_hook(session);
+    assert!(hook_ran_record(&env, session).is_some(), "ack was written");
+
+    env.cleanup(session);
+    assert_eq!(
+        hook_ran_record(&env, session),
+        None,
+        "SessionEnd must remove the ack along with the sentinel directory"
+    );
+
+    daemon.stop();
+    guard.assert_clean();
+}
+
 // ==== the watcher is single-instance: racing spawns → one winner, no leak =========
 
 #[test]

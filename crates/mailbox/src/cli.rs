@@ -128,6 +128,9 @@ pub enum Command {
     Topics(TopicsArgs),
     /// Live fleet health: which sessions can actually be woken, and who is behind.
     Dashboard(DashboardArgs),
+    /// Actively prove which sessions can be woken right now, by bumping each
+    /// sentinel and requiring the wake hook to answer.
+    Doctor(DoctorArgs),
     /// Block until this session has mail, then exit 2 (the asyncRewake contract).
     Wait(WaitArgs),
     /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
@@ -439,6 +442,19 @@ pub struct DashboardArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct DoctorArgs {
+    /// Probe only this session, instead of every session with a sentinel.
+    #[arg(long, value_parser = parse_session)]
+    pub session: Option<SessionId>,
+    /// How long a session has to answer before it is reported deaf.
+    #[arg(long, default_value_t = 10_000)]
+    pub timeout_ms: u64,
+    /// List every session probed, not just the faults.
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct ReadArgs {
     /// Maximum events per topic to return (bridge default if omitted).
     #[arg(long)]
@@ -539,6 +555,7 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitC
         // socket-free read-only commands) and never reach here.
         Command::Wait(_) => unreachable!("wait is handled synchronously in main"),
         Command::Dashboard(_) => unreachable!("dashboard is handled synchronously in main"),
+        Command::Doctor(_) => unreachable!("doctor is handled synchronously in main"),
         Command::Harness(args) => run_harness(format, args).await,
     }
 }
@@ -1902,6 +1919,160 @@ fn render_skill_report(
 /// also the automatic fallback when the terminal cannot be driven (piped output, no
 /// TTY, CI): a health view that fails because it is being piped to a file would be
 /// useless in exactly the situation where someone is capturing evidence.
+/// `mailbox doctor` — actively prove which sessions can be woken right now
+/// (ADR-0016).
+///
+/// Socket-free and synchronous for the same reason as `dashboard`: a health check
+/// has to work when the daemon is down, and this one needs nothing from it — it
+/// bumps sentinel files and reads the hook's acks.
+///
+/// **Exit 1 when any session is deaf.** This is a check, not a report: a fleet with
+/// an unreachable agent is a fleet that will silently drop work, and a caller
+/// scripting it (a cron, a supervisor agent) must be able to notice without parsing
+/// prose. Sessions with no live process are NOT faults and do not affect the code.
+pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
+    let root = match mailbox::sentinel::Sentinel::for_session(&SessionId::new("probe")) {
+        // `for_session` is the one place the root rule lives; we only want the root,
+        // so resolve a throwaway session and walk up from its directory.
+        Ok(sentinel) => match sentinel.dir().parent().and_then(|p| p.parent()) {
+            Some(root) => root.to_path_buf(),
+            None => {
+                eprintln!("mailbox doctor: could not resolve the sentinel root");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(err) => {
+            eprintln!("mailbox doctor: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let sessions = match &args.session {
+        Some(session) => vec![session.clone()],
+        None => mailbox::doctor::sessions_with_sentinels(&root),
+    };
+    if sessions.is_empty() {
+        println!(
+            "no sessions to probe (no sentinel directories under {})",
+            root.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Without a process table we cannot tell "deaf" from "not running". Say so and
+    // keep going rather than reporting confident nonsense: the probe still proves
+    // who IS reachable, which is the half that never lies.
+    let live = mailbox::doctor::live_claude_sessions();
+    if live.is_none() {
+        eprintln!(
+            "warning: could not read the process table, so sessions that have exited \
+             cannot be told apart from sessions that are deaf"
+        );
+    }
+    let live = live.unwrap_or_default();
+
+    let probe = mailbox::doctor::Probe {
+        budget: std::time::Duration::from_millis(args.timeout_ms),
+    };
+    let report = probe.run(&sessions, &live);
+
+    match format {
+        OutputFormat::Json => println!("{}", doctor_json(&report)),
+        OutputFormat::Human => render_doctor(&report, args.all),
+    }
+    if report.deaf() > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Render the probe as prose, faults first.
+fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
+    use mailbox::doctor::Reachability;
+
+    let deaf = report.deaf();
+    println!(
+        "probed {} session(s) in one window, {}ms budget: {} wakeable, {} deaf",
+        report.sessions.len(),
+        report.budget.as_millis(),
+        report.wakeable(),
+        deaf
+    );
+    for row in &report.sessions {
+        let show = show_all || row.reachability.is_fault();
+        if !show {
+            continue;
+        }
+        let detail = match &row.reachability {
+            Reachability::Wakeable { took } => {
+                format!("wakeable (answered in {}ms)", took.as_millis())
+            }
+            Reachability::Deaf => {
+                "DEAF — its sentinel changed and Claude Code never ran the wake hook; \
+                 mail will not reach this agent"
+                    .to_string()
+            }
+            Reachability::Gone => "gone (no live Claude Code process; not a fault)".to_string(),
+            Reachability::NeverArmed => {
+                "never armed (no sentinel has been written yet)".to_string()
+            }
+            Reachability::Undetermined { reason } => format!("undetermined ({reason})"),
+        };
+        println!("  {}  {}", row.session.as_str(), detail);
+    }
+    if report.looks_like_a_stale_install() {
+        println!(
+            "\nNOTHING answered. Before believing that, check that the `mailbox` binary your \
+             FileChanged hook runs is current — the ack this probe reads is written by that \
+             binary, so an old one looks exactly like a fleet-wide blackout. Re-run after \
+             installing; no session needs restarting, since the hook invokes the binary afresh \
+             every time."
+        );
+    } else if deaf > 0 {
+        println!(
+            "\n{deaf} agent(s) cannot be woken. Mail still lands in their inboxes durably, but \
+             they will not act on it until they take a turn for another reason. Deafness is \
+             acquired, so re-run this after any recovery to confirm."
+        );
+    }
+}
+
+/// The machine-readable probe result, for a supervisor agent or a cron.
+fn doctor_json(report: &mailbox::doctor::FleetReport) -> String {
+    use mailbox::doctor::Reachability;
+
+    let rows: Vec<serde_json::Value> = report
+        .sessions
+        .iter()
+        .map(|row| {
+            let mut value = serde_json::json!({
+                "session": row.session.as_str(),
+                "state": row.reachability.label(),
+                "fault": row.reachability.is_fault(),
+            });
+            match &row.reachability {
+                Reachability::Wakeable { took } => {
+                    value["answered_ms"] = serde_json::json!(took.as_millis() as u64);
+                }
+                Reachability::Undetermined { reason } => {
+                    value["reason"] = serde_json::json!(reason);
+                }
+                _ => {}
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "budget_ms": report.budget.as_millis() as u64,
+        "wakeable": report.wakeable(),
+        "deaf": report.deaf(),
+        "stale_install_suspected": report.looks_like_a_stale_install(),
+        "sessions": rows,
+    })
+    .to_string()
+}
+
 pub fn run_dashboard(format: OutputFormat, args: &DashboardArgs) -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
@@ -2092,6 +2263,32 @@ pub fn run_wake_hook() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Stamp the ack FIRST, before any decision and before the store is even
+    // consulted (ADR-0016). The point of this record is not what the hook decides
+    // — it is that Claude Code delivered the file-change event at all, which is the
+    // one hop the bridge cannot otherwise observe. Recording it late, or only on
+    // the wake path, would make a healthy-but-quiet session indistinguishable from
+    // an unwatched one, which is the confusion this record exists to end.
+    // Best-effort: a health record must never be able to break a wake.
+    match Sentinel::for_session(&session) {
+        Ok(sentinel) => {
+            if let Err(err) = sentinel.record_hook_ran(std::time::SystemTime::now()) {
+                warn!(
+                    session = %session.as_str(),
+                    error = %err,
+                    "could not record that the FileChanged hook ran; wake is unaffected but \
+                     `mailbox doctor` will under-report this session's health"
+                );
+            }
+        }
+        Err(err) => warn!(
+            session = %session.as_str(),
+            error = %err,
+            "could not resolve the sentinel to record that the FileChanged hook ran; \
+             wake is unaffected"
+        ),
+    }
 
     // No store at all: the bridge has never run here, so there is nothing to wake
     // about. Exit 0 (no wake) — never loop an agent over a phantom sentinel.

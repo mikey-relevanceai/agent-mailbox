@@ -676,6 +676,53 @@ SESSION    UNREAD   WAITER   INBOX   WATCH   WAKE
 - It reads the store **read-only**, so it still renders when the bridge is down —
   headed `daemon DOWN`, which is precisely when you want to look at it.
 
+> **The dashboard's WAKE column is history, not a live verdict.** Measured against
+> an active probe on 19 live idle sessions it was wrong 9 times: 6 sessions it called
+> suspect answered immediately, and 3 it called verified could not be woken at all.
+> To ask about *now*, use `mailbox doctor`.
+
+### `mailbox doctor` — can these agents be woken *right now*?
+
+The dashboard reconstructs what has happened. `doctor` runs the experiment
+([ADR-0016](adr/0016-prove-wakeability-with-an-active-probe.md)): it bumps each
+session's sentinel and requires the `FileChanged` hook to answer, which it does by
+stamping `.mailbox-hook-ran` on every run.
+
+```bash
+mailbox doctor                    # probe every session; print only the faults
+mailbox doctor --all              # list every session probed
+mailbox doctor --json             # for a supervisor agent or a cron
+mailbox doctor --session <id>     # just one
+mailbox doctor --timeout-ms 20000 # longer budget on a loaded machine
+```
+
+```text
+probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 6 deaf
+  459ba64c-…  DEAF — its sentinel changed and Claude Code never ran the wake hook; mail will not reach this agent
+  8ce450e7-…  DEAF — …
+```
+
+- **Exit 1 when any session is deaf**, so a supervisor can notice without parsing
+  prose. Sessions with no live process do not affect the exit code.
+- The verdicts are `wakeable` (the hook answered — positive proof), `deaf` (live,
+  armed, silent — **the fault**), `gone` (no live Claude Code process; normal, not a
+  fault), `never_armed`, and `undetermined`.
+- **Wakeability is perishable.** A session that answers today can be deaf tomorrow
+  with no visible event in between, so re-run this rather than trusting an old
+  result. That is the finding that motivates the command existing at all.
+- Every session is bumped **before any is polled**, so the fleet is measured in one
+  window — which is what makes "this session is deaf" distinguishable from "something
+  global hiccuped".
+- Probing does not change what an agent will be told is unread: the bump rewrites the
+  sentinel with the bytes it already holds. A session with nothing unread answers with
+  exit 0 and no model turn. A session that *does* have unread mail will be woken —
+  which is correct, since it should already have been.
+- Reads no store and needs no daemon, like `dashboard`.
+- If **nothing at all** answers, suspect the install before the fleet: the ack is
+  written by whichever `mailbox` binary the hook invokes, and an old one looks
+  identical to a total blackout. `doctor` says so when it sees that pattern. No
+  session needs restarting after an upgrade.
+
 ---
 
 ## 6. Try it now (no network)
