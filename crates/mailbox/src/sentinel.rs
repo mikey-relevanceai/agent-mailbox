@@ -83,6 +83,20 @@ const RETRIGGER_BASENAME: &str = ".mailbox-retriggered";
 /// [`Sentinel::remove_dir`] cleans it up for free.
 const HOOK_RAN_BASENAME: &str = ".mailbox-hook-ran";
 
+/// The basenames of the turn-boundary pair, stamped by the `UserPromptSubmit` and
+/// `Stop` hooks respectively (ADR-0016).
+///
+/// Together they answer "is this session mid-turn right now?", which a health probe
+/// MUST know before it accuses anyone of being unreachable: a session executing a
+/// turn cannot run its `FileChanged` hook, so it is silent for a completely ordinary
+/// reason and looks identical to one whose watch is dead.
+///
+/// Two files rather than one mutable state, because each is written by a different
+/// hook process and they must never race over a shared value: the later stamp simply
+/// wins the comparison.
+const TURN_STARTED_BASENAME: &str = ".mailbox-turn-started";
+const TURN_ENDED_BASENAME: &str = ".mailbox-turn-ended";
+
 /// Env var overriding the sentinel root (defaults to `~/.mailbox`). Tests point it
 /// at a tempdir so a test can NEVER touch a real `~/.mailbox`.
 pub const ENV_SENTINEL_ROOT: &str = "MAILBOX_SENTINEL_ROOT";
@@ -170,6 +184,23 @@ pub enum HookRunRecord {
     At(HookRun),
     /// A record exists but could not be read or parsed.
     Unreadable,
+}
+
+/// Whether a session is executing a turn.
+///
+/// This exists because "did not answer" has two completely different causes, and
+/// conflating them is the single most misleading thing a wake health check can do:
+/// a **busy** session is silent because Claude Code is running its turn and will
+/// pick up mail at the turn boundary anyway (ADR-0012), whereas a **deaf** idle
+/// session is silent because nothing will ever tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    /// Not mid-turn: a `FileChanged` now is the session's real chance to be woken,
+    /// so silence here is meaningful.
+    Idle,
+    /// Mid-turn: the last turn started after the last one ended. Silence proves
+    /// nothing about the watch.
+    Busy,
 }
 
 /// What bumping a sentinel actually did.
@@ -386,6 +417,61 @@ impl Sentinel {
     /// `<dir>/.mailbox-hook-ran` — the wake hook's ack record.
     fn hook_ran_path(&self) -> PathBuf {
         self.dir.join(HOOK_RAN_BASENAME)
+    }
+
+    /// Stamp that a turn has STARTED (the `UserPromptSubmit` hook).
+    pub fn record_turn_started(&self, at: std::time::SystemTime) -> Result<(), SentinelError> {
+        self.stamp(TURN_STARTED_BASENAME, at)
+    }
+
+    /// Stamp that a turn has ENDED (the `Stop` hook, which already fires at every
+    /// turn boundary).
+    pub fn record_turn_ended(&self, at: std::time::SystemTime) -> Result<(), SentinelError> {
+        self.stamp(TURN_ENDED_BASENAME, at)
+    }
+
+    /// Whether this session is mid-turn.
+    ///
+    /// A turn is open when its start is newer than the last end. Both stamps missing
+    /// means a session that has never taken a turn — it is sitting at the prompt,
+    /// which is [`TurnState::Idle`] and genuinely probeable.
+    ///
+    /// Note what is deliberately NOT counted as a turn start: a wake. A turn that
+    /// begins because the `FileChanged` hook exited 2 has, by definition, already
+    /// written its ack before the turn opened — so the probe has its answer and does
+    /// not need this signal at all.
+    pub fn turn_state(&self) -> TurnState {
+        let started = self.read_stamp(TURN_STARTED_BASENAME);
+        let ended = self.read_stamp(TURN_ENDED_BASENAME);
+        match (started, ended) {
+            (Some(started), Some(ended)) if started > ended => TurnState::Busy,
+            (Some(_), None) => TurnState::Busy,
+            _ => TurnState::Idle,
+        }
+    }
+
+    /// Write a nanosecond stamp into `basename`, creating the session dir if needed.
+    fn stamp(&self, basename: &str, at: std::time::SystemTime) -> Result<(), SentinelError> {
+        std::fs::create_dir_all(&self.dir).map_err(|source| SentinelError::CreateDir {
+            path: self.dir.clone(),
+            source,
+        })?;
+        let nanos = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = self.dir.join(basename);
+        std::fs::write(&path, nanos.to_string())
+            .map_err(|source| SentinelError::Write { path, source })
+    }
+
+    /// Read a nanosecond stamp, treating absent or corrupt as "no stamp".
+    fn read_stamp(&self, basename: &str) -> Option<u128> {
+        std::fs::read_to_string(self.dir.join(basename))
+            .ok()?
+            .trim()
+            .parse::<u128>()
+            .ok()
     }
 
     /// Remove the session's sentinel directory (and the file within), idempotently

@@ -280,6 +280,9 @@ pub enum HarnessCommand {
     /// SessionStart / Stop hook: launch a waiter IFF the session is subscribed.
     /// SUPERSEDED by `session-start` (ADR-0008); retained as a primitive.
     Arm(ArmArgs),
+    /// UserPromptSubmit hook (ADR-0016): record that a turn has opened, so a health
+    /// probe can tell a busy session apart from an unreachable one. Never wakes.
+    TurnStart,
     /// SessionEnd hook: reap the watcher, remove the sentinel, and drop this
     /// session's interests/subscriptions.
     Cleanup,
@@ -1189,6 +1192,7 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
         HarnessCommand::Arm(args) => run_harness_arm(args).await,
         HarnessCommand::Cleanup => run_harness_cleanup().await,
         HarnessCommand::EnsureWatcher => Ok(run_ensure_watcher_hook().await),
+        HarnessCommand::TurnStart => Ok(run_turn_start_hook()),
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
         HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
         // `wake` and `watch` are dispatched synchronously by `main` (they need no tokio
@@ -2013,6 +2017,11 @@ fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
                  mail will not reach this agent"
                     .to_string()
             }
+            Reachability::Busy => {
+                "busy (mid-turn, so it could not answer; it picks mail up at the turn \
+                 boundary — re-probe when idle)"
+                    .to_string()
+            }
             Reachability::Gone => "gone (no live Claude Code process; not a fault)".to_string(),
             Reachability::NeverArmed => {
                 "never armed (no sentinel has been written yet)".to_string()
@@ -2460,6 +2469,55 @@ pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
 /// **forever** — never another Stop — whose watcher then dies stays deaf until it next
 /// takes a turn or is restarted. That is the accepted limit of a zero-spurious-wake
 /// design; the OS service supervises the daemon, this hook supervises the watcher.
+/// Which end of a turn is being recorded.
+#[derive(Clone, Copy)]
+enum TurnBoundary {
+    Started,
+    Ended,
+}
+
+/// Stamp a turn boundary for `session` (ADR-0016).
+///
+/// Best-effort throughout: these stamps exist so a health check can avoid libelling a
+/// busy session as unreachable. Losing one costs accuracy in `mailbox doctor`; failing
+/// the hook over it would cost a turn, so it is logged and swallowed.
+fn record_turn_boundary(session: &SessionId, boundary: TurnBoundary) {
+    let sentinel = match Sentinel::for_session(session) {
+        Ok(sentinel) => sentinel,
+        Err(err) => {
+            warn!(session = %session.as_str(), error = %err,
+                "could not resolve the sentinel to record a turn boundary; \
+                 `mailbox doctor` may report this session as deaf while it is merely busy");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let result = match boundary {
+        TurnBoundary::Started => sentinel.record_turn_started(now),
+        TurnBoundary::Ended => sentinel.record_turn_ended(now),
+    };
+    if let Err(err) = result {
+        warn!(session = %session.as_str(), error = %err,
+            "could not record a turn boundary; `mailbox doctor` may report this session \
+             as deaf while it is merely busy");
+    }
+}
+
+/// The `UserPromptSubmit` hook (ADR-0016): record that a turn has opened.
+///
+/// Pairs with the `Stop` hook's turn-ended stamp. It does nothing else — it prints
+/// nothing, never blocks, and always exits 0, because a hook on the prompt path must
+/// be incapable of getting between the user and their agent.
+pub fn run_turn_start_hook() -> ExitCode {
+    match HookInput::from_reader(std::io::stdin().lock()) {
+        Ok(input) => record_turn_boundary(&input.session_id, TurnBoundary::Started),
+        Err(err) => warn!(error = %err,
+            "mailbox harness turn-start: could not read the UserPromptSubmit payload; \
+             no turn boundary recorded"),
+    }
+    ExitCode::SUCCESS
+}
+
 pub async fn run_ensure_watcher_hook() -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
@@ -2481,6 +2539,13 @@ pub async fn run_ensure_watcher_hook() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Close the turn (ADR-0016). The Stop hook already fires at every turn boundary,
+    // so it is the natural place to record that this session is no longer executing —
+    // which is what lets `mailbox doctor` tell a session that CANNOT be woken apart
+    // from one that is merely mid-turn and will pick its mail up at this very
+    // boundary. Best-effort: bookkeeping must never be able to fail a Stop hook.
+    record_turn_boundary(&session, TurnBoundary::Ended);
 
     // Re-register the inbox on EVERY Stop (ADR-0007's invariant, restored — ADR-0013).
     // Best-effort and fail-open: a down bridge is logged and skipped, never fatal to the

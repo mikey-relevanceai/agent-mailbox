@@ -313,6 +313,13 @@ impl HookInstallSpec {
         format!("{} harness ensure-watcher", self.mailbox_bin)
     }
 
+    /// The `turn-start` hook command (`<bin> harness turn-start`). The
+    /// `UserPromptSubmit` hook (ADR-0016): stamps that a turn has opened so a health
+    /// probe can tell "busy" from "unreachable". Prints nothing and always exits 0.
+    fn turn_start_command(&self) -> String {
+        format!("{} harness turn-start", self.mailbox_bin)
+    }
+
     /// The `cleanup` hook command string (`<bin> harness cleanup`).
     fn cleanup_command(&self) -> String {
         format!("{} harness cleanup", self.mailbox_bin)
@@ -367,6 +374,17 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                 "hooks": [{
                     "type": "command",
                     "command": spec.ensure_watcher_command(),
+                }],
+            })],
+            // UserPromptSubmit opens a turn. Paired with Stop's turn-ended stamp it
+            // tells a health probe whether a silent session is mid-turn (and will pick
+            // its mail up at the boundary anyway) or genuinely unable to be woken —
+            // a distinction that, unmade, libels every busy agent as deaf (ADR-0016).
+            "UserPromptSubmit": [json!({
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": spec.turn_start_command(),
                 }],
             })],
             // FileChanged fires when the watcher bumps the sentinel. The matcher is
@@ -488,6 +506,7 @@ fn is_our_command(command: &str) -> bool {
             Some("session-start")
                 | Some("wake")
                 | Some("ensure-watcher")
+                | Some("turn-start")
                 | Some("watch")
                 | Some("arm")
                 | Some("cleanup")

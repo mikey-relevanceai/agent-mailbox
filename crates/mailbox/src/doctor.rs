@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use mailbox_protocol::SessionId;
 
-use crate::sentinel::{BumpOutcome, HookRunRecord, Sentinel, SentinelError};
+use crate::sentinel::{BumpOutcome, HookRunRecord, Sentinel, SentinelError, TurnState};
 
 /// How long to wait for the wake hook to answer before calling a session deaf.
 ///
@@ -71,8 +71,13 @@ pub enum Reachability {
         took: Duration,
     },
     /// A live Claude Code process, a sentinel that was bumped, and no answer within
-    /// the budget. **This is the fault**: mail for this agent will not reach it.
+    /// the budget — while the session was **idle**, so the silence is meaningful.
+    /// **This is the fault**: mail for this agent will not reach it.
     Deaf,
+    /// The session was mid-turn, so it could not have run the hook and its silence
+    /// proves nothing. NOT a fault: a busy session picks its mail up at the turn
+    /// boundary (ADR-0012). Re-probe once it is idle to learn anything about it.
+    Busy,
     /// No live Claude Code process owns this session, so there is nothing to wake.
     /// Expected and harmless — sessions outlive their processes because `SessionEnd`
     /// does not run when a terminal is closed or a process is killed.
@@ -102,6 +107,7 @@ impl Reachability {
         match self {
             Self::Wakeable { .. } => "wakeable",
             Self::Deaf => "deaf",
+            Self::Busy => "busy",
             Self::Gone => "gone",
             Self::NeverArmed => "never_armed",
             Self::Undetermined { .. } => "undetermined",
@@ -248,11 +254,20 @@ impl Probe {
         FleetReport {
             sessions: in_flight
                 .into_iter()
-                .map(|entry| SessionReport {
-                    session: entry.session,
-                    // Anything still unsettled had a live process, a real sentinel,
-                    // and a bump — and did not answer. That is the fault case.
-                    reachability: entry.settled.unwrap_or(Reachability::Deaf),
+                .map(|entry| {
+                    // Anything still unsettled had a live process, a real sentinel, and
+                    // a bump — and did not answer. That is only a fault if the session
+                    // was IDLE and could therefore have answered; a session executing a
+                    // turn is silent for an entirely ordinary reason, and calling that
+                    // deaf libels every busy agent in the fleet.
+                    let unanswered = match entry.sentinel.turn_state() {
+                        TurnState::Busy => Reachability::Busy,
+                        TurnState::Idle => Reachability::Deaf,
+                    };
+                    SessionReport {
+                        session: entry.session,
+                        reachability: entry.settled.unwrap_or(unanswered),
+                    }
                 })
                 .collect(),
             budget: self.budget,
@@ -647,6 +662,88 @@ mod tests {
 
         assert_eq!(report.sessions[0].reachability, Reachability::NeverArmed);
         assert_eq!(report.deaf(), 0);
+    }
+
+    /// The correction that motivated `Busy` existing at all: a session executing a
+    /// turn cannot run its `FileChanged` hook, so it is silent for a wholly ordinary
+    /// reason. The first version of this probe called that deaf and libelled four
+    /// busy agents — including the one running the probe.
+    #[test]
+    fn a_session_mid_turn_is_busy_not_deaf() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = SessionId::new("mid-turn-1234");
+        let sentinel = arm(dir.path(), &session);
+
+        // A turn opened and has not closed: exactly what UserPromptSubmit + Stop record.
+        let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1000);
+        sentinel.record_turn_ended(t0).unwrap();
+        sentinel
+            .record_turn_started(t0 + Duration::from_secs(1))
+            .unwrap();
+
+        let report = Probe {
+            budget: Duration::from_millis(200),
+        }
+        .run_under_root(
+            dir.path(),
+            std::slice::from_ref(&session),
+            &BTreeSet::from([session.as_str().to_string()]),
+        );
+
+        assert_eq!(report.sessions[0].reachability, Reachability::Busy);
+        assert_eq!(
+            report.deaf(),
+            0,
+            "a busy session is not a fault: it collects its mail at the turn boundary"
+        );
+    }
+
+    /// The other half of the pair: once the turn has closed, silence means something
+    /// again. Without this, adding `Busy` would simply have hidden the real fault.
+    #[test]
+    fn a_session_whose_turn_has_ended_is_deaf_again_when_silent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = SessionId::new("turn-done-1234");
+        let sentinel = arm(dir.path(), &session);
+
+        let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1000);
+        sentinel.record_turn_started(t0).unwrap();
+        sentinel
+            .record_turn_ended(t0 + Duration::from_secs(1))
+            .unwrap();
+
+        let report = Probe {
+            budget: Duration::from_millis(200),
+        }
+        .run_under_root(
+            dir.path(),
+            std::slice::from_ref(&session),
+            &BTreeSet::from([session.as_str().to_string()]),
+        );
+
+        assert_eq!(report.sessions[0].reachability, Reachability::Deaf);
+        assert_eq!(report.deaf(), 1);
+    }
+
+    /// A session that has never taken a turn is sitting at the prompt — idle, and
+    /// genuinely probeable. Treating "no stamps" as busy would make every fresh
+    /// session permanently unmeasurable.
+    #[test]
+    fn a_session_that_has_never_taken_a_turn_is_treated_as_idle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = SessionId::new("never-prompted-1234");
+        arm(dir.path(), &session);
+
+        let report = Probe {
+            budget: Duration::from_millis(200),
+        }
+        .run_under_root(
+            dir.path(),
+            std::slice::from_ref(&session),
+            &BTreeSet::from([session.as_str().to_string()]),
+        );
+
+        assert_eq!(report.sessions[0].reachability, Reachability::Deaf);
     }
 
     /// A stale stamp from an earlier wake must not be mistaken for an answer to THIS

@@ -705,8 +705,12 @@ probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 6 deaf
 - **Exit 1 when any session is deaf**, so a supervisor can notice without parsing
   prose. Sessions with no live process do not affect the exit code.
 - The verdicts are `wakeable` (the hook answered — positive proof), `deaf` (live,
-  armed, silent — **the fault**), `gone` (no live Claude Code process; normal, not a
-  fault), `never_armed`, and `undetermined`.
+  armed, **idle**, and silent — **the fault**), `busy` (mid-turn, so it could not have
+  answered; not a fault, it collects mail at the turn boundary), `gone` (no live
+  Claude Code process; normal, not a fault), `never_armed`, and `undetermined`.
+- Busy-vs-deaf comes from a pair of turn-boundary stamps written by the
+  `UserPromptSubmit` and `Stop` hooks, so **re-run `mailbox harness install-hooks`**
+  after upgrading. Without the new hook every busy session reports as `deaf`.
 - **Wakeability is perishable.** A session that answers today can be deaf tomorrow
   with no visible event in between, so re-run this rather than trusting an old
   result. That is the finding that motivates the command existing at all.

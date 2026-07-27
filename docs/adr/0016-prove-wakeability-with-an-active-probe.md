@@ -43,6 +43,15 @@ mislead in the same way.
 moment.** A per-session loop that finds silence has no way to know whether the fleet
 was fine and this agent is not, or whether something global hiccuped for ten seconds.
 
+**A busy session is silent too.** This one was found the hard way: the first
+version of this probe reported 11 deaf sessions on a live fleet, and 4 of them were
+simply mid-turn — including the session running the probe. A session executing a
+turn cannot run its `FileChanged` hook, so it looks exactly like a deaf one, and it
+is not a fault at all: it collects its mail at the turn boundary
+([ADR-0012](0012-level-triggered-wake-at-the-turn-boundary.md)). A health check that
+cannot make this distinction slanders every working agent that happens to be busy —
+the same conflation that sent the original investigation chasing ghosts.
+
 ## Decision
 
 **1. The `FileChanged` wake hook records that it ran.** On every invocation, before
@@ -73,6 +82,18 @@ the watcher decides sentinel content.
 one window, which is what makes "this session is deaf" separable from "something was
 wrong for ten seconds".
 
+**3a. Turn boundaries are recorded, so "busy" is a verdict rather than a libel.**
+The `UserPromptSubmit` hook stamps `.mailbox-turn-started`; the `Stop` hook — which
+already fires at every turn boundary — stamps `.mailbox-turn-ended`. A session is
+mid-turn exactly when the start is newer than the end. An unanswered probe against a
+busy session reports `Busy` (not a fault); only an unanswered probe against an
+**idle** session is `Deaf`.
+
+A wake deliberately does not count as a turn start: a turn opened by the wake hook
+exiting 2 has, by construction, already written its ack before the turn began, so the
+probe already has its answer. Both stamps are best-effort — losing one costs accuracy
+in `doctor`, and failing a prompt-path hook over bookkeeping would cost a turn.
+
 **4. Liveness comes from the process table, and "gone" is a first-class verdict.**
 Claude Code carries its session id in its own argv (`--session-id`, `--resume`), so
 `ps` can answer a question no mailbox-owned state can. `Reachability::Gone` is
@@ -102,6 +123,9 @@ is the thing that is broken. It needs nothing from the daemon anyway.
   the resulting `FileChanged` with exit 0 and no model turn. Probing a session that
   *does* have unread mail will wake it — correctly, since it should already have been
   woken.
+- `mailbox harness install-hooks` must be re-run to wire the new `UserPromptSubmit`
+  hook. Until it is, busy sessions keep reporting as `deaf` — over-reporting, in the
+  safe direction, but over-reporting.
 - Reading `ps` is a new platform dependency. It is best-effort: if it cannot be run,
   `doctor` says so and degrades to not distinguishing `Gone`, rather than inventing a
   liveness answer.
@@ -130,6 +154,11 @@ Continuous probing needs a policy for what to do about a deaf agent, and the dec
 taken with the user is to **detect and alarm, not auto-recover** — the bridge must not
 poke sessions by itself. `doctor` is the mechanism; scheduling and escalation are the
 operator's, and can be built on its exit code and `--json`.
+
+**Detect "busy" from child processes instead of turn stamps.** Tried first, and it
+is a poor proxy: a long-lived MCP server child makes an idle session look busy, and a
+session thinking with no tool call in flight looks idle while it is mid-turn. The two
+hook stamps answer the question exactly, at the cost of one more hook.
 
 **Report `Gone` as a fault.** Rejected: it is the normal end state of most sessions,
 it is not actionable, and treating it as a fault is exactly what made a real
