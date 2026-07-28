@@ -160,8 +160,19 @@ impl FleetReport {
     /// replace. A fleet where NOTHING answers is far more likely to be a stale
     /// install than every agent breaking at once, so we say so rather than let the
     /// operator draw the terrifying conclusion.
+    ///
+    /// It takes a MINIMUM SAMPLE to say that. "Nothing answered" is only surprising
+    /// when enough sessions were asked; on a single-session probe it is trivially
+    /// true of any genuine fault, and the first version of this fired on exactly
+    /// that — telling an operator to go check a correct install while looking
+    /// straight at a real deaf agent. Blaming the tooling for a true positive is the
+    /// same class of confident-but-false signal as the one this command replaces, so
+    /// the hint stays silent unless the blackout is fleet-shaped.
     pub fn looks_like_a_stale_install(&self) -> bool {
-        self.deaf() > 0 && self.wakeable() == 0
+        /// Below this many silent sessions, silence is a fault report, not evidence
+        /// about the install.
+        const MIN_SAMPLE: usize = 3;
+        self.wakeable() == 0 && self.deaf() >= MIN_SAMPLE
     }
 }
 
@@ -770,6 +781,59 @@ mod tests {
             report.sessions[0].reachability,
             Reachability::Deaf,
             "history of having woken once is not evidence of being wakeable now"
+        );
+    }
+
+    fn report(states: Vec<Reachability>) -> FleetReport {
+        FleetReport {
+            sessions: states
+                .into_iter()
+                .enumerate()
+                .map(|(i, reachability)| SessionReport {
+                    session: SessionId::new(&format!("s{i}-abcdefgh")),
+                    reachability,
+                })
+                .collect(),
+            budget: Duration::from_secs(1),
+        }
+    }
+
+    /// Probing ONE session and finding it deaf is a fault report, not evidence that
+    /// the install is stale. The first version told the operator to go check a
+    /// perfectly current install while staring at a real deaf agent.
+    #[test]
+    fn a_single_deaf_session_is_not_blamed_on_the_install() {
+        assert!(!report(vec![Reachability::Deaf]).looks_like_a_stale_install());
+        assert!(!report(vec![Reachability::Deaf, Reachability::Deaf]).looks_like_a_stale_install());
+    }
+
+    /// A fleet-shaped blackout still is.
+    #[test]
+    fn a_fleet_wide_blackout_still_points_at_the_install() {
+        assert!(
+            report(vec![
+                Reachability::Deaf,
+                Reachability::Deaf,
+                Reachability::Deaf
+            ])
+            .looks_like_a_stale_install()
+        );
+    }
+
+    /// One session answering proves the ack mechanism works, so the install is
+    /// exonerated no matter how many others are deaf.
+    #[test]
+    fn one_answer_exonerates_the_install() {
+        assert!(
+            !report(vec![
+                Reachability::Deaf,
+                Reachability::Deaf,
+                Reachability::Deaf,
+                Reachability::Wakeable {
+                    took: Duration::ZERO
+                },
+            ])
+            .looks_like_a_stale_install()
         );
     }
 
