@@ -790,7 +790,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, reachability)| SessionReport {
-                    session: SessionId::new(&format!("s{i}-abcdefgh")),
+                    session: SessionId::new(format!("s{i}-abcdefgh")),
                     reachability,
                 })
                 .collect(),
