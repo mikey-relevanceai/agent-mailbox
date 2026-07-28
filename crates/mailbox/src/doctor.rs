@@ -142,6 +142,25 @@ impl FleetReport {
             .count()
     }
 
+    /// How many sessions the probe could not measure at all.
+    ///
+    /// Reported separately from faults and from health because it is neither, and
+    /// letting it read as "fine" is how a fault hides. A busy session is silent for an
+    /// ordinary reason AND a deaf session is silent — so a deaf session that happens
+    /// to be mid-turn is indistinguishable from a healthy one, and lands here. An
+    /// unmeasured session is an open question, not a clean bill of health.
+    pub fn unmeasured(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.reachability,
+                    Reachability::Busy | Reachability::Undetermined { .. }
+                )
+            })
+            .count()
+    }
+
     /// How many sessions answered.
     pub fn wakeable(&self) -> usize {
         self.sessions

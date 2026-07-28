@@ -1980,6 +1980,22 @@ pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
     };
     let report = probe.run(&sessions, &live);
 
+    // A session cannot measure itself. Running this command IS a turn, so the caller
+    // is busy by construction for the whole probe and can only ever report itself as
+    // UNMEASURED — which reads as "no fault found" to anyone skimming. An agent
+    // auditing its own fleet is therefore structurally blind to its own deafness, and
+    // that blind spot has to be stated rather than left for the reader to deduce.
+    if let Some(caller) =
+        env_session(ENV_MAILBOX_SESSION).or_else(|| env_session(ENV_CLAUDE_SESSION))
+        && report.sessions.iter().any(|r| r.session.as_str() == caller)
+    {
+        eprintln!(
+            "warning: {caller} is the session running this command, so it is busy for the \
+             whole probe and cannot be measured here. Probe it from another session (or a \
+             cron) to learn whether it can be woken."
+        );
+    }
+
     match format {
         OutputFormat::Json => println!("{}", doctor_json(&report)),
         OutputFormat::Human => render_doctor(&report, args.all),
@@ -1997,11 +2013,12 @@ fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
 
     let deaf = report.deaf();
     println!(
-        "probed {} session(s) in one window, {}ms budget: {} wakeable, {} deaf",
+        "probed {} session(s) in one window, {}ms budget: {} wakeable, {} deaf, {} UNMEASURED",
         report.sessions.len(),
         report.budget.as_millis(),
         report.wakeable(),
-        deaf
+        deaf,
+        report.unmeasured()
     );
     for row in &report.sessions {
         let show = show_all || row.reachability.is_fault();
@@ -2018,8 +2035,9 @@ fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
                     .to_string()
             }
             Reachability::Busy => {
-                "busy (mid-turn, so it could not answer; it picks mail up at the turn \
-                 boundary — re-probe when idle)"
+                "UNMEASURED — mid-turn, so it could not have answered. This is NOT a \
+                 clean bill of health: a deaf session that happens to be busy looks \
+                 exactly like this. Re-probe it while idle."
                     .to_string()
             }
             Reachability::Gone => "gone (no live Claude Code process; not a fault)".to_string(),
@@ -2076,6 +2094,7 @@ fn doctor_json(report: &mailbox::doctor::FleetReport) -> String {
         "budget_ms": report.budget.as_millis() as u64,
         "wakeable": report.wakeable(),
         "deaf": report.deaf(),
+        "unmeasured": report.unmeasured(),
         "stale_install_suspected": report.looks_like_a_stale_install(),
         "sessions": rows,
     })
