@@ -1244,7 +1244,7 @@ async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
     // sentinel root is logged, but we still exit 0 (the hook must never fail).
     match Sentinel::for_session(&session) {
         Ok(sentinel) => {
-            print_watch_paths(sentinel.path());
+            print_watch_paths(&sentinel);
             spawn_detached_watcher(&session);
         }
         Err(err) => error!(
@@ -1263,11 +1263,30 @@ async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
 /// cwd), so a bump to it fires the `FileChanged` hook even on a truly-idle session.
 /// Per-session isolation comes from this absolute path — the static matcher is the
 /// shared basename.
-fn print_watch_paths(sentinel_path: &std::path::Path) {
+fn print_watch_paths(sentinel: &Sentinel) {
+    // TWO paths, narrowest first (ADR-0016).
+    //
+    // [0] this session's own sentinel — the original registration, and the floor:
+    //     if the shared root turns out not to be watched recursively, behaviour is
+    //     exactly what it was before.
+    // [1] the shared `by-agent` root — names no session, so an identity change
+    //     (`SessionStart:fork` mints a new id and a new directory) cannot leave this
+    //     process watching a path nothing writes to any more. That is the failure we
+    //     measured: mail kept landing on the pre-fork sentinel while the watch had
+    //     moved on with the new identity.
+    //
+    // Registering both is deliberately belt-and-braces: the extra path can only add
+    // triggers, never remove them, and every extra trigger is answered by the wake
+    // hook's per-session unread check — exit 0, no model turn. The measured cost is
+    // one ~40ms process per live session per bump, against a fleet peak of 65 bumps
+    // in an hour.
     let registration = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "watchPaths": [sentinel_path.display().to_string()],
+            "watchPaths": [
+                sentinel.path().display().to_string(),
+                sentinel.agents_root().display().to_string(),
+            ],
         }
     });
     // stdout is the hook contract; a serialization failure is not possible for this

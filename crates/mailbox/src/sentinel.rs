@@ -260,6 +260,21 @@ impl Sentinel {
         &self.dir
     }
 
+    /// The shared `<root>/by-agent` directory holding EVERY session's sentinel.
+    ///
+    /// Registered alongside the per-session path so the watch survives an identity
+    /// change: it names no session, so a fork that mints a new id cannot strand it.
+    /// Safe to broadcast on because the wake hook filters per session — it peeks
+    /// only its OWN unread and exits 0 otherwise (the ADR-0008 anti-loop guard), so
+    /// a change to a neighbour's sentinel costs one cheap process and no model turn.
+    pub fn agents_root(&self) -> &Path {
+        // `dir` is `<root>/by-agent/<session>`, so its parent is the shared root.
+        // Falls back to `dir` itself rather than panicking: a sentinel with no parent
+        // cannot occur through the constructors, and degrading to the narrower watch
+        // is strictly safer than failing the registration.
+        self.dir.parent().unwrap_or(&self.dir)
+    }
+
     /// Write the unread `topics` into the sentinel, bumping its mtime so the
     /// `FileChanged` watcher fires. Topic NAMES only (payload-free); one per line,
     /// so a reader can split them trivially.
@@ -724,6 +739,30 @@ mod tests {
         let s = Sentinel::under_root(dir.path(), &SessionId::new("s1"));
         assert_eq!(s.bump_in_place().unwrap(), BumpOutcome::NothingToBump);
         assert!(!s.path().exists(), "the probe must not create the sentinel");
+    }
+
+    /// The load-bearing property of the shared root: it is IDENTICAL for two
+    /// different sessions. That is what makes a watch registered against it survive
+    /// an identity change — a forked session gets a new id and a new per-session
+    /// directory, but the root it registered is still the root its mail lands under.
+    #[test]
+    fn the_agents_root_is_shared_across_sessions_and_is_the_parent_of_each() {
+        let before = Sentinel::under_root(Path::new("/r"), &SessionId::new("before-fork"));
+        let after = Sentinel::under_root(Path::new("/r"), &SessionId::new("after-fork"));
+
+        assert_eq!(before.agents_root(), Path::new("/r/by-agent"));
+        assert_eq!(
+            before.agents_root(),
+            after.agents_root(),
+            "a fork must not change the shared root, or the watch is stranded"
+        );
+        assert_ne!(
+            before.dir(),
+            after.dir(),
+            "the per-session directories still differ — isolation is unchanged"
+        );
+        assert_eq!(before.dir().parent(), Some(before.agents_root()));
+        assert!(after.path().starts_with(before.agents_root()));
     }
 
     #[test]
