@@ -174,6 +174,22 @@ const MIN_TIMING_MARGIN_MS: u64 = 10_000;
 /// a proportion of the idle.
 const MAX_TIMING_MARGIN_MS: u64 = 300_000;
 
+/// Claude Code's kill deadline for the `FileChanged` wake hook, in **seconds**.
+///
+/// Deliberately NOT [`HookInstallSpec::timeout_secs`]. That value exists to bound a
+/// hook that *blocks* — it must stay above `max_block_ms` so a waiting waiter is
+/// never killed mid-wait — and it is measured in the tens of minutes. The wake hook
+/// blocks on nothing: it peeks the read-only store and exits. Measured on a real
+/// fleet it completes in ~40ms.
+///
+/// Sharing the blocking hook's hour-long deadline gave a 40ms peek an hour of rope.
+/// That is the wrong direction to be wrong in: if the hook ever does wedge (a stuck
+/// read, an NFS stall), a long deadline is exactly how long wake delivery could stay
+/// blocked behind it — indistinguishable, from the outside, from the session simply
+/// having gone deaf. Thirty seconds is ~700x the observed runtime and still bounds
+/// the damage to something a human would notice rather than mistake for a fault.
+pub const WAKE_HOOK_TIMEOUT_SECS: u64 = 30;
+
 /// The install spec is invalid — the timing knobs would defeat the re-arm exit.
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -400,8 +416,8 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     // payload is the wake hook's payload-free stderr reminder).
                     "asyncRewake": true,
                     // Claude Code's per-hook kill deadline (seconds) — a backstop for
-                    // a fast hook, not a re-arm timer.
-                    "timeout": spec.timeout_secs,
+                    // a fast hook, NOT `timeout_secs`. See [`WAKE_HOOK_TIMEOUT_SECS`].
+                    "timeout": WAKE_HOOK_TIMEOUT_SECS,
                 }],
             })],
             // SessionEnd tears the watcher down, removes the sentinel, and drops
@@ -836,7 +852,12 @@ mod tests {
         let wake = &fc["hooks"][0];
         assert_eq!(wake["command"], "/opt/mailbox harness wake");
         assert_eq!(wake["asyncRewake"], true);
-        assert_eq!(wake["timeout"], 3600);
+        // The wake hook carries its OWN short deadline, not the blocking hook's.
+        assert_eq!(wake["timeout"], WAKE_HOOK_TIMEOUT_SECS);
+        assert!(
+            WAKE_HOOK_TIMEOUT_SECS < spec().timeout_secs,
+            "a non-blocking peek must never inherit the blocking waiter's deadline"
+        );
 
         // SessionEnd: cleanup, NOT asyncRewake.
         let end = &hooks["SessionEnd"][0]["hooks"][0];

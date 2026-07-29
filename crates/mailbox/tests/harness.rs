@@ -1170,7 +1170,10 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_eq!(file_changed["matcher"], ".mailbox-wake");
     let wake = &file_changed["hooks"][0];
     assert_eq!(wake["asyncRewake"], true);
-    assert_eq!(wake["timeout"], 3600);
+    assert_eq!(
+        wake["timeout"],
+        mailbox_harness::install::WAKE_HOOK_TIMEOUT_SECS
+    );
     assert!(wake["command"].as_str().unwrap().contains("harness wake"));
 
     assert!(
