@@ -338,17 +338,32 @@ pub struct StatusReport {
     /// The topics `session` is subscribed to (card 11): the read behind
     /// "arm-iff-subscribed", also handy by hand.
     pub subscriptions: Vec<Topic>,
+    /// How many topics `session` is subscribed to — always `subscriptions.len()`,
+    /// carried as its own field so a caller that wants only the number reads one
+    /// scalar instead of measuring a list it then discards. That caller is a
+    /// status line: it re-renders on every prompt, so `.subscription_count` keeps
+    /// it a one-key `jq` that does not change shape as the topic list grows.
+    ///
+    /// This counts the session's own `agent.<id>` inbox topic when registered, so
+    /// a freshly-armed session with no watches reads `1`, not `0` — the inbox is a
+    /// real subscription, and hiding it would make the number disagree with the
+    /// list beside it. `inbox` says whether that particular one is registered.
+    pub subscription_count: u64,
     /// Per-topic unread counts for `session` (topics with zero are omitted).
     pub unread: Vec<TopicUnread>,
 }
 
 impl StatusReport {
     /// Assemble the wire report from the domain [`StatusView`] and its session.
+    ///
+    /// The sole constructor, which is what keeps `subscription_count` honest: it
+    /// is derived here from the very list it counts, never passed in.
     pub fn from_view(session: SessionId, view: StatusView) -> Self {
         StatusReport {
             inbox: inbox_topic(&session).ok(),
             session,
             watches: view.watches.into_iter().map(WatchStatus::from).collect(),
+            subscription_count: view.subscriptions.len() as u64,
             subscriptions: view.subscriptions,
             unread: view
                 .unread
@@ -609,6 +624,48 @@ mod tests {
         assert_eq!(value["version"], serde_json::json!(PROTOCOL_VERSION));
         let back: Response = decode_frame(&line).unwrap();
         assert_eq!(resp, back);
+    }
+
+    /// Build a status view holding just `subscriptions` (the axis under test).
+    fn view_of(subscriptions: &[&str]) -> StatusView {
+        StatusView {
+            watches: vec![],
+            subscriptions: subscriptions
+                .iter()
+                .map(|t| Topic::parse(*t).unwrap())
+                .collect(),
+            unread: vec![],
+        }
+    }
+
+    /// `subscription_count` is derived from the list it counts, and reaches the
+    /// wire as its own key — the one a status line reads instead of measuring
+    /// `subscriptions`. The two can never disagree, so the assertion is written as
+    /// that invariant rather than as a hard-coded 2.
+    #[test]
+    fn status_carries_a_subscription_count_that_matches_its_list() {
+        let report = StatusReport::from_view(
+            SessionId::new("s1"),
+            view_of(&["agent.s1", "github.pr.o/r#1"]),
+        );
+        assert_eq!(
+            report.subscription_count as usize,
+            report.subscriptions.len()
+        );
+
+        let value = serde_json::to_value(Response::Status(report)).unwrap();
+        assert_eq!(value["subscription_count"], 2);
+        assert_eq!(value["subscriptions"].as_array().unwrap().len(), 2);
+    }
+
+    /// The un-armed session: no subscriptions is `0`, not a missing key — a status
+    /// line must be able to render it without a `// 0` fallback in its `jq`.
+    #[test]
+    fn a_session_with_no_subscriptions_counts_zero() {
+        let report = StatusReport::from_view(SessionId::new("s1"), view_of(&[]));
+        assert_eq!(report.subscription_count, 0);
+        let value = serde_json::to_value(Response::Status(report)).unwrap();
+        assert_eq!(value["subscription_count"], 0);
     }
 
     #[test]

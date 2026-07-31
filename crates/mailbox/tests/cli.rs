@@ -433,6 +433,48 @@ fn two_sessions_share_one_watch_refcounted() {
     // s2's interest remains; the daemon's graceful Drop reaps the shared adapter.
 }
 
+/// `status` answers "how many topics is this session on?" as a single number, in
+/// both output modes. This is the read a Claude Code status line makes on every
+/// prompt: it wants one scalar, not a topic list it has to measure.
+#[test]
+fn status_reports_how_many_subscriptions_a_session_has() {
+    let daemon = Daemon::start();
+    let session = "sess-sub-count";
+
+    // A session on nothing reports an honest 0 — a present key, not an absent one,
+    // so the status line needs no fallback for the un-armed case.
+    let before = daemon.run(&["--json", "status", "--session", session]);
+    assert_ok(&before, "status before subscribing");
+    assert_eq!(parse_json(&stdout(&before))["subscription_count"], 0);
+
+    for topic in ["test.count.alpha", "test.count.beta"] {
+        assert_ok(
+            &daemon.run(&["subscribe", topic, "--session", session]),
+            "subscribe",
+        );
+    }
+
+    let status = daemon.run(&["--json", "status", "--session", session]);
+    assert_ok(&status, "status");
+    let value = parse_json(&stdout(&status));
+    assert_eq!(value["subscription_count"], 2);
+    assert_eq!(
+        value["subscriptions"].as_array().unwrap().len(),
+        2,
+        "the count must agree with the list it summarises"
+    );
+
+    // The human line carries the same number, so the two modes never tell a
+    // different story about the same session.
+    let human = daemon.run(&["status", "--session", session]);
+    assert_ok(&human, "human status");
+    let text = stdout(&human);
+    assert!(
+        text.contains("subscriptions (2):"),
+        "human status should show the count; got: {text}"
+    );
+}
+
 // ==== A1: an oversized / unterminated frame is rejected, not buffered ==========
 
 #[test]

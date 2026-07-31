@@ -1113,7 +1113,10 @@ fn render_status(report: &StatusReport) {
     if report.subscriptions.is_empty() {
         println!("subscriptions: none");
     } else {
-        println!("subscriptions:");
+        // The count leads the list so the human line carries the same number
+        // `--json`'s `subscription_count` does, rather than making a reader tally
+        // the rows themselves.
+        println!("subscriptions ({}):", report.subscription_count);
         for topic in &report.subscriptions {
             println!("  {}", topic.as_str());
         }

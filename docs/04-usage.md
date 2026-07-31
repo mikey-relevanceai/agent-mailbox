@@ -614,7 +614,8 @@ session: my-session
 inbox: agent.my-session (registered)
 watches:
   github-pr myrepo#42  state=running interest=1 interval=60s child=pid 51234
-subscriptions:
+subscriptions (2):
+  agent.my-session
   github.pr.me/myrepo#42
 unread:
   [github.pr.me/myrepo#42] 1
@@ -628,9 +629,50 @@ unread:
   (`desired`/`running`/`stopped`/`failed`), how many sessions are `interest`ed,
   the poll `interval`, and the adapter's `child` pid when the supervisor is
   running one. `running` with a pid means the poller is live.
-- **subscriptions** — the topics this session listens on.
+- **subscriptions** — the topics this session listens on, headed by how many
+  there are. The count includes this session's own `agent.<id>` inbox, so an
+  armed session with no watches reads `1`, not `0` — the inbox is a real
+  subscription, and the `inbox` line above says whether it is registered.
 - **unread** — per-topic count of events past this session's cursor. `read`
   drains these.
+
+### Putting the subscription count in a Claude Code status line
+
+`--json` carries the same number as a single `subscription_count` key, so a
+status line reads one scalar rather than downloading the topic list to measure
+it:
+
+```bash
+mailbox status --session "$MAILBOX_SESSION_ID" --json | jq .subscription_count
+```
+
+Claude Code hands a status-line command the session id on stdin, which is the id
+to ask about:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/statusline.sh — "📬 3" when this session is on 3 topics.
+session=$(jq -r .session_id)
+count=$(mailbox status --session "$session" --json 2>/dev/null | jq -r '.subscription_count // empty')
+[ -n "$count" ] && printf '📬 %s' "$count"
+```
+
+Two things that script must survive, because a status line re-renders on every
+prompt and must never become a red line in the UI:
+
+- **The bridge being down.** `status` is a socket client, so with no
+  `mailbox serve` it exits non-zero and `--json` prints an error object instead
+  ([ADR-0004](adr/0004-cli-serve-daemon-and-socket.md)) — right for a human at a
+  terminal, noise in a status line. Hence `2>/dev/null` and `// empty`: the
+  latter is load-bearing, because a plain `jq -r .subscription_count` on that
+  error object renders the string `null` into your status line.
+- **The count being `0`.** That is an answer, not a failure: this session is on
+  no topics — including no inbox — so peers cannot `send` to it and nothing will
+  wake it. Worth showing rather than hiding, and `// empty` still yields it
+  (jq's `//` only skips `null` and `false`, not `0`).
+
+Note the count is *subscriptions*, not mail: it does not move when events arrive.
+For "do I have unread?", sum `.unread[].unread` from the same report.
 
 ### `mailbox dashboard` — is the wake path actually working?
 

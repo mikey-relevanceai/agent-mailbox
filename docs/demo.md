@@ -78,7 +78,7 @@ session: demo-session
 inbox: agent.demo-session (NOT registered — peers cannot send to this session)
 watches:
   stub demo  state=running interest=1 interval=500ms child=pid 23407
-subscriptions:
+subscriptions (2):
   demo.hello
   stub.demo
 unread:
@@ -96,7 +96,7 @@ session: demo-session
 inbox: agent.demo-session (NOT registered — peers cannot send to this session)
 watches:
   stub demo  state=stopped interest=0 interval=500ms child=stopped
-subscriptions:
+subscriptions (1):
   demo.hello
 unread: none
 
