@@ -63,7 +63,6 @@ fn assert_woken_for(env: &Env, session: &str, topic: &str) {
     );
 }
 
-
 /// A generous bound for "the supervisor spawned/settled the adapter", well above
 /// its ~1s restart backoff, so the suite stays green under parallel load.
 const SETTLE: Duration = Duration::from_secs(20);

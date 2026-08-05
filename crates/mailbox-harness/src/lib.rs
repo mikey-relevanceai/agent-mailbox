@@ -38,12 +38,12 @@
 //! `--session` / `MAILBOX_SESSION_ID`. That settles the previously-open "how does
 //! a session name itself" question.
 
-pub mod pidfile;
 pub mod atomic;
 pub mod cleanup;
 pub mod home;
 pub mod hook;
 pub mod install;
+pub mod pidfile;
 pub mod skills;
 
 use mailbox_protocol::PROTOCOL_VERSION;

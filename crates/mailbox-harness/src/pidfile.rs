@@ -7,18 +7,14 @@
 //! daemon's sweep for interest refresh (ADR-0009), and `cleanup` to reap the watcher
 //! at `SessionEnd`.
 //!
-//! This module used to also hold the `arm` decision and the exec-into-waiter path for
-//! the ADR-0006 re-arm loop. That loop is gone (ADR-0008 replaced it with the watcher
-//! + `FileChanged` wake), and so is `mailbox harness arm` — what is left is the
-//! pidfile itself.
+//! This module used to also hold the `arm` decision and the exec-into-waiter path
+//! for the ADR-0006 re-arm loop. That loop is gone (ADR-0008 replaced it with the
+//! watcher + `FileChanged` wake), and so is `mailbox harness arm` — what is left is
+//! the pidfile itself.
 
 use std::path::{Path, PathBuf};
 
 use mailbox_protocol::SessionId;
-
-
-
-
 
 /// The pidfile that records the live waiter's PID for a session.
 ///
@@ -37,10 +33,6 @@ pub fn read_pidfile(waiters_dir: &Path, session: &SessionId) -> Option<u32> {
     let text = std::fs::read_to_string(pidfile_path(waiters_dir, session)).ok()?;
     text.trim().parse().ok()
 }
-
-
-
-
 
 /// Test-only helper to plant a pidfile (production writes it inside the waiter,
 /// `mailbox::wake`). Lets the cleanup/reap tests simulate a recorded waiter.

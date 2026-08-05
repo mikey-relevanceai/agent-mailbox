@@ -120,10 +120,6 @@ impl Daemon {
         daemon
     }
 
-
-
-
-
     /// Run a `mailbox` client command against this daemon and return its output.
     fn run(&self, args: &[&str]) -> Output {
         mailbox_command()
@@ -133,9 +129,6 @@ impl Daemon {
             .output()
             .expect("run mailbox client")
     }
-
-
-
 
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload)
     /// and return its output.
@@ -171,7 +164,6 @@ impl Drop for Daemon {
     }
 }
 
-
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -204,7 +196,6 @@ fn poll_until<T>(what: &str, timeout: Duration, mut f: impl FnMut() -> Option<T>
     }
 }
 
-
 /// Wait for `child` to exit within `timeout`, killing it if it overruns. Returns
 /// `None` if it had to be killed (i.e. it did not exit on its own in time).
 fn wait_within(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -221,7 +212,6 @@ fn wait_within(child: &mut Child, timeout: Duration) -> Option<std::process::Exi
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
 
 /// The single watch's state string + interest from `status`, or `None`.
 fn watch_state_interest(daemon: &Daemon, session: &str) -> Option<(String, u64)> {
@@ -283,39 +273,7 @@ fn session_start_with_bridge_down_and_no_store_exits_zero_without_waking() {
     );
 }
 
-/// **The regression test for adv-1: a bridge blip at a re-arm `Stop` must not deafen
-/// the session forever.**
-///
-/// `arm` probes the bridge to decide whether to arm. It used to SKIP on a probe failure
-/// ("fail safe: do not wake"). But the re-arm loop now depends on `arm` succeeding at
-/// *every* re-arm `Stop` (ADR-0006), and an idle session fires no further `Stop` — so a
-/// single momentary blip left the session with no waiter and nothing to retry it. Deaf,
-/// permanently, from one dropped connection.
-///
-/// So arm FAILS OPEN: it arms anyway, which is safe because the waiter re-checks
-/// subscriptions itself under its lock. This proves the whole path: with the bridge
-/// DOWN, a live waiter is armed; when the bridge comes back and publishes, that waiter
-/// — blocked on its FIFO the entire time — is kicked and wakes with the topic.
-/// The other half of the fail-open rule: a CLEAN "you subscribe to nothing" still arms
-/// nothing. Fail-open must not become arm-always — a session with no subscriptions has
-/// nothing to be woken about, and a waiter for it would be pure noise.
-///
-/// The session id here cannot form an inbox topic (a slash is not in the grammar), so
-/// the always-on inbox registration cannot give it a subscription — which is exactly
-/// the state that must skip.
-/// **adv-3: the `max_block < timeout` invariant, enforced where it is USED.**
-///
-/// `install-hooks` validating the pairing protects nothing if `arm` is launched from a
-/// hand-edited settings.json — or from a hook entry with no `timeout` at all, where
-/// Claude Code applies its own 600s default and our 55-minute max-block gets the waiter
-/// KILLED mid-block (after which an idle session, firing no further `Stop`, is never
-/// re-armed: the headline bug).
-///
-/// So `arm` takes the deadline it runs under (`--timeout-secs`, written into the hook
-/// command by `install-hooks`) and CLAMPS an unsafe `--max-block-ms` down, loudly.
-/// Here: an 11s deadline with a 60s block. Unclamped, the waiter would sit blocked for
-/// 60s (long past the kill). Clamped, it yields at ~1s with the benign re-arm notice —
-/// so the session stays armed, and the log says exactly what happened.
+/// `cleanup` must never fail the `SessionEnd` hook, even with the bridge down.
 #[test]
 fn cleanup_with_bridge_down_still_exits_zero() {
     // No daemon: EndSession is unreachable. Cleanup retries, then defers to the
@@ -391,39 +349,10 @@ fn ac3_cleanup_drops_watch_interest_to_zero() {
     assert!(subscriptions(&daemon, session).is_empty());
 }
 
-// ==== A / HIGH#1: a second arm is a lock loser and does NOT orphan the first =====
+// ==== install-hooks writes the hook set, and never destroys a settings file =====
 
-/// Two arms for the same idle session: the second's waiter loses the single-waiter
-/// lock and exits WITHOUT touching the pidfile, so the pidfile keeps naming the
-/// LIVE first waiter — which cleanup then reaps, leaving no zombie. This is the
-/// regression for HIGH#1 (a doomed re-arm used to overwrite the pidfile with its
-/// own dead pid, orphaning the real waiter forever).
-/// Simulates an `arm` whose pre-exec probe passed but whose `SessionEnd` landed
-/// before its waiter checked: the waiter (`mailbox wait`) re-checks subscriptions
-/// after taking the lock, finds none, and self-exits WITHOUT waking or orphaning
-/// (exit 0, pidfile removed). Regression for HIGH#2.
-/// **The regression test for the headline bug.**
-///
-/// The waiter cannot outlive its hook process: Claude Code kills it at the hook
-/// `timeout`, and `execv` does not reset that clock. The old design re-exec'd at
-/// `max_block` and hoped for a fresh timeout; it did not get one, so the waiter was
-/// killed mid-block — and because a truly idle session fires **no further `Stop`**,
-/// nothing ever re-armed it. The session went silently, permanently unwakeable.
-///
-/// The fix is that the waiter *yields* at `max_block` instead: exit 2 (a wake) with a
-/// benign notice, which guarantees a `Stop`, which re-arms a FRESH hook process. So
-/// this test churns the boundary with a tiny `max_block` and asserts:
-///
-/// 1. every boundary crossing is a **wake (exit 2)**, never a silent exit — an exit 0
-///    or 1 here IS the bug, because nothing would follow it;
-/// 2. its stderr is the **benign re-arm notice**, and never claims mail that does not
-///    exist;
-/// 3. across the churn, every publish still produces a **mail wake** — the boundary
-///    loses no events.
-/// A waiter the harness KILLED at its hook timeout leaves a pidfile naming a dead
-/// pid. Until it is cleared, `mailbox agents` / `status` keep reporting a live waiter
-/// that does not exist — the exact fingerprint that made the original bug so hard to
-/// see. `arm` must reap it before arming a real waiter.
+/// The shipped snippet wires the hook set, and an explicit `--settings` merges into
+/// that file while preserving unrelated keys.
 #[test]
 fn install_hooks_emits_valid_settings_snippet() {
     let dir = TempDir::new().unwrap();
@@ -508,10 +437,6 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert!(merged["hooks"]["FileChanged"].is_array(), "hooks merged in");
 }
 
-/// A `max_block` at or above the hook `timeout` silently reintroduces the headline
-/// bug: Claude Code kills the waiter while it is still blocked, and an idle session
-/// fires no further `Stop`, so nothing ever re-arms it. `install-hooks` must REFUSE
-/// such a pairing — loudly, and without writing a single byte of settings.
 /// `--settings <path>` is an instruction, so a MISSING file is created — that is
 /// how a settings file gets bootstrapped on purpose (the default path never is).
 #[test]
@@ -968,9 +893,7 @@ fn install_hooks(home: &Path, args: &[&str]) -> Output {
         .expect("run install-hooks")
 }
 
-
 /// The default settings file under a redirected home.
 fn default_settings(home: &Path) -> PathBuf {
     home.join(".claude").join("settings.json")
 }
-

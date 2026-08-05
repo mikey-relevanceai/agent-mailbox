@@ -1205,5 +1205,4 @@ mod tests {
         let end = hook_commands(&twice, "SessionEnd");
         assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
     }
-
 }
