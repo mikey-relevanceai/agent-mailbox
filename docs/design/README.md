@@ -16,7 +16,7 @@ Likely next designs:
 
 - Bridge core (topics, publish, subscriptions, delivery vs processed cursors)
 - Adapter host / subprocess transport
-- Claude Code harness integrator (`asyncRewake` waiter + Stop re-arm)
+- Claude Code harness integrator (sentinel + `FileChanged` → `asyncRewake` wake)
 
 ## When to write one
 

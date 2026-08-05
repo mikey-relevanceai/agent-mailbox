@@ -24,20 +24,21 @@ touches your real `~/.agent-mailbox` or `~/.claude`), then walks four steps:
 0. **start the daemon** — `mailbox serve`, wait for its socket.
 1. **four-verb core** — `subscribe` → `publish` (standing in for an adapter) →
    `read`.
-2. **wake an idle session** — run the `SessionStart` hook so it spawns the
-   detached watcher (exactly what Claude Code does), then `publish` and watch
-   the watcher bump the session's sentinel with the topic NAME only. Running the
-   `FileChanged` hook on that change exits **2** with a payload-free
-   `mail on topic X` reminder — the asyncRewake contract the harness turns into
-   a session wake.
+2. **wake an idle session** — run the `SessionStart` hook so it ARMS the session's
+   sentinel (exactly what Claude Code does), then `publish` and see the DAEMON
+   rewrite that sentinel with the topic NAME only. Running the `FileChanged` hook on
+   that change exits **2** with a payload-free `mail on topic X` reminder — the
+   asyncRewake contract the harness turns into a session wake. There are no sleeps in
+   this step: the daemon writes the sentinel before it answers the publish.
 3. **supervised adapter** — `watch stub` records interest and the daemon spawns
    the reference stub poller; `status` shows it `running` with a child pid;
    `read` drains its synthetic edges. The agent never launched this loop.
 4. **teardown** — `unwatch` drops the last interest and the supervisor stops the
    adapter; `status` shows `stopped`, no child. **No zombie poller.**
 
-The script asserts the idle waiter woke with exit 2 and fails loudly otherwise,
-so it doubles as a smoke test of the whole path.
+The script asserts the wake hook exited 2 (and that `SessionStart` armed the
+sentinel at all) and fails loudly otherwise, so it doubles as a smoke test of the
+whole path.
 
 ### Expected output
 
@@ -60,13 +61,13 @@ $ mailbox read --session demo-session
   [demo.hello] offset=0 id=evt-1 body={"msg":"first"}
 
 == 2. wake an idle session (the FileChanged contract) ==
-running the SessionStart hook (spawns the detached watcher) ...
+running the SessionStart hook (arms the sentinel) ...
   watchPaths registered with the harness:
     {"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<workdir>/sentinel/by-agent/demo-session/.mailbox-wake"]}}
 publishing while the session is idle ...
 $ mailbox publish demo.hello --body '{"msg":"wake up"}'
 published event evt-2 at offset 1
-the watcher bumped the sentinel (topic NAMES only, never a body):
+the daemon bumped the sentinel (topic NAMES only, never a body):
     demo.hello
 running the FileChanged hook, as Claude Code would on that change ...
 wake hook exit code: 2   (2 = wake this session)

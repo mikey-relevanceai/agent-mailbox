@@ -45,7 +45,7 @@ sweep already uses to refresh interests and the reconcile uses to resume watches
 
 Mechanics:
 
-- A `Failed` watch whose interest set contains a session with a live waiter is
+- A `Failed` watch whose interest set contains a still-running session is
   retried via the idempotent `Supervisor::ensure_running`. The failure streak was
   cleared when the watch gave up, so this begins a fresh attempt: success →
   `Running{pid}`; failure → the normal backoff path, climbing back to `Failed`.

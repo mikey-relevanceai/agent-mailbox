@@ -21,13 +21,13 @@ read the two hard rules below.
 ## Two hard rules (this is the whole point)
 
 1. **NEVER re-arm.** Do not run any arm/listen command after a wake. The
-   `SessionStart` Claude Code hook (`mailbox harness session-start`) starts a
-   detached watcher that keeps you wakeable for the whole session, and a `Stop`
-   hook (`mailbox harness ensure-watcher`) silently re-ensures it at every turn
-   boundary — so **just ending your turn is the correct, complete action**; it
-   keeps you armed. Ending your turn NEVER wakes you (the Stop hook exits 0, never
-   a wake). If you catch yourself about to "re-arm listening," stop — it is already
-   armed, and it stays armed with no action from you.
+   `SessionStart` Claude Code hook (`mailbox harness session-start`) arms a wake
+   sentinel file that Claude Code watches for the whole session, and a `Stop` hook
+   (`mailbox harness turn-end`) silently re-checks it at every turn boundary — so
+   **just ending your turn is the correct, complete action**; it keeps you armed.
+   Ending your turn NEVER wakes you (the Stop hook exits 0, never a wake). If you
+   catch yourself about to "re-arm listening," stop — it is already armed, and it
+   stays armed with no action from you.
 2. **NEVER spawn a background poller.** Do not run `gh-watch.sh`, and do not
    background a `while true; gh …; sleep` loop or anything like it. To watch a
    PR, declare a `watch` — the bridge daemon owns and supervises the poller (one
@@ -43,9 +43,8 @@ zombie pollers and lost wakes.
 commands below take **no `--session` flag** — just run them.
 
 > **Do not write `--session "$MAILBOX_SESSION_ID"`.** That variable is usually
-> **empty** in your shell (the hooks set it only for the background waiter, not
-> for your commands), so it expands to `--session ""` and binds a phantom empty
-> session instead of you. Omit the flag and let `mailbox` resolve you correctly.
+> **empty** in your shell (only the hooks set it), so it expands to `--session ""`
+> and binds a phantom empty session instead of you. Omit the flag and let `mailbox` resolve you correctly.
 
 Run `mailbox whoami` any time to confirm who you are. Pass `--session <id>` only
 when you deliberately want to act as a *different* session.
@@ -112,7 +111,7 @@ is judged on its own terms.
 
 ### On wake
 
-When the world changes, the bridge kicks your armed waiter and Claude Code
+When the world changes, the bridge writes your wake sentinel and Claude Code
 surfaces a system reminder like `mail on topic github.pr.OWNER/REPO#NUMBER`. When
 you see it:
 
@@ -127,9 +126,9 @@ infrastructure keeps you armed for the next message.
 
 **Every wake is real mail.** You will only ever be woken with a `mail on topic …`
 reminder — there is no "keeping you alive" nudge to ignore. When you wake, there is
-something to `mailbox read`. (Behind the scenes a detached watcher wakes you the
-moment mail arrives and stays silent otherwise, so an idle session costs nothing and
-never sees a spurious wake.)
+something to `mailbox read`. (Behind the scenes the bridge daemon writes one file
+the moment mail arrives, and nothing at all otherwise — so an idle session costs
+nothing and never sees a spurious wake.)
 
 **Mail that arrives while you are BUSY reaches you at the end of that turn**, not
 mid-turn — you cannot be woken while already awake. So you may finish a turn and
@@ -180,7 +179,7 @@ mailbox send PEER_SESSION_ID --text "review done on PR 42, please rebase"
 mailbox send PEER_SESSION_ID --body '{"kind":"review-done","pr":42}'
 ```
 
-The peer's idle waiter wakes with `mail on topic agent.<its-id>`; it runs
+The idle peer wakes with `mail on topic agent.<its-id>`; it runs
 `mailbox read` and sees your message with a `"from"` field naming **your** session
 id. To reply, it just sends back to that id. That is the whole protocol.
 
@@ -196,10 +195,11 @@ Notes that matter:
 - **`send` to an unregistered agent FAILS** (non-zero, naming the target). That is
   correct: such a message could never be delivered. Run `mailbox agents` to see who
   is actually addressable — do not retry or work around it.
-- **Liveness in `mailbox agents`**: `idle (waiter appears blocked)` means a send
-  should wake that peer immediately; `busy or unarmed` means it is mid-turn — your
-  message still lands in its inbox and it will see it on its next read. It is a
-  best-effort probe, not a heartbeat.
+- **Liveness in `mailbox agents`**: `running` means a Claude Code process still owns
+  that session, so a send has someone to reach. It does NOT mean idle, healthy, or
+  reachable — a running peer may be mid-turn, and only `mailbox doctor` proves a peer
+  can actually be woken. `not running` means nobody is executing that session; your
+  message still lands durably in its inbox, it just has nobody to collect it.
 
 ## Quick reference
 

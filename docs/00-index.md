@@ -35,12 +35,12 @@ Also:
 ```text
 Adapters (detect world changes)          Peer agents (mailbox send)
         ↓ publish                                ↓ publish to agent.<session-id>
-Bridge (durable events + subscriptions + wake kicks)
-        ↓ harness wake
+Bridge (durable events + subscriptions; writes each subscriber's wake sentinel)
+        ↓ FileChanged hook → harness wake
 Agent sessions (react, never poll)
 ```
 
-Adapters never know how wake works. The bridge owns topics and per-subscriber cursors. Harness integrators own arm/re-arm so the agent does not. Every live session is automatically subscribed to its own inbox topic (`agent.<session-id>`), so agents can wake each other with no human in the loop (ADR-0007).
+Adapters never know how wake works. The bridge owns topics, per-subscriber cursors, and the sentinel write. Harness integrators own arming so the agent does not. Every live session is automatically subscribed to its own inbox topic (`agent.<session-id>`), so agents can wake each other with no human in the loop (ADR-0007).
 
 ## Repo map
 
@@ -48,7 +48,7 @@ Adapters never know how wake works. The bridge owns topics and per-subscriber cu
 |---|---|
 | `crates/mailbox` | Bridge CLI (`cargo run -p mailbox`) |
 | `crates/mailbox-protocol` | Shared wire/domain types |
-| `crates/mailbox-harness` | Session wake / re-arm helpers |
+| `crates/mailbox-harness` | Claude Code integration: hooks + skills install, hook payload parse |
 | `adapters/` | External adapter processes |
 
 Agent-facing working agreements: [AGENTS.md](../AGENTS.md).

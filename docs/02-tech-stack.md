@@ -97,7 +97,7 @@ Subprocess remains valid forever for “I already trust this binary / script.”
 | Component | Process | Trust |
 |---|---|---|
 | Bridge core | `mailbox` | Trusted; owns DB, cursors, kicks |
-| Harness waiter | Claude hook / child of session | Trusted per user session |
+| Harness hooks | Claude hook / child of session | Trusted per user session |
 | Subprocess adapter | separate OS process | Same user; treat events as untrusted *content* |
 | WASI adapter (later) | sandboxed guest | Least privilege; host mediates I/O |
 | Ingress (later, if webhooks) | separate process preferred | Hostile network; verify then enqueue only |
@@ -122,7 +122,7 @@ pollers**. Design: [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md
 
 1. Stub adapter publishes on a schedule via the subprocess protocol.
 2. One or more sessions subscribe to the same topic.
-3. Claude harness waiter wakes without agent re-arm.
+3. Claude harness wakes the idle session without an agent re-arm.
 4. Delivery cursor advances so mid-turn publishes surface on the next `Stop`.
 5. Two subscribers each see the event with independent cursors.
 6. GitHub watch: one process per PR; two sessions share it; first SessionEnd
