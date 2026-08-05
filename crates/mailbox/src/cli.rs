@@ -79,7 +79,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the long-lived bridge daemon (owns the single writer + waker + socket).
+    /// Run the long-lived bridge daemon (owns the single writer, the socket, and
+    /// the sentinel writes that wake idle sessions).
     Serve,
     /// Publish an event to a topic.
     Publish(PublishArgs),
@@ -106,8 +107,9 @@ pub enum Command {
     /// Actively prove which sessions can be woken right now, by bumping each
     /// sentinel and requiring the wake hook to answer.
     Doctor(DoctorArgs),
-    /// Claude Code hook handlers and setup (arm / cleanup / install-hooks /
-    /// install-skills). The harness owns the wake loop so the agent never re-arms.
+    /// Claude Code hook handlers and setup (session-start / wake / turn-end /
+    /// turn-start / cleanup / install-hooks / install-skills). The harness owns the
+    /// wake loop so the agent never re-arms.
     Harness(HarnessArgs),
 }
 

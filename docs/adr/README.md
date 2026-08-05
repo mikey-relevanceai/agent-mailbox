@@ -62,6 +62,7 @@ the reasoning, not for the mechanism.
 | [0016](0016-prove-wakeability-with-an-active-probe.md) | Prove wakeability with an ACTIVE probe (`mailbox doctor`) plus a hook-ran ack, because log-derived wake health was wrong in both directions and wakeability turns out to be perishable; a session with no live process is `gone`, not a fault | Accepted; one clause overtaken — `wait` and `dashboard` no longer exist, so `doctor` is the ONLY read-only socket-free command |
 | [0017](0017-daemon-bumps-the-sentinel.md) | The daemon bumps the sentinel directly: delete the per-session watcher, the FIFO, the single-waiter lock and the pidfile — wakeability was an emergent property of six components, each able to fail silently; liveness moves to the process table | Accepted |
 | [0018](0018-publish-has-one-rule.md) | `publish` has ONE rule: the event goes to the topic and wakes every subscriber, its author included. "Be caught up to speak", `--no-session` and `event.author_session` are deleted — the bridge no longer tries to know who is speaking | Accepted |
+| [0019](0019-remove-the-observability-and-re-arm-surfaces.md) | Delete `harness arm`, `mailbox wait` and the whole max-block apparatus (retained primitives nothing invoked), and `mailbox dashboard` (inferred wake health, measured wrong in BOTH directions against 0016's probe). `doctor` is the only wake-health surface | Accepted; **written after the fact** to close a gap in the record |
 
 ## When to write one
 
