@@ -2,14 +2,14 @@
 //!
 //! # What this is, and why it exists
 //!
-//! The detached watcher (see [`crate::wake::Waiter::watch_sentinel`]) does not wake
-//! an idle Claude Code session directly — a background process has no way to. What
-//! DOES wake an idle session is Claude Code's `FileChanged` hook: when an external
+//! The `serve` daemon cannot wake an idle Claude Code session directly — no external
+//! process can. What DOES wake one is Claude Code's `FileChanged` hook: when another
 //! process changes a watched file, the hook fires even on a truly-idle session, and
-//! an `asyncRewake` hook that exits 2 wakes it. So the watcher's job on a real-mail
-//! kick is to **change a file** — this sentinel — and let the `FileChanged` hook
-//! (`mailbox harness wake`) do the waking. This replaces the ADR-0006 exit-2
-//! re-arm, whose every re-arm cost a full model turn on a long idle.
+//! an `asyncRewake` hook that exits 2 wakes it. So the daemon's job on a publish is
+//! to **change a file** — this sentinel — and let the `FileChanged` hook
+//! (`mailbox harness wake`) do the waking. This replaced the ADR-0006 exit-2 re-arm,
+//! whose every re-arm cost a full model turn on a long idle; the detached watcher
+//! that used to sit between the daemon and this file is gone too (ADR-0017).
 //!
 //! # Layout
 //!

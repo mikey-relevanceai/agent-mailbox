@@ -3,7 +3,7 @@
 //!
 //! # Why inference was not enough
 //!
-//! [`crate::dashboard::wake_health`] reads `harness.log` and asks "has a wake hook
+//! There used to be a `dashboard` that read `harness.log` and asked "has a wake hook
 //! ever run for this session?". That is real evidence, but it answers the wrong
 //! question in two directions, both measured on a live fleet of 19 idle sessions:
 //!
@@ -466,8 +466,8 @@ fn looks_like_session_id(value: &str) -> bool {
 /// Every session that has a per-session sentinel directory under `root`.
 ///
 /// The sentinel root is the one place that knows about sessions without needing the
-/// daemon, which keeps `doctor` working when the bridge is down — the same reasoning
-/// that made the dashboard a read-only store reader (ADR-0015).
+/// daemon, which keeps `doctor` working when the bridge is down — a health check must
+/// not depend on the component most likely to be the broken one (ADR-0015, ADR-0016).
 ///
 /// Directory names are filename-ENCODED session ids. Rather than write a decoder
 /// (a second encoding rule that could drift from the first), we accept only names

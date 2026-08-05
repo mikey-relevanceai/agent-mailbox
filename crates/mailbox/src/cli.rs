@@ -1615,32 +1615,6 @@ fn render_skill_report(
     Ok(())
 }
 
-/// Run `wait` synchronously (no tokio runtime): open the read-only store and
-/// block on the FIFO. Finalizes the card-05 PROVISIONAL command into its real
-/// shape — `mailbox wait --session <id>` — with the same exit-code contract.
-///
-/// Exit codes: `2` = wake the session (mail, OR the benign re-arm boundary — both
-/// carry their reason on stderr); `1` = a waiter error, including an unresolvable
-/// session (a waiter with no identity has nothing to wait on); `0` = there is nothing
-/// to wake about (the session has no subscriptions, or no store exists at all).
-///
-/// With `--max-block-ms`, a block that elapses with no mail exits **2** with
-/// [`REARM_NOTICE`]. That is the whole re-arm design (ADR-0006): the waiter cannot
-/// outlive its hook process (Claude Code kills it at the `timeout`, and `execv` does
-/// not reset that clock), and a truly idle session fires no further `Stop` — so a
-/// killed waiter would never be re-armed. Waking *before* the deadline is what
-/// guarantees a `Stop`, and therefore a fresh `arm` with a fresh timeout. Without
-/// `--max-block-ms`, `wait` blocks indefinitely (the card-05 contract).
-/// `mailbox dashboard`: the live fleet health view (ADR-0015).
-///
-/// Synchronous and socket-free, like `wait`: it opens the store READ-ONLY, so it
-/// still renders when the `serve` daemon is down — the state it reports as
-/// `daemon DOWN` rather than refusing to draw.
-///
-/// `--once` prints a plain-text snapshot instead of taking over the terminal. It is
-/// also the automatic fallback when the terminal cannot be driven (piped output, no
-/// TTY, CI): a health view that fails because it is being piped to a file would be
-/// useless in exactly the situation where someone is capturing evidence.
 /// `mailbox doctor` — actively prove which sessions can be woken right now
 /// (ADR-0016).
 ///
