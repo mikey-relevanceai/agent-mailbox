@@ -5,7 +5,7 @@ it, wire the Claude Code hooks, run the agent-facing loop, and check state as a
 human. It assumes nothing beyond a stable Rust toolchain and (for GitHub
 watching) the `gh` CLI.
 
-New to the design? Read [01-wake-and-rearm](01-wake-and-rearm.md) for *why* the
+New to the design? Read [01-wake](01-wake.md) for *why* the
 loop is shaped this way. This doc is the *how*.
 
 ---
@@ -280,7 +280,7 @@ What each hook does:
 waiter exit 2 at `--max-block-ms` to force a re-arm — one model turn per `max_block` of
 idle. That is gone: nothing runs on a timer, so an idle subscribed session costs **zero**
 model turns until real mail arrives, and **every wake is real mail**. See
-[01-wake-and-rearm](01-wake-and-rearm.md),
+[01-wake](01-wake.md),
 [ADR-0008](adr/0008-on-demand-wake-filechanged.md) and
 [ADR-0017](adr/0017-daemon-bumps-the-sentinel.md).
 

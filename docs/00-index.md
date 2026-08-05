@@ -18,7 +18,7 @@ Notes for the project. **New here and want to *use* it?** Start with
 | # | Doc | What it covers |
 |---|---|---|
 | 00 | [Index](00-index.md) | This page |
-| 01 | [Wake and re-arm](01-wake-and-rearm.md) | Idle-session wake via Claude Code `asyncRewake`, delivery cursors, Codex gap |
+| 01 | [Wake](01-wake.md) | Idle-session wake: the daemon writes a sentinel, `FileChanged` + `asyncRewake` turn it into a wake; delivery cursors, Codex gap |
 | 02 | [Tech stack](02-tech-stack.md) | Rust bridge, subprocess adapters (WASI later), security process split, early test bar |
 | 03 | [Working agreements](03-working-agreements.md) | ADRs, designs, branch/PR default, mikey-in-a-box install |
 

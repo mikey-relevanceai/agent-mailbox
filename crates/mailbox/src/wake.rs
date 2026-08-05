@@ -16,7 +16,7 @@
 //!
 //! # What crosses the boundary (and what does not)
 //!
-//! Wake is **payload-free** (ADR-0001, docs/01-wake-and-rearm.md): the sentinel
+//! Wake is **payload-free** (ADR-0001, docs/01-wake.md): the sentinel
 //! carries topic NAMES only, and the woken hook reports at most those names on its
 //! stderr. The event body never crosses this boundary — it stays in the durable log
 //! and is read later by the agent's `read`. Wake is ingress, not authority.
@@ -44,7 +44,7 @@ use crate::sentinel::{RetriggerRecord, Sentinel, SentinelError};
 use crate::storage::{ReadOnlyStore, SessionId, StorageError, Unread, WakeWatermark};
 
 /// The process exit code that asks the Claude Code harness to wake the idle session
-/// (the `asyncRewake` contract, docs/01-wake-and-rearm.md). A `u8` so the sole
+/// (the `asyncRewake` contract, docs/01-wake.md). A `u8` so the sole
 /// consumer maps it to a `std::process::ExitCode` without a lossy cast.
 pub const WAKE_EXIT_CODE: u8 = 2;
 

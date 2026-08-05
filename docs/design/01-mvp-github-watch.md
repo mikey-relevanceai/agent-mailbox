@@ -7,7 +7,7 @@
 - Related ADRs: [0001](../adr/0001-rust-bridge-subprocess-adapters.md),
   [0002](../adr/0002-mvp-crate-stack.md),
   [0003](../adr/0003-single-writer-sqlite.md)
-- Related: [01-wake-and-rearm](../01-wake-and-rearm.md), prior skill
+- Related: [01-wake](../01-wake.md), prior skill
   `agent-ipc` / `agent-ipc-github`
 
 > **Card 09 status note.** The `stub` watch kind + its resolver landed as the
@@ -83,7 +83,7 @@ Parity with `agent-ipc-github`, plus CI:
 - **Adapter** only polls and publishes; it does not wake agents or touch SQLite.
 - **Bridge** owns durability, subscriptions, delivery cursors, and **adapter
   process lifecycle**.
-- **Harness** owns arm/re-arm via hooks ([01-wake-and-rearm](../01-wake-and-rearm.md)).
+- **Harness** owns arm/re-arm via hooks ([01-wake](../01-wake.md)).
 
 ## Adapter lifecycle (no zombies)
 
@@ -196,7 +196,7 @@ No `ipc-arm.sh` step.
 | Bridge down | Publish/watch commands fail; no silent orphan writers |
 | One of N sessions dies | That session’s interest dropped; adapter keeps running for the rest |
 | Last session dies / hard kill | Reconcile / TTL sweeper drops dead interests; stop adapter when count hits 0 |
-| Mid-turn publishes | Delivery cursor + Stop re-arm ([01](../01-wake-and-rearm.md)) |
+| Mid-turn publishes | Delivery cursor + Stop re-arm ([01](../01-wake.md)) |
 
 ## Test plan
 

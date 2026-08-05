@@ -1,8 +1,15 @@
-# Wake (on-demand, ADR-0008 + ADR-0017)
+# Wake: how an idle session hears about the world
 
-How an idle agent session gets woken when the world changes — and how listening
-stays armed for the whole session without the agent doing anything, and **without a
-periodic re-arm** (the ADR-0006 re-arm is [superseded](adr/0008-on-demand-wake-filechanged.md)).
+How an idle agent session gets woken when the world changes, and how it stays
+wakeable for the whole session with the agent doing nothing at all — no arm
+command, no re-arm, nothing on a timer.
+
+The design in force is [ADR-0017](adr/0017-daemon-bumps-the-sentinel.md) (the daemon
+writes the sentinel) over [ADR-0008](adr/0008-on-demand-wake-filechanged.md) (the
+wake is a file change, not a timer). The **re-arm** this file used to be named for —
+ADR-0006's `Stop` → `arm` → exit-2-at-`max_block` loop, one model turn per
+`max_block` of idle — no longer exists in any form; it is described below only as
+the problem the current design solves.
 
 ## Layers
 

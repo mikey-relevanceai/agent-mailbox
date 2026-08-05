@@ -1788,7 +1788,7 @@ pub fn run_wake_hook() -> ExitCode {
     match mail.peek_unread() {
         Ok(topics) if !topics.is_empty() => {
             // The payload-free wake reminder — topic names only — surfaced to the
-            // agent verbatim as its system reminder (docs/01-wake-and-rearm.md).
+            // agent verbatim as its system reminder (docs/01-wake.md).
             eprintln!("{}", mailbox::wake::reminder(&topics));
             info!(
                 session = %session.as_str(),

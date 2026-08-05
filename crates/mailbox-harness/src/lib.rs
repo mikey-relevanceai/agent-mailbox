@@ -3,7 +3,7 @@
 //! # The whole agent-facing loop is subscribe / read / react / unsubscribe
 //!
 //! The agent never re-arms itself. Infrastructure owns the wake loop via Claude
-//! Code hooks (see `docs/01-wake-and-rearm.md`): the `serve` daemon writes a
+//! Code hooks (see `docs/01-wake.md`): the `serve` daemon writes a
 //! session's wake sentinel when mail lands for it, the `FileChanged` hook fires on
 //! that change even against an idle session, and an `asyncRewake` hook that exits 2
 //! wakes it. [`install`](install) wires that hook set into `~/.claude/settings.json`

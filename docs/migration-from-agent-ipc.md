@@ -9,7 +9,7 @@ The headline change: **the agent stops owning the wake loop.** No more
 `ipc-arm.sh` after every message, no more background `gh-watch.sh` pollers piling
 up. The Claude Code *hooks* keep the waiter armed, and the *bridge daemon*
 supervises the PR pollers (one per PR, refcounted, torn down when the last
-interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
+interested session leaves). See [01-wake](01-wake.md) and
 [design/01](design/01-mvp-github-watch.md) for the why.
 
 ---

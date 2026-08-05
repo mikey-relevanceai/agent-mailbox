@@ -25,7 +25,7 @@
 ## Context
 
 Claude Code owns the re-arm loop through hooks (see
-[docs/01-wake-and-rearm.md](../01-wake-and-rearm.md)): `SessionStart`/`Stop` run
+[docs/01-wake.md](../01-wake.md)): `SessionStart`/`Stop` run
 `mailbox harness arm`, which — for a subscribed session — becomes the card-05
 waiter (`mailbox wait`), and `SessionEnd` runs `mailbox harness cleanup`. Three
 forces shape how this must be coordinated:

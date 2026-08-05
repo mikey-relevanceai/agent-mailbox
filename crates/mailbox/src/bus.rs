@@ -8,7 +8,7 @@
 //!
 //! - **Baseline-on-subscribe.** A fresh subscription starts at the topic head,
 //!   so a new subscriber only ever sees events published *after* it subscribed —
-//!   history is never replayed (docs/01-wake-and-rearm.md).
+//!   history is never replayed (docs/01-wake.md).
 //! - **Advance-on-read, no ack.** [`Bus::read`] returns a session's unread events
 //!   and advances that session's per-topic cursors to what it returned, in one
 //!   step. The agent loop is subscribe → idle → wake → read → react; there is no

@@ -25,7 +25,7 @@
 //!
 //! This REPLACES the ADR-0006 `SessionStart`/`Stop` → `arm` → exit-2-re-arm loop,
 //! whose every re-arm cost a full model turn on a long idle. See
-//! `docs/01-wake-and-rearm.md`, ADR-0008 and ADR-0017.
+//! `docs/01-wake.md`, ADR-0008 and ADR-0017.
 //!
 //! # Where the hooks go, and why that is a TYPE
 //!
