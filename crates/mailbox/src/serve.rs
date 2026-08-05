@@ -515,11 +515,12 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
         | Request::Status { session }
-        | Request::Agents { session }
         | Request::EndSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
-        // logged by the agents module with both ends).
-        Request::Send { from, .. } => Some(from),
+        // logged by the agents module with both ends) — and there may be none, when
+        // a human sent it. `agents` marks its caller and otherwise ignores it, so it
+        // too may arrive without one. Both log as `session="-"`, like a publish.
+        Request::Send { from: session, .. } | Request::Agents { session } => session.as_ref(),
     }
 }
 
@@ -591,10 +592,14 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
 
 /// Thin translation over [`mailbox::agents::send`] (card 16): publish to the
 /// target's inbox, refusing loudly if that agent has no registered inbox.
+///
+/// `from` is optional: it is the reply address stamped into the body, not a right
+/// to send. A human poking an agent from a terminal has none, and the message is
+/// delivered without a `from` key rather than refused.
 async fn send(
     bus: &Bus,
     storage: &Storage,
-    from: SessionId,
+    from: Option<SessionId>,
     to: SessionId,
     body: serde_json::Map<String, serde_json::Value>,
 ) -> Response {
@@ -615,9 +620,12 @@ async fn send(
 /// it must not be repeated per listed agent. An unreadable process table yields an
 /// empty set, i.e. every agent reads `live: false` — an understatement, never a
 /// claim that an absent agent is there.
-async fn agents(storage: &Storage, caller: SessionId) -> Response {
+///
+/// `caller` is optional and only decides which row is marked `is_self`; a human
+/// listing the fleet sees the same fleet with nothing marked.
+async fn agents(storage: &Storage, caller: Option<SessionId>) -> Response {
     let live = mailbox::doctor::live_claude_sessions().unwrap_or_default();
-    match mailbox::agents::list(storage, &live, &caller).await {
+    match mailbox::agents::list(storage, &live, caller.as_ref()).await {
         Ok(agents) => Response::Agents {
             agents: agents
                 .into_iter()

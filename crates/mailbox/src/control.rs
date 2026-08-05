@@ -119,14 +119,25 @@ pub enum Request {
     /// The body is a JSON **object** on the wire (a `Map`, not a `Value`), so
     /// "there is somewhere to stamp `from`" is a type-level guarantee rather than
     /// a runtime check. It stays opaque to the bus either way (ADR-0001).
+    ///
+    /// **`from` is OPTIONAL**, because the caller's identity is not what `send`
+    /// exists for: its job is to deliver, and `from` is only the reply address it
+    /// stamps on the way. An agent messaging a peer has one and it is stamped; a
+    /// HUMAN poking an agent from an ordinary terminal has none, and refusing to
+    /// deliver would be trading a working poke for a missing courtesy. `None` means
+    /// "this message has no reply address", which the daemon states by omitting the
+    /// `from` key entirely rather than inventing a placeholder.
     Send {
-        from: SessionId,
+        from: Option<SessionId>,
         to: SessionId,
         body: serde_json::Map<String, Value>,
     },
     /// List the sessions with a registered agent inbox (card-16 discovery).
-    /// `session` is the *caller*, so the reply can mark which agent is itself.
-    Agents { session: SessionId },
+    /// `session` is the *caller*, so the reply can mark which agent is itself —
+    /// and it is OPTIONAL for that reason: marking a row is all it does. A human
+    /// listing the fleet from a terminal is not one of the agents, so with `None`
+    /// every agent is listed and no row is marked.
+    Agents { session: Option<SessionId> },
     /// List known topics with subscriber/event counts, optionally filtered to a
     /// prefix (card-16 discovery).
     Topics { prefix: Option<String> },
@@ -283,7 +294,9 @@ pub struct AgentSummary {
     /// nobody is running that session any more; a message still lands durably in its
     /// inbox, it just has nobody left to collect it.
     pub live: bool,
-    /// Whether this row is the caller itself.
+    /// Whether this row is the caller itself. Always `false` when the request
+    /// carried no caller (a human at a terminal is not one of these agents), so
+    /// "nobody is marked" and "I am not listed" read the same — which they are.
     pub is_self: bool,
 }
 
@@ -539,6 +552,24 @@ mod tests {
         round_trip_request(Request::Status {
             session: SessionId::new("s1"),
         });
+    }
+
+    /// The two ops whose caller is optional survive the wire in BOTH shapes. A
+    /// missing caller has to be a real value on the frame, not an encoding that
+    /// happens to decode — otherwise "a human sent this" would be indistinguishable
+    /// from a truncated frame.
+    #[test]
+    fn send_and_agents_round_trip_with_and_without_a_caller() {
+        for from in [Some(SessionId::new("s-a")), None] {
+            round_trip_request(Request::Send {
+                from,
+                to: SessionId::new("s-b"),
+                body: serde_json::Map::new(),
+            });
+        }
+        for session in [Some(SessionId::new("s-a")), None] {
+            round_trip_request(Request::Agents { session });
+        }
     }
 
     #[test]

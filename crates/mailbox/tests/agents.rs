@@ -122,6 +122,109 @@ fn round_trip_two_idle_agents_wake_each_other() {
     guard.assert_clean();
 }
 
+// ==== the human manual poke: no session in the environment at all ==============
+
+/// A HUMAN in an ordinary terminal — no `$CLAUDE_CODE_SESSION_ID` anywhere — can
+/// look at the fleet and poke an agent. Both commands ran through `Env::run`, which
+/// strips the variable, so this is the literal `env -u CLAUDE_CODE_SESSION_ID` case.
+///
+/// This is a regression guard. Making `$CLAUDE_CODE_SESSION_ID` the single source of
+/// a session's identity was right for the session-scoped commands, but it was applied
+/// to `agents` and `send` too, and both then refused to run outside a Claude Code
+/// session — advising the human to invent a `CLAUDE_CODE_SESSION_ID`, which for these
+/// two commands is nonsense. Neither needs an identity to do its job: `agents` only
+/// marks which row is the caller, and `send` only stamps a reply address.
+#[test]
+fn a_human_with_no_session_can_list_agents_and_poke_one() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let b = "s-bob";
+    arm_idle(&env, b);
+
+    // 1. Discovery, with no caller: the agent is listed, and NO row is marked self.
+    let out = env.run_ok(&["--json", "agents"], "agents with no session");
+    let value: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("agents json");
+    let rows = value["agents"].as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "the registered agent is listed: {rows:?}");
+    assert_eq!(rows[0]["session"], b);
+    assert_eq!(rows[0]["inbox"], format!("agent.{b}"));
+    assert!(
+        rows.iter().all(|r| r["is_self"] == Value::Bool(false)),
+        "with no caller there is no self to mark: {rows:?}"
+    );
+
+    let out = env.run_ok(&["agents"], "agents (human, no session)");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("1 agent(s):"), "{text}");
+    assert!(text.contains(&format!("inbox=agent.{b}")), "{text}");
+    assert!(
+        !text.contains("<- you"),
+        "nobody may be marked as the caller when there is no caller: {text}"
+    );
+
+    // 2. The poke itself lands, and the sender is told it carries no reply address.
+    let out = env.run_ok(&["send", b, "--text", "please rebase"], "send, no session");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("no `from`"),
+        "the sender is told the message has no reply address: {stderr}"
+    );
+
+    // 3. It wakes B exactly like a peer's message does — the wake path is unchanged.
+    poll_until("B's sentinel names its inbox", SETTLE, || {
+        env.sentinel_topics(b)
+            .iter()
+            .any(|t| t == &format!("agent.{b}"))
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(b).status.code(),
+        Some(2),
+        "a human's message wakes B like any other"
+    );
+
+    // 4. B reads it. The content is there; `from` is ABSENT, not null and not a
+    //    placeholder — which is how B knows there is nobody to reply to.
+    let events = env.read_events(b);
+    assert_eq!(events.len(), 1, "B has exactly one message");
+    assert_eq!(events[0]["body"]["text"], "please rebase");
+    assert!(
+        events[0]["body"].get("from").is_none(),
+        "a human's message must carry no `from` key at all: {}",
+        events[0]["body"]
+    );
+
+    let _ = env.cleanup(b);
+    guard.assert_clean();
+}
+
+/// The refusal that DOES survive with no session: an unregistered target is still a
+/// hard error. Tolerating a missing caller is not tolerating an undeliverable send.
+#[test]
+fn a_human_send_to_an_unregistered_agent_still_fails() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let out = env.run(&["send", "s-ghost", "--text", "hello?"]);
+    assert!(
+        !out.status.success(),
+        "a human's send to an unregistered agent must still exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no registered inbox"),
+        "the same actionable error a peer gets: {stderr}"
+    );
+
+    guard.assert_clean();
+}
+
 // ==== send to an unregistered agent fails loudly (baseline-on-subscribe) ========
 
 /// A message to a session with no registered inbox could never be delivered — a

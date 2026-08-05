@@ -98,9 +98,11 @@ pub enum Command {
     /// Show this session's identity (id + inbox topic), its watches, its
     /// subscriptions and its unread counts. The identity half needs no bridge.
     Status,
-    /// Message a peer agent: publish to its inbox, stamped with your session id.
+    /// Message a peer agent: publish to its inbox, stamped with your session id if
+    /// you are a session (a human's message carries no reply address).
     Send(SendArgs),
-    /// List the agents with a registered inbox (who you can `send` to).
+    /// List the agents with a registered inbox (who you can `send` to). Marks which
+    /// one is you, when you are one of them.
     Agents,
     /// List known topics with their subscriber and event counts.
     Topics(TopicsArgs),
@@ -136,11 +138,26 @@ const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 /// An empty or whitespace-only value names no session, so it is treated as absent
 /// rather than binding a phantom session id.
 fn resolve_session() -> anyhow::Result<SessionId> {
-    session_from_env_value(&std::env::var(ENV_CLAUDE_SESSION).unwrap_or_default()).context(
+    resolve_session_optional().context(
         "no session id: this command must run inside a Claude Code session, which sets \
          CLAUDE_CODE_SESSION_ID. To run it by hand, set that variable yourself \
          (CLAUDE_CODE_SESSION_ID=<id> mailbox ...)",
     )
+}
+
+/// Resolve the calling session if the environment names one, WITHOUT failing when
+/// it does not.
+///
+/// For the commands where a session is a nicety rather than the point. `send` uses
+/// it to stamp a reply address; `agents` uses it to mark which row is the caller;
+/// `doctor` uses it to warn that the caller cannot measure itself. None of the three
+/// is *about* the caller, so refusing to run without one would refuse the human
+/// manual-poke workflow — look at the fleet, poke an agent — for the sake of a field
+/// that command does not need. Commands that genuinely are about the caller (`read`,
+/// `status`, `subscribe`, `unsubscribe`, `watch`, `unwatch`) use
+/// [`resolve_session_or_fail`] instead, because "whose?" is their whole content.
+fn resolve_session_optional() -> Option<SessionId> {
+    session_from_env_value(&std::env::var(ENV_CLAUDE_SESSION).unwrap_or_default())
 }
 
 /// The identity rule itself, as a pure function of the raw env value so it is
@@ -249,8 +266,10 @@ pub struct TopicArgs {
 ///
 /// `--text` and `--body` are mutually exclusive: `--text` IS the shorthand for
 /// `--body '{"text": "..."}'`, so accepting both would only raise the question of
-/// which wins. Neither is also fine — a bare `send <target>` is a poke, and the
-/// receiver still learns who it came from (the `from` stamp is always present).
+/// which wins. Neither is also fine — a bare `send <target>` is a poke, and a peer
+/// sending one is still identified by the `from` the bridge stamps. A HUMAN's poke
+/// carries no `from` at all, so an empty body says genuinely nothing; give it a
+/// `--text` if the agent is meant to act on something in particular.
 #[derive(Args, Debug)]
 pub struct SendArgs {
     /// The agent to message: a bare session id, or its full `agent.<id>` topic.
@@ -443,10 +462,26 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCo
 /// `send`: message a peer agent. The body the bridge publishes is
 /// `{"from": "<sender>", ...}` — see [`mailbox::agents`] for the convention and
 /// for why an unregistered target is a hard error rather than a silent publish.
+///
+/// **The session is optional here** (see [`resolve_session_optional`]). `send`'s job
+/// is to deliver; `from` is only the reply address stamped on the way. A human in an
+/// ordinary terminal has no session id and so no address to be replied to — and a
+/// human poking an agent is a workflow this bridge exists to support, so the message
+/// goes with no `from` and the sender is told that on stderr.
 async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCode> {
-    let from = resolve_session_or_fail(format)?;
+    let from = resolve_session_optional();
     let to = parse_send_target(&args.target)?;
     let body = send_body(args.text, args.body)?;
+    if from.is_none() {
+        // stderr in BOTH modes: `--json` stdout is a machine contract, and in human
+        // mode this is a caveat about the send, not its result.
+        eprintln!(
+            "note: no CLAUDE_CODE_SESSION_ID, so this message carries no `from` and \
+             {} cannot reply to it. That is normal when a human pokes an agent from a \
+             terminal — say who you are in the text if you want an answer.",
+            to.as_str()
+        );
+    }
     request(format, Request::Send { from, to, body }).await
 }
 
@@ -474,7 +509,8 @@ fn send_body(
                 ),
             }
         }
-        // A bare poke: the receiver still learns who sent it (the `from` stamp).
+        // A bare poke. From a peer it still carries the `from` stamp; from a human it
+        // carries nothing at all, which is a legitimate "go look" nudge.
         (None, None) => Ok(serde_json::Map::new()),
     }
 }
@@ -503,11 +539,17 @@ fn parse_send_target(raw: &str) -> anyhow::Result<SessionId> {
     }
 }
 
+/// `agents`: who has a registered inbox, i.e. who can be `send` to.
+///
+/// **The session is optional here** (see [`resolve_session_optional`]). The caller's
+/// only effect on this listing is which row is marked `<- you`; with no session,
+/// every agent is still listed and no row is marked. Refusing to answer "who exists"
+/// to a human at a terminal would be refusing the question, not protecting anything.
 async fn run_agents(format: OutputFormat) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Agents {
-            session: resolve_session_or_fail(format)?,
+            session: resolve_session_optional(),
         },
     )
     .await
@@ -722,9 +764,12 @@ fn request_context(request: &Request) -> String {
             format!("unwatching stub {label} for {}", session.as_str())
         }
         Request::Status { session } => format!("status for {}", session.as_str()),
-        Request::Send { from, to, .. } => {
-            format!("sending from {} to {}", from.as_str(), to.as_str())
-        }
+        // An unattributed send is a real case (a human at a terminal), so it says so
+        // rather than printing an empty "sending from  to X".
+        Request::Send { from, to, .. } => match from {
+            Some(from) => format!("sending from {} to {}", from.as_str(), to.as_str()),
+            None => format!("sending to {} (no sender session)", to.as_str()),
+        },
         Request::Agents { .. } => "listing agents".to_string(),
         Request::Topics { prefix } => match prefix {
             Some(prefix) => format!("listing topics under {prefix:?}"),
@@ -843,6 +888,9 @@ fn describe_sub(state: &SubscribeState) -> String {
 /// woken" — a live agent may be mid-turn, and `mailbox doctor` is the only thing
 /// that proves wakeability. A `send` to an agent that is not running still lands
 /// durably, so the line says so rather than leaving the reader to guess.
+///
+/// The `<- you` marker is simply absent when the caller is not a session (a human at
+/// a terminal), which is honest: there is no row to mark.
 fn render_agents(agents: &[AgentSummary]) {
     if agents.is_empty() {
         println!("no agents registered (nobody is addressable yet)");
@@ -1591,7 +1639,7 @@ pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
     // UNMEASURED — which reads as "no fault found" to anyone skimming. An agent
     // auditing its own fleet is therefore structurally blind to its own deafness, and
     // that blind spot has to be stated rather than left for the reader to deduce.
-    if let Ok(caller) = resolve_session()
+    if let Some(caller) = resolve_session_optional()
         && report.sessions.iter().any(|r| r.session == caller)
     {
         let caller = caller.as_str();
@@ -2099,7 +2147,7 @@ mod tests {
         let from_body = send_body(None, Some(r#"{"kind":"review-done"}"#.to_string())).unwrap();
         assert_eq!(from_body["kind"], serde_json::json!("review-done"));
 
-        // A bare poke is allowed: the `from` stamp the bridge adds is enough.
+        // A bare poke is allowed: from a peer, the `from` stamp is enough on its own.
         assert!(send_body(None, None).unwrap().is_empty());
     }
 
