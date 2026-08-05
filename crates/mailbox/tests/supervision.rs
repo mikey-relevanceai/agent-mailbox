@@ -24,6 +24,7 @@
 //! orphan process survives (pid reaped). The supervisor is always shut down so
 //! its adapters are reaped before the test ends.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -677,7 +678,7 @@ async fn clean_finite_exit_is_terminal_not_restarted() {
 // ---- AC5: bridge restart, resume iff a live session wants it ------------------
 
 /// On bridge restart a previously-running watch whose interested session has NO
-/// live waiter is not resumed: reconcile marks it stopped and clears the pid, even
+/// live process is not resumed: reconcile marks it stopped and clears the pid, even
 /// though the interest row survives. The fail-safe half of design/01 rule 6 — an
 /// interest we cannot prove belongs to a live session gets no poller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -709,15 +710,16 @@ async fn ac5_bridge_restart_does_not_resume_watch_of_a_dead_session() {
         .await
         .unwrap();
 
-    // Bridge restart. `s1` has no pidfile in `dir`, so its waiter is not alive.
-    reconcile_startup(&storage, &supervisor, dir.path())
+    // Bridge restart with `s1` gone: no Claude Code process carries its id.
+    let live = BTreeSet::new();
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
     assert_eq!(
         watch_state(&storage, watch_id).await,
         WatchState::Stopped,
-        "a previously-running watch whose session has no live waiter is stopped, not resumed"
+        "a previously-running watch whose session has exited is stopped, not resumed"
     );
     // The stored child_pid column is cleared to NULL (a Stopped watch carries no
     // pid — the storage model would reject a Stopped row that still had one).
@@ -731,7 +733,7 @@ async fn ac5_bridge_restart_does_not_resume_watch_of_a_dead_session() {
     assert_eq!(storage.interest_count(watch_id).await.unwrap(), 1);
 }
 
-/// With no live waiter to resume anything, `reconcile_startup` touches ONLY
+/// With no live session to resume anything, `reconcile_startup` touches ONLY
 /// previously-running watches: a mix of Desired/Running/Stopped leaves Desired and
 /// Stopped untouched and marks the Running one Stopped. Desired carries no stale
 /// pid, so demoting it would be pure churn.
@@ -763,7 +765,8 @@ async fn reconcile_startup_only_touches_running_watches() {
         .await
         .unwrap();
 
-    reconcile_startup(&storage, &supervisor, _dir.path())
+    let live = BTreeSet::new();
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
@@ -794,8 +797,8 @@ async fn reconcile_startup_only_touches_running_watches() {
 /// those interests could not notice or recover, because the only event that would
 /// have given them a turn was the one the stopped poller would have published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconcile_startup_resumes_a_watch_whose_session_has_a_live_waiter() {
-    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+async fn reconcile_startup_resumes_a_watch_whose_session_is_still_running() {
+    let (_bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let s1 = SessionId::new("s1");
 
     // The pre-restart state: a watch the previous daemon had running under a pid
@@ -824,16 +827,11 @@ async fn reconcile_startup_resumes_a_watch_whose_session_has_a_live_waiter() {
         .await
         .unwrap();
 
-    // A live watcher for s1: a pidfile naming THIS process, which `kill(pid, 0)`
-    // finds — the same probe ADR-0009 gave the TTL sweeper.
-    std::fs::write(
-        dir.path()
-            .join(format!("{}.waiter.pid", s1.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    // s1 is still running: the process table carries its id (ADR-0017's probe,
+    // handed in by `serve` as one `ps` read per reconcile).
+    let live = BTreeSet::from([s1.as_str().to_string()]);
 
-    reconcile_startup(&storage, &supervisor, dir.path())
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
@@ -851,7 +849,7 @@ async fn reconcile_startup_resumes_a_watch_whose_session_has_a_live_waiter() {
         WatchState::Running {
             pid: mailbox::storage::Pid::new(pid)
         },
-        "a watch whose interested session has a live waiter is resumed on restart"
+        "a watch whose interested session is still running is resumed on restart"
     );
 
     supervisor.shutdown().await.unwrap();
@@ -863,8 +861,8 @@ async fn reconcile_startup_resumes_a_watch_whose_session_has_a_live_waiter() {
 /// interested session is alive is resumed, not left in the contradictory state.
 /// This pins that heal path, which the Running-start tests do not exercise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconcile_startup_resumes_a_stopped_watch_with_a_live_waiter() {
-    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+async fn reconcile_startup_resumes_a_stopped_watch_of_a_running_session() {
+    let (_bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let s1 = SessionId::new("s1");
 
     // The inconsistent pre-restart state the old path itself created: Stopped, yet
@@ -887,14 +885,9 @@ async fn reconcile_startup_resumes_a_stopped_watch_with_a_live_waiter() {
         .add_interest(watch_id, s1.clone(), 1_000)
         .await
         .unwrap();
-    std::fs::write(
-        dir.path()
-            .join(format!("{}.waiter.pid", s1.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    let live = BTreeSet::from([s1.as_str().to_string()]);
 
-    reconcile_startup(&storage, &supervisor, dir.path())
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
@@ -919,7 +912,7 @@ async fn reconcile_startup_resumes_a_stopped_watch_with_a_live_waiter() {
 /// future refactor to `.all(...)` or a first-match-only check is caught.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconcile_startup_resumes_when_only_one_of_several_sessions_is_alive() {
-    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let (_bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let dead = SessionId::new("dead");
     let alive = SessionId::new("alive");
 
@@ -950,15 +943,10 @@ async fn reconcile_startup_resumes_when_only_one_of_several_sessions_is_alive() 
         .add_interest(watch_id, alive.clone(), 1_000)
         .await
         .unwrap();
-    // Only `alive` has a live waiter pidfile; `dead` has none.
-    std::fs::write(
-        dir.path()
-            .join(format!("{}.waiter.pid", alive.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    // Only `alive` still has a Claude Code process; `dead` does not.
+    let live = BTreeSet::from([alive.as_str().to_string()]);
 
-    reconcile_startup(&storage, &supervisor, dir.path())
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
@@ -983,7 +971,7 @@ async fn reconcile_startup_resumes_when_only_one_of_several_sessions_is_alive() 
 /// the give-up stands until the sweep retries it (ADR-0011) or a re-`watch`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconcile_startup_leaves_a_failed_watch_alone() {
-    let (_bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let (_bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let s1 = SessionId::new("s1");
 
     let watch_id = storage
@@ -1004,15 +992,10 @@ async fn reconcile_startup_leaves_a_failed_watch_alone() {
         .add_interest(watch_id, s1.clone(), 1_000)
         .await
         .unwrap();
-    // A live waiter — to prove liveness does NOT override the Failed skip.
-    std::fs::write(
-        dir.path()
-            .join(format!("{}.waiter.pid", s1.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    // A live session — to prove liveness does NOT override the Failed skip.
+    let live = BTreeSet::from([s1.as_str().to_string()]);
 
-    reconcile_startup(&storage, &supervisor, dir.path())
+    reconcile_startup(&storage, &supervisor, &live)
         .await
         .unwrap();
 
@@ -1042,12 +1025,12 @@ fn raw_child_pid(db_dir: &std::path::Path, watch_id: WatchId) -> Option<i64> {
 /// A fresh interest is not swept; a stale one is, and its adapter is stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
-    let (bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(6);
     let s1 = SessionId::new("s1");
-    // An empty waiters dir: s1 has no pidfile, so the sweep's liveness probe finds
-    // no live waiter and the TTL alone decides — which is what this test drives.
-    let waiters = dir.path();
+    // Nobody is running: the live set is empty, so the sweep's liveness probe
+    // spares nothing and the TTL alone decides — which is what this test drives.
+    let live = BTreeSet::<String>::new();
 
     record(
         &bus,
@@ -1068,7 +1051,7 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
 
     // A fresh interest (last-seen stamped at `record`) is NOT stale under a 1s TTL.
     let swept = supervisor
-        .sweep(Duration::from_secs(1), waiters)
+        .sweep(Duration::from_secs(1), live.clone())
         .await
         .unwrap();
     assert!(swept.is_empty(), "a fresh interest must not be swept");
@@ -1079,7 +1062,7 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     let old = mailbox::clock::now_millis() - 10_000;
     storage.touch_interest(watch_id, s1, old).await.unwrap();
     let swept = supervisor
-        .sweep(Duration::from_secs(1), waiters)
+        .sweep(Duration::from_secs(1), live)
         .await
         .unwrap();
     assert_eq!(swept, vec![watch_id], "the stale interest's watch is swept");
@@ -1095,23 +1078,22 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     supervisor.shutdown().await.unwrap();
 }
 
-/// REGRESSION (ADR-0009). A session whose watcher is ALIVE must survive a sweep no
-/// matter how long ago it last spoke to the bridge.
+/// REGRESSION (ADR-0009, carried forward to ADR-0017). A session that is still
+/// RUNNING must survive a sweep no matter how long ago it last spoke to the bridge.
 ///
-/// Under ADR-0008 an idle session is silent by design — it takes zero turns and
-/// makes zero requests until real mail arrives — so its `last_seen` never advances
-/// on its own. A TTL keyed on the session's own traffic therefore reaped exactly
-/// the healthy idle sessions ADR-0008 exists to enable, killing the adapter under a
-/// live watcher and leaving the session silently deaf (its bus subscription
-/// survived, so `subscribe` still answered "already subscribed" while no adapter
-/// existed to produce events). The sweep now probes the waiter pidfile, so liveness
-/// comes from the watcher's existence rather than the agent's chatter.
+/// An idle session is silent by design — it takes zero turns and makes zero
+/// requests until real mail arrives — so its `last_seen` never advances on its own.
+/// A TTL keyed on the session's own traffic therefore reaped exactly the healthy
+/// idle sessions on-demand wake exists to enable, killing the adapter under a live
+/// agent and leaving the session silently deaf (its bus subscription survived, so
+/// `subscribe` still answered "already subscribed" while no adapter existed to
+/// produce events). The sweep now reads the process table, so liveness comes from
+/// the agent's existence rather than from its chatter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ttl_sweeper_spares_a_live_waiter_however_stale_its_last_seen() {
-    let (bus, storage, supervisor, dir) = fresh(StubResolverFixture::interval(20)).await;
+async fn ttl_sweeper_spares_a_live_session_however_stale_its_last_seen() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
     let watched = pr(7);
     let s1 = SessionId::new("s1");
-    let waiters = dir.path();
 
     record(
         &bus,
@@ -1130,12 +1112,8 @@ async fn ttl_sweeper_spares_a_live_waiter_however_stale_its_last_seen() {
     })
     .await;
 
-    // A live watcher: a pidfile naming THIS process, which `kill(pid, 0)` finds.
-    std::fs::write(
-        waiters.join(format!("{}.waiter.pid", s1.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    // s1's Claude Code process is still running.
+    let live = BTreeSet::from([s1.as_str().to_string()]);
 
     // Backdate last-seen far past the TTL — the exact state an idle-but-live
     // session reaches on its own, since nothing but `watch` ever stamps it.
@@ -1146,39 +1124,38 @@ async fn ttl_sweeper_spares_a_live_waiter_however_stale_its_last_seen() {
         .unwrap();
 
     let swept = supervisor
-        .sweep(Duration::from_secs(1), waiters)
+        .sweep(Duration::from_secs(1), live.clone())
         .await
         .unwrap();
     assert!(
         swept.is_empty(),
-        "a session with a live waiter must never be swept, however stale its last-seen"
+        "a session that is still running must never be swept, however stale its last-seen"
     );
     assert_eq!(
         supervisor.running_pid(watch_id).await,
         Some(pid),
-        "the adapter must still be running under a live watcher"
+        "the adapter must still be running under a live agent"
     );
     assert!(pid_alive(pid));
 
     // The sweep refreshed it rather than merely skipping it, so the next sweep is
     // decided by fresh evidence and not by the stale stamp we planted.
     let swept = supervisor
-        .sweep(Duration::from_secs(1), waiters)
+        .sweep(Duration::from_secs(1), live)
         .await
         .unwrap();
     assert!(swept.is_empty(), "the refresh must persist across sweeps");
 
-    // Once the watcher is gone, the TTL backstop reclaims the watch as before.
-    std::fs::remove_file(waiters.join(format!("{}.waiter.pid", s1.encode_filename()))).unwrap();
+    // Once the agent has exited, the TTL backstop reclaims the watch as before.
     storage.touch_interest(watch_id, s1, ancient).await.unwrap();
     let swept = supervisor
-        .sweep(Duration::from_secs(1), waiters)
+        .sweep(Duration::from_secs(1), BTreeSet::new())
         .await
         .unwrap();
     assert_eq!(
         swept,
         vec![watch_id],
-        "with the watcher gone the stale interest is swept"
+        "with the agent gone the stale interest is swept"
     );
     assert_pid_reaped(pid).await;
 
@@ -1314,7 +1291,7 @@ async fn repeated_start_failures_give_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
     let healthy = Arc::new(AtomicBool::new(false));
-    let (bus, storage, supervisor, dir) = fresh(FlakyResolver::new(healthy.clone())).await;
+    let (bus, storage, supervisor, _dir) = fresh(FlakyResolver::new(healthy.clone())).await;
     let watched = pr(9);
     let s1 = SessionId::new("s1");
 
@@ -1337,20 +1314,14 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
     })
     .await;
 
-    // Upstream recovers, and s1 is still alive — a waiter pidfile naming THIS
-    // process, which `kill(pid, 0)` finds (ADR-0009's probe, the sweep's liveness
-    // signal).
+    // Upstream recovers, and s1's Claude Code process is still running — the
+    // sweep's liveness signal (ADR-0017's probe).
     healthy.store(true, Ordering::SeqCst);
-    std::fs::write(
-        dir.path()
-            .join(format!("{}.waiter.pid", s1.encode_filename())),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    let live = BTreeSet::from([s1.as_str().to_string()]);
 
     // One sweep retries the failed watch; it comes back Running under a fresh pid.
     supervisor
-        .sweep(Duration::from_secs(3600), dir.path())
+        .sweep(Duration::from_secs(3600), live)
         .await
         .unwrap();
     let pid = poll_until("failed watch retried to running", || {
@@ -1369,14 +1340,14 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
     supervisor.shutdown().await.unwrap();
 }
 
-/// The fail-safe half: a `Failed` watch whose session has NO live waiter is left
+/// The fail-safe half: a `Failed` watch whose session is NO LONGER RUNNING is left
 /// `Failed` by the sweep — no zombie retries hammering an upstream nobody is
 /// waiting on. Same liveness invariant as the TTL sweep and the startup reconcile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sweep_does_not_retry_a_failed_watch_of_a_dead_session() {
     // Nonexistent program: every spawn fails, so the watch gives up to Failed and
     // would stay there unless something retries it.
-    let (bus, storage, supervisor, dir) = fresh(FixtureResolver::nonexistent()).await;
+    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::nonexistent()).await;
     let watched = pr(10);
     let s1 = SessionId::new("s1");
 
@@ -1397,10 +1368,10 @@ async fn sweep_does_not_retry_a_failed_watch_of_a_dead_session() {
     })
     .await;
 
-    // No waiter pidfile for s1: the sweep cannot prove the session alive. A long
+    // s1 is not in the live set: the sweep cannot prove the session alive. A long
     // TTL keeps the interest from being reaped, isolating the retry decision.
     supervisor
-        .sweep(Duration::from_secs(3600), dir.path())
+        .sweep(Duration::from_secs(3600), BTreeSet::new())
         .await
         .unwrap();
 

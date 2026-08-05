@@ -191,7 +191,6 @@ impl WakeReason {
     }
 }
 
-
 /// Why one `poll` on the FIFO returned: a kick byte arrived (drain + re-check),
 /// or the bounded block elapsed with no kick (the re-arm boundary, ADR-0006).
 /// A named enum, not a `bool`, so the branch reads plainly.
@@ -202,7 +201,6 @@ enum Blocked {
     /// The `max_block` budget elapsed before any kick (bounded waits only).
     TimedOut,
 }
-
 
 /// How the detached watcher ([`Waiter::watch_sentinel`]) ended.
 ///
@@ -218,7 +216,6 @@ pub enum WatchOutcome {
     /// arm-iff-subscribed re-check, mirroring [`WaitOutcome::Unsubscribed`]).
     Unsubscribed,
 }
-
 
 /// How one [`Waiter::retrigger_if_unread`] ended (ADR-0012).
 ///
@@ -522,7 +519,6 @@ impl Waiter {
     pub fn pidfile_path(&self) -> &Path {
         &self.pidfile_path
     }
-
 
     /// Peek at the session's currently-unread topics WITHOUT blocking, arming, or
     /// consuming anything — the read the `FileChanged` wake hook makes to decide

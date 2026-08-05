@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::{Env, poll_until};
+use common::{Env, FakeClaude, poll_until};
 
 /// Generous bound for a real process to arm / wake / exit under CI load. Every
 /// wait is a bounded poll, never a fixed sleep.
@@ -82,7 +82,10 @@ fn round_trip_two_idle_agents_wake_each_other() {
     // wake wire now, so it is where payload-freeness has to hold.
     let topics = poll_until("B's sentinel names its inbox", SETTLE, || {
         let topics = env.sentinel_topics(b);
-        topics.iter().any(|t| t == &format!("agent.{b}")).then_some(topics)
+        topics
+            .iter()
+            .any(|t| t == &format!("agent.{b}"))
+            .then_some(topics)
     });
     assert!(
         !topics.iter().any(|t| t.contains("please review PR 42")),
@@ -114,11 +117,7 @@ fn round_trip_two_idle_agents_wake_each_other() {
             .any(|t| t == &format!("agent.{a}"))
             .then_some(())
     });
-    assert_eq!(
-        env.wake_hook(a).status.code(),
-        Some(2),
-        "B's reply wakes A"
-    );
+    assert_eq!(env.wake_hook(a).status.code(), Some(2), "B's reply wakes A");
 
     let events = env.read_events(a);
     assert_eq!(events.len(), 1);
@@ -406,9 +405,13 @@ fn publish_namespace_near_misses_are_allowed_but_a_real_inbox_is_rejected() {
 
 // ==== discovery: agents (liveness + self) and topics ===========================
 
-/// `agents` lists registered inboxes, marks the caller, and reports live-waiter
-/// liveness honestly — live while the peer is idle on a waiter, not live once that
-/// waiter is gone. Both the human and `--json` shapes are checked.
+/// `agents` lists registered inboxes, marks the caller, and reports liveness
+/// honestly — live while the peer's Claude Code process exists, not live once it has
+/// exited. Both the human and `--json` shapes are checked.
+///
+/// Liveness is driven with real processes, not a planted file: the bridge reads it
+/// from the process table, so anything a test could plant would be testing a
+/// different mechanism than production uses.
 #[test]
 fn agents_reports_registration_liveness_and_self() {
     let env = Env::new();
@@ -416,9 +419,13 @@ fn agents_reports_registration_liveness_and_self() {
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    let (a, b) = ("s-a", "s-b");
+    // Session ids long enough to be recognised as ids (the parser's guard against
+    // counting an id quoted inside an unrelated command line).
+    let (a, b) = ("agent-alpha", "agent-bravo");
     arm_idle(&env, a);
     arm_idle(&env, b);
+    let claude_a = FakeClaude::running(a);
+    let claude_b = FakeClaude::running(b);
 
     // --json: both registered, both live, and A is marked as itself.
     let rows = agents(&env, a);
@@ -428,8 +435,8 @@ fn agents_reports_registration_liveness_and_self() {
     assert_eq!(row_a["inbox"], format!("agent.{a}"));
     assert_eq!(row_a["is_self"], true);
     assert_eq!(row_b["is_self"], false, "B is not the caller");
-    assert_eq!(row_a["live_waiter"], true, "A is idle on a live waiter");
-    assert_eq!(row_b["live_waiter"], true, "B is idle on a live waiter");
+    assert_eq!(row_a["live"], true, "A's agent process is running");
+    assert_eq!(row_b["live"], true, "B's agent process is running");
 
     // human: names both agents, their inbox topics, and marks the caller.
     let out = env.run_ok(&["agents", "--session", a], "agents (human)");
@@ -439,26 +446,24 @@ fn agents_reports_registration_liveness_and_self() {
     assert!(text.contains(&format!("inbox=agent.{b}")), "{text}");
     assert!(text.contains("<- you"), "the caller is marked: {text}");
 
-    // Kill B's watcher (as a busy, mid-turn agent has none): B stays REGISTERED and
-    // addressable, but is no longer reported as idle-and-listening.
-    let pid: u32 = std::fs::read_to_string(env.waiter_pidfile(b))
-        .expect("B's watcher pidfile")
-        .trim()
-        .parse()
-        .expect("pid");
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    poll_until("B's watcher is gone", SETTLE, || {
+    // B's agent exits (a closed terminal, a killed process — no `SessionEnd` runs).
+    // B stays REGISTERED and addressable; it is simply no longer running.
+    claude_b.stop(b);
+    poll_until("B's agent process is gone", SETTLE, || {
         let row = agent_row(&env, a, b).expect("B stays registered");
-        (row["live_waiter"] == Value::Bool(false)).then_some(())
+        (row["live"] == Value::Bool(false)).then_some(())
     });
     assert!(
         agent_row(&env, a, b).is_some(),
-        "a busy agent is still addressable"
+        "an agent that has exited is still addressable"
+    );
+    assert_eq!(
+        agent_row(&env, a, a).expect("A is listed")["live"],
+        Value::Bool(true),
+        "A is unaffected by B exiting"
     );
 
+    claude_a.stop(a);
     let _ = env.cleanup(a);
     let _ = env.cleanup(b);
     guard.assert_clean();

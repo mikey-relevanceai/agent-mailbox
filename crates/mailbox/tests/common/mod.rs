@@ -379,7 +379,6 @@ impl Env {
         self.waiters_dir().join(format!("{session}.waiter.pid"))
     }
 
-
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload),
     /// the fake harness driver's teardown half. Returns its output.
     pub fn cleanup(&self, session: &str) -> Output {
@@ -611,6 +610,79 @@ impl Drop for Daemon {
     }
 }
 
+// ---- a stand-in for a running Claude Code process ------------------------------
+
+/// A process that looks like Claude Code to the ONE liveness signal the bridge
+/// trusts: [`mailbox::doctor::live_claude_sessions`] scans the process table for a
+/// program named `claude` carrying `--session-id <id>` in its own argv.
+///
+/// It is a symlink to `/bin/sh` named `claude`, running a sleep loop with the
+/// session id in its arguments — so `ps` reports exactly the shape it reports for
+/// the real binary, with no Claude Code installed and no network. Killed and reaped
+/// on drop, so a failing assertion cannot leak it.
+///
+/// The session id must LOOK like one (at least 8 characters of `[A-Za-z0-9_-]`), or
+/// the parser rejects it — that guard is what stops a session id quoted inside some
+/// unrelated command line from being counted as a live agent.
+pub struct FakeClaude {
+    child: Child,
+    _dir: TempDir,
+}
+
+impl FakeClaude {
+    /// Start a fake Claude Code for `session` and block until the process table
+    /// actually reports it. Waiting here (rather than in each test) keeps the
+    /// liveness assertions about the code under test instead of about `ps` latency.
+    pub fn running(session: &str) -> Self {
+        let dir = TempDir::new().expect("fake claude tempdir");
+        let bin = dir.path().join("claude");
+        std::os::unix::fs::symlink("/bin/sh", &bin).expect("symlink /bin/sh as claude");
+        let child = Command::new(&bin)
+            .args(["-c", "while :; do sleep 1; done", "--session-id", session])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the fake claude");
+        poll_until(
+            "the fake claude appears in the process table",
+            Duration::from_secs(10),
+            || {
+                mailbox::doctor::live_claude_sessions()
+                    .filter(|live| live.contains(session))
+                    .map(|_| ())
+            },
+        );
+        FakeClaude { child, _dir: dir }
+    }
+
+    /// Kill and reap it, then block until it has left the process table — so a test
+    /// asserting "this agent is gone" is not racing the kernel.
+    pub fn stop(mut self, session: &str) {
+        self.terminate();
+        poll_until(
+            "the fake claude leaves the process table",
+            Duration::from_secs(10),
+            || {
+                mailbox::doctor::live_claude_sessions()
+                    .map(|live| !live.contains(session))
+                    .unwrap_or(true)
+                    .then_some(())
+            },
+        );
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for FakeClaude {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
 
 /// A spawned child that is killed and reaped when the test drops it, so a failing
 /// assertion can never leak a process into the next test.

@@ -52,7 +52,7 @@
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,11 +106,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Interests older than this are swept. The sweeper refreshes the last-seen of
-/// every session whose waiter pidfile is alive (ADR-0009), so an interest only
-/// ages out once the session's watcher has been gone for the whole TTL — i.e.
+/// every session that still has a live Claude Code process (ADR-0017), so an
+/// interest only ages out once its agent has been gone for the whole TTL — i.e.
 /// once the session has genuinely died without a `SessionEnd`. Generous by
-/// design: it doubles as the grace period for a transiently-absent pidfile, and
-/// missing a slow cleanup beats dropping a live session's watch.
+/// design: it doubles as the grace period for a momentarily unreadable process
+/// table, and missing a slow cleanup beats dropping a live session's watch.
 const DEFAULT_INTEREST_TTL: Duration = Duration::from_secs(3600);
 
 /// Runtime-tunable daemon limits. Defaults are the constants above; each may be
@@ -155,9 +155,6 @@ struct Ctx {
     bus: Bus,
     storage: Storage,
     supervisor: Supervisor,
-    /// The per-session waiter FIFOs/pidfiles directory — the source of the
-    /// live-waiter liveness `agents` reports (card 16).
-    waiters_dir: Arc<PathBuf>,
 }
 
 /// Run the daemon until a termination signal (SIGINT/SIGTERM) arrives.
@@ -188,12 +185,22 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         RestartPolicy::default(),
     );
 
-    // 5. Reconcile the previous daemon's watches: resume the ones an alive session
-    //    still wants (proved by its watcher pidfile — ADR-0009's probe), stop the
-    //    rest. Must run AFTER the supervisor exists, since resuming spawns through
-    //    it. Under ADR-0008 an idle session takes zero turns and can never
-    //    re-`watch`, so a watch not resumed here stays dead for that session's life.
-    reconcile_startup(&storage, &supervisor, &config.waiters_dir()).await?;
+    // 5. Reconcile the previous daemon's watches: resume the ones a live session
+    //    still wants (proved by its Claude Code process — ADR-0017's probe), stop
+    //    the rest. Must run AFTER the supervisor exists, since resuming spawns
+    //    through it. An idle session takes zero turns and can never re-`watch`, so a
+    //    watch not resumed here stays dead for that session's life.
+    //
+    //    An unreadable process table means we cannot prove ANY session alive. Doing
+    //    the reconcile anyway would stop every watch on a `ps` hiccup, so we skip it
+    //    loudly instead and let the first successful sweep reconcile.
+    match mailbox::doctor::live_claude_sessions() {
+        Some(live) => reconcile_startup(&storage, &supervisor, &live).await?,
+        None => warn!(
+            "could not read the process table, so no watch could be proven wanted; \
+             skipped the startup reconcile (the periodic sweep will reconcile instead)"
+        ),
+    }
 
     // 6. We hold the lock, so any leftover socket node is provably stale.
     let socket_path = config.socket_path();
@@ -211,16 +218,15 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 
     // 7. Periodically sweep stale interests so a hard-killed session's watch is
     //    reconciled and its adapter stopped when its interest hits zero. The
-    //    sweep probes waiter pidfiles for liveness first, so a live-but-silent
-    //    session is never swept out from under itself (ADR-0009).
-    let sweeper = spawn_sweeper(supervisor.clone(), config.waiters_dir());
+    //    sweep reads the process table for liveness first, so a live-but-silent
+    //    session is never swept out from under itself (ADR-0017).
+    let sweeper = spawn_sweeper(supervisor.clone());
 
     // 8. Serve until a shutdown signal, capping concurrent handlers.
     let ctx = Ctx {
         bus,
         storage,
         supervisor: supervisor.clone(),
-        waiters_dir: Arc::new(config.waiters_dir()),
     };
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     let result = accept_loop(&listener, &ctx, &connections, limits).await;
@@ -249,7 +255,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 /// The interval must stay well below the TTL: the sweep is also the liveness
 /// refresh, so a session needs several probes inside one TTL window for a single
 /// missed probe to be harmless.
-fn spawn_sweeper(supervisor: Supervisor, waiters_dir: PathBuf) -> tokio::task::JoinHandle<()> {
+fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
     let interval = env_var("MAILBOX_SWEEP_INTERVAL_MS")
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_SWEEP_INTERVAL);
@@ -259,7 +265,15 @@ fn spawn_sweeper(supervisor: Supervisor, waiters_dir: PathBuf) -> tokio::task::J
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match supervisor.sweep(ttl, waiters_dir.clone()).await {
+            // ONE `ps` per sweep, not one per interested session. An unreadable
+            // process table would look like "every session is dead", so it skips the
+            // sweep entirely rather than reap live agents' watches on a hiccup — the
+            // TTL is generous enough to absorb several missed sweeps.
+            let Some(live) = mailbox::doctor::live_claude_sessions() else {
+                warn!("could not read the process table; skipped this TTL sweep");
+                continue;
+            };
+            match supervisor.sweep(ttl, live).await {
                 Ok(swept) if !swept.is_empty() => {
                     info!(
                         count = swept.len(),
@@ -531,7 +545,6 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         bus,
         storage,
         supervisor,
-        waiters_dir,
     } = ctx;
     match request {
         Request::Publish {
@@ -566,7 +579,7 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         }
         Request::Status { session } => status(storage, session).await,
         Request::Send { from, to, body } => send(bus, storage, from, to, body).await,
-        Request::Agents { session } => agents(storage, waiters_dir, session).await,
+        Request::Agents { session } => agents(storage, session).await,
         Request::Topics { prefix } => topics(storage, prefix).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
     }
@@ -593,15 +606,21 @@ async fn send(
 }
 
 /// Thin translation over [`mailbox::agents::list`] (card-16 discovery).
-async fn agents(storage: &Storage, waiters_dir: &Path, caller: SessionId) -> Response {
-    match mailbox::agents::list(storage, waiters_dir, &caller).await {
+///
+/// The live-session scan happens HERE, once per request: it shells out to `ps`, so
+/// it must not be repeated per listed agent. An unreadable process table yields an
+/// empty set, i.e. every agent reads `live: false` — an understatement, never a
+/// claim that an absent agent is there.
+async fn agents(storage: &Storage, caller: SessionId) -> Response {
+    let live = mailbox::doctor::live_claude_sessions().unwrap_or_default();
+    match mailbox::agents::list(storage, &live, &caller).await {
         Ok(agents) => Response::Agents {
             agents: agents
                 .into_iter()
                 .map(|agent| AgentSummary {
                     session: agent.session,
                     inbox: agent.inbox,
-                    live_waiter: agent.live_waiter,
+                    live: agent.live,
                     is_self: agent.is_self,
                 })
                 .collect(),

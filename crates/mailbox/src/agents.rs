@@ -31,7 +31,7 @@
 //! *provenance*, not authority: a message body remains untrusted data and must
 //! never be treated as an instruction to obey (ADR-0001).
 
-use std::path::Path;
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -41,7 +41,6 @@ use mailbox_protocol::{AdapterId, Event, Timestamp, Topic, TopicError, inbox_top
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{SessionId, Storage, StorageError};
-use crate::wake::waiter_alive;
 
 /// The body key carrying the sender's session id. The receiver replies by
 /// `send`ing back to this value, so it is a documented part of the (bus-opaque)
@@ -99,10 +98,14 @@ pub struct AgentInbox {
     pub session: SessionId,
     /// Its inbox topic.
     pub inbox: Topic,
-    /// Whether a waiter is blocked for it right now (idle and listening). See
-    /// [`crate::wake::waiter_alive`] for exactly what this does and does not
-    /// claim — it is a live-waiter probe, not a heartbeat.
-    pub live_waiter: bool,
+    /// Whether a Claude Code process is still running for this session
+    /// ([`crate::doctor::live_claude_sessions`]).
+    ///
+    /// It says the agent EXISTS, not that it is idle, healthy, or reachable — a
+    /// live process may be mid-turn, and `mailbox doctor` is the command that
+    /// actually proves wakeability. A `send` to an agent that reads `false` still
+    /// lands durably in its inbox; it simply has nobody left to collect it.
+    pub live: bool,
     /// Whether this is the caller itself.
     pub is_self: bool,
 }
@@ -190,12 +193,17 @@ async fn is_registered(storage: &Storage, session: &SessionId) -> Result<bool, S
 
 /// Every registered agent inbox, with liveness, marking `caller` as itself.
 ///
-/// `waiters_dir` is the directory holding the per-session waiter pidfiles (the
-/// daemon's own, derived from the storage path), which is where liveness comes
-/// from.
+/// `live` is the set of session ids that currently have a Claude Code process, as
+/// read from the process table by [`crate::doctor::live_claude_sessions`]. It is
+/// passed in rather than scanned here so the whole listing is measured in ONE `ps`
+/// call, and so this function stays a pure projection a test can drive directly.
+///
+/// A session missing from `live` reads as `live: false`. That understates when the
+/// process table could not be read at all — the same direction the pidfile probe
+/// this replaces erred in, and the safe one: never claim an agent is there.
 pub async fn list(
     storage: &Storage,
-    waiters_dir: &Path,
+    live: &BTreeSet<String>,
     caller: &SessionId,
 ) -> Result<Vec<AgentInbox>, SendError> {
     let sessions = storage.list_agent_inboxes().await?;
@@ -206,7 +214,7 @@ pub async fn list(
         // `expect` keeps the impossible case a value, not a panic.
         let inbox = inbox_topic(&session)?;
         agents.push(AgentInbox {
-            live_waiter: waiter_alive(waiters_dir, &session),
+            live: live.contains(session.as_str()),
             is_self: &session == caller,
             session,
             inbox,
@@ -334,7 +342,7 @@ mod tests {
         // auto-inbox re-registration (an arm's Subscribe) within the guard window is
         // refused, so the dead session never reappears in `agents` (FIX 1). Only the
         // AutoInbox path is guarded — the path the doomed arm actually uses.
-        let (bus, storage, dir) = fresh().await;
+        let (bus, storage, _dir) = fresh().await;
         let b = SessionId::new("s-b");
         register(&bus, &b).await;
         storage.end_session(b.clone(), now_millis()).await.unwrap();
@@ -348,16 +356,18 @@ mod tests {
             crate::storage::SubscribeOutcome::RefusedSessionRecentlyEnded
         );
 
-        let waiters = dir.path().join("waiters");
         assert!(
-            list(&storage, &waiters, &b).await.unwrap().is_empty(),
+            list(&storage, &BTreeSet::new(), &b)
+                .await
+                .unwrap()
+                .is_empty(),
             "a tombstoned session must not be listed as an agent"
         );
     }
 
     #[tokio::test]
     async fn list_reports_registered_inboxes_and_marks_self() {
-        let (bus, storage, dir) = fresh().await;
+        let (bus, storage, _dir) = fresh().await;
         let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
         register(&bus, &a).await;
         register(&bus, &b).await;
@@ -367,8 +377,7 @@ mod tests {
             .await
             .unwrap();
 
-        let waiters = dir.path().join("waiters");
-        let agents = list(&storage, &waiters, &a).await.unwrap();
+        let agents = list(&storage, &BTreeSet::new(), &a).await.unwrap();
         assert_eq!(
             agents
                 .iter()
@@ -378,7 +387,30 @@ mod tests {
         );
         assert!(agents[0].is_self, "the caller is marked");
         assert!(!agents[1].is_self);
-        // No waiter processes exist in this unit test, so nothing is live.
-        assert!(agents.iter().all(|x| !x.live_waiter));
+    }
+
+    /// Liveness is exactly membership of the live-session set — nothing is inferred
+    /// from the mailbox's own state. That is the whole point of the signal: a
+    /// session's subscriptions, sentinel and interests all outlive the Claude Code
+    /// process they belong to, so only the process table can answer this.
+    #[tokio::test]
+    async fn liveness_is_membership_of_the_live_session_set() {
+        let (bus, storage, _dir) = fresh().await;
+        let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
+        register(&bus, &a).await;
+        register(&bus, &b).await;
+
+        let live = BTreeSet::from(["s-a".to_string()]);
+        let agents = list(&storage, &live, &a).await.unwrap();
+        assert!(agents[0].live, "s-a has a live Claude Code process");
+        assert!(
+            !agents[1].live,
+            "s-b is registered and addressable, but nobody is running it"
+        );
+
+        // An empty set (including the "could not read the process table" case) never
+        // claims an agent is there.
+        let agents = list(&storage, &BTreeSet::new(), &a).await.unwrap();
+        assert!(agents.iter().all(|x| !x.live));
     }
 }

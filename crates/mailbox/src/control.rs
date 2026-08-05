@@ -291,12 +291,14 @@ pub struct AgentSummary {
     /// Its inbox topic (`agent.<session-id>`), carried explicitly so a consumer
     /// never has to re-derive the grammar.
     pub inbox: Topic,
-    /// Whether a waiter is blocked for this session right now — i.e. the agent is
-    /// idle and a `send` will wake it immediately. `false` means it is busy
-    /// (mid-turn) or never armed; a message still lands durably in its inbox and
-    /// surfaces on its next read. This is NOT a heartbeat (see
-    /// [`mailbox::wake::waiter_alive`]).
-    pub live_waiter: bool,
+    /// Whether a Claude Code process is still running for this session, read from
+    /// the process table ([`mailbox::doctor::live_claude_sessions`]).
+    ///
+    /// It says the agent EXISTS, not that it is idle or reachable: a live agent may
+    /// be mid-turn, and only `mailbox doctor` proves wakeability. `false` means
+    /// nobody is running that session any more; a message still lands durably in its
+    /// inbox, it just has nobody left to collect it.
+    pub live: bool,
     /// Whether this row is the caller itself.
     pub is_self: bool,
 }

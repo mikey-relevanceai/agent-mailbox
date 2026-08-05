@@ -15,9 +15,7 @@ use tracing::{error, info, warn};
 
 use mailbox::sentinel::Sentinel;
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
-use mailbox::wake::{
-    RetriggerOutcome, Waiter, WakeError, WakeOutcome, WatchOutcome,
-};
+use mailbox::wake::{RetriggerOutcome, Waiter, WakeError, WakeOutcome, WatchOutcome};
 use mailbox_harness::hook::HookInput;
 use mailbox_harness::install::DEFAULT_HOOK_TIMEOUT_SECS;
 use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
@@ -28,7 +26,6 @@ use crate::control::{
     UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
-
 
 /// Exit code for a REFUSED publish ("you have unread mail on this topic; read first").
 ///
@@ -938,13 +935,12 @@ fn describe_sub(state: &SubscribeState) -> String {
 
 /// Render the registered agent inboxes.
 ///
-/// The liveness column is stated in full rather than as a bare `live`/`idle`
-/// flag, because it is easy to over-read: at best it means "a waiter *appears*
-/// blocked for this session", not "this agent is healthy". It is a best-effort
-/// probe (`kill(pid, 0)` on a pidfile) that cannot rule out PID reuse, so the
-/// wording hedges. A `send` to an agent with no live waiter still lands durably —
-/// so the footer says so instead of leaving the reader to guess (there is no
-/// heartbeat here, and we do not pretend otherwise).
+/// The liveness column is stated in full rather than as a bare `live`/`idle` flag,
+/// because it is easy to over-read. It means "a Claude Code process is still running
+/// this session", which is NOT "this agent is idle" and NOT "this agent can be
+/// woken" — a live agent may be mid-turn, and `mailbox doctor` is the only thing
+/// that proves wakeability. A `send` to an agent that is not running still lands
+/// durably, so the line says so rather than leaving the reader to guess.
 fn render_agents(agents: &[AgentSummary]) {
     if agents.is_empty() {
         println!("no agents registered (nobody is addressable yet)");
@@ -952,17 +948,17 @@ fn render_agents(agents: &[AgentSummary]) {
     }
     println!("{} agent(s):", agents.len());
     for agent in agents {
-        let waiter = if agent.live_waiter {
-            "idle (waiter appears blocked — a send should wake it)"
+        let liveness = if agent.live {
+            "running (a send reaches it; `mailbox doctor` proves it can be woken)"
         } else {
-            "busy or unarmed (a send still lands in its inbox)"
+            "not running (a send still lands in its inbox)"
         };
         let me = if agent.is_self { "  <- you" } else { "" };
         println!(
             "  {}  inbox={}  {}{}",
             agent.session.as_str(),
             agent.inbox.as_str(),
-            waiter,
+            liveness,
             me
         );
     }
@@ -1257,7 +1253,6 @@ fn spawn_detached_watcher(session: &SessionId) {
     }
 }
 
-
 /// Ensure `session` is subscribed to its own inbox topic, over the socket
 /// (always-on agent inboxes, ADR-0007).
 ///
@@ -1343,8 +1338,6 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
         ),
     }
 }
-
-
 
 /// The `SessionEnd` hook: reap the waiter (process half) and drop the session's
 /// subscriptions + interests on the bridge (durable half, which stops any adapter
@@ -1851,7 +1844,6 @@ fn doctor_json(report: &mailbox::doctor::FleetReport) -> String {
     })
     .to_string()
 }
-
 
 /// The `FileChanged` wake hook (ADR-0008), run synchronously (a read-only peek, no
 /// runtime): decide whether THIS session has genuine unread mail and, if so, WAKE it.
