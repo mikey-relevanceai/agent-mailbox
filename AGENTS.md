@@ -82,8 +82,8 @@ opens the sentinel files, not the store, and needs no daemon at all).
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest and unsubscribe. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Record a `stub` watch + interest, subscribe to `stub.<label>`, and spawn the reference stub adapter (card 09), which publishes a synthetic event every `--interval-ms` (default 1000), `--count` times (`0`/default = forever). The one watch kind that spawns a real adapter today. |
 | `mailbox unwatch stub <label>` | Drop this session's interest in the stub watch and unsubscribe. |
-| `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent: publish to its `agent.<id>` inbox with `from` stamped by the bridge. `<target>` is a bare session id or the full `agent.*` topic. Refuses an unregistered inbox rather than dropping the message into a void ([ADR-0007](docs/adr/0007-always-on-agent-inboxes.md)); there is no `--force`. The ONLY writer of an inbox topic — generic `publish` refuses `agent.*`. |
-| `mailbox agents` | List the sessions with a registered inbox (who you can `send` to), each with `running` / `not running` read from the process table. `running` means the agent EXISTS, not that it can be woken — only `doctor` proves that. |
+| `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent: publish to its `agent.<id>` inbox with `from` stamped by the bridge. `<target>` is a bare session id or the full `agent.*` topic. Refuses an unregistered inbox rather than dropping the message into a void ([ADR-0007](docs/adr/0007-always-on-agent-inboxes.md)); there is no `--force`. The ONLY writer of an inbox topic — generic `publish` refuses `agent.*`. **The caller's session is OPTIONAL**: it is only the reply address, so a HUMAN at a terminal can poke an agent, and that message is stored with the `from` key **absent** (never a placeholder, and any caller-supplied `from` is stripped). Receivers must treat `from` as optional — no `from`, no reply. |
+| `mailbox agents` | List the sessions with a registered inbox (who you can `send` to), each with `running` / `not running` read from the process table. `running` means the agent EXISTS, not that it can be woken — only `doctor` proves that. **The caller's session is OPTIONAL**: it only decides which row is marked `is_self`, so with no session every agent is listed and no row is marked. |
 | `mailbox topics [--prefix <p>]` | List known topics with subscriber and event counts. A topic exists because something subscribed or published to it. |
 | `mailbox status` | **Who this session is** (id + inbox topic — there is no separate `whoami`; the identity half is derived locally, so it still answers with the bridge down, saying `bridge: UNREACHABLE` and still exiting non-zero), plus watches (interest counts, lifecycle state + child pid when the supervisor is running one), this session's subscriptions and unread counts. Both `stub` and `github-pr` watches read `running` with a pid once their adapter is spawned. The subscription list is summarised by a `subscription_count` scalar (`subscriptions (N):` on the human line) so a Claude Code **status line** can read one number per prompt instead of measuring the list; it counts the session's own inbox topic, so an armed session with no watches reads 1. |
 | `mailbox doctor [--all] [--json] [--session ID] [--timeout-ms N]` | Actively PROVE which sessions can be woken right now ([ADR-0016](docs/adr/0016-prove-wakeability-with-an-active-probe.md)): bumps each sentinel content-preservingly and requires the `FileChanged` hook to answer (it stamps `.mailbox-hook-ran` on every run). Verdicts: `wakeable` (positive proof), `deaf` (live, armed, IDLE and silent — **the fault**), `busy` (mid-turn, so it could not have answered — reported as **UNMEASURED**, an open question, NOT a clean bill of health: a deaf session that happens to be busy looks exactly like this, so re-probe it while idle), `gone` (no live Claude Code process — normal, NOT a fault), `never_armed`, `undetermined`. The summary line counts three buckets — `N wakeable, N deaf, N UNMEASURED`. **Exits 1 if any session is deaf**, so a supervisor can gate on it. **A session cannot measure itself**: running the command IS a turn, so the caller is busy by construction and can only ever report itself UNMEASURED — `doctor` warns about this on stderr rather than letting an agent auditing its own fleet read its blind spot as health. Bumps the whole fleet before polling any of it, so one deaf session is distinguishable from one bad moment. Wakeability is PERISHABLE — a session that answers today can be deaf tomorrow — so re-run it rather than trusting an old result. Read-only and daemon-free. |
@@ -100,6 +100,27 @@ named session by hand, prefix it: `CLAUDE_CODE_SESSION_ID=<id> mailbox status`.
 to *probe*.) The hooks are unaffected — they read `session_id` from the Claude Code
 hook stdin JSON, which `mailbox harness session-start`/`turn-end`/`cleanup` parse;
 `session-start` then arms that session's wake sentinel.
+
+**Requiring a session is per-command, and the test is "does this command need to know
+whose?"** — not "is it a socket client?".
+
+- **REQUIRED** for the genuinely session-scoped commands, where the caller *is* the
+  subject: `read` (my unread, advances my cursor), `status` (my state), `subscribe`,
+  `unsubscribe`, `watch`, `unwatch`. Without an identity these have no meaning, so
+  they fail with an error naming the variable.
+- **OPTIONAL** where the identity is a courtesy the command adds on the way: `send`
+  (stamps a reply address) and `agents` (marks which row is you). Both work with no
+  session, which is what makes the **human manual-poke workflow** possible —
+  `mailbox agents` to look, `mailbox send <id> --text …` to poke, from an ordinary
+  terminal with no `CLAUDE_CODE_SESSION_ID` at all. Advising a human to invent one
+  for these would be nonsense: they are not acting *as* anyone.
+- **NOT RESOLVED AT ALL** by `publish` (every publisher is the same publisher,
+  [ADR-0018](docs/adr/0018-publish-has-one-rule.md)), `topics` (a global read), and
+  `doctor` (it probes *named* sessions; it reads the ambient one only to warn that a
+  caller cannot measure itself).
+
+A command that resolves a session it does not use is a bug of this class: it refuses
+a workflow to enforce a field it then ignores. Adding one, check which bucket it is in.
 `--json` (global) makes any command emit
 machine-readable JSON on stdout; logs always go to stderr so JSON stays clean.
 When the daemon is down, socket clients fail loudly (non-zero, "start it with
