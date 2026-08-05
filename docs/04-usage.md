@@ -262,8 +262,8 @@ What each hook does:
 waiter exit 2 at `--max-block-ms` to force a re-arm — one model turn per `max_block` of
 idle. That is gone: the detached watcher blocks indefinitely with no timer, so an idle
 subscribed session costs **zero** model turns until real mail arrives, and **every wake
-is real mail**. (`mailbox wait` / `mailbox harness arm` and their timing knobs survive
-as retained primitives, but are no longer wired into the hooks.) See
+is real mail**. (`mailbox wait`, `mailbox harness arm` and their timing knobs have been
+removed — nothing had invoked them since ADR-0008.) See
 [01-wake-and-rearm](01-wake-and-rearm.md) and
 [ADR-0008](adr/0008-on-demand-wake-filechanged.md).
 
@@ -674,7 +674,7 @@ prompt and must never become a red line in the UI:
 Note the count is *subscriptions*, not mail: it does not move when events arrive.
 For "do I have unread?", sum `.unread[].unread` from the same report.
 
-### `mailbox dashboard` — is the wake path actually working?
+### Is the wake path actually working?
 
 `status` answers "what does this session have?". It cannot answer "will this session
 ever be told?", because the last hop of the wake — Claude Code noticing the sentinel
@@ -682,50 +682,15 @@ file and running the `FileChanged` hook — happens outside the bridge. A sessio
 have a registered inbox, a live watcher, and a sentinel being bumped on every kick,
 and still never wake.
 
-`mailbox dashboard` is the fleet-wide view of exactly that
-([ADR-0015](adr/0015-dashboard-reads-the-store-read-only.md)):
-
-```bash
-mailbox dashboard              # live view; [q]uit [r]efresh [d] no-wake only [a] incl. dead
-mailbox dashboard --once       # one plain-text snapshot (what you paste into an issue)
-mailbox dashboard --deaf-only  # just the sessions with no observed wake
-```
-
-```text
-MAILBOX  daemon up  59 live / 306 known sessions  31 watches  250 events
-WAKE     28 verified, 98 with no wake observed
-
-SESSION    UNREAD   WAITER   INBOX   WATCH   WAKE
-3800bebb   7        live     reg     1       NO WAKE OBSERVED (8 sentinel bumps, 0 hook runs)
-5fd46282   0        live     reg     1       wake verified (12 hook runs, 8 wakes)
-```
-
-- **WAKE** is *evidence*, not a verdict, reconstructed from `harness.log`:
-  - `wake verified` — a `FileChanged` hook demonstrably ran for this session, so the
-    harness IS watching its sentinel. Positive proof; any hook run counts, including
-    the ones that found nothing.
-  - `NO WAKE OBSERVED` — its sentinel has been bumped and no hook has ever run. Very
-    likely unwakeable. It is not called *deaf* because the log cannot prove that: it
-    may have rotated, or every bump may have landed mid-turn (a lost edge —
-    [ADR-0012](adr/0012-level-triggered-wake-at-the-turn-boundary.md)). The bump count
-    is shown so you can check the claim.
-  - `no evidence yet` — never bumped. A new session sits here.
-- Rows sort **worst-first**: a session sitting on unread mail it cannot be woken for
-  is the first thing on screen.
-- **live / known** — subscriptions outlive a session whose `SessionEnd` never ran, so
-  the store knows about many more sessions than exist. Dead ones are hidden (they
-  cannot be woken and are not a fault); `--all` shows them.
-- It reads the store **read-only**, so it still renders when the bridge is down —
-  headed `daemon DOWN`, which is precisely when you want to look at it.
-
-> **The dashboard's WAKE column is history, not a live verdict.** Measured against
-> an active probe on 19 live idle sessions it was wrong 9 times: 6 sessions it called
-> suspect answered immediately, and 3 it called verified could not be woken at all.
-> To ask about *now*, use `mailbox doctor`.
+There used to be a `mailbox dashboard` that inferred this from `harness.log`. It was
+removed: measured against an active probe on 19 live idle sessions it was wrong 9
+times — 6 sessions it called suspect answered immediately, and 3 it called verified
+could not be woken at all. History cannot answer a question about now, so ask
+directly.
 
 ### `mailbox doctor` — can these agents be woken *right now*?
 
-The dashboard reconstructs what has happened. `doctor` runs the experiment
+`doctor` runs the experiment
 ([ADR-0016](adr/0016-prove-wakeability-with-an-active-probe.md)): it bumps each
 session's sentinel and requires the `FileChanged` hook to answer, which it does by
 stamping `.mailbox-hook-ran` on every run.
@@ -763,7 +728,7 @@ probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 6 deaf
   sentinel with the bytes it already holds. A session with nothing unread answers with
   exit 0 and no model turn. A session that *does* have unread mail will be woken —
   which is correct, since it should already have been.
-- Reads no store and needs no daemon, like `dashboard`.
+- Reads no store and needs no daemon.
 - If **nothing at all** answers, suspect the install before the fleet: the ack is
   written by whichever `mailbox` binary the hook invokes, and an old one looks
   identical to a total blackout. `doctor` says so when it sees that pattern. No

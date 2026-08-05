@@ -1,6 +1,12 @@
 # ADR-0006: Harness wake loop — re-arm exit, waiter-owned pidfile, arm-iff-subscribed
 
-- Status: **Partially superseded by [ADR-0008](0008-on-demand-wake-filechanged.md).**
+- Status: **Superseded by [ADR-0008](0008-on-demand-wake-filechanged.md); the `arm` and
+  `wait` commands it describes have been REMOVED.** What survives is the waiter
+  pidfile (still written by the watcher, still the liveness signal for ADR-0009) and
+  the publish rules. Everything about the periodic re-arm — `max_block`, the exit-2
+  boundary, the arm decision, exec-into-waiter — is gone from the code.
+
+  Original status note: **Partially superseded by [ADR-0008](0008-on-demand-wake-filechanged.md).**
   The **periodic re-arm** (the `Stop` → `arm` → exit-2-at-`max_block` loop) is
   replaced by the ADR-0008 detached watcher + `FileChanged` wake, which eliminates the
   per-`max_block` re-arm model turn. Everything ELSE decided here still stands and is

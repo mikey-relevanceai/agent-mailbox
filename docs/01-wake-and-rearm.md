@@ -113,9 +113,10 @@ a hook child:
 - It survives a daemon restart the same way the ADR-0006 waiter did (the FIFO is
   re-openable; the kick reaches the already-blocked watcher).
 
-**Retained primitives.** `mailbox wait` and `mailbox harness arm` (with the
-`max_block`/re-arm-exit logic) still exist and are tested, but are **no longer wired
-into the hooks** — the periodic-re-arm *mechanism* is superseded. See ADR-0008 §F.
+**Removed primitives.** `mailbox wait` and `mailbox harness arm`, and the max-block
+timing knobs behind them, have been deleted. Nothing had invoked them since ADR-0008
+replaced the re-arm loop with the detached watcher; they survived only as a
+"retained primitive" exercised by their own tests.
 
 **The wake edge only reaches an IDLE session, so the turn boundary re-arms it
 level-triggered (ADR-0012).** `FileChanged` → exit 2 does nothing for a session that is

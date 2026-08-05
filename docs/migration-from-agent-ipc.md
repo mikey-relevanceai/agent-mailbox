@@ -18,7 +18,7 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 
 | Old skill loop | New agent-mailbox flow |
 |---|---|
-| Agent runs `ipc-arm.sh` in the background after each turn to re-arm the wake | **Nothing.** `SessionStart`/`Stop` hooks run `mailbox harness arm`; the agent never re-arms |
+| Agent runs `ipc-arm.sh` in the background after each turn to re-arm the wake | **Nothing.** `SessionStart`/`Stop` hooks run `mailbox harness session-start` / `ensure-watcher`; the agent never re-arms |
 | One arm = one wake; agent must re-arm after reading | Hooks keep the waiter armed across wakes; the waiter yields (a benign re-arm wake) before the hook timeout would kill it, so the next `Stop` arms a fresh one |
 | Agent spawns `gh-watch.sh` per PR with `run_in_background`, must remember to kill it | `mailbox watch github-pr OWNER/REPO#N` — the **daemon** owns the poller; one per PR, shared across sessions |
 | Watcher state in `~/.claude/agent-ipc/watchers/*.state` files | Baseline persists centrally in the bridge's SQLite (`adapter_baseline`), round-tripped via the protocol |
@@ -44,7 +44,7 @@ in full in [04-usage.md § The four-verb agent loop](04-usage.md#3-the-four-verb
 ## The two rules that changed
 
 1. **Agents never re-arm.** Delete every `ipc-arm.sh` call. Arming is a
-   `SessionStart`/`Stop` hook now (`mailbox harness arm`), installed once.
+   `SessionStart`/`Stop` hooks now (`mailbox harness session-start` / `ensure-watcher`), installed once.
 2. **Agents never spawn a background poller.** Delete every backgrounded
    `gh-watch.sh` (and any `while true; gh …; sleep` loop). Declare a `watch`
    instead; the bridge daemon runs and supervises the poller.
