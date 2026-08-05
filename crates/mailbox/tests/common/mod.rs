@@ -17,18 +17,18 @@
 //! No network, no real GitHub, no real Claude Code.
 //!
 //! The load-bearing new mechanism here is [`LeakGuard`]: an RAII process-leak
-//! detector scoped to THIS test's daemon subtree + waiters dir (never a global
-//! `pgrep`), so a leaked adapter / waiter / serve fails the test loudly. That is
-//! the automated enforcement of the design's headline "no zombie pollers"
-//! guarantee (design/01 § Adapter lifecycle).
+//! detector scoped to THIS test's daemon subtree (never a global `pgrep`), so a
+//! leaked adapter / serve fails the test loudly. That is the automated enforcement
+//! of the design's headline "no zombie pollers" guarantee (design/01 § Adapter
+//! lifecycle).
 
 #![allow(dead_code)] // A shared harness: not every helper is used by every test file.
 
 // [`mailbox_command`] — the session-stripping spawner — IS now shared by every test
-// binary in the crate (`cli.rs`, `harness.rs`, `wake.rs`, `stub_e2e.rs`,
-// `github_pr_e2e.rs`, and the `Env`-based suites): it is a correctness helper, not a
-// convenience, so the 5 hand-copied variants were a real hazard (one of them, in
-// `wake.rs`, had already drifted and did NOT strip the ambient session).
+// binary in the crate (`cli.rs`, `harness.rs`, `stub_e2e.rs`, `github_pr_e2e.rs`, and
+// the `Env`-based suites): it is a correctness helper, not a convenience, so the
+// hand-copied variants were a real hazard (one of them had already drifted and did
+// NOT strip the ambient session).
 //
 // TODO(card-12 follow-up): `stub_e2e.rs`, `github_pr_e2e.rs`, and `harness.rs` still
 // carry their own copies of `Daemon` / `poll_until` / `wait_for_socket` / `FAKE_GH`.
@@ -192,13 +192,9 @@ impl Env {
         self.db_path.parent().unwrap().join("mailbox.sock")
     }
 
-    pub fn waiters_dir(&self) -> PathBuf {
-        self.db_path.parent().unwrap().join("waiters")
-    }
-
-    /// The ADR-0008 sentinel root for this env, under the tempdir. ALWAYS passed as
-    /// `MAILBOX_SENTINEL_ROOT` to any command that resolves a sentinel (`session-start`,
-    /// `watch`, `cleanup`), so a test can NEVER touch the real `~/.mailbox`.
+    /// The sentinel root for this env, under the tempdir. ALWAYS passed as
+    /// `MAILBOX_SENTINEL_ROOT` to the daemon AND to any command that resolves a
+    /// sentinel, so a test can NEVER touch the real `~/.mailbox`.
     pub fn sentinel_root(&self) -> PathBuf {
         self.db_path.parent().unwrap().join("sentinel")
     }
@@ -212,8 +208,8 @@ impl Env {
             .join(".mailbox-wake")
     }
 
-    /// The topic names the watcher last wrote into `session`'s sentinel (payload-free),
-    /// or an empty vec if it was never written.
+    /// The topic names last written into `session`'s sentinel (payload-free), or an
+    /// empty vec if it was never written.
     pub fn sentinel_topics(&self, session: &str) -> Vec<String> {
         match std::fs::read_to_string(self.sentinel_path(session)) {
             Ok(text) => text
@@ -265,6 +261,10 @@ impl Env {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            // The daemon writes the wake sentinels now, so it MUST be pointed at the
+            // tempdir root — without this a test would bump files under the
+            // developer's real ~/.mailbox.
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_adapter_bin())
             .env("MAILBOX_GH_ADAPTER_BIN", github_pr_adapter_bin())
             .env("MAILBOX_GH_BIN", &self.fake_gh)
@@ -281,10 +281,10 @@ impl Env {
         daemon
     }
 
-    /// A [`LeakGuard`] scoped to this env's waiters dir. Track each daemon's pid on
-    /// it (via [`LeakGuard::track_daemon`]) so its adapter subtree is watched.
+    /// A [`LeakGuard`] for this env. Track each daemon's pid on it (via
+    /// [`LeakGuard::track_daemon`]) so its adapter subtree is watched.
     pub fn leak_guard(&self) -> LeakGuard {
-        LeakGuard::new(self.waiters_dir())
+        LeakGuard::default()
     }
 
     // ---- CLI client helpers (need only the DB path — the daemon supplies the
@@ -374,11 +374,6 @@ impl Env {
         self.run_ok(&["publish", topic], "publish");
     }
 
-    /// The pidfile path the harness writes for a session's waiter.
-    pub fn waiter_pidfile(&self, session: &str) -> PathBuf {
-        self.waiters_dir().join(format!("{session}.waiter.pid"))
-    }
-
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload),
     /// the fake harness driver's teardown half. Returns its output.
     pub fn cleanup(&self, session: &str) -> Output {
@@ -401,10 +396,10 @@ impl Env {
         child.wait_with_output().expect("cleanup output")
     }
 
-    /// Run `mailbox harness session-start` (the ADR-0008 SessionStart hook), feeding it
-    /// the hook JSON on stdin exactly as Claude Code would. Returns its Output — stdout
-    /// carries the `watchPaths` registration JSON. As a side effect it spawns a DETACHED
-    /// watcher (tracked by the [`LeakGuard`] via its pidfile); reap it with `cleanup`.
+    /// Run `mailbox harness session-start` (the SessionStart hook), feeding it the hook
+    /// JSON on stdin exactly as Claude Code would. Returns its Output — stdout carries
+    /// the `watchPaths` registration JSON, and as a side effect the session's wake
+    /// sentinel is armed (created).
     pub fn session_start(&self, session: &str) -> Output {
         let mut child = mailbox_command()
             .args(["harness", "session-start"])
@@ -423,14 +418,32 @@ impl Env {
         child.wait_with_output().expect("session-start output")
     }
 
-    /// Run `mailbox harness ensure-watcher` (the ADR-0008 Stop-liveness hook) for a
-    /// session, feeding the Stop hook JSON on stdin exactly as Claude Code would. As a
-    /// side effect it may spawn a DETACHED watcher (tracked by the [`LeakGuard`] via its
-    /// pidfile); reap it with `cleanup`. Returns its Output — stdout carries the
-    /// re-printed `watchPaths` registration; it must ALWAYS exit 0 (never a wake).
-    pub fn ensure_watcher(&self, session: &str) -> Output {
+    /// Run `session-start` for a session and assert it armed: the sentinel exists.
+    ///
+    /// Arming is now SYNCHRONOUS (the hook writes the file itself), so this needs no
+    /// poll — which is the point. It used to spawn a detached watcher and every
+    /// caller had to wait for a pidfile to appear before the session was really
+    /// wakeable.
+    pub fn arm(&self, session: &str) {
+        let out = self.session_start(session);
+        assert!(
+            out.status.success(),
+            "session-start must exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            self.sentinel_path(session).exists(),
+            "session-start must arm the sentinel (Claude Code cannot watch a file that \
+             does not exist)"
+        );
+    }
+
+    /// Run `mailbox harness turn-end` (the Stop hook) for a session, feeding the Stop
+    /// hook JSON on stdin exactly as Claude Code would. It must ALWAYS exit 0 (never a
+    /// wake) and print nothing on stdout.
+    pub fn turn_end(&self, session: &str) -> Output {
         let mut child = mailbox_command()
-            .args(["harness", "ensure-watcher"])
+            .args(["harness", "turn-end"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("RUST_LOG", "error")
@@ -438,32 +451,15 @@ impl Env {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn mailbox harness ensure-watcher");
+            .expect("spawn mailbox harness turn-end");
         let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"Stop"}}"#);
-        let mut stdin = child.stdin.take().expect("ensure-watcher stdin");
+        let mut stdin = child.stdin.take().expect("turn-end stdin");
         stdin.write_all(payload.as_bytes()).expect("write payload");
         drop(stdin);
-        child.wait_with_output().expect("ensure-watcher output")
+        child.wait_with_output().expect("turn-end output")
     }
 
-    /// Spawn the detached watcher directly (`mailbox harness watch --session <id>`), for
-    /// tests that exercise the watcher in isolation. Wrapped in [`ChildGuard`] so a test
-    /// panic can never leak the live watcher (its Drop kills + reaps it).
-    pub fn spawn_watcher(&self, session: &str) -> ChildGuard {
-        let child = mailbox_command()
-            .args(["harness", "watch", "--session", session])
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn mailbox harness watch");
-        ChildGuard(child)
-    }
-
-    /// Run `mailbox harness wake` (the ADR-0008 FileChanged hook) for a session, feeding
+    /// Run `mailbox harness wake` (the FileChanged hook) for a session, feeding
     /// the hook JSON. Returns its Output: exit code 2 = wake (stderr has the reminder),
     /// 0 = no wake (the anti-loop path).
     pub fn wake_hook(&self, session: &str) -> Output {
@@ -714,36 +710,31 @@ impl Drop for ChildGuard {
 #[derive(Debug, Clone)]
 pub struct LeakedProcess {
     pub pid: u32,
-    /// Why this pid is a leak: a surviving descendant of a tracked daemon, or a
-    /// live waiter named by a pidfile.
+    /// Why this pid is a leak (today: a surviving descendant of a tracked daemon).
     pub source: &'static str,
     pub cmd: String,
 }
 
 /// The load-bearing enforcement of "no zombie pollers": a leak detector scoped to
 /// THIS test's processes — the descendant subtree of each tracked `mailbox serve`
-/// pid (adapters + their `gh` children are all children of `serve`) plus the live
-/// waiter pids named in this test's own waiters dir.
+/// pid (adapters + their `gh` children are all children of `serve`).
 ///
-/// It keys on the daemon's PID subtree and the tempdir waiters dir, NOT a global
-/// `pgrep`, so it can never mistake a concurrently-running test's adapter for a
-/// leak of this one. [`LeakGuard::assert_clean`] is the load-bearing check (call
-/// it after teardown, while the daemon is still alive so its subtree is walkable);
-/// [`Drop`] is a best-effort backstop that also kills any stray so it cannot
-/// escape the test binary.
+/// It keys on the daemon's PID subtree, NOT a global `pgrep`, so it can never
+/// mistake a concurrently-running test's adapter for a leak of this one.
+/// [`LeakGuard::assert_clean`] is the load-bearing check (call it after teardown,
+/// while the daemon is still alive so its subtree is walkable); [`Drop`] is a
+/// best-effort backstop that also kills any stray so it cannot escape the test
+/// binary.
+///
+/// It used to also scan the per-session waiter pidfiles. There are no per-session
+/// processes any more — the daemon writes the sentinels itself — so the adapter
+/// subtree is the whole population that can leak.
+#[derive(Default)]
 pub struct LeakGuard {
-    waiters_dir: PathBuf,
     daemon_pids: Vec<u32>,
 }
 
 impl LeakGuard {
-    pub fn new(waiters_dir: PathBuf) -> Self {
-        LeakGuard {
-            waiters_dir,
-            daemon_pids: Vec::new(),
-        }
-    }
-
     /// Track a daemon's pid so its whole adapter subtree is watched for leaks.
     pub fn track_daemon(&mut self, pid: u32) {
         self.daemon_pids.push(pid);
@@ -769,23 +760,6 @@ impl LeakGuard {
             }
         }
 
-        // Any waiter still alive per its pidfile is a leaked waiter (cleanup should
-        // have reaped it). Keyed on THIS test's waiters dir.
-        for pid in live_waiter_pids(&self.waiters_dir) {
-            if seen.insert(pid) {
-                let cmd = table
-                    .iter()
-                    .find(|(p, _, _)| *p == pid)
-                    .map(|(_, _, c)| c.clone())
-                    .unwrap_or_else(|| "<waiter>".to_string());
-                leaks.push(LeakedProcess {
-                    pid,
-                    source: "waiter-pidfile",
-                    cmd,
-                });
-            }
-        }
-
         leaks
     }
 
@@ -801,7 +775,7 @@ impl LeakGuard {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "process leak — a poller/waiter/adapter that should have been torn down is \
+                    "process leak — a poller/adapter that should have been torn down is \
                      still alive (no-zombie-pollers violated): {leaks:#?}"
                 );
             }
@@ -879,24 +853,6 @@ fn descendants(root: u32, table: &[(u32, u32, String)]) -> Vec<(u32, String)> {
         }
     }
     result
-}
-
-/// The pids named by `*.waiter.pid` files in `dir` that are still alive.
-fn live_waiter_pids(dir: &Path) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(".waiter.pid"))
-        })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|s| s.trim().parse::<u32>().ok())
-        .filter(|&pid| pid_alive(pid))
-        .collect()
 }
 
 // ---- small polling / process utilities ----------------------------------------

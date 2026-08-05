@@ -369,10 +369,9 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&out, "install-hooks");
     let value = parse_json(&stdout(&out));
 
-    // The ADR-0008 hooks are wired: SessionStart(matcher "" — all sources, so it
-    // re-fires on resume per ADR-0013) → plain session-start, FileChanged(matcher = the
-    // sentinel basename) → asyncRewake wake, SessionEnd → cleanup. There is NO Stop
-    // re-arm hook.
+    // The hook set is wired: SessionStart(matcher "" — all sources, so it re-fires on
+    // resume per ADR-0013) → plain session-start, FileChanged(matcher = the sentinel
+    // basename) → asyncRewake wake, SessionEnd → cleanup. There is NO Stop re-arm hook.
     let hooks = &value["hooks"];
     assert_eq!(
         hooks["SessionStart"][0]["matcher"], "",
@@ -389,20 +388,20 @@ fn install_hooks_emits_valid_settings_snippet() {
             .unwrap()
             .contains("harness session-start")
     );
-    // The Stop hook is the ADR-0008 Stop-liveness poke (`ensure-watcher`): plain, NOT
-    // asyncRewake, so it re-ensures the watcher without ever waking the session. It is
-    // NOT the retired periodic re-arm.
+    // The Stop hook is the turn boundary (`turn-end`): plain, NOT asyncRewake, so it
+    // closes the turn, re-registers the inbox and re-triggers busy-window mail without
+    // ever waking the session. It is NOT the retired periodic re-arm.
     let stop = &hooks["Stop"][0]["hooks"][0];
     assert!(
         stop["command"]
             .as_str()
             .unwrap()
-            .contains("harness ensure-watcher"),
-        "Stop must run the ensure-watcher liveness hook"
+            .contains("harness turn-end"),
+        "Stop must run the turn-end hook"
     );
     assert!(
         stop.get("asyncRewake").is_none(),
-        "the Stop-liveness hook must NOT be asyncRewake (it never wakes)"
+        "the Stop hook must NOT be asyncRewake (it never wakes)"
     );
 
     let file_changed = &hooks["FileChanged"][0];
@@ -478,9 +477,8 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
 
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
-    // The foreign Stop hook survives, AND our Stop-liveness hook (ensure-watcher) is
-    // appended alongside it — the ADR-0008 snippet now writes a Stop hook (FIX 3), but
-    // it must never clobber a foreign one.
+    // The foreign Stop hook survives, AND our turn-end hook is appended alongside it —
+    // the snippet writes a Stop hook, but it must never clobber a foreign one.
     let stop = merged["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(
         stop.len(),
@@ -492,8 +490,8 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
         stop[1]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("harness ensure-watcher"),
-        "our Stop-liveness hook is appended after the foreign one"
+            .contains("harness turn-end"),
+        "our turn-end hook is appended after the foreign one"
     );
     // Our hooks landed on their own events.
     assert!(

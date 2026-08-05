@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use mailbox::sentinel::Sentinel;
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
-use mailbox::wake::{RetriggerOutcome, Waiter, WakeError, WakeOutcome, WatchOutcome};
+use mailbox::wake::{RetriggerOutcome, SessionMail, WAKE_EXIT_CODE};
 use mailbox_harness::hook::HookInput;
 use mailbox_harness::install::DEFAULT_HOOK_TIMEOUT_SECS;
 use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
@@ -237,38 +237,26 @@ pub struct HarnessArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum HarnessCommand {
-    /// SessionStart hook (ADR-0008): register the inbox, print the `watchPaths`
-    /// registering this session's sentinel, and spawn the detached mail watcher.
+    /// SessionStart hook: register the inbox, ARM this session's wake sentinel, and
+    /// print the `watchPaths` that puts a watch on it.
     SessionStart,
-    /// FileChanged hook (ADR-0008): wake (exit 2) IFF this session has genuine
-    /// unread mail, else exit 0 — the anti-loop guard against a stray sentinel touch.
+    /// FileChanged hook: wake (exit 2) IFF this session has genuine unread mail,
+    /// else exit 0 — the anti-loop guard against a stray sentinel touch.
     Wake,
-    /// The detached per-session mail watcher (ADR-0008). Spawned by `session-start`;
-    /// blocks on the FIFO and bumps the wake sentinel on real mail. Not run by hand.
-    Watch(WatchSentinelArgs),
-    /// Stop hook (ADR-0008 Stop-liveness): re-register this session's inbox (best-effort,
-    /// ADR-0013) and respawn the detached watcher IFF it is missing/dead. NEVER wakes
-    /// (exit 0 always).
-    EnsureWatcher,
+    /// Stop hook: close the turn, re-register this session's inbox (ADR-0013), and
+    /// re-bump the sentinel if mail arrived while the session was busy (ADR-0012).
+    /// NEVER wakes (exit 0 always).
+    TurnEnd,
     /// UserPromptSubmit hook (ADR-0016): record that a turn has opened, so a health
     /// probe can tell a busy session apart from an unreachable one. Never wakes.
     TurnStart,
-    /// SessionEnd hook: reap the watcher, remove the sentinel, and drop this
-    /// session's interests/subscriptions.
+    /// SessionEnd hook: remove the sentinel and drop this session's
+    /// interests/subscriptions.
     Cleanup,
     /// Merge the hooks into the Claude Code settings.json (and print the snippet).
     InstallHooks(InstallHooksArgs),
     /// Install the embedded agent-mailbox skill into the Claude Code skills dir.
     InstallSkills(InstallSkillsArgs),
-}
-
-/// Arguments to the detached watcher (`harness watch`). It is spawned by
-/// `session-start` with an explicit `--session`, so unlike the hooks it does not
-/// read the session from a hook stdin payload.
-#[derive(Args, Debug)]
-pub struct WatchSentinelArgs {
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -1107,51 +1095,49 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     Ok(label.to_string())
 }
 
-/// Dispatch a `harness` subcommand. `session-start`, `arm`, `cleanup`, and
-/// `ensure-watcher` are socket clients (the last re-registers the inbox — ADR-0013);
-/// the two `install-*` setup commands touch no bridge.
+/// Dispatch a `harness` subcommand. `session-start`, `cleanup`, and `turn-end` are
+/// socket clients (the last two re-register the inbox / end the session); the two
+/// `install-*` setup commands touch no bridge.
 async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<ExitCode> {
     match args.command {
         HarnessCommand::SessionStart => run_harness_session_start().await,
         HarnessCommand::Cleanup => run_harness_cleanup().await,
-        HarnessCommand::EnsureWatcher => Ok(run_ensure_watcher_hook().await),
+        HarnessCommand::TurnEnd => Ok(run_turn_end_hook().await),
         HarnessCommand::TurnStart => Ok(run_turn_start_hook()),
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
         HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
-        // `wake` and `watch` are dispatched synchronously by `main` (they need no tokio
-        // runtime — `wake` is a read-only peek, `watch` is a blocking loop) and never
-        // reach here. `ensure-watcher` is async now (it re-registers the inbox over the
-        // socket — ADR-0013), so it IS dispatched here.
+        // `wake` is dispatched synchronously by `main` (a read-only peek needs no tokio
+        // runtime) and never reaches here. `turn-end` re-registers the inbox over the
+        // socket, so it IS dispatched here.
         HarnessCommand::Wake => unreachable!("harness wake is handled synchronously in main"),
-        HarnessCommand::Watch(_) => {
-            unreachable!("harness watch is handled synchronously in main")
-        }
     }
 }
 
-/// The `SessionStart` hook (ADR-0008): the short-lived, non-asyncRewake setup that
-/// arms on-demand wake for this session.
+/// The `SessionStart` hook: the short-lived, non-asyncRewake setup that arms wake
+/// for this session.
 ///
 /// It is wired with matcher `""`, so it fires on EVERY SessionStart source — `startup`
 /// AND `resume`/`clear`/`compact` (ADR-0013). A resume is a fresh process that has lost
-/// its predecessor's inbox registration, watchPaths, and watcher; running this on resume
-/// re-establishes all three. Every step below is idempotent, so re-running it on a live
+/// its predecessor's inbox registration and watchPaths; running this on resume
+/// re-establishes both. Every step below is idempotent, so re-running it on a live
 /// session (e.g. a `compact` mid-session) is a safe no-op. It:
 ///
 /// 1. reads `session_id` from the hook's stdin JSON;
 /// 2. ensures the always-on agent inbox subscription (card 16 / ADR-0007);
-/// 3. prints the `watchPaths` JSON registering this session's ABSOLUTE sentinel
-///    path, so Claude Code watches it even though it lives outside the cwd;
-/// 4. spawns the detached watcher (`harness watch`), fully daemonized so it outlives
-///    this hook;
+/// 3. ARMS the wake sentinel — writes the session's current unread topic set, which
+///    creates the file if it is not there ([`SessionMail::arm`]);
+/// 4. prints the `watchPaths` JSON registering that ABSOLUTE sentinel path, so Claude
+///    Code watches it even though it lives outside the cwd;
 /// 5. exits 0.
 ///
-/// **Fail-open.** If the bridge is down the inbox registration is skipped, but the
-/// watchPaths are still printed and the watcher is still spawned: the watcher
-/// self-validates `has_subscription` under its lock, so an unsubscribed session's
-/// watcher simply self-exits, whereas NOT arming would leave an idle session
-/// permanently unwakeable. There is no exit-2 anywhere on this path — waking is the
-/// `FileChanged` hook's job, not this one's.
+/// **Order matters between 3 and 4**: the file must exist before the watch is
+/// registered on it. The daemon rewrites it on every publish, which is a MODIFY; the
+/// very first write would otherwise be a CREATE, an event the watch may not deliver.
+///
+/// **Fail-open.** If the bridge is down the inbox registration is skipped, and arming
+/// falls back to an empty topic set — but the sentinel is still written and the
+/// watchPaths still printed, so the session is wake-wired the moment a daemon exists.
+/// There is no exit-2 anywhere on this path — waking is the `FileChanged` hook's job.
 async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
     let config =
         StorageConfig::from_env().context("resolving storage path for harness session-start")?;
@@ -1162,23 +1148,49 @@ async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
     // Always-on inbox first (best-effort; a down bridge does not fail the hook).
     register_inbox(&config, &session, "session-start").await;
 
-    // Print the watchPaths registration (stdout is this hook's contract) and spawn
-    // the detached watcher. Both are best-effort-but-loud: a failure to resolve the
-    // sentinel root is logged, but we still exit 0 (the hook must never fail).
+    // Arm the sentinel, then register the watch on it. Best-effort-but-loud: a
+    // failure to resolve the sentinel root is logged, but we still exit 0 (the hook
+    // must never fail).
     match Sentinel::for_session(&session) {
         Ok(sentinel) => {
+            arm_sentinel(&config, &session, &sentinel);
             print_watch_paths(&sentinel);
-            spawn_detached_watcher(&session);
         }
         Err(err) => error!(
             session = %session.as_str(),
             error = %err,
-            "could not resolve the wake sentinel path; on-demand wake is NOT armed for this session \
+            "could not resolve the wake sentinel path; wake is NOT armed for this session \
              (set MAILBOX_SENTINEL_ROOT or a home). The session still receives mail durably; it \
              just will not wake on it"
         ),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write the session's current unread topic set into its sentinel, creating the file
+/// so `watchPaths` has something to watch (see [`SessionMail::arm`] for why the
+/// create/modify distinction matters).
+///
+/// Best-effort: a failure is logged and the hook still exits 0. The one thing it must
+/// not do is fail a hook, because a `SessionStart` that exits non-zero is a worse
+/// outcome than a session that misses one wake.
+fn arm_sentinel(config: &StorageConfig, session: &SessionId, sentinel: &Sentinel) {
+    let mail = SessionMail::new(config.path().to_path_buf(), session.clone());
+    match mail.arm(sentinel) {
+        Ok(topics) => info!(
+            session = %session.as_str(),
+            sentinel = %sentinel.path().display(),
+            topics = topics.iter().map(Topic::as_str).collect::<Vec<_>>().join(","),
+            "armed the wake sentinel"
+        ),
+        Err(err) => error!(
+            session = %session.as_str(),
+            error = %err,
+            "could not write the wake sentinel; this session will not wake until something \
+             else writes it (the daemon does on the next publish, but Claude Code may not \
+             deliver that first CREATE to the watch)"
+        ),
+    }
 }
 
 /// Print the `SessionStart` `watchPaths` registration to stdout: it tells Claude
@@ -1216,53 +1228,16 @@ fn print_watch_paths(sentinel: &Sentinel) {
     }
 }
 
-/// Spawn the detached mail watcher (`mailbox harness watch --session <id>`) so it
-/// OUTLIVES this hook process (ADR-0008).
-///
-/// Daemonization is two-part: here we detach the child's stdio (so it holds no
-/// pipe back to the hook), and the watcher process itself calls `setsid` on
-/// startup to leave the hook's process group — so a `killpg` on the hook's group,
-/// or the hook's own exit, cannot take the watcher down. It is deliberately NOT
-/// waited on: this hook exits immediately, the child is reparented to init, and no
-/// hook `timeout` applies to it (it is not an asyncRewake hook child).
-///
-/// Best-effort: a spawn failure is logged, never fatal to the hook. The watcher is
-/// single-instance (it takes the per-session lock), so a redundant spawn — e.g. a
-/// SessionStart racing a still-live watcher — has one winner and the loser exits.
-fn spawn_detached_watcher(session: &SessionId) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            error!(session = %session.as_str(), error = %err, "could not resolve the mailbox binary to spawn the watcher");
-            return;
-        }
-    };
-    let spawn = std::process::Command::new(exe)
-        .args(["harness", "watch", "--session", session.as_str()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    match spawn {
-        Ok(child) => {
-            info!(session = %session.as_str(), pid = child.id(), "spawned the detached mail watcher")
-        }
-        Err(err) => {
-            error!(session = %session.as_str(), error = %err, "could not spawn the detached mail watcher; the session will not wake on mail")
-        }
-    }
-}
-
 /// Ensure `session` is subscribed to its own inbox topic, over the socket
 /// (always-on agent inboxes, ADR-0007).
 ///
-/// `source` names the hook that called us (`"session-start"`, `"ensure-watcher"`,
-/// `"arm"`) and rides every log line: since ADR-0013 both `session-start` (on a
-/// resume) and `ensure-watcher` (every `Stop`) re-register the inbox, and an
-/// operator diagnosing "why didn't my resumed agent wake?" needs to tell a
-/// resume's SessionStart re-registration apart from a Stop healing a lapsed one.
+/// `source` names the hook that called us (`"session-start"`, `"turn-end"`) and
+/// rides every log line: since ADR-0013 both `session-start` (on a resume) and
+/// `turn-end` (every `Stop`) re-register the inbox, and an operator diagnosing "why
+/// didn't my resumed agent wake?" needs to tell a resume's SessionStart
+/// re-registration apart from a Stop healing a lapsed one.
 ///
-/// Idempotent by construction: `ensure-watcher` runs on every `Stop`, and
+/// Idempotent by construction: `turn-end` runs on every `Stop`, and
 /// `subscribe` is an idempotent no-op that leaves an existing delivery cursor
 /// untouched — so a re-registration can neither duplicate the subscription nor
 /// skip mail the agent has not read yet. Baseline-on-subscribe applies on the
@@ -1309,7 +1284,7 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
             source,
             topic = %topic.as_str(),
             "did not register the agent inbox: session recently ended (tombstone guard); \
-             the next Stop's ensure-watcher re-registers it once the guard lapses (ADR-0013)"
+             the next Stop's turn-end re-registers it once the guard lapses (ADR-0013)"
         ),
         Ok(Response::Subscribed { outcome, .. }) => info!(
             session = %session.as_str(),
@@ -1339,10 +1314,14 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
     }
 }
 
-/// The `SessionEnd` hook: reap the waiter (process half) and drop the session's
-/// subscriptions + interests on the bridge (durable half, which stops any adapter
-/// whose last interest this session held). Best-effort: a down bridge must not
-/// fail the hook, and the waiter is reaped regardless.
+/// The `SessionEnd` hook: remove the session's wake sentinel and drop its
+/// subscriptions + interests on the bridge (which stops any adapter whose last
+/// interest this session held). Best-effort: a down bridge must not fail the hook.
+///
+/// It no longer reaps anything. There is no per-session process to reap — the
+/// daemon writes the sentinel itself (ADR-0017) — so teardown is two file/socket
+/// operations rather than a signal to a detached child that may or may not still
+/// exist.
 ///
 /// A transient bridge failure is RETRIED a few times (brief backoff) so a
 /// momentary blip does not leak the session's interest. If every attempt fails,
@@ -1355,13 +1334,8 @@ async fn run_harness_cleanup() -> anyhow::Result<ExitCode> {
         .context("reading the SessionEnd hook payload from stdin")?
         .session_id;
 
-    // Reap the watcher (its pidfile is the same `<session>.waiter.pid` the waiter
-    // uses, so this SIGTERMs whichever detached process is live for this session).
-    let reap = mailbox_harness::cleanup::reap_waiter(&config.waiters_dir(), &session);
-    info!(session = %session.as_str(), outcome = reap.as_str(), "reaped session watcher");
-
-    // Remove the session's wake sentinel dir (ADR-0008), so no `by-agent/<id>`
-    // directory outlives the session. Best-effort: a never-created sentinel or an
+    // Remove the session's wake sentinel dir, so no `by-agent/<id>` directory
+    // outlives the session. Best-effort: a never-created sentinel or an
     // unresolvable root must not fail the hook.
     match Sentinel::for_session(&session) {
         Ok(sentinel) => match sentinel.remove_dir() {
@@ -1853,7 +1827,7 @@ fn doctor_json(report: &mailbox::doctor::FleetReport) -> String {
 ///   wake the idle session (the `asyncRewake` wake wire, payload-free: topic names
 ///   only, never a body).
 /// - **0** — no unread mail. A `FileChanged` fires on ANY change to the watched
-///   sentinel (the watcher's own bookkeeping write, a stray editor touch, a
+///   sentinel (a `doctor` probe's content-preserving bump, a stray editor touch, a
 ///   `create`/`remove` at `SessionEnd`), so exiting 2 unconditionally would loop the
 ///   agent forever. Exiting 0 unless the read-only store confirms unread is what
 ///   breaks that loop — the earlier prototype looped precisely because it did not.
@@ -1924,23 +1898,18 @@ pub fn run_wake_hook() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let waiter = Waiter::new(
-        config.waiters_dir(),
-        config.path().to_path_buf(),
-        session.clone(),
-    );
-    match waiter.peek_unread() {
+    let mail = SessionMail::new(config.path().to_path_buf(), session.clone());
+    match mail.peek_unread() {
         Ok(topics) if !topics.is_empty() => {
-            let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
             // The payload-free wake reminder — topic names only — surfaced to the
             // agent verbatim as its system reminder (docs/01-wake-and-rearm.md).
-            eprintln!("mail on topic {}", names.join(", "));
+            eprintln!("{}", mailbox::wake::reminder(&topics));
             info!(
                 session = %session.as_str(),
-                topics = names.join(","),
+                topics = topics.iter().map(Topic::as_str).collect::<Vec<_>>().join(","),
                 "FileChanged wake: genuine unread mail; exiting 2 to wake the session"
             );
-            ExitCode::from(WakeOutcome::EXIT_CODE)
+            ExitCode::from(WAKE_EXIT_CODE)
         }
         Ok(_) => {
             // A change fired but nothing is unread — the anti-loop path. Do NOT wake.
@@ -1964,126 +1933,6 @@ pub fn run_wake_hook() -> ExitCode {
     }
 }
 
-/// The detached mail watcher (ADR-0008), run synchronously (a blocking FIFO loop,
-/// no runtime). Spawned by the `SessionStart` hook; not invoked by hand.
-///
-/// It first calls `setsid` to detach into its own session and process group, so the
-/// hook's exit — or a `killpg` on the hook's group — cannot take it down. Then it
-/// runs [`Waiter::watch_sentinel`], which blocks on the mail FIFO forever and bumps
-/// the wake sentinel on real mail, until `SIGTERM`'d at `SessionEnd`.
-///
-/// Exit codes: **0** for every clean end — the arm-iff-subscribed self-exit
-/// ([`WatchOutcome::Unsubscribed`]) AND the single-instance lock-loser
-/// ([`WakeError::AlreadyWaiting`], the expected outcome when a `SessionStart` races a
-/// still-live watcher). **1** only for a genuine watcher failure.
-pub fn run_watch_sentinel(args: &WatchSentinelArgs) -> ExitCode {
-    // Detach into a fresh session/process group. EPERM means we are already a group
-    // leader (already detached), which is fine — either way we end up detached.
-    if let Err(err) = nix::unistd::setsid() {
-        info!(
-            error = %err,
-            "watcher setsid did not detach a new session (already a leader?); continuing"
-        );
-    }
-
-    let config = match StorageConfig::from_env() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("mailbox harness watch: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let session = match args.session.resolve() {
-        Ok(session) => session,
-        Err(err) => {
-            eprintln!("mailbox harness watch: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let sentinel = match Sentinel::for_session(&session) {
-        Ok(sentinel) => sentinel,
-        Err(err) => {
-            error!(session = %session.as_str(), error = %err, "watcher could not resolve its sentinel path");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // No store yet (hooks installed but no daemon started): nothing to watch. Exit 0,
-    // like the waiter — a fresh SessionStart re-spawns us once the bridge exists.
-    if !config.path().exists() {
-        info!(
-            session = %session.as_str(),
-            db = %config.path().display(),
-            "no mailbox store exists; watcher exiting without arming (start `mailbox serve`)"
-        );
-        return ExitCode::SUCCESS;
-    }
-
-    let waiter = Waiter::new(
-        config.waiters_dir(),
-        config.path().to_path_buf(),
-        session.clone(),
-    );
-    match waiter.watch_sentinel(&sentinel) {
-        Ok(WatchOutcome::Unsubscribed) => ExitCode::SUCCESS,
-        // The single-instance invariant working as designed: a second watcher (a
-        // SessionStart racing a still-live one) loses the lock and exits cleanly. It
-        // is the EXPECTED outcome, not a fault — exit 0 so nothing reads it as an error.
-        Err(WakeError::AlreadyWaiting { path }) => {
-            info!(
-                session = %session.as_str(),
-                lock = %path.display(),
-                "another watcher already holds this session's lock; exiting cleanly (single-instance)"
-            );
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            error!(session = %session.as_str(), error = %err, "watcher failed");
-            eprintln!("mailbox harness watch: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// The `Stop` hook: the turn-boundary safety net. It does two things and NEVER wakes
-/// the session itself.
-///
-/// 1. **Watcher liveness** (ADR-0008): respawn the detached watcher if it died.
-/// 2. **The level-triggered re-trigger** (ADR-0012): if the session is sitting on
-///    unread mail it has not been re-triggered for, re-bump the wake sentinel — see
-///    [`retrigger_wake_if_unread`] for why an edge-only wake goes deaf on a BUSY
-///    session, which is the bug that motivates it.
-///
-/// It is the recovery mechanism for **a dead watcher**: if the watcher died (a crash, an
-/// OS/OOM kill, an unrecoverable FIFO error), a session that keeps taking turns re-spawns
-/// it here. It respawns only when the pidfile is missing or names a dead pid; a LIVE
-/// watcher is left untouched — and even a redundant spawn is free, because the loser
-/// loses the single-instance lock and exits `AlreadyWaiting` (exit 0).
-///
-/// It **prints nothing to stdout**: a Stop hook cannot register `watchPaths` (that is a
-/// `SessionStart`-only output — emitting it from a Stop fails Claude Code's event-name
-/// check), so watchPath registration lives solely in the `SessionStart` hook. That hook
-/// now fires on resume too (matcher `""`, ADR-0013), so a resumed process re-registers
-/// its own watchPaths rather than relying on this one — which it never could.
-///
-/// It **also re-registers the session's inbox** on every turn boundary (best-effort,
-/// fail-open — ADR-0013), restoring the ADR-0007 invariant that the inbox is registered
-/// on every `SessionStart` AND every `Stop`. ADR-0008 moved registration into
-/// `session-start` alone and dropped it here; the consequence was that a session whose
-/// inbox lapsed (a resume within the tombstone guard, an unsubscribe) had no per-turn
-/// path to re-register. The socket call fails safe: a down/erroring bridge is logged and
-/// skipped, exactly like `session-start`'s registration.
-///
-/// It **never exits 2** (it is not an `asyncRewake` hook), so a Stop can never itself
-/// wake the session — that is the load-bearing invariant. It exits 1 on a config/stdin
-/// error (it could do nothing useful) and 0 otherwise, including every no-op and every
-/// respawn. The inbox re-registration is the one bridge socket call it makes; watcher
-/// liveness stays local, and a down daemon cannot block it (the client fails fast).
-///
-/// The residual it does NOT cover (documented in ADR-0008): a session that goes idle
-/// **forever** — never another Stop — whose watcher then dies stays deaf until it next
-/// takes a turn or is restarted. That is the accepted limit of a zero-spurious-wake
-/// design; the OS service supervises the daemon, this hook supervises the watcher.
 /// Which end of a turn is being recorded.
 #[derive(Clone, Copy)]
 enum TurnBoundary {
@@ -2133,85 +1982,87 @@ pub fn run_turn_start_hook() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub async fn run_ensure_watcher_hook() -> ExitCode {
+/// The `Stop` hook: the turn boundary. It does three things and NEVER wakes the
+/// session itself.
+///
+/// 1. **Closes the turn** (ADR-0016), so `mailbox doctor` can tell a session that
+///    CANNOT be woken from one that is merely mid-turn.
+/// 2. **Re-registers the session's inbox** (ADR-0013), restoring the ADR-0007
+///    invariant that the inbox is registered on every `SessionStart` AND every
+///    `Stop`. This is what heals a session whose inbox lapsed (a resume refused
+///    inside the tombstone guard, an unsubscribe) without waiting for a restart.
+/// 3. **Re-arms and re-triggers the wake sentinel** (ADR-0012) — see
+///    [`rearm_and_retrigger`].
+///
+/// It **prints nothing to stdout**: Claude Code validates that a hook's
+/// `hookSpecificOutput.hookEventName` matches the firing event, and `watchPaths` is a
+/// `SessionStart`-only output, so emitting it here would fail the hook. Registration
+/// therefore lives solely in `session-start`, which fires on resume too (matcher `""`,
+/// ADR-0013).
+///
+/// It **never exits 2** (it is not an `asyncRewake` hook), so a Stop can never itself
+/// wake the session — that is the load-bearing invariant. It exits 1 only on a
+/// config/stdin error (it could do nothing useful) and 0 otherwise.
+///
+/// It used to be called `ensure-watcher`, because its main job was respawning the
+/// per-session watcher process. There is no watcher (ADR-0017), so the name would now
+/// describe something that does not exist.
+pub async fn run_turn_end_hook() -> ExitCode {
     let config = match StorageConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
-            // Logged, not just eprintln'd: a total ensure-watcher failure now ALSO means
-            // the per-turn inbox re-registration (ADR-0013) never ran, so it must leave a
-            // trace where an operator diagnosing an unreachable session looks (harness.log
-            // when resolvable, else stderr). Same reasoning for the stdin branch below.
-            error!(error = %err, "mailbox harness ensure-watcher: could not resolve storage config; \
-                did not re-register the inbox or ensure the watcher");
+            // Logged, not just eprintln'd: a total turn-end failure ALSO means the
+            // per-turn inbox re-registration (ADR-0013) never ran, so it must leave a
+            // trace where an operator diagnosing an unreachable session looks
+            // (harness.log when resolvable, else stderr). Same for the stdin branch.
+            error!(error = %err, "mailbox harness turn-end: could not resolve storage config; \
+                did not re-register the inbox or re-arm the sentinel");
             return ExitCode::FAILURE;
         }
     };
     let session = match HookInput::from_reader(std::io::stdin().lock()) {
         Ok(input) => input.session_id,
         Err(err) => {
-            error!(error = %err, "mailbox harness ensure-watcher: could not read the Stop hook \
-                payload; did not re-register the inbox or ensure the watcher");
+            error!(error = %err, "mailbox harness turn-end: could not read the Stop hook \
+                payload; did not re-register the inbox or re-arm the sentinel");
             return ExitCode::FAILURE;
         }
     };
 
-    // Close the turn (ADR-0016). The Stop hook already fires at every turn boundary,
-    // so it is the natural place to record that this session is no longer executing —
-    // which is what lets `mailbox doctor` tell a session that CANNOT be woken apart
-    // from one that is merely mid-turn and will pick its mail up at this very
-    // boundary. Best-effort: bookkeeping must never be able to fail a Stop hook.
     record_turn_boundary(&session, TurnBoundary::Ended);
 
-    // Re-register the inbox on EVERY Stop (ADR-0007's invariant, restored — ADR-0013).
-    // Best-effort and fail-open: a down bridge is logged and skipped, never fatal to the
-    // hook (a Stop must never wake or fail). This is what heals a session whose inbox was
-    // dropped and whose SessionStart re-registration was refused by the tombstone guard:
-    // once the 10s guard lapses, the next Stop re-subscribes it. Idempotent — an existing
-    // subscription's cursor is left untouched.
-    register_inbox(&config, &session, "ensure-watcher").await;
+    // Best-effort and fail-open: a down bridge is logged and skipped, never fatal to
+    // the hook. Idempotent — an existing subscription's cursor is left untouched.
+    register_inbox(&config, &session, "turn-end").await;
 
-    // A Stop hook must NOT print a `watchPaths` registration: Claude Code validates that
-    // a hook's `hookSpecificOutput.hookEventName` matches the firing event, and watchPath
-    // registration is a `SessionStart`-only output — emitting it here fails the Stop hook
-    // ("expected 'Stop' but got 'SessionStart'"). So this hook stays silent on stdout and
-    // only ensures watcher liveness. (Consequence: this hook cannot re-register the
-    // watchPath mid-session — but `session-start` now re-registers it on every resume via
-    // its wider matcher (ADR-0013), so a fresh process is not left relying on the previous
-    // process's registration persisting.)
+    rearm_and_retrigger(&config, &session);
 
-    // Ensure a detached watcher is alive; respawn only when it is missing or dead. A
-    // live watcher is left strictly alone (the respawn would lose the single-instance
-    // lock anyway, but skipping it avoids a needless per-turn process spawn).
-    if mailbox::wake::waiter_alive(&config.waiters_dir(), &session) {
-        info!(
-            session = %session.as_str(),
-            "ensure-watcher: a live watcher already holds the lock; leaving it (no-op)"
-        );
-    } else {
-        info!(
-            session = %session.as_str(),
-            "ensure-watcher: no live watcher; respawning the detached watcher"
-        );
-        spawn_detached_watcher(&session);
-    }
-
-    // The ADR-0012 turn-boundary re-trigger: level-triggered here, edge-triggered
-    // thereafter. This is what rescues mail that arrived while the session was BUSY.
-    retrigger_wake_if_unread(&config, &session);
-
-    // ALWAYS exit 0 — a Stop-liveness hook must never wake the session.
+    // ALWAYS exit 0 — a Stop hook must never wake the session.
     ExitCode::SUCCESS
 }
 
-/// Run the ADR-0012 turn-boundary re-trigger and log what it decided.
+/// The turn boundary's wake work: make sure the session is ARMED, then run the
+/// ADR-0012 re-trigger. Reports what it decided; never fails the hook.
 ///
-/// The decision itself lives in [`Waiter::retrigger_if_unread`] (the wake domain owns
-/// "read unread, bump the sentinel"); this is the hook-layer half — resolve the
-/// config edges, then report the outcome. It is a safety net on a per-turn hook, so
-/// every failure is a logged no-op: a `Stop` that failed loudly, or slowly, would
-/// cost every turn on every session.
-fn retrigger_wake_if_unread(config: &StorageConfig, session: &SessionId) {
-    // No store: the bridge has never run here, so there is nothing to re-trigger.
+/// **Re-arm** is the replacement for the old "respawn the dead watcher" net. The
+/// sentinel is now the only per-session artefact the wake path has, so a session
+/// whose sentinel went missing (a cleaned `~/.mailbox`, a stray `rm`) is deaf until
+/// something recreates it — and the daemon's own write would be a CREATE, which the
+/// watch may not deliver. Re-creating it here costs one `stat` per turn and is the
+/// only self-heal a Stop hook can perform.
+///
+/// **Re-trigger** is the level check: the decision lives in
+/// [`SessionMail::retrigger_if_unread`] (the wake domain owns "read unread, write the
+/// sentinel"); this is the hook-layer half — resolve the config edges, then report
+/// the outcome.
+///
+/// Both are safety nets on a per-turn hook, so every failure is a logged no-op: a
+/// `Stop` that failed loudly, or slowly, would cost every turn on every session.
+fn rearm_and_retrigger(config: &StorageConfig, session: &SessionId) {
+    // No store: the bridge has never run here, so there is nothing to re-trigger and
+    // nothing to arm. Deliberately NOT creating a sentinel — inventing one for a
+    // machine with no bridge would make `mailbox doctor` report a session that was
+    // never armed at all.
     if !config.path().exists() {
         info!(session = %session.as_str(), "turn boundary: no mailbox store; nothing to re-trigger");
         return;
@@ -2219,17 +2070,22 @@ fn retrigger_wake_if_unread(config: &StorageConfig, session: &SessionId) {
     let sentinel = match Sentinel::for_session(session) {
         Ok(sentinel) => sentinel,
         Err(err) => {
-            warn!(session = %session.as_str(), error = %err, "turn boundary: no sentinel path; skipping the re-trigger");
+            warn!(session = %session.as_str(), error = %err, "turn boundary: no sentinel path; skipping the re-arm and re-trigger");
             return;
         }
     };
 
-    let waiter = Waiter::new(
-        config.waiters_dir(),
-        config.path().to_path_buf(),
-        session.clone(),
-    );
-    match waiter.retrigger_if_unread(&sentinel) {
+    let mail = SessionMail::new(config.path().to_path_buf(), session.clone());
+    if !sentinel.path().exists() {
+        warn!(
+            session = %session.as_str(),
+            sentinel = %sentinel.path().display(),
+            "turn boundary: the wake sentinel is missing (this session could not have been \
+             woken); re-arming it"
+        );
+        arm_sentinel(config, session, &sentinel);
+    }
+    match mail.retrigger_if_unread(&sentinel) {
         Ok(outcome) => log_retrigger(session, &outcome),
         Err(err) => {
             warn!(session = %session.as_str(), error = %err, "turn boundary: could not check unread; skipping the re-trigger")

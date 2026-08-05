@@ -26,16 +26,11 @@ use common::{Env, FakeClaude, poll_until};
 /// wait is a bounded poll, never a fixed sleep.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// Start `session` through the production `SessionStart` hook (registering its
-/// inbox, ADR-0007) and block until its detached watcher is genuinely live — the
-/// pidfile is written only AFTER the watcher takes the single-waiter lock, so its
-/// presence means "blocked and listening", not merely "process spawned".
+/// Start `session` through the production `SessionStart` hook: register its inbox
+/// (ADR-0007) and arm its wake sentinel. Both are synchronous, so when this returns
+/// the session is genuinely addressable and wakeable.
 fn arm_idle(env: &Env, session: &str) {
-    let out = env.session_start(session);
-    assert!(out.status.success(), "session-start must exit 0");
-    poll_until("watcher pidfile appears", SETTLE, || {
-        env.waiter_pidfile(session).exists().then_some(())
-    });
+    env.arm(session);
 }
 
 /// `mailbox agents --json` as seen by `caller`.
@@ -300,13 +295,12 @@ fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
     );
 
     // A racing SessionStart within the guard window is refused: the inbox subscribe
-    // is rejected, so the watcher finds no subscription and self-exits rather than
-    // arming a session that has already ended.
+    // is rejected, so the session is not resurrected as an agent. (The sentinel is
+    // still written — it is a file, not a claim of registration — and `SessionEnd`
+    // has already removed the directory once; a doomed re-arm leaves nothing but a
+    // path `mailbox doctor` will report as never having answered.)
     let out = env.session_start(b);
     assert!(out.status.success(), "session-start still exits 0");
-    poll_until("the racing watcher exits without arming", SETTLE, || {
-        (!env.waiter_pidfile(b).exists()).then_some(())
-    });
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "the dead session must not be resurrected as an agent"

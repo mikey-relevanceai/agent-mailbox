@@ -37,14 +37,10 @@ use common::{
     descendant_pids, pid_alive, poll_until,
 };
 
-/// Start `session` through the production `SessionStart` hook and block until its
-/// detached watcher is listening (the pidfile lands after it takes the lock).
+/// Start `session` through the production `SessionStart` hook, which registers its
+/// inbox and arms its wake sentinel.
 fn arm(env: &Env, session: &str) {
-    let out = env.session_start(session);
-    assert!(out.status.success(), "session-start must exit 0");
-    poll_until("watcher pidfile appears", SETTLE, || {
-        env.waiter_pidfile(session).exists().then_some(())
-    });
+    env.arm(session);
 }
 
 /// Block until `session`'s sentinel names `topic`, then confirm the `FileChanged`
@@ -751,20 +747,14 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
 
 /// The load-bearing guard must not be a no-op that always passes. This deliberately
 /// leaks live processes into the two scopes the guard watches — a descendant of a
-/// tracked "daemon" root, and a pid named by a waiter pidfile — and asserts the
-/// guard REPORTS them (would flip a scenario red), then reports clean once they are
-/// reaped. If the guard could not see these, every scenario's `assert_clean` would
-/// be worthless.
+/// tracked "daemon" root — and asserts the guard REPORTS it (would flip a scenario
+/// red), then reports clean once it is reaped. If the guard could not see this,
+/// every scenario's `assert_clean` would be worthless.
 #[test]
 fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
     use std::process::{Command, Stdio};
-    use tempfile::TempDir;
 
-    // ---- daemon-descendant scope: a live child of a tracked root is caught -----
-    let dir = TempDir::new().unwrap();
-    let waiters = dir.path().join("waiters");
-    std::fs::create_dir_all(&waiters).unwrap();
-
+    // A live child of a tracked root must be caught.
     // `sh -c 'sleep 60; true'` stays alive as the PARENT of a `sleep` child (the
     // trailing command defeats sh's exec-optimization), so `sleep` is a genuine
     // descendant of a UNIQUE root we own — never another test's process.
@@ -776,7 +766,7 @@ fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
         .spawn()
         .expect("spawn sh root");
 
-    let mut guard = LeakGuard::new(waiters.clone());
+    let mut guard = LeakGuard::default();
     guard.track_daemon(root.id());
 
     let leaks = poll_until("guard sees the descendant leak", SETTLE, || {
@@ -798,34 +788,5 @@ fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
     let _ = root.wait();
     poll_until("guard clears once the subtree is reaped", SETTLE, || {
         guard.find_leaks().is_empty().then_some(())
-    });
-
-    // ---- waiter-pidfile scope: a live pid named by a pidfile is caught ---------
-    let dir2 = TempDir::new().unwrap();
-    let waiters2 = dir2.path().join("waiters");
-    std::fs::create_dir_all(&waiters2).unwrap();
-
-    let mut waiter = Command::new("sleep")
-        .arg("60")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn fake waiter");
-    std::fs::write(waiters2.join("proof.waiter.pid"), waiter.id().to_string()).unwrap();
-
-    let guard2 = LeakGuard::new(waiters2); // no daemon tracked — only the pidfile scope
-    let found = guard2.find_leaks();
-    assert!(
-        found
-            .iter()
-            .any(|l| l.source == "waiter-pidfile" && l.pid == waiter.id()),
-        "the guard must catch a live waiter named by a pidfile; got {found:?}"
-    );
-
-    let _ = waiter.kill();
-    let _ = waiter.wait();
-    poll_until("guard clears once the waiter is reaped", SETTLE, || {
-        guard2.find_leaks().is_empty().then_some(())
     });
 }

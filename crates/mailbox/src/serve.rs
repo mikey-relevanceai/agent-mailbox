@@ -168,10 +168,14 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    Held for the daemon's whole life (released on drop at end of `run`).
     let _lock = acquire_daemon_lock(&config.lock_path())?;
 
-    // 3. Now it is safe to open the single writer + wake channel.
+    // 3. Now it is safe to open the single writer + wake channel. The sentinel root
+    //    is resolved ONCE here: a daemon that cannot resolve it could never wake
+    //    anybody, and a bridge that cannot do its job fails loudly rather than
+    //    serving a bus whose whole point is silently missing (ADR-0004).
     let storage = Storage::open(config.clone()).await?;
-    let waker = Waker::new(config.waiters_dir());
-    let bus = Bus::with_waker(storage.clone(), waker);
+    let sentinel_root = mailbox::sentinel::root_from_env()
+        .map_err(|e| anyhow::anyhow!("could not resolve the wake sentinel root: {e}"))?;
+    let bus = Bus::with_waker(storage.clone(), Waker::new(&sentinel_root));
 
     // 4. Build the watch supervisor with the default resolver: a `stub` watch
     //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the
@@ -212,6 +216,9 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         version = crate::cli::LONG_VERSION,
         socket = %socket_path.display(),
         db = %config.path().display(),
+        // Where wakes land. Worth a line: it is the one path a "why didn't my agent
+        // wake?" investigation has to check agrees with what `watchPaths` registered.
+        sentinel_root = %sentinel_root.display(),
         max_connections = limits.max_connections,
         "bridge serving (single writer + waker + supervisor); Ctrl-C or SIGTERM to stop"
     );

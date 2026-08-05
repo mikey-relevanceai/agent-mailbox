@@ -1,31 +1,31 @@
 //! Emitting (and merging) the Claude Code `settings.json` hooks snippet.
 //!
-//! `install-hooks` wires the ADR-0008 on-demand wake loop with four hooks and NO
-//! periodic re-arm WAKE (the `Stop` hook is a plain exit-0 liveness poke, never a wake):
+//! `install-hooks` wires the on-demand wake loop with five hooks. Exactly ONE of
+//! them can ever wake the session (`FileChanged`); the rest are plain exit-0 hooks:
 //!
 //! - `SessionStart` (matcher `""` — all sources) runs `mailbox harness session-start`,
-//!   a plain synchronous hook: it registers the inbox, prints the `watchPaths`
-//!   registering this session's sentinel, and spawns the detached watcher. It fires on
-//!   `startup` AND on `resume`/`clear`/`compact`, so a resumed session (a fresh process)
-//!   re-establishes all three — the gap ADR-0013 closes.
-//! - `Stop` (matcher `""`) runs `mailbox harness ensure-watcher`, a plain synchronous
-//!   hook (NEVER asyncRewake): the pessimistic Stop-liveness net — respawn the detached
-//!   watcher iff it is dead, and re-register the inbox (best-effort). It NEVER exits 2
-//!   (never wakes) — it exits 1 only on a config/stdin error and 0 otherwise — so it is
-//!   the primary recovery for a died watcher without ever costing a model turn.
+//!   a plain synchronous hook: it registers the inbox, ARMS this session's wake
+//!   sentinel, and prints the `watchPaths` registering it. It fires on `startup` AND on
+//!   `resume`/`clear`/`compact`, so a resumed session (a fresh process) re-establishes
+//!   all three — the gap ADR-0013 closes.
+//! - `Stop` (matcher `""`) runs `mailbox harness turn-end`, a plain synchronous hook
+//!   (NEVER asyncRewake): it closes the turn (ADR-0016), re-registers the inbox
+//!   (ADR-0013), and re-bumps the sentinel for mail that arrived while the session was
+//!   busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a config/stdin error and 0
+//!   otherwise — so it can never cost a model turn of its own.
+//! - `UserPromptSubmit` runs `mailbox harness turn-start`: the other half of the
+//!   turn-boundary pair, so `mailbox doctor` can tell a BUSY session from a deaf one
+//!   (ADR-0016).
 //! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
-//!   as an `asyncRewake` hook with a `timeout` (seconds): when the watcher bumps the
+//!   as an `asyncRewake` hook with a `timeout` (seconds): when the daemon writes the
 //!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
-//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a re-arm
-//!   timer.
-//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): reap
-//!   the watcher, remove the sentinel, drop interests/subscriptions.
+//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a timer.
+//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): remove
+//!   the sentinel, drop interests/subscriptions.
 //!
 //! This REPLACES the ADR-0006 `SessionStart`/`Stop` → `arm` → exit-2-re-arm loop,
-//! whose every re-arm cost a full model turn on a long idle. The `arm` command
-//! itself is retained as a primitive (and its timing knobs `--max-block-ms` /
-//! `--timeout-secs` still validated by [`HookInstallSpec::validate`]), but it is no
-//! longer wired into the snippet. See `docs/01-wake-and-rearm.md`, ADR-0008.
+//! whose every re-arm cost a full model turn on a long idle. See
+//! `docs/01-wake-and-rearm.md`, ADR-0008 and ADR-0017.
 //!
 //! # Where the hooks go, and why that is a TYPE
 //!
@@ -160,26 +160,26 @@ pub const WAKE_HOOK_TIMEOUT_SECS: u64 = 30;
 
 impl HookInstallSpec {
     /// The `session-start` hook command (`<bin> harness session-start`). A
-    /// short-lived, synchronous hook (ADR-0008): it registers the inbox, prints the
-    /// `watchPaths`, and spawns the detached watcher, then exits 0. NOT asyncRewake —
-    /// it never wakes the session itself.
+    /// short-lived, synchronous hook: it registers the inbox, arms the wake sentinel,
+    /// and prints the `watchPaths`, then exits 0. NOT asyncRewake — it never wakes the
+    /// session itself.
     fn session_start_command(&self) -> String {
         format!("{} harness session-start", self.mailbox_bin)
     }
 
     /// The `wake` hook command (`<bin> harness wake`). The `FileChanged` hook
     /// (ADR-0008): it wakes the session (exit 2) only when there is genuine unread
-    /// mail, else exits 0.
+    /// mail, else exits 0. The ONLY hook that can wake anything.
     fn wake_command(&self) -> String {
         format!("{} harness wake", self.mailbox_bin)
     }
 
-    /// The `ensure-watcher` hook command (`<bin> harness ensure-watcher`). The
-    /// `Stop`-liveness hook (ADR-0008): a plain hook that respawns the detached watcher
-    /// iff it is dead and re-registers the inbox (best-effort, ADR-0013). NOT
-    /// asyncRewake — it never wakes the session.
-    fn ensure_watcher_command(&self) -> String {
-        format!("{} harness ensure-watcher", self.mailbox_bin)
+    /// The `turn-end` hook command (`<bin> harness turn-end`). The `Stop` hook: a
+    /// plain hook that closes the turn (ADR-0016), re-registers the inbox (ADR-0013)
+    /// and re-arms/re-triggers the wake sentinel (ADR-0012). NOT asyncRewake — it never
+    /// wakes the session.
+    fn turn_end_command(&self) -> String {
+        format!("{} harness turn-end", self.mailbox_bin)
     }
 
     /// The `turn-start` hook command (`<bin> harness turn-start`). The
@@ -195,28 +195,28 @@ impl HookInstallSpec {
     }
 }
 
-/// Build the `{ "hooks": { … } }` snippet for the ADR-0008 on-demand wake loop.
+/// Build the `{ "hooks": { … } }` snippet for the on-demand wake loop.
 ///
-/// Four hooks, and NO periodic re-arm WAKE (that is the whole point — it eliminates the
-/// spurious re-arm model turns of ADR-0006). The `Stop` hook is NOT a re-arm wake: it
-/// is a plain, exit-0 liveness poke.
+/// Five hooks, exactly one of which can wake the session:
 ///
 /// - `SessionStart` (matcher `""`, all sources) runs `session-start` (plain,
-///   synchronous): register the inbox, print the `watchPaths` registering this session's
-///   sentinel, spawn the detached watcher. Firing on every source (not just `startup`)
-///   is what re-establishes all three on a resume (ADR-0013).
-/// - `Stop` runs `ensure-watcher` (plain, synchronous, NEVER asyncRewake): the
-///   pessimistic Stop-liveness net (ADR-0008 FIX 3) — respawn the detached watcher iff
-///   it is dead, and re-register the inbox (best-effort, restoring ADR-0007's
-///   register-on-every-Stop invariant). It NEVER exits 2 (never wakes) — it exits 1 only
-///   on a config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
-///   NEVER a model turn. This is the primary recovery for a watcher that died.
+///   synchronous): register the inbox, arm the wake sentinel, print the `watchPaths`
+///   registering it. Firing on every source (not just `startup`) is what re-establishes
+///   all three on a resume (ADR-0013).
+/// - `Stop` runs `turn-end` (plain, synchronous, NEVER asyncRewake): close the turn
+///   (ADR-0016), re-register the inbox (restoring ADR-0007's register-on-every-Stop
+///   invariant), re-arm a missing sentinel, and re-trigger for mail that arrived while
+///   the session was busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a
+///   config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
+///   NEVER a model turn.
+/// - `UserPromptSubmit` runs `turn-start`: the turn-opened stamp `mailbox doctor` needs
+///   to tell BUSY from deaf (ADR-0016).
 /// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
-///   basename ([`WAKE_SENTINEL_BASENAME`]): when the watcher bumps the sentinel, this
+///   basename ([`WAKE_SENTINEL_BASENAME`]): when the daemon writes the sentinel, this
 ///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
-///   It carries `timeout_secs` as its kill deadline — it is a fast read-only peek, so
-///   the timeout is only a backstop.
-/// - `SessionEnd` runs `cleanup` (plain): reap the watcher, remove the sentinel, drop
+///   It carries its own short kill deadline — it is a fast read-only peek, so the
+///   timeout is only a backstop.
+/// - `SessionEnd` runs `cleanup` (plain): remove the sentinel, drop
 ///   subscriptions/interests.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
@@ -235,14 +235,14 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.session_start_command(),
                 }],
             })],
-            // Stop fires at every turn boundary: a plain (NOT asyncRewake) liveness poke
-            // that respawns a dead watcher and re-prints watchPaths, exiting 0 always so
-            // it can never itself wake the session (ADR-0008 Stop-liveness).
+            // Stop fires at every turn boundary: a plain (NOT asyncRewake) hook that
+            // closes the turn, re-registers the inbox and re-triggers for busy-window
+            // mail, exiting 0 always so it can never itself wake the session.
             "Stop": [json!({
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
-                    "command": spec.ensure_watcher_command(),
+                    "command": spec.turn_end_command(),
                 }],
             })],
             // UserPromptSubmit opens a turn. Paired with Stop's turn-ended stamp it
@@ -256,7 +256,7 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.turn_start_command(),
                 }],
             })],
-            // FileChanged fires when the watcher bumps the sentinel. The matcher is
+            // FileChanged fires when the daemon writes the sentinel. The matcher is
             // the sentinel BASENAME (Claude Code matches FileChanged by basename);
             // per-session isolation comes from the absolute path SessionStart
             // registered via watchPaths.
@@ -273,8 +273,7 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "timeout": WAKE_HOOK_TIMEOUT_SECS,
                 }],
             })],
-            // SessionEnd tears the watcher down, removes the sentinel, and drops
-            // interests/subscriptions.
+            // SessionEnd removes the sentinel and drops interests/subscriptions.
             "SessionEnd": [json!({
                 "matcher": "",
                 "hooks": [{
@@ -370,15 +369,19 @@ fn is_our_command(command: &str) -> bool {
         && tokens.next() == Some("harness")
         && matches!(
             tokens.next(),
-            // Current (ADR-0008) hooks, plus the retired `arm` so it is swept on
-            // upgrade, plus `watch` for symmetry (never installed as a hook, but ours).
+            // Current hooks, plus every subcommand we have EVER installed as one, so
+            // an upgrade REPLACES the old group instead of leaving a hook pointing at
+            // a subcommand this binary no longer has: `arm` (ADR-0006),
+            // `ensure-watcher` (renamed to `turn-end`), and `watch` (the deleted
+            // detached watcher, ADR-0017).
             Some("session-start")
                 | Some("wake")
-                | Some("ensure-watcher")
+                | Some("turn-end")
                 | Some("turn-start")
+                | Some("cleanup")
+                | Some("ensure-watcher")
                 | Some("watch")
                 | Some("arm")
-                | Some("cleanup")
         )
 }
 
@@ -671,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn snippet_is_valid_and_wires_the_adr0008_hooks() {
+    fn snippet_is_valid_and_wires_the_wake_hooks() {
         let snippet = hooks_snippet(&spec());
         let hooks = &snippet["hooks"];
 
@@ -687,15 +690,15 @@ mod tests {
             "session-start must NOT be asyncRewake"
         );
 
-        // The Stop hook is the ADR-0008 Stop-liveness poke: `ensure-watcher`, plain
-        // (NOT asyncRewake, no timeout), so it can never itself wake the session.
+        // The Stop hook is the turn boundary: `turn-end`, plain (NOT asyncRewake, no
+        // timeout), so it can never itself wake the session.
         let stop = &hooks["Stop"][0];
         assert_eq!(stop["matcher"], "");
-        let ew = &stop["hooks"][0];
-        assert_eq!(ew["command"], "/opt/mailbox harness ensure-watcher");
+        let te = &stop["hooks"][0];
+        assert_eq!(te["command"], "/opt/mailbox harness turn-end");
         assert!(
-            ew.get("asyncRewake").is_none(),
-            "the Stop-liveness hook must NOT be asyncRewake (it never wakes)"
+            te.get("asyncRewake").is_none(),
+            "the Stop hook must NOT be asyncRewake (it never wakes)"
         );
 
         // FileChanged: matcher = the sentinel basename, asyncRewake wake with timeout.
@@ -1104,8 +1107,8 @@ mod tests {
         });
         let merged = merge_into_settings(old, &hooks_snippet(&spec()));
 
-        // The stale Stop → arm hook is swept and REPLACED by the Stop-liveness hook
-        // (ensure-watcher) — the retired exit-2 re-arm must not survive.
+        // The stale Stop → arm hook is swept and REPLACED by the turn-end hook — the
+        // retired exit-2 re-arm must not survive.
         let stop = hook_commands(&merged, "Stop");
         assert!(
             !stop.iter().any(|c| c.contains("harness arm")),
@@ -1113,8 +1116,8 @@ mod tests {
         );
         assert_eq!(
             stop,
-            vec!["/opt/mailbox harness ensure-watcher"],
-            "the Stop event now carries the ADR-0008 Stop-liveness hook: {stop:?}"
+            vec!["/opt/mailbox harness turn-end"],
+            "the Stop event now carries the turn-end hook: {stop:?}"
         );
         // SessionStart now runs session-start, FileChanged runs wake — the new loop.
         assert_eq!(
@@ -1152,11 +1155,14 @@ mod tests {
     fn our_commands_are_recognised_whatever_the_binary_path_or_flags() {
         assert!(is_our_command("/opt/mailbox harness session-start"));
         assert!(is_our_command("mailbox harness wake"));
+        assert!(is_our_command("mailbox harness turn-end"));
+        // The retired names are still recognised, so an UPGRADE replaces them rather
+        // than leaving a hook pointing at a subcommand this binary no longer has.
         assert!(is_our_command("mailbox harness ensure-watcher"));
+        assert!(is_our_command("mailbox harness watch --session x"));
         assert!(is_our_command("/a/b/c/mailbox harness cleanup"));
         // The retired `arm` is still recognised, so an upgrade sweeps it.
         assert!(is_our_command("/opt/mailbox harness arm --max-block-ms 1"));
-        assert!(is_our_command("mailbox harness watch --session x"));
         // Not ours: another tool, and our own non-hook commands.
         assert!(!is_our_command("echo other"));
         assert!(!is_our_command("/opt/mailbox read --session x"));

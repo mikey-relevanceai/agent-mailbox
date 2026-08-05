@@ -231,13 +231,7 @@ impl Sentinel {
     /// The one env-reading edge; [`resolve_root`] is the pure core so the path
     /// scheme is unit-testable without mutating the (process-global) environment.
     pub fn for_session(session: &SessionId) -> Result<Self, SentinelError> {
-        let root = resolve_root(
-            env_nonempty(ENV_SENTINEL_ROOT),
-            env_nonempty(ENV_HOME),
-            env_nonempty("HOME"),
-        )
-        .ok_or(SentinelError::NoRoot)?;
-        Ok(Self::under_root(&root, session))
+        Ok(Self::under_root(&root_from_env()?, session))
     }
 
     /// Build the sentinel paths under an explicit `root` (used by
@@ -484,6 +478,21 @@ impl Sentinel {
             Err(err) => Err(err),
         }
     }
+}
+
+/// The sentinel root, resolved from the environment.
+///
+/// The `serve` daemon resolves this ONCE at startup and hands it to its
+/// [`crate::wake::Waker`], rather than re-reading three environment variables on
+/// every publish. Hooks, which are one-shot processes, go through
+/// [`Sentinel::for_session`] instead.
+pub fn root_from_env() -> Result<PathBuf, SentinelError> {
+    resolve_root(
+        env_nonempty(ENV_SENTINEL_ROOT),
+        env_nonempty(ENV_HOME),
+        env_nonempty("HOME"),
+    )
+    .ok_or(SentinelError::NoRoot)
 }
 
 /// The pure sentinel-root rule: [`ENV_SENTINEL_ROOT`] wins; else `~/.mailbox` with

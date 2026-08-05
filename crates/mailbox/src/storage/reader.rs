@@ -4,27 +4,17 @@
 //!
 //! The single-writer rule (ADR-0003) says only the bridge mutates the database,
 //! and everything else speaks the protocol. But wake has a genuinely separate
-//! actor: the **waiter** is its own process (a background hook launched with
-//! `asyncRewake`, see docs/01-wake-and-rearm.md), and before it blocks it must
-//! answer one question — "does this session have unread mail right now?" — so a
-//! publish that landed *before* the waiter started still fires (the missed-kick
-//! safety). ADR-0003 explicitly permits this: "reads used for wake/delivery ...
-//! stay read-only and never mutate."
+//! actor: the Claude Code **hooks** are their own one-shot processes, and each must
+//! answer one question — "does this session have unread mail right now?" — without a
+//! daemon socket, because a hook that could not answer while the bridge was down
+//! would wake the agent (or refuse to) on no evidence at all. ADR-0003 explicitly
+//! permits this: "reads used for wake/delivery ... stay read-only and never mutate."
 //!
 //! So this type opens the SQLite file with [`OpenFlags::SQLITE_OPEN_READ_ONLY`]
 //! and **no** create flag: it cannot write, cannot create the file, and never
 //! advances a cursor. Advancing a session's cursor is the exclusive job of the
 //! agent's later `read` through the single writer — checking unread here is
-//! deliberately non-destructive so the waiter can peek without consuming.
-//!
-//! # The second reader: `mailbox dashboard` (ADR-0015)
-//!
-//! The waiter is no longer the only actor with that shape. `mailbox dashboard` is a
-//! health view whose whole job is to be readable when things are broken — including
-//! when the `serve` daemon is the broken thing — so routing it through the socket
-//! would take the view away in one of the failure modes it exists to diagnose. It
-//! reads through [`ReadOnlyStore::fleet`] under the same rule: read-only open, no
-//! create, no mutation, no cursor ever advanced.
+//! deliberately non-destructive so a hook can peek without consuming.
 
 use std::path::Path;
 
@@ -58,7 +48,7 @@ const UNREAD_PREDICATE: &str = "e.offset > COALESCE(
 
 /// A read-only view of the durable store, opened as a side connection.
 ///
-/// Held by the waiter process. Every method is a plain `SELECT`; there is no
+/// Held by the hook processes. Every method is a plain `SELECT`; there is no
 /// path from here to a mutation.
 #[derive(Debug)]
 pub struct ReadOnlyStore {
@@ -70,8 +60,8 @@ impl ReadOnlyStore {
     ///
     /// Uses `SQLITE_OPEN_READ_ONLY` with **no** create flag, so a missing file
     /// is an error ([`StorageError::Open`]) rather than a silently-created empty
-    /// DB — a waiter with no bridge/store behind it has nothing to wait on, and
-    /// we would rather say so than invent an empty database. A `busy_timeout`
+    /// DB — a hook with no bridge/store behind it has nothing to report, and we
+    /// would rather say so than invent an empty database. A `busy_timeout`
     /// is set as a defensive backstop; with WAL the reader does not contend with
     /// the writer, so it should never fire.
     ///
@@ -100,7 +90,7 @@ impl ReadOnlyStore {
     /// cursor row exists yet — any event (cursor treated as `-1`, since offsets
     /// start at 0). This is the read-only twin of `do_read_unread`'s predicate;
     /// it reports which topics *would* deliver without advancing anything.
-    /// The waiter both decides whether to wake (non-empty ⇒ wake) and names the
+    /// The wake hook both decides whether to wake (non-empty ⇒ wake) and names the
     /// topics for the reminder from this one call, so a separate `has_unread`
     /// boolean would be redundant.
     pub fn topics_with_unread(&self, session: &SessionId) -> Result<Vec<Topic>, StorageError> {
@@ -118,23 +108,6 @@ impl ReadOnlyStore {
     /// have already re-triggered a wake for" from "mail newer than that".
     pub fn unread(&self, session: &SessionId) -> Result<Unread, StorageError> {
         query_unread(&self.conn, session.as_str())
-    }
-
-    /// Whether `session` currently has at least one subscription.
-    ///
-    /// The waiter-side "arm-iff-subscribed" re-check (card 11): distinct from
-    /// [`topics_with_unread`](Self::topics_with_unread), which is empty both when
-    /// the session has NO subscription AND when it is subscribed but caught up.
-    /// This asks the narrower question — "is there anything to be woken about at
-    /// all?" — so a waiter that raced a `SessionEnd`/unsubscribe (interest already
-    /// dropped) can self-exit instead of blocking forever as an orphan.
-    pub fn has_subscription(&self, session: &SessionId) -> Result<bool, StorageError> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM subscription WHERE session_id = ?1)",
-            [session.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(exists)
     }
 }
 

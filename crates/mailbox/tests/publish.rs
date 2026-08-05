@@ -34,18 +34,14 @@ use common::{Env, poll_until};
 /// How long to wait for a wake that SHOULD happen.
 const WAKE: Duration = Duration::from_secs(10);
 
-/// Start `session` through the production `SessionStart` hook and block until its
-/// detached watcher is really listening (the pidfile lands after it takes the lock).
+/// Start `session` through the production `SessionStart` hook, which registers its
+/// inbox and arms its wake sentinel.
 fn arm(env: &Env, session: &str) {
-    let out = env.session_start(session);
-    assert!(out.status.success(), "session-start must exit 0");
-    poll_until("the watcher arms", WAKE, || {
-        env.waiter_pidfile(session).exists().then_some(())
-    });
+    env.arm(session);
 }
 
-/// Block until `session`'s sentinel names `topic` — the modern wake wire: the
-/// watcher writes the topic there and the `FileChanged` hook turns it into a wake.
+/// Block until `session`'s sentinel names `topic` — the wake wire: the daemon writes
+/// the topic there and the `FileChanged` hook turns it into a wake.
 fn assert_woken_for(env: &Env, session: &str, topic: &str) {
     poll_until(&format!("{session}'s sentinel names {topic}"), WAKE, || {
         env.sentinel_topics(session)

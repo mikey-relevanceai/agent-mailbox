@@ -120,10 +120,10 @@ impl Delivery {
 /// Cheap to clone — it holds a [`Storage`] handle, which is itself just a channel
 /// to the single writer. Every clone talks to the same durable log.
 ///
-/// A bus optionally carries a [`Waker`]: when present, [`Bus::publish`] kicks the
-/// FIFO of every session subscribed to the published topic (payload-free wake).
-/// Without one, publish is a pure durable append — useful for tests and for any
-/// caller that does not own the wake channel.
+/// A bus optionally carries a [`Waker`]: when present, [`Bus::publish`] writes the
+/// wake sentinel of every session subscribed to the published topic (payload-free
+/// wake). Without one, publish is a pure durable append — useful for tests and for
+/// any caller that does not own the wake channel.
 #[derive(Clone, Debug)]
 pub struct Bus {
     storage: Storage,
@@ -147,10 +147,10 @@ impl Bus {
         }
     }
 
-    /// Build a bus that kicks waiters on publish, using `waker` as the wake
-    /// primitive. The bridge wires this so a publish wakes idle sessions; the
-    /// bus depends only on the [`Waker`] abstraction, so the primitive (FIFO
-    /// today, socket later) can change without touching this layer.
+    /// Build a bus that wakes subscribers on publish, using `waker` as the wake
+    /// primitive. The bridge wires this so a publish wakes idle sessions; the bus
+    /// depends only on the [`Waker`] abstraction, so how a session is actually
+    /// woken can change without touching this layer.
     pub fn with_waker(storage: Storage, waker: Waker) -> Self {
         Self {
             storage,
@@ -165,19 +165,18 @@ impl Bus {
     /// publish carries no bus-level policy over the body — it is stored verbatim
     /// and never interpreted (ADR-0001).
     ///
-    /// # Kick-on-publish (payload-free)
+    /// # Wake-on-publish (payload-free)
     ///
-    /// After the event is durably appended, a bus with a [`Waker`] signals every
-    /// session subscribed to `topic`. The kick is a bare byte and the topic name
-    /// is used only for logging — no body ever crosses the wake boundary. The
-    /// kick happens *after* the durable append, which is what makes the waiter's
-    /// open→check→block ordering race-free (see [`crate::wake`]).
+    /// After the event is durably appended, a bus with a [`Waker`] writes the wake
+    /// sentinel of every session subscribed to `topic`. The sentinel carries topic
+    /// NAMES only — no body ever crosses the wake boundary. The write happens
+    /// *after* the durable append and in the same process, so there is no window in
+    /// which a wake could name mail that is not yet readable.
     ///
-    /// A kick is best-effort and must never fail a publish: the event is already
-    /// durable, and a session with no live waiter is normal. If listing the
-    /// subscribers itself fails (a store error on the read path), we log and
-    /// return the published event anyway — a late waiter's unread check still
-    /// covers the mail.
+    /// Waking is best-effort and must never fail a publish: the event is already
+    /// durable. If listing the subscribers itself fails (a store error on the read
+    /// path), we log and return the published event anyway — the mail is still
+    /// there, and the session's next turn boundary re-triggers for it (ADR-0012).
     pub async fn publish(
         &self,
         topic: Topic,
@@ -190,14 +189,14 @@ impl Bus {
             .publish(topic.clone(), adapter, timestamp, body)
             .await?;
 
-        self.kick_subscribers(&topic).await;
+        self.wake_subscribers(&topic).await;
 
         Ok(event)
     }
 
     /// Publish `body` to `topic` **as `publisher`** — an agent, not an adapter —
-    /// applying the caller-aware rule and then kicking every subscriber EXCEPT the
-    /// publisher.
+    /// applying the caller-aware rule and then waking every subscriber, the
+    /// publisher included.
     ///
     /// The rule itself is one atomic writer command
     /// ([`Storage::publish_as_session`], see [`PublishAttempt`]):
@@ -208,7 +207,7 @@ impl Bus {
     ///
     /// And here, at the wake boundary:
     ///
-    /// 2. **Every subscriber is kicked, the publisher included** (ADR-0014). Authorship
+    /// 2. **Every subscriber is woken, the publisher included** (ADR-0014). Authorship
     ///    is provenance, not a claim about what the agent already knows: the common
     ///    case — a `github-pr` transition the agent itself caused — carries no author
     ///    session at all and has always woken it. Suppressing only the attributable
@@ -219,7 +218,7 @@ impl Bus {
     /// it before you may speak again would make a second publish impossible
     /// (`storage::writer`).
     ///
-    /// A REFUSED publish kicks nobody: there is nothing to wake about.
+    /// A REFUSED publish wakes nobody: there is nothing to wake about.
     pub async fn publish_as_session(
         &self,
         publisher: SessionId,
@@ -235,7 +234,7 @@ impl Bus {
 
         match &attempt {
             PublishAttempt::Published(_) => {
-                self.kick_subscribers(&topic).await;
+                self.wake_subscribers(&topic).await;
             }
             // Log the decision: a refused publish is a real, observable outcome the
             // agent must act on (read first), not a silent no-op.
@@ -251,27 +250,55 @@ impl Bus {
         Ok(attempt)
     }
 
-    /// Kick every session subscribed to `topic` — the publisher included (ADR-0014).
+    /// Wake every session subscribed to `topic` — the publisher included (ADR-0014)
+    /// — by writing its currently-unread topic set into its wake sentinel.
     ///
-    /// Best-effort and it must never fail a publish: the event is already durable,
-    /// and a session with no live waiter is normal. If listing the subscribers itself
-    /// fails, we log and move on — a later waiter's unread check still covers the
-    /// mail.
-    async fn kick_subscribers(&self, topic: &Topic) {
+    /// # Why each subscriber's WHOLE unread set, not just this topic
+    ///
+    /// The sentinel is the session's payload-free statement of "you have mail on
+    /// these topics", and the `Stop`-hook re-trigger writes the same thing. Writing
+    /// only the just-published topic would make the two disagree, so a session that
+    /// was already sitting on mail elsewhere would see that mail vanish from the file
+    /// between one publish and the next. It costs one extra read per subscriber — the
+    /// same unread predicate the wake hook itself uses (`storage::reader`).
+    ///
+    /// Best-effort throughout: it must never fail a publish, because the event is
+    /// already durable. If listing the subscribers or reading one session's unread
+    /// fails, we log and move on — the mail is still there, and the session's next
+    /// turn boundary re-triggers for it (ADR-0012).
+    async fn wake_subscribers(&self, topic: &Topic) {
         let Some(waker) = &self.waker else {
             return;
         };
-        match self.storage.sessions_subscribed(topic.clone()).await {
-            Ok(sessions) => {
-                waker.kick_all(&sessions, topic);
+        let sessions = match self.storage.sessions_subscribed(topic.clone()).await {
+            Ok(sessions) => sessions,
+            Err(err) => {
+                warn!(
+                    topic = topic.as_str(),
+                    error = %err,
+                    "could not list subscribers to wake after publish; \
+                     the mail is durable and surfaces at their next turn boundary"
+                );
+                return;
             }
-            Err(err) => warn!(
-                topic = topic.as_str(),
-                error = %err,
-                "could not list subscribers to kick after publish; \
-                 relying on waiter unread-check"
-            ),
+        };
+
+        let mut unread_by_session = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            match self.storage.unread_counts(session.clone()).await {
+                Ok(counts) => {
+                    unread_by_session.push((session, counts.into_iter().map(|(t, _)| t).collect()))
+                }
+                Err(err) => warn!(
+                    session = session.as_str(),
+                    topic = topic.as_str(),
+                    error = %err,
+                    "could not read a subscriber's unread topics to wake it; skipping \
+                     (the mail is durable and surfaces at its next turn boundary)"
+                ),
+            }
         }
+        waker.wake_all(&unread_by_session, topic);
     }
 
     /// Subscribe `session` to each of `topics`, baselining its delivery cursor to

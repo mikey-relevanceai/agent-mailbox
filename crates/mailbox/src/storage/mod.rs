@@ -63,17 +63,10 @@ const ENV_HOME: &str = "AGENT_MAILBOX_HOME";
 /// Directory (under home) and file name of the default database.
 const DEFAULT_DIR: &str = ".agent-mailbox";
 const DEFAULT_FILE: &str = "mailbox.db";
-/// Subdirectory (beside the database file) that holds per-session waiter FIFOs.
-/// Deriving it from the resolved DB path — rather than re-resolving HOME — means
-/// the wake FIFOs automatically follow every storage override (`AGENT_MAILBOX_DB`,
-/// `AGENT_MAILBOX_HOME`, or a test's explicit path) and can never drift from the
-/// database they signal about.
-const WAITERS_SUBDIR: &str = "waiters";
 /// File name (beside the database file) of the user-scoped Unix socket the
-/// `serve` daemon binds. Derived from the resolved DB path for the same reason as
-/// [`WAITERS_SUBDIR`]: the CLI clients and the daemon must agree on one path
-/// under every storage override, with no separate env to keep in sync (card 06,
-/// ADR-0004).
+/// `serve` daemon binds. Derived from the resolved DB path — rather than from a
+/// separate env var — so the CLI clients and the daemon agree on one path under
+/// every storage override, with nothing to keep in sync (card 06, ADR-0004).
 const SOCKET_FILE: &str = "mailbox.sock";
 /// File name (beside the database file) of the daemon's exclusive lockfile. The
 /// `serve` daemon holds an advisory `flock` on this for its whole life BEFORE it
@@ -136,25 +129,12 @@ impl StorageConfig {
         &self.path
     }
 
-    /// The directory that holds per-session waiter FIFOs, beside the database
-    /// file (`<db-parent>/waiters`). Derived from the resolved DB path so the
-    /// wake channel follows the same env overrides as storage (see
-    /// [`WAITERS_SUBDIR`]). Falls back to a bare relative `waiters` only if the
-    /// DB path has no parent (a bare filename), matching how [`Storage::open`]
-    /// treats an empty parent.
-    pub fn waiters_dir(&self) -> PathBuf {
-        match self.path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(WAITERS_SUBDIR),
-            _ => PathBuf::from(WAITERS_SUBDIR),
-        }
-    }
-
     /// The user-scoped Unix socket the `serve` daemon binds and CLI clients
     /// connect to (`<db-parent>/mailbox.sock`). Derived from the resolved DB path
-    /// exactly like [`waiters_dir`](Self::waiters_dir) so daemon and clients agree
-    /// on one location under every storage override without a separate env var
-    /// (card 06 / ADR-0004). Falls back to a bare relative name only if the DB
-    /// path has no parent, matching how [`Storage::open`] treats an empty parent.
+    /// so daemon and clients agree on one location under every storage override
+    /// without a separate env var (card 06 / ADR-0004). Falls back to a bare
+    /// relative name only if the DB path has no parent, matching how
+    /// [`Storage::open`] treats an empty parent.
     pub fn socket_path(&self) -> PathBuf {
         self.sibling(SOCKET_FILE)
     }
@@ -174,9 +154,9 @@ impl StorageConfig {
         self.sibling(LOCK_FILE)
     }
 
-    /// The directory that holds the database, socket, lockfile, and waiters. The
-    /// daemon creates it `0700` so every user-scoped resource beneath it is
-    /// owner-only from creation.
+    /// The directory that holds the database, socket, and lockfile. The daemon
+    /// creates it `0700` so every user-scoped resource beneath it is owner-only
+    /// from creation.
     pub fn dir(&self) -> PathBuf {
         match self.path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),

@@ -9,12 +9,12 @@
 //! - [`control`] — the request/response types client and server share;
 //! - [`cli`] — the clap command layer, argument parsing, and output formatting.
 //!
-//! Three commands do not use the socket. `serve` *is* the daemon. `wait` opens the
-//! store read-only and blocks on its wake FIFO, so it runs synchronously with no
-//! tokio runtime — its blocking `poll` would otherwise idle a runtime worker for no
-//! benefit. `dashboard` is the second read-only reader (ADR-0015): a health view has
-//! to render when the daemon is down, which is exactly when a socket client cannot.
-//! Both read-only opens are permitted by ADR-0003 and neither can mutate.
+//! Three commands do not use the socket. `serve` *is* the daemon. `harness wake` is
+//! the `FileChanged` hook: a read-only peek at the store, so it runs synchronously
+//! with no tokio runtime. `doctor` is the other read-only reader (ADR-0016): a health
+//! check has to work when the daemon is the thing that is broken, which is exactly
+//! when a socket client cannot. Both read-only opens are permitted by ADR-0003 and
+//! neither can mutate.
 //!
 //! [`Storage`]: mailbox::storage::Storage
 //! [`Waker`]: mailbox::wake::Waker
@@ -36,13 +36,13 @@ fn main() -> ExitCode {
     // clap handles --help/--version and prints usage errors itself (exit 2).
     let cli = Cli::parse();
 
-    // Route `tracing` events. For `wait` and `harness arm`, the process stderr is
-    // a WIRE channel: on exit 2 Claude Code surfaces it to the agent as the "mail
-    // on topic X" reminder (payload-free wake). A `RUST_LOG=info` tracing line on
-    // that stderr would pollute the reminder, so those two commands send tracing to
-    // a log file under the mailbox dir (or suppress it) — the reminder is written
-    // with a bare `eprintln!`, keeping the wire clean regardless of `RUST_LOG`.
-    // Every other command keeps logs on stderr (stdout stays clean for `--json`).
+    // Route `tracing` events. For the hooks, the process stderr is a WIRE channel:
+    // on exit 2 Claude Code surfaces it to the agent as the "mail on topic X"
+    // reminder (payload-free wake). A `RUST_LOG=info` tracing line on that stderr
+    // would pollute the reminder, so those commands send tracing to a log file under
+    // the mailbox dir (or suppress it) — the reminder is written with a bare
+    // `eprintln!`, keeping the wire clean regardless of `RUST_LOG`. Every other
+    // command keeps logs on stderr (stdout stays clean for `--json`).
     init_tracing(&cli.command);
 
     match cli.command {
@@ -50,19 +50,15 @@ fn main() -> ExitCode {
         // proves wakeability from sentinel files and the process table, and a health
         // check must still work when the daemon is the thing that is broken.
         Command::Doctor(args) => cli::run_doctor(cli::output_format(cli.json), &args),
-        // The ADR-0008 FileChanged wake hook (a read-only peek) and the detached
-        // watcher (a blocking FIFO loop) also run synchronously — no runtime — and
-        // own their own exit codes (see their handlers). Matched here so they never
-        // reach the async path.
+        // The FileChanged wake hook is a read-only peek that owns its own exit code
+        // (2 = wake), so it runs synchronously — no runtime. Matched here so it never
+        // reaches the async path.
         Command::Harness(cli::HarnessArgs {
             command: HarnessCommand::Wake,
         }) => cli::run_wake_hook(),
-        Command::Harness(cli::HarnessArgs {
-            command: HarnessCommand::Watch(args),
-        }) => cli::run_watch_sentinel(&args),
-        // The ADR-0008 Stop-liveness hook (ensure-watcher) is NOT matched here: it
-        // re-registers the inbox over the socket (ADR-0013), so it needs the async
-        // runtime and is dispatched via the async path below like the other socket hooks.
+        // The Stop hook (turn-end) is NOT matched here: it re-registers the inbox over
+        // the socket (ADR-0013), so it needs the async runtime and is dispatched via
+        // the async path below like the other socket hooks.
         // Everything else is async (socket client, or the serve daemon).
         command => {
             let runtime = match tokio::runtime::Runtime::new() {
@@ -91,44 +87,39 @@ fn main() -> ExitCode {
 /// Whether this command's tracing must be kept OFF stderr and sent to
 /// `harness.log` instead. Two reasons a harness command qualifies:
 ///
-/// - its stderr is a WAKE WIRE — the ADR-0008 `harness wake` hook writes the
-///   payload-free reminder there on exit 2, so a tracing line would pollute it;
-/// - its stdout is a HOOK CONTRACT or it is a DETACHED daemon — `harness
-///   session-start` prints the `watchPaths` JSON on stdout, and `harness watch` runs
-///   detached with no terminal; both want their lifecycle in `harness.log`, not on a
-///   channel Claude Code reads (or a stderr nobody sees).
+/// - its stderr is a WAKE WIRE — the `harness wake` hook writes the payload-free
+///   reminder there on exit 2, so a tracing line would pollute it;
+/// - its stdout is a HOOK CONTRACT — `harness session-start` prints the `watchPaths`
+///   JSON there, and it wants its lifecycle in `harness.log` rather than on a channel
+///   Claude Code parses.
 fn is_wire_stderr(command: &Command) -> bool {
     matches!(
         command,
         Command::Harness(cli::HarnessArgs {
-            command: HarnessCommand::Wake
-                | HarnessCommand::Watch(_)
-                | HarnessCommand::SessionStart
-                | HarnessCommand::EnsureWatcher
+            command: HarnessCommand::Wake | HarnessCommand::SessionStart | HarnessCommand::TurnEnd
         })
     )
 }
 
-/// Initialise the `tracing` subscriber. Wire-stderr commands (`wait`, `harness
-/// arm`) log to `<db-dir>/harness.log` (append) so their stderr stays a clean wake
-/// channel; if that file cannot be opened, or for any other command, tracing goes
-/// to stderr as usual. Filtered by `RUST_LOG`.
+/// Initialise the `tracing` subscriber. Wire-stderr commands (the hooks) log to
+/// `<db-dir>/harness.log` (append) so their stderr stays a clean wake channel; if
+/// that file cannot be opened, or for any other command, tracing goes to stderr as
+/// usual. Filtered by `RUST_LOG`.
 ///
 /// The two sinks default differently ON PURPOSE (card 16 / FIX 3). Other commands'
 /// stderr stays quiet — ERROR only — so an agent's terminal is not flooded. The
-/// `harness.log` file defaults to **INFO**, because it is the *only* place the wake
-/// loop leaves a trace, and the four lines that answer "why didn't my agent wake?"
-/// — armed / found-no-subscriptions / woke-with-unread / max-block-yielded, plus
-/// the publisher's delivered-vs-no-reader kick counts — are all `info!`. At WARN
-/// they were discarded, which is precisely why a session that silently stopped
-/// being wakeable was unfalsifiable from outside the process. `RUST_LOG` overrides
-/// either sink.
+/// `harness.log` file defaults to **INFO**, because it is the *only* place the hook
+/// side of the wake loop leaves a trace, and the lines that answer "why didn't my
+/// agent wake?" — armed / woke-with-unread / re-triggered-at-the-turn-boundary — are
+/// all `info!`. At WARN they were discarded, which is precisely why a session that
+/// silently stopped being wakeable was unfalsifiable from outside the process.
+/// `RUST_LOG` overrides either sink.
 fn init_tracing(command: &Command) {
     if is_wire_stderr(command)
         && let Some(file) = wire_log_file()
     {
-        // Default to INFO for the harness log: the waiter's lifecycle must be
-        // visible at the DEFAULT level, or the next wake bug is again invisible. A
+        // Default to INFO for the harness log: the hooks' decisions must be visible
+        // at the DEFAULT level, or the next wake bug is again invisible. A
         // set `RUST_LOG` still wins. This raises verbosity ONLY on the harness.log
         // sink — no other command's stderr is affected, and the exit-2 stderr wire
         // stays payload-free regardless (tracing never goes there).
@@ -144,12 +135,12 @@ fn init_tracing(command: &Command) {
             .init();
     } else {
         // The daemon owns the OTHER half of the "why didn't my agent wake?" trail:
-        // `kick_all` logs, per publish, how many subscribed sessions it actually
-        // delivered a wake byte to vs had no live reader. That is an `info!`, and at
-        // the ERROR default it was discarded — so the publisher's side of a missed
-        // wake was as invisible as the waiter's. `serve` runs in its own terminal (or
-        // a redirected log), so INFO there floods nobody. Every other command keeps
-        // the quiet ERROR default: their stderr is the agent's terminal.
+        // `wake_all` logs, per publish, how many subscribers' sentinels it actually
+        // bumped. That is an `info!`, and at the ERROR default it was discarded — so
+        // the publisher's side of a missed wake was as invisible as the hook's.
+        // `serve` runs in its own terminal (or a redirected log), so INFO there floods
+        // nobody. Every other command keeps the quiet ERROR default: their stderr is
+        // the agent's terminal.
         let default = match command {
             Command::Serve => LevelFilter::INFO,
             _ => LevelFilter::ERROR,

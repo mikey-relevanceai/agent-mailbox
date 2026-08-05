@@ -4,9 +4,10 @@
 # loop. It proves, on your machine with no GitHub and no Claude Code, that:
 #
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
-#   2. an *idle* waiter wakes when mail lands (the asyncRewake contract:
-#      the watcher bumps the sentinel and `mailbox harness wake` exits 2 with a
-#      payload-free "mail on topic X" reminder);
+#   2. an *idle* session wakes when mail lands (the asyncRewake contract: the
+#      daemon bumps that session's sentinel as part of the publish, and
+#      `mailbox harness wake` exits 2 with a payload-free "mail on topic X"
+#      reminder);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
 #   4. `unwatch` / end-session tears the adapter down (no zombie pollers).
@@ -100,24 +101,29 @@ run "${MAILBOX} read --session ${SESSION}"
 
 # --- 2. wake an IDLE session ---------------------------------------------------
 # This is the load-bearing mechanic, and it is exactly what Claude Code does. The
-# SessionStart hook spawns a DETACHED watcher; a publish makes that watcher bump
-# the session's sentinel file; Claude Code's FileChanged hook fires on the change
-# even though the session is idle, and `mailbox harness wake` exits 2 iff there is
-# genuine unread mail. Here we drive the same three steps by hand.
+# SessionStart hook ARMS the session's sentinel file and registers a watch on it;
+# a publish makes the DAEMON rewrite that file as part of serving the publish;
+# Claude Code's FileChanged hook fires on the change even though the session is
+# idle, and `mailbox harness wake` exits 2 iff there is genuine unread mail. Here
+# we drive the same three steps by hand — with no sleeps, because there is no
+# third process whose scheduling we would have to wait on.
 step "2. wake an idle session (the FileChanged contract)"
-echo "running the SessionStart hook (spawns the detached watcher) ..."
+echo "running the SessionStart hook (arms the sentinel) ..."
 echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
   | "${MAILBOX}" harness session-start >"${WORK_DIR}/watchpaths.json"
 echo "  watchPaths registered with the harness:"
 sed 's/^/    /' "${WORK_DIR}/watchpaths.json"
-sleep 0.5   # let the watcher reach its blocking read
+
+SENTINEL="${MAILBOX_SENTINEL_ROOT}/by-agent/${SESSION}/.mailbox-wake"
+if [[ ! -f "${SENTINEL}" ]]; then
+  echo "error: SessionStart did not arm the sentinel at ${SENTINEL}" >&2
+  exit 1
+fi
 
 echo "publishing while the session is idle ..."
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
-sleep 0.5   # let the watcher observe the kick and bump the sentinel
 
-SENTINEL="${MAILBOX_SENTINEL_ROOT}/by-agent/${SESSION}/.mailbox-wake"
-echo "the watcher bumped the sentinel (topic NAMES only, never a body):"
+echo "the daemon bumped the sentinel (topic NAMES only, never a body):"
 sed 's/^/    /' "${SENTINEL}"
 
 echo "running the FileChanged hook, as Claude Code would on that change ..."
