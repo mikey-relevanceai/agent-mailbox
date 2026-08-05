@@ -418,21 +418,26 @@ loop, stop: declare a `watch` instead.
 
 Run `mailbox <cmd> --help` for the authoritative flags.
 
-**Session identity is automatic.** The session-scoped commands resolve *you* from
-`$CLAUDE_CODE_SESSION_ID` (which Claude Code exports into every tool call), so you
-do **not** pass `--session` — just run them, and `mailbox whoami` confirms who you
-are. Pass `--session <id>` only to act as a *different* session. Full resolution
-order: `--session` > `$MAILBOX_SESSION_ID` > `$CLAUDE_CODE_SESSION_ID`.
+**Session identity is automatic, and there is no flag for it.** The session-scoped
+commands resolve *you* from `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into
+every tool call — that is the single source of a session's own identity. Just run
+them; `mailbox whoami` confirms who you are.
 
-> **Pitfall:** do not write `--session "$MAILBOX_SESSION_ID"`. In an agent's shell
-> that variable is usually **empty** (only the hooks set it), so it expands to
-> `--session ""`. An empty flag is treated as absent and
-> falls through to `$CLAUDE_CODE_SESSION_ID` — but the clearer fix is to just omit
-> the flag.
+To run a command **as a named session** from a script or by hand (there is nothing in
+the agent loop that needs this), set the variable for that one command:
 
-Add global `--json` for machine-readable stdout. Below, `--session` is shown only
-where it is a genuine argument; the session-scoped commands take the optional
-override but do not need it.
+```bash
+CLAUDE_CODE_SESSION_ID=some-session mailbox status
+```
+
+> The `--session` flag and the `MAILBOX_SESSION_ID` fallback are **gone**. Nothing in
+> production set either, and the flag's main effect on agents was to let them break
+> themselves: `--session "$MAILBOX_SESSION_ID"` — a shape this doc used to have to warn
+> against — expands to `--session ""` in an agent's shell and bound a phantom empty
+> session. `mailbox doctor --session <id>` is unrelated and survives: it names a
+> session to *probe*, not an identity to act as.
+
+Add global `--json` for machine-readable stdout.
 
 | Command | What it does |
 |---|---|
@@ -602,7 +607,7 @@ subscribers and no events (a fresh inbox) is listed just as honestly as a busy o
 counts, it does not `read`):
 
 ```bash
-mailbox status --session my-session
+mailbox status
 ```
 
 ```text
@@ -639,17 +644,19 @@ status line reads one scalar rather than downloading the topic list to measure
 it:
 
 ```bash
-mailbox status --session "$MAILBOX_SESSION_ID" --json | jq .subscription_count
+mailbox status --json | jq .subscription_count
 ```
 
-Claude Code hands a status-line command the session id on stdin, which is the id
-to ask about:
+Claude Code hands a status-line command the session id on stdin. Pass it through the
+env var the CLI reads, so the line is about that session whether or not Claude Code
+exported it into the status-line process:
 
 ```bash
 #!/usr/bin/env bash
 # ~/.claude/statusline.sh — "📬 3" when this session is on 3 topics.
 session=$(jq -r .session_id)
-count=$(mailbox status --session "$session" --json 2>/dev/null | jq -r '.subscription_count // empty')
+count=$(CLAUDE_CODE_SESSION_ID="$session" mailbox status --json 2>/dev/null \
+  | jq -r '.subscription_count // empty')
 [ -n "$count" ] && printf '📬 %s' "$count"
 ```
 

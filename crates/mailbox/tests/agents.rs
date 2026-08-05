@@ -34,7 +34,7 @@ fn arm_idle(env: &Env, session: &str) {
 
 /// `mailbox agents --json` as seen by `caller`.
 fn agents(env: &Env, caller: &str) -> Vec<Value> {
-    let out = env.run_ok(&["--json", "agents", "--session", caller], "agents");
+    let out = env.run_as_ok(caller, &["--json", "agents"], "agents");
     let value: Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("agents json");
     value["agents"].as_array().cloned().unwrap_or_default()
@@ -67,8 +67,9 @@ fn round_trip_two_idle_agents_wake_each_other() {
     arm_idle(&env, b);
 
     // --- A → B ---------------------------------------------------------------
-    env.run_ok(
-        &["send", b, "--text", "please review PR 42", "--session", a],
+    env.run_as_ok(
+        a,
+        &["send", b, "--text", "please review PR 42"],
         "send a->b",
     );
 
@@ -100,10 +101,7 @@ fn round_trip_two_idle_agents_wake_each_other() {
     assert_eq!(events[0]["body"]["text"], "please review PR 42");
 
     // --- B → A (the reply) ----------------------------------------------------
-    env.run_ok(
-        &["send", a, "--text", "done, approved", "--session", b],
-        "send b->a",
-    );
+    env.run_as_ok(b, &["send", a, "--text", "done, approved"], "send b->a");
 
     poll_until("A's sentinel names its inbox", SETTLE, || {
         env.sentinel_topics(a)
@@ -136,7 +134,7 @@ fn send_to_an_unregistered_agent_fails_loudly_and_publishes_nothing() {
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    let out = env.run(&["send", "s-ghost", "--text", "hello?", "--session", "s-a"]);
+    let out = env.run_as("s-a", &["send", "s-ghost", "--text", "hello?"]);
     assert!(
         !out.status.success(),
         "sending to an unregistered agent must exit non-zero"
@@ -195,12 +193,13 @@ fn send_to_a_session_without_an_inbox_still_fails() {
     guard.track_daemon(daemon.pid());
 
     // A session that subscribed to something, but never armed (so never registered).
-    env.run_ok(
-        &["subscribe", "some.other.topic", "--session", "s-hookless"],
+    env.run_as_ok(
+        "s-hookless",
+        &["subscribe", "some.other.topic"],
         "subscribe",
     );
 
-    let out = env.run(&["send", "s-hookless", "--text", "hi", "--session", "s-a"]);
+    let out = env.run_as("s-a", &["send", "s-hookless", "--text", "hi"]);
     assert!(
         !out.status.success(),
         "a session with no INBOX is not addressable, even though it has subscriptions"
@@ -226,10 +225,7 @@ fn generic_publish_to_an_inbox_topic_is_rejected() {
 
     let b = "s-b";
     // B registers its inbox (a subscribe to its own inbox IS registration).
-    env.run_ok(
-        &["subscribe", &format!("agent.{b}"), "--session", b],
-        "register",
-    );
+    env.run_as_ok(b, &["subscribe", &format!("agent.{b}")], "register");
 
     // A forged publish straight into B's inbox is refused, non-zero, and points at
     // the sanctioned path.
@@ -256,7 +252,7 @@ fn generic_publish_to_an_inbox_topic_is_rejected() {
     );
 
     // The sanctioned path is unaffected: a peer `send` still delivers.
-    env.run_ok(&["send", b, "--text", "legit", "--session", "s-a"], "send");
+    env.run_as_ok("s-a", &["send", b, "--text", "legit"], "send");
     assert_eq!(
         env.unread_total(b),
         1,
@@ -324,16 +320,13 @@ fn an_explicit_subscribe_by_a_resumed_session_within_guard_delivers() {
     let b = "s-resumed";
     let topic = "team.updates";
     // B subscribes explicitly, then its session ends (tombstone written).
-    env.run_ok(&["subscribe", topic, "--session", b], "subscribe");
+    env.run_as_ok(b, &["subscribe", topic], "subscribe");
     let _ = env.cleanup(b);
 
     // Within the guard window the resumed session re-subscribes explicitly. It must
     // NOT be refused (that is the whole bug): an explicit subscribe is a live-turn
     // action, never the doomed post-teardown arm.
-    let out = env.run_ok(
-        &["subscribe", topic, "--session", b],
-        "explicit re-subscribe",
-    );
+    let out = env.run_as_ok(b, &["subscribe", topic], "explicit re-subscribe");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         !text.contains("refused"),
@@ -432,7 +425,7 @@ fn agents_reports_registration_liveness_and_self() {
     assert_eq!(row_b["live"], true, "B's agent process is running");
 
     // human: names both agents, their inbox topics, and marks the caller.
-    let out = env.run_ok(&["agents", "--session", a], "agents (human)");
+    let out = env.run_as_ok(a, &["agents"], "agents (human)");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("2 agent(s):"), "{text}");
     assert!(text.contains(&format!("inbox=agent.{a}")), "{text}");
@@ -474,14 +467,11 @@ fn topics_reports_counts_and_filters_by_prefix() {
     let (a, b) = ("s-a", "s-b");
     // Register two inboxes WITHOUT arming (subscribe is what registration is).
     for s in [a, b] {
-        env.run_ok(
-            &["subscribe", &format!("agent.{s}"), "--session", s],
-            "register inbox",
-        );
+        env.run_as_ok(s, &["subscribe", &format!("agent.{s}")], "register inbox");
     }
-    env.run_ok(&["subscribe", "team.ci", "--session", a], "subscribe");
-    env.run_ok(&["send", b, "--text", "one", "--session", a], "send");
-    env.run_ok(&["send", b, "--text", "two", "--session", a], "send");
+    env.run_as_ok(a, &["subscribe", "team.ci"], "subscribe");
+    env.run_as_ok(a, &["send", b, "--text", "one"], "send");
+    env.run_as_ok(a, &["send", b, "--text", "two"], "send");
 
     let out = env.run_ok(&["--json", "topics"], "topics");
     let value: Value =
@@ -549,7 +539,7 @@ fn whoami_and_status_surface_the_inbox_topic() {
     let s = "s-me";
 
     // Before registration, `status` says plainly that peers cannot reach us.
-    let out = env.run_ok(&["status", "--session", s], "status");
+    let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains(&format!("inbox: agent.{s} (NOT registered")),
@@ -558,13 +548,13 @@ fn whoami_and_status_surface_the_inbox_topic() {
 
     arm_idle(&env, s);
 
-    let out = env.run_ok(&["--json", "whoami", "--session", s], "whoami");
+    let out = env.run_as_ok(s, &["--json", "whoami"], "whoami");
     let value: Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("whoami json");
     assert_eq!(value["session"], s);
     assert_eq!(value["inbox_topic"], format!("agent.{s}"));
 
-    let out = env.run_ok(&["status", "--session", s], "status");
+    let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains(&format!("inbox: agent.{s} (registered)")),

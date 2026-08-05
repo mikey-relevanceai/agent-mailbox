@@ -117,10 +117,14 @@ impl Daemon {
     }
 
     /// Run a `mailbox` client command against this daemon and return its output.
-    fn run(&self, args: &[&str]) -> Output {
+    /// Run a one-shot `mailbox` client command **as `session`**, via the env var
+    /// Claude Code exports into every tool call. That is the only way a command
+    /// learns whose session it is — there is no `--session` flag.
+    fn run_as(&self, session: &str, args: &[&str]) -> Output {
         mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("CLAUDE_CODE_SESSION_ID", session)
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
@@ -187,7 +191,7 @@ fn parse_json(text: &str) -> serde_json::Value {
 /// Read `session`'s unread events (advancing its cursor) and return them as a
 /// JSON array. Panics on a non-`read` result.
 fn read_events(daemon: &Daemon, session: &str) -> Vec<serde_json::Value> {
-    let out = daemon.run(&["--json", "read", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "read"]);
     assert_ok(&out, "read");
     let value = parse_json(&stdout(&out));
     assert_eq!(value["result"], "read", "expected a read result: {value}");
@@ -224,7 +228,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::process::Exit
 
 /// The single watch's state string from `status`, or `None` if there is no watch.
 fn watch_state(daemon: &Daemon, session: &str) -> Option<String> {
-    let out = daemon.run(&["--json", "status", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&out, "status");
     let value = parse_json(&stdout(&out));
     let watches = value["watches"].as_array()?;
@@ -241,15 +245,7 @@ fn ac09_1_watch_stub_events_appear_in_read_then_unwatch_stops() {
 
     // Full path: CLI watch → serve → supervisor → resolver → spawn stub.
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "stub",
-            "demo",
-            "--interval-ms",
-            "150",
-            "--session",
-            session,
-        ]),
+        &daemon.run_as(session, &["watch", "stub", "demo", "--interval-ms", "150"]),
         "watch stub",
     );
 
@@ -273,7 +269,7 @@ fn ac09_1_watch_stub_events_appear_in_read_then_unwatch_stops() {
     // Unwatch (last interest gone) → the supervisor tears the adapter down and
     // the watch reaches `stopped` (no zombie poller).
     assert_ok(
-        &daemon.run(&["unwatch", "stub", "demo", "--session", session]),
+        &daemon.run_as(session, &["unwatch", "stub", "demo"]),
         "unwatch stub",
     );
     poll_until("stub watch stopped", Duration::from_secs(10), || {
@@ -289,15 +285,10 @@ fn ac09_2_delivery_cursor_advances_across_reads() {
     let session = "s-cursor";
 
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "stub",
-            "cursor",
-            "--interval-ms",
-            "120",
-            "--session",
+        &daemon.run_as(
             session,
-        ]),
+            &["watch", "stub", "cursor", "--interval-ms", "120"],
+        ),
         "watch stub cursor",
     );
 
@@ -346,7 +337,7 @@ fn ac09_2_two_subscribers_independent_cursors() {
     // adapter had begun would baseline the late subscriber past early events.)
     for session in ["a", "b"] {
         assert_ok(
-            &daemon.run(&["subscribe", "stub.fanout", "--session", session]),
+            &daemon.run_as(session, &["subscribe", "stub.fanout"]),
             "subscribe to stub.fanout",
         );
     }
@@ -354,15 +345,10 @@ fn ac09_2_two_subscribers_independent_cursors() {
     // A THIRD session's watch starts the one shared adapter publishing to
     // stub.fanout (one entity, one process).
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "stub",
-            "fanout",
-            "--interval-ms",
-            "120",
-            "--session",
+        &daemon.run_as(
             "starter",
-        ]),
+            &["watch", "stub", "fanout", "--interval-ms", "120"],
+        ),
         "watch stub fanout",
     );
 
@@ -425,15 +411,7 @@ fn ac09_2_a_stub_publish_wakes_the_subscribed_session() {
     // Watching subscribes the session; the stub then publishes on its interval,
     // and each publish makes the daemon write this session's sentinel.
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "stub",
-            "wake",
-            "--interval-ms",
-            "120",
-            "--session",
-            session,
-        ]),
+        &daemon.run_as(session, &["watch", "stub", "wake", "--interval-ms", "120"]),
         "watch stub wake",
     );
 

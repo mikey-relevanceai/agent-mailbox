@@ -52,11 +52,11 @@ demo workdir: /var/folders/.../mailbox-demo.wFPR9y
 daemon up (pid 47854), socket at /var/folders/.../mailbox-demo.wFPR9y/mailbox.sock
 
 == 1. four-verb core: subscribe, publish, read ==
-$ mailbox subscribe demo.hello --session demo-session
+$ mailbox subscribe demo.hello
 subscribed to demo.hello (new, empty topic (no baseline))
 $ mailbox publish demo.hello --body '{"msg":"first"}'
 published event evt-1 at offset 0
-$ mailbox read --session demo-session
+$ mailbox read
 1 unread event(s):
   [demo.hello] offset=0 id=evt-1 body={"msg":"first"}
 
@@ -73,14 +73,14 @@ running the FileChanged hook, as Claude Code would on that change ...
 wake hook exit code: 2   (2 = wake this session)
 wake reminder (stderr, payload-free):
     mail on topic demo.hello
-$ mailbox read --session demo-session
+$ mailbox read
 1 unread event(s):
   [demo.hello] offset=1 id=evt-2 body={"msg":"wake up"}
 
 == 3. supervised adapter: watch stub, see it running, read its edges ==
-$ mailbox watch stub demo --interval-ms 500 --session demo-session
+$ mailbox watch stub demo --interval-ms 500
 watching stub.demo (interest=1, subscription: new, empty topic (no baseline))
-$ mailbox status --session demo-session
+$ mailbox status
 session: demo-session
 inbox: agent.demo-session (registered)
 watches:
@@ -91,16 +91,16 @@ subscriptions (3):
   stub.demo
 unread:
   [stub.demo] 3
-$ mailbox read --session demo-session --limit 5
+$ mailbox read --limit 5
 3 unread event(s):
   [stub.demo] offset=0 id=evt-3 body={"seq":0,"source":"stub"}
   [stub.demo] offset=1 id=evt-4 body={"seq":1,"source":"stub"}
   [stub.demo] offset=2 id=evt-5 body={"seq":2,"source":"stub"}
 
 == 4. unwatch -> the supervisor stops the adapter (no zombie poller) ==
-$ mailbox unwatch stub demo --session demo-session
+$ mailbox unwatch stub demo
 unwatched stub.demo (remaining interest=0)
-$ mailbox status --session demo-session
+$ mailbox status
 session: demo-session
 inbox: agent.demo-session (registered)
 watches:
@@ -145,26 +145,26 @@ local stack can stand in for.
    mailbox serve
    ```
 
-2. **In a Claude Code session**, have the agent watch the PR. With the hooks
-   installed the session id comes from Claude Code; from a shell you pass it
-   explicitly:
+2. **In a Claude Code session**, have the agent watch the PR. The session id comes
+   from `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command it runs;
+   from a plain shell, set it yourself (`CLAUDE_CODE_SESSION_ID=<id> mailbox …`):
 
    ```bash
-   mailbox watch github-pr OWNER/REPO#N --interval 60 --session "$MAILBOX_SESSION_ID"
+   mailbox watch github-pr OWNER/REPO#N --interval 60
    ```
 
    `status` should now show the watch `running` with a child pid:
 
    ```bash
-   mailbox status --session "$MAILBOX_SESSION_ID"
+   mailbox status
    #   github-pr REPO#N  state=running interest=1 interval=60s child=pid <...>
    ```
 
    The adapter **baselines on its first poll** — it publishes nothing for state
    that already exists, only for *transitions* after it starts watching.
 
-3. **Let the session go idle.** The `Stop` hook arms a waiter. Do not run any
-   arm command — that is the whole point.
+3. **Let the session go idle.** The hooks keep it armed. Do not run any arm
+   command — that is the whole point.
 
 4. **Trigger an edge** on the PR (any one of these):
    - **Merge** — merge the PR, so GitHub flips its state to `MERGED` (the edge
@@ -177,11 +177,11 @@ local stack can stand in for.
      checks).
 
 5. **Watch the idle session wake.** Within ~one poll interval the adapter
-   publishes the edge, the bridge kicks the waiter, and Claude Code surfaces a
+   publishes the edge, the daemon bumps the session's sentinel, and Claude Code surfaces a
    system reminder (`mail on topic github.pr.OWNER/REPO#N`). The agent then:
 
    ```bash
-   mailbox read --session "$MAILBOX_SESSION_ID"
+   mailbox read
    #   1 unread event(s):
    #     [github.pr.OWNER/REPO#N] offset=… id=… body={"source":"github-pr","edge":"mergeable_conflicting","repo":"OWNER/REPO","pr":N}
    ```
@@ -197,7 +197,7 @@ local stack can stand in for.
 6. **Done — clean up:**
 
    ```bash
-   mailbox unwatch github-pr OWNER/REPO#N --session "$MAILBOX_SESSION_ID"
+   mailbox unwatch github-pr OWNER/REPO#N
    ```
 
    or just end the session — `SessionEnd` drops the interest and stops the poller

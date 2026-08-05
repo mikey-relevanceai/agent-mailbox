@@ -239,9 +239,12 @@ No `ipc-arm.sh` step.
   and cards 09/10 landed the real adapters — `serve`'s `DefaultResolver` now
   spawns the `stub` and `github-pr` pollers, so a live watch reads `running` with
   a child pid.
-- ~~How Claude session identity is named for interest rows.~~ **Settled (card
-  06):** the `SessionId` comes from `--session <id>`, falling back to the
-  `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).
+- ~~How Claude session identity is named for interest rows.~~ **Settled:** the
+  `SessionId` comes from `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into
+  every tool call, and nowhere else. (The `--session` flag and the
+  `MAILBOX_SESSION_ID` fallback this originally named are both gone — nothing acted
+  as another session, and the flag mostly let agents bind a phantom empty one.) The
+  harness hooks are separate: each reads `session_id` from its own stdin payload.
 - **Deferred (post-MVP):** whether peer agent→agent messaging ships in the same
   slice as GitHub watch. The MVP demo is GitHub PR watching; peer messaging is
   already expressible as plain publish/subscribe on a shared topic (the bus does

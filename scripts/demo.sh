@@ -55,6 +55,12 @@ export MAILBOX_SENTINEL_ROOT="${WORK_DIR}/sentinel"
 export RUST_LOG="${RUST_LOG:-error}"
 
 SESSION="demo-session"
+# The session every client command below runs as. There is no `--session` flag:
+# a command learns whose session it is from `$CLAUDE_CODE_SESSION_ID`, which Claude
+# Code exports into every tool call — so exporting it here is exactly the shape an
+# agent's own shell has. (`serve` and the harness hooks ignore it: the daemon has no
+# session, and a hook reads `session_id` from its payload on stdin.)
+export CLAUDE_CODE_SESSION_ID="${SESSION}"
 SERVE_PID=""
 
 cleanup() {
@@ -95,9 +101,9 @@ echo "daemon up (pid ${SERVE_PID}), socket at ${SOCK}"
 # --- 1. the four-verb loop, by hand -------------------------------------------
 # subscribe -> publish (stands in for an adapter) -> read.
 step "1. four-verb core: subscribe, publish, read"
-run "${MAILBOX} subscribe demo.hello --session ${SESSION}"
+run "${MAILBOX} subscribe demo.hello"
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"first\"}'"
-run "${MAILBOX} read --session ${SESSION}"
+run "${MAILBOX} read"
 
 # --- 2. wake an IDLE session ---------------------------------------------------
 # This is the load-bearing mechanic, and it is exactly what Claude Code does. The
@@ -139,24 +145,24 @@ if [[ "${WAKE_RC}" -ne 2 ]]; then
   echo "error: expected the wake hook to exit 2, got ${WAKE_RC}" >&2
   exit 1
 fi
-run "${MAILBOX} read --session ${SESSION}"
+run "${MAILBOX} read"
 
 # --- 3. a bridge-SUPERVISED adapter (no agent-owned poller) -------------------
 # `watch stub` records interest, subscribes the session, and the daemon spawns
 # the stub adapter, which publishes a synthetic edge every --interval-ms. The
 # agent NEVER launches this loop itself.
 step "3. supervised adapter: watch stub, see it running, read its edges"
-run "${MAILBOX} watch stub demo --interval-ms 500 --session ${SESSION}"
+run "${MAILBOX} watch stub demo --interval-ms 500"
 sleep 1.2   # let the supervisor spawn the adapter and it publish a couple edges
-run "${MAILBOX} status --session ${SESSION}"
-run "${MAILBOX} read --session ${SESSION} --limit 5"
+run "${MAILBOX} status"
+run "${MAILBOX} read --limit 5"
 
 # --- 4. teardown: no zombie pollers -------------------------------------------
 # Dropping the last interest stops the adapter. `status` shows no running child.
 step "4. unwatch -> the supervisor stops the adapter (no zombie poller)"
-run "${MAILBOX} unwatch stub demo --session ${SESSION}"
+run "${MAILBOX} unwatch stub demo"
 sleep 0.5
-run "${MAILBOX} status --session ${SESSION}"
+run "${MAILBOX} status"
 
 echo
 echo "OK — subscribe/read, idle-wake, supervised watch, and teardown all worked."

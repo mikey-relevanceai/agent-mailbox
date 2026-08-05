@@ -95,13 +95,13 @@ pub enum Command {
     /// Drop interest in a watch.
     Unwatch(UnwatchArgs),
     /// Show watches (interest + child pid) and this session's unread counts.
-    Status(SessionOpt),
+    Status,
     /// Print this session's own id and inbox topic. Needs no bridge.
-    Whoami(SessionOpt),
+    Whoami,
     /// Message a peer agent: publish to its inbox, stamped with your session id.
     Send(SendArgs),
     /// List the agents with a registered inbox (who you can `send` to).
-    Agents(SessionOpt),
+    Agents,
     /// List known topics with their subscriber and event counts.
     Topics(TopicsArgs),
     /// Actively prove which sessions can be woken right now, by bumping each
@@ -112,94 +112,42 @@ pub enum Command {
     Harness(HarnessArgs),
 }
 
-/// Env var the harness hooks export for a session (card 11).
-const ENV_MAILBOX_SESSION: &str = "MAILBOX_SESSION_ID";
-/// Env var **Claude Code itself** exports into every tool invocation. It carries
-/// the same id the hooks receive on stdin, so it is the fallback that lets an
-/// agent learn its own identity with nothing installed but the binary (card 16).
+/// The env var **Claude Code exports into every tool invocation**, carrying the id of
+/// the session that ran the command. It is the SINGLE source of a session's own
+/// identity, so an agent learns who it is with nothing installed but the binary, and
+/// there is exactly one answer to "who am I" rather than a precedence order.
+///
+/// There used to be a `--session` flag and a `MAILBOX_SESSION_ID` fallback ahead of
+/// this. Nothing in production set either: the harness hooks read `session_id` from
+/// the hook payload on stdin, adapters have no session at all, and no command acts
+/// *as* another session. What the flag did do is let an agent break itself — the skill
+/// carried a whole section warning against `--session "$MAILBOX_SESSION_ID"`, which in
+/// an agent's shell expands to `--session ""` and bound a phantom empty session.
+///
+/// `mailbox doctor --session <id>` survives and is a different thing: it names another
+/// session to PROBE, not an identity to act as.
 const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 
-/// The session identity every session-scoped command needs. Parsed ONCE here at
-/// the clap edge into a branded [`SessionId`] (parse, don't validate), so the
-/// handlers never re-mint it from a bare `String`.
+/// Resolve the calling session's own id from the environment, branding it into a
+/// [`SessionId`] once here at the edge (parse, don't validate), or fail with a message
+/// naming where it looked.
 ///
-/// Resolution order: `--session` > `MAILBOX_SESSION_ID` > `CLAUDE_CODE_SESSION_ID`
-/// (see [`resolve_session`]). The env fallbacks are read here rather than through
-/// clap's `env =` because clap supports only ONE env var per argument, and the
-/// precedence between the two is a rule we want stated (and tested) explicitly.
-#[derive(Args, Debug)]
-pub struct SessionOpt {
-    /// This session's id. Defaults to `$MAILBOX_SESSION_ID`, else
-    /// `$CLAUDE_CODE_SESSION_ID` (which Claude Code exports into every tool call).
-    #[arg(long, value_parser = parse_session)]
-    pub session: Option<SessionId>,
+/// An empty or whitespace-only value names no session, so it is treated as absent
+/// rather than binding a phantom session id.
+fn resolve_session() -> anyhow::Result<SessionId> {
+    session_from_env_value(&std::env::var(ENV_CLAUDE_SESSION).unwrap_or_default()).context(
+        "no session id: this command must run inside a Claude Code session, which sets \
+         CLAUDE_CODE_SESSION_ID. To run it by hand, set that variable yourself \
+         (CLAUDE_CODE_SESSION_ID=<id> mailbox ...)",
+    )
 }
 
-impl SessionOpt {
-    /// Resolve the session from the flag and the environment, or fail with an
-    /// actionable message naming every place we looked.
-    pub fn resolve(&self) -> anyhow::Result<SessionId> {
-        resolve_session(
-            self.session.clone(),
-            env_session(ENV_MAILBOX_SESSION),
-            env_session(ENV_CLAUDE_SESSION),
-        )
-    }
-}
-
-/// A non-empty environment variable, trimmed of surrounding whitespace. An empty
-/// or whitespace-only value names no session, so it is treated as absent rather
-/// than resolving to a phantom session id.
-fn env_session(key: &str) -> Option<String> {
-    let value = std::env::var(key).ok()?;
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// The user-facing diagnostic for an ignored empty `--session`. A real stderr line
-/// (see [`resolve_session`]), not a filtered log event.
-const EMPTY_SESSION_WARNING: &str = "mailbox: warning: ignoring an empty --session (it names no session); \
-     falling back to MAILBOX_SESSION_ID / CLAUDE_CODE_SESSION_ID — omit the flag instead";
-
-/// The session-resolution rule, as a pure function of its three inputs so the
-/// precedence is unit-testable without touching process env.
-fn resolve_session(
-    flag: Option<SessionId>,
-    mailbox_env: Option<String>,
-    claude_env: Option<String>,
-) -> anyhow::Result<SessionId> {
-    // An empty/whitespace `--session` is treated as absent, not as a real (empty)
-    // session id, so it falls through to the env fallbacks. This is the common
-    // trap: `--session "$MAILBOX_SESSION_ID"` with that var unset expands to
-    // `--session ""`, and an explicit flag wins the precedence — so without this
-    // it would bind a phantom empty session instead of resolving via
-    // `CLAUDE_CODE_SESSION_ID`. (The env sources are already emptiness-filtered by
-    // `env_session`.)
-    let flag = flag.and_then(|s| {
-        let trimmed = s.as_str().trim();
-        if trimmed.is_empty() {
-            // Never silent: the caller believes they named a session and did not, so
-            // whichever session we DO bind is not the one they typed. (This is the
-            // `--session "$MAILBOX_SESSION_ID"` trap.)
-            //
-            // A DIRECT stderr line, not a `tracing` event: at the default filter
-            // (ERROR) a `warn!` was swallowed for exactly the commands where the trap
-            // bites — `mailbox publish --session ""` printed nothing at all — so the
-            // one diagnostic that names the trap never reached the agent that walked
-            // into it. It is also duplicated into `tracing` so it lands in harness.log
-            // for `wait`/`arm`, whose stderr goes elsewhere.
-            eprintln!("{EMPTY_SESSION_WARNING}");
-            warn!("{EMPTY_SESSION_WARNING}");
-            return None;
-        }
-        Some(SessionId::new(trimmed))
-    });
-    flag.or_else(|| mailbox_env.map(SessionId::new))
-        .or_else(|| claude_env.map(SessionId::new))
-        .context(
-            "no session id: pass --session <id>, or set MAILBOX_SESSION_ID \
-             (the harness hooks do) or CLAUDE_CODE_SESSION_ID (Claude Code does)",
-        )
+/// The identity rule itself, as a pure function of the raw env value so it is
+/// unit-testable without mutating process env. An empty or whitespace-only value
+/// names NO session — it must never bind a phantom empty session id.
+fn session_from_env_value(raw: &str) -> Option<SessionId> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| SessionId::new(trimmed))
 }
 
 /// Wrap a raw session label into a [`SessionId`]. Infallible — the harness owns
@@ -294,8 +242,6 @@ pub struct PublishArgs {
 pub struct TopicArgs {
     /// Topic to (un)subscribe.
     pub topic: String,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 /// Arguments to `send`: who to message, and what to say.
@@ -314,8 +260,6 @@ pub struct SendArgs {
     /// A JSON **object** body (stored verbatim; the bridge only adds `from`).
     #[arg(long)]
     pub body: Option<String>,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -343,8 +287,6 @@ pub struct ReadArgs {
     /// Maximum events per topic to return (bridge default if omitted).
     #[arg(long)]
     pub limit: Option<u32>,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -369,8 +311,6 @@ pub struct GithubPrWatchArgs {
     /// Poll interval in seconds (the supervised adapter's poll cadence).
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -383,8 +323,6 @@ pub struct StubWatchArgs {
     /// How many events to publish; `0` (the default) means publish forever.
     #[arg(long, default_value_t = 0)]
     pub count: u64,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -405,16 +343,12 @@ pub enum UnwatchTargetCmd {
 pub struct GithubPrUnwatchArgs {
     /// PR reference: `owner/repo#number`.
     pub spec: String,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
 pub struct StubUnwatchArgs {
     /// Stub label previously passed to `watch stub`.
     pub label: String,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 /// Run an async command (everything except `wait`). Returns the process exit code on
@@ -430,10 +364,10 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitC
         Command::Read(args) => run_read(format, args).await,
         Command::Watch(args) => run_watch(format, args).await,
         Command::Unwatch(args) => run_unwatch(format, args).await,
-        Command::Status(args) => run_status(format, args).await,
-        Command::Whoami(args) => run_whoami(format, args),
+        Command::Status => run_status(format).await,
+        Command::Whoami => run_whoami(format),
         Command::Send(args) => run_send(format, args).await,
-        Command::Agents(args) => run_agents(format, args).await,
+        Command::Agents => run_agents(format).await,
         Command::Topics(args) => run_topics(format, args).await,
         // `doctor` is dispatched synchronously by `main` (it is socket-free and
         // read-only) and never reaches here.
@@ -472,7 +406,7 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
     request(
         format,
         Request::Subscribe {
-            session: resolve_session_or_fail(format, &args.session)?,
+            session: resolve_session_or_fail(format)?,
             topic,
             // An explicit `mailbox subscribe` from a live turn: unguarded, and it
             // clears any tombstone (proof-of-life, ADR-0007). Only the automatic
@@ -488,7 +422,7 @@ async fn run_unsubscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Resul
     request(
         format,
         Request::Unsubscribe {
-            session: resolve_session_or_fail(format, &args.session)?,
+            session: resolve_session_or_fail(format)?,
             topic,
         },
     )
@@ -499,7 +433,7 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCo
     request(
         format,
         Request::Read {
-            session: resolve_session_or_fail(format, &args.session)?,
+            session: resolve_session_or_fail(format)?,
             limit: args.limit,
         },
     )
@@ -509,8 +443,8 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCo
 /// `whoami`: this session's id and its inbox topic — the address a peer uses to
 /// `send` to it. Deliberately NOT a socket call: identity does not depend on the
 /// bridge, so an agent can always answer "who am I" even when the daemon is down.
-fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
-    let session = resolve_session_or_fail(format, &args)?;
+fn run_whoami(format: OutputFormat) -> anyhow::Result<ExitCode> {
+    let session = resolve_session_or_fail(format)?;
     let inbox = inbox_topic(&session)
         .with_context(|| format!("session {:?} cannot form an inbox topic", session.as_str()))?;
 
@@ -530,7 +464,7 @@ fn run_whoami(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode
 /// `{"from": "<sender>", ...}` — see [`mailbox::agents`] for the convention and
 /// for why an unregistered target is a hard error rather than a silent publish.
 async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCode> {
-    let from = resolve_session_or_fail(format, &args.session)?;
+    let from = resolve_session_or_fail(format)?;
     let to = parse_send_target(&args.target)?;
     let body = send_body(args.text, args.body)?;
     request(format, Request::Send { from, to, body }).await
@@ -589,11 +523,11 @@ fn parse_send_target(raw: &str) -> anyhow::Result<SessionId> {
     }
 }
 
-async fn run_agents(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
+async fn run_agents(format: OutputFormat) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Agents {
-            session: resolve_session_or_fail(format, &args)?,
+            session: resolve_session_or_fail(format)?,
         },
     )
     .await
@@ -612,12 +546,12 @@ async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<Ex
 async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<ExitCode> {
     let req = match args.target {
         WatchTargetCmd::GithubPr(gh) => Request::Watch {
-            session: resolve_session_or_fail(format, &gh.session)?,
+            session: resolve_session_or_fail(format)?,
             target: parse_pr_spec(&gh.spec)?,
             interval_secs: gh.interval,
         },
         WatchTargetCmd::Stub(stub) => Request::WatchStub {
-            session: resolve_session_or_fail(format, &stub.session)?,
+            session: resolve_session_or_fail(format)?,
             // Validate the label at the edge (same as the daemon) so a bad label
             // is a clean local error, not a round-trip.
             label: parse_stub_label(&stub.label)?,
@@ -631,22 +565,22 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<Exit
 async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<ExitCode> {
     let req = match args.target {
         UnwatchTargetCmd::GithubPr(gh) => Request::Unwatch {
-            session: resolve_session_or_fail(format, &gh.session)?,
+            session: resolve_session_or_fail(format)?,
             target: parse_pr_spec(&gh.spec)?,
         },
         UnwatchTargetCmd::Stub(stub) => Request::UnwatchStub {
-            session: resolve_session_or_fail(format, &stub.session)?,
+            session: resolve_session_or_fail(format)?,
             label: parse_stub_label(&stub.label)?,
         },
     };
     request(format, req).await
 }
 
-async fn run_status(format: OutputFormat, args: SessionOpt) -> anyhow::Result<ExitCode> {
+async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
     request(
         format,
         Request::Status {
-            session: resolve_session_or_fail(format, &args)?,
+            session: resolve_session_or_fail(format)?,
         },
     )
     .await
@@ -706,13 +640,8 @@ fn fail(format: OutputFormat, message: &str) -> anyhow::Error {
 /// `mailbox --json <cmd>` printed nothing on stdout and only a plain-text stderr
 /// line. Exits non-zero (via the returned `Err` → `ExitCode::FAILURE`), never
 /// exit 2 — a resolution failure is an error, not a wake.
-fn resolve_session_or_fail(
-    format: OutputFormat,
-    session: &SessionOpt,
-) -> anyhow::Result<SessionId> {
-    session
-        .resolve()
-        .map_err(|err| fail(format, &format!("{err:#}")))
+fn resolve_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
+    resolve_session().map_err(|err| fail(format, &format!("{err:#}")))
 }
 
 /// A short "what was being attempted" label for a failed request, for the stderr
@@ -1619,10 +1548,10 @@ pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
     // UNMEASURED — which reads as "no fault found" to anyone skimming. An agent
     // auditing its own fleet is therefore structurally blind to its own deafness, and
     // that blind spot has to be stated rather than left for the reader to deduce.
-    if let Some(caller) =
-        env_session(ENV_MAILBOX_SESSION).or_else(|| env_session(ENV_CLAUDE_SESSION))
-        && report.sessions.iter().any(|r| r.session.as_str() == caller)
+    if let Ok(caller) = resolve_session()
+        && report.sessions.iter().any(|r| r.session == caller)
     {
+        let caller = caller.as_str();
         eprintln!(
             "warning: {caller} is the session running this command, so it is busy for the \
              whole probe and cannot be measured here. Probe it from another session (or a \
@@ -2068,64 +1997,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_flag_beats_both_env_vars() {
-        let resolved = resolve_session(
-            Some(SessionId::new("from-flag")),
-            Some("from-mailbox-env".to_string()),
-            Some("from-claude-env".to_string()),
-        )
-        .unwrap();
-        assert_eq!(resolved, SessionId::new("from-flag"));
+    fn a_session_id_comes_from_the_env_value_verbatim_but_trimmed() {
+        assert_eq!(
+            session_from_env_value("from-claude-env"),
+            Some(SessionId::new("from-claude-env"))
+        );
+        // Trimmed for the same reason the value is validated at all: a shell can
+        // hand us a trailing newline, and that is the same session.
+        assert_eq!(
+            session_from_env_value("  real  "),
+            Some(SessionId::new("real"))
+        );
     }
 
+    /// An empty `$CLAUDE_CODE_SESSION_ID` names NO session, so it must fail loudly
+    /// rather than bind an anonymous empty one. This was the sharp edge of the old
+    /// `--session` flag: `--session "$MAILBOX_SESSION_ID"` (which the skill had to warn
+    /// agents away from) expanded to `--session ""` in an agent's shell and, being an
+    /// explicit flag, won the precedence — binding a phantom session the agent then
+    /// could not be woken on.
     #[test]
-    fn mailbox_env_beats_claude_env() {
-        // The harness hooks set MAILBOX_SESSION_ID deliberately; Claude Code's own
-        // CLAUDE_CODE_SESSION_ID is the LAST resort, so it must not win.
-        let resolved = resolve_session(
-            None,
-            Some("from-mailbox-env".to_string()),
-            Some("from-claude-env".to_string()),
-        )
-        .unwrap();
-        assert_eq!(resolved, SessionId::new("from-mailbox-env"));
-    }
-
-    #[test]
-    fn claude_env_is_the_last_fallback() {
-        let resolved = resolve_session(None, None, Some("from-claude-env".to_string())).unwrap();
-        assert_eq!(resolved, SessionId::new("from-claude-env"));
-    }
-
-    #[test]
-    fn empty_session_flag_falls_back_to_env_not_a_phantom_session() {
-        // The trap: `--session "$MAILBOX_SESSION_ID"` with that var unset expands to
-        // `--session ""`. An empty flag must be treated as absent and fall through
-        // to CLAUDE_CODE_SESSION_ID, NOT bind an anonymous empty session.
-        let resolved = resolve_session(
-            Some(SessionId::new("")),
-            None,
-            Some("from-claude-env".to_string()),
-        )
-        .unwrap();
-        assert_eq!(resolved, SessionId::new("from-claude-env"));
-
-        // Whitespace-only is treated the same, and a kept flag is trimmed for
-        // consistency with the env sources.
-        let whitespace = resolve_session(Some(SessionId::new("   ")), None, None).unwrap_err();
-        assert!(format!("{whitespace}").contains("no session id"));
-        let trimmed = resolve_session(Some(SessionId::new("  real  ")), None, None).unwrap();
-        assert_eq!(trimmed, SessionId::new("real"));
-    }
-
-    #[test]
-    fn no_session_anywhere_is_an_actionable_error() {
-        let err = resolve_session(None, None, None).unwrap_err();
-        let message = format!("{err}");
-        // The error must name every place we looked, or the agent cannot fix it.
-        assert!(message.contains("--session"), "{message}");
-        assert!(message.contains("MAILBOX_SESSION_ID"), "{message}");
-        assert!(message.contains("CLAUDE_CODE_SESSION_ID"), "{message}");
+    fn an_empty_or_blank_session_env_value_names_nobody() {
+        assert_eq!(session_from_env_value(""), None);
+        assert_eq!(session_from_env_value("   "), None);
+        assert_eq!(session_from_env_value("\n"), None);
     }
 
     #[test]

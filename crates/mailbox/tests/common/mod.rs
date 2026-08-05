@@ -56,15 +56,14 @@ pub fn mailbox_bin() -> &'static str {
 /// A `mailbox` command with the AMBIENT session environment stripped.
 ///
 /// `cargo test` inherits the developer's environment, and inside a Claude Code
-/// session that includes `CLAUDE_CODE_SESSION_ID` — which `mailbox` legitimately
-/// resolves as the caller's session (that is the point of auto-resolution, and
-/// `publish` now uses it). A test that did not strip it would run its commands as
+/// session that includes `CLAUDE_CODE_SESSION_ID` — the one place `mailbox` reads a
+/// session's identity from. A test that did not strip it would run its commands as
 /// the DEVELOPER's session and behave differently on a laptop than in CI. So every
-/// test subprocess starts with NO session unless the test names one itself.
+/// test subprocess starts with NO session unless the test names one itself (via
+/// [`Env::run_as`], which sets that variable).
 pub fn mailbox_command() -> Command {
     let mut cmd = Command::new(mailbox_bin());
-    cmd.env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("MAILBOX_SESSION_ID");
+    cmd.env_remove("CLAUDE_CODE_SESSION_ID");
     cmd
 }
 
@@ -303,9 +302,9 @@ impl Env {
     /// Run a one-shot `mailbox` client command **as `session`**, via the env var
     /// Claude Code itself exports into every tool call.
     ///
-    /// This is the AGENT's real path: an agent passes no `--session`, and the CLI
-    /// resolves it from `$CLAUDE_CODE_SESSION_ID`. Tests that want to prove the
-    /// auto-resolution (rather than the explicit `--session` override) drive it here.
+    /// This is the ONLY way to name a session: there is no `--session` flag, and this
+    /// is the agent's real path (Claude Code sets the variable, the agent passes
+    /// nothing).
     pub fn run_as(&self, session: &str, args: &[&str]) -> Output {
         mailbox_command()
             .args(args)
@@ -483,7 +482,7 @@ impl Env {
     // ---- status / read projections ------------------------------------------
 
     fn status(&self, session: &str) -> Value {
-        let out = self.run_ok(&["--json", "status", "--session", session], "status");
+        let out = self.run_as_ok(session, &["--json", "status"], "status");
         parse_json(&String::from_utf8_lossy(&out.stdout))
     }
 
@@ -517,7 +516,7 @@ impl Env {
 
     /// Read a session's unread events (advancing its cursor) as a JSON array.
     pub fn read_events(&self, session: &str) -> Vec<Value> {
-        let out = self.run_ok(&["--json", "read", "--session", session], "read");
+        let out = self.run_as_ok(session, &["--json", "read"], "read");
         let value = parse_json(&String::from_utf8_lossy(&out.stdout));
         value["events"].as_array().cloned().unwrap_or_default()
     }

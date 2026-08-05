@@ -82,16 +82,9 @@ fn scenario_1_conflict_review_ci_each_publish_exactly_once() {
 
     let s = "s1";
     let spec = env.pr_spec(1);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -135,10 +128,7 @@ fn scenario_1_conflict_review_ci_each_publish_exactly_once() {
     );
 
     // Teardown: the last interest leaves → the poller is torn down (no zombie).
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped after unwatch", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -161,16 +151,9 @@ fn scenario_1b_merge_surfaces_exactly_once() {
 
     let s = "s1";
     let spec = env.pr_spec(1);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -201,10 +184,7 @@ fn scenario_1b_merge_surfaces_exactly_once() {
         "a merged PR re-fires nothing — the merge edge is terminal end to end"
     );
 
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped after unwatch", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -227,28 +207,14 @@ fn scenario_2_two_sessions_share_one_child_with_independent_cursors() {
 
     let spec = env.pr_spec(2);
     let topic = env.pr_topic(2);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "a",
-        ],
+    env.run_as_ok(
+        "a",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch a",
     );
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "b",
-        ],
+    env.run_as_ok(
+        "b",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch b",
     );
 
@@ -290,14 +256,8 @@ fn scenario_2_two_sessions_share_one_child_with_independent_cursors() {
     );
 
     // Teardown: both leave → the shared child is torn down.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "a"],
-        "unwatch a",
-    );
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "b"],
-        "unwatch b",
-    );
+    env.run_as_ok("a", &["unwatch", "github-pr", &spec], "unwatch a");
+    env.run_as_ok("b", &["unwatch", "github-pr", &spec], "unwatch b");
     poll_until("shared child reaped after last interest", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -319,37 +279,20 @@ fn scenario_3_first_session_leaves_child_survives_second_still_woken() {
 
     let spec = env.pr_spec(3);
     let topic = env.pr_topic(3);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "a",
-        ],
+    env.run_as_ok(
+        "a",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch a",
     );
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "b",
-        ],
+    env.run_as_ok(
+        "b",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch b",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid("a"));
 
     // First session leaves: the child MUST keep running for the second.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "a"],
-        "unwatch a",
-    );
+    env.run_as_ok("a", &["unwatch", "github-pr", &spec], "unwatch a");
     let (state, interest) = poll_until("interest drops to 1", SETTLE, || {
         env.watch_state_interest("b")
     });
@@ -375,10 +318,7 @@ fn scenario_3_first_session_leaves_child_survives_second_still_woken() {
     );
 
     // Last session leaves → child gone.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "b"],
-        "unwatch b",
-    );
+    env.run_as_ok("b", &["unwatch", "github-pr", &spec], "unwatch b");
     poll_until("child reaped once the last interest leaves", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -404,16 +344,9 @@ fn scenario_4_last_session_leaves_child_gone_and_no_further_api_calls() {
 
     let s = "solo";
     let spec = env.pr_spec(4);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -423,10 +356,7 @@ fn scenario_4_last_session_leaves_child_gone_and_no_further_api_calls() {
     });
 
     // Last interest gone → child torn down, watch stopped.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("child reaped", SETTLE, || (!pid_alive(pid)).then_some(()));
     poll_until("watch stopped", SETTLE, || {
         (env.watch_state_interest(s)?.0 == "stopped").then_some(())
@@ -460,16 +390,9 @@ fn scenario_5_kill_adapter_restarts_once_then_stays_stopped() {
 
     let s = "s5";
     let spec = env.pr_spec(5);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid1 = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -503,10 +426,7 @@ fn scenario_5_kill_adapter_restarts_once_then_stays_stopped() {
     }
 
     // Interest 0 → reaped and stays stopped.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("restarted adapter reaped on last interest", SETTLE, || {
         (!pid_alive(pid2)).then_some(())
     });
@@ -538,16 +458,9 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
 
     let s = "s6";
     let spec = env.pr_spec(6);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid1 = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -613,16 +526,9 @@ fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     guard.track_daemon(daemon.pid());
 
     let s = "waker";
-    env.run_ok(
-        &[
-            "watch",
-            "stub",
-            "wake",
-            "--interval-ms",
-            "150",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "stub", "wake", "--interval-ms", "150"],
         "watch stub",
     );
 
@@ -633,7 +539,7 @@ fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     assert_woken_for(&env, s, "stub.wake");
 
     // Teardown: stop the poller + drop the session (SessionEnd), leaving nothing.
-    env.run_ok(&["unwatch", "stub", "wake", "--session", s], "unwatch stub");
+    env.run_as_ok(s, &["unwatch", "stub", "wake"], "unwatch stub");
     let _ = env.cleanup(s);
     guard.assert_clean();
 }
@@ -650,7 +556,7 @@ fn wake_many_publishes_coalesce_to_one_wake() {
 
     let s = "coalesce";
     let topic = "t.coalesce";
-    env.run_ok(&["subscribe", topic, "--session", s], "subscribe");
+    env.run_as_ok(s, &["subscribe", topic], "subscribe");
 
     arm(&env, s);
     assert!(
@@ -694,16 +600,9 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
 
     let s = "midturn";
     let spec = env.pr_spec(7);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -733,10 +632,7 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
     );
 
     // Teardown.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped", SETTLE, || (!pid_alive(pid)).then_some(()));
     let _ = env.cleanup(s);
     guard.assert_clean();

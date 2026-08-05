@@ -26,9 +26,10 @@
 //!
 //! Claude Code passes each hook its payload as JSON on stdin, including
 //! `session_id`. [`hook::HookInput::parse`] reads it into a branded
-//! [`mailbox_protocol::SessionId`]; the binary exports it to the CLI as
-//! `--session` / `MAILBOX_SESSION_ID`. That settles the previously-open "how does
-//! a session name itself" question.
+//! [`mailbox_protocol::SessionId`], and the hook handler uses that directly. A hook
+//! therefore never depends on the environment for identity, which is why the CLI's
+//! `--session` flag could be deleted without touching this crate: a *client* command
+//! resolves itself from `$CLAUDE_CODE_SESSION_ID`, a *hook* is told who it is.
 
 pub mod atomic;
 pub mod home;

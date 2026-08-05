@@ -111,10 +111,14 @@ impl Daemon {
     }
 
     /// Run a `mailbox` client command against this daemon and return its output.
-    fn run(&self, args: &[&str]) -> Output {
+    /// Run a one-shot `mailbox` client command **as `session`**, via the env var
+    /// Claude Code exports into every tool call. That is the only way a command
+    /// learns whose session it is — there is no `--session` flag.
+    fn run_as(&self, session: &str, args: &[&str]) -> Output {
         mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("CLAUDE_CODE_SESSION_ID", session)
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
@@ -205,7 +209,7 @@ fn wait_within(child: &mut Child, timeout: Duration) -> Option<std::process::Exi
 
 /// The single watch's state string + interest from `status`, or `None`.
 fn watch_state_interest(daemon: &Daemon, session: &str) -> Option<(String, u64)> {
-    let out = daemon.run(&["--json", "status", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&out, "status");
     let value = parse_json(&stdout(&out));
     let watch = value["watches"].as_array()?.first()?.clone();
@@ -216,7 +220,7 @@ fn watch_state_interest(daemon: &Daemon, session: &str) -> Option<(String, u64)>
 }
 
 fn subscriptions(daemon: &Daemon, session: &str) -> Vec<String> {
-    let out = daemon.run(&["--json", "status", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&out, "status");
     let value = parse_json(&stdout(&out));
     value["subscriptions"]
@@ -310,15 +314,10 @@ fn ac3_cleanup_drops_watch_interest_to_zero() {
     let session = "s3b";
     // A watch attaches this session's refcounted interest and spawns the stub.
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "stub",
-            "demo",
-            "--interval-ms",
-            "60000",
-            "--session",
+        &daemon.run_as(
             session,
-        ]),
+            &["watch", "stub", "demo", "--interval-ms", "60000"],
+        ),
         "watch stub",
     );
     poll_until("watch has interest 1", Duration::from_secs(10), || {

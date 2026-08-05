@@ -31,11 +31,11 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 | You used to… | Now run… |
 |---|---|
 | `ipc-arm.sh` (background, re-run after each turn) | *nothing* — install the hooks once (`mailbox harness install-hooks`, which merges into `~/.claude/settings.json`) |
-| Start `gh-watch.sh OWNER/REPO N` in the background | `mailbox watch github-pr OWNER/REPO#N --session <id>` |
-| Read the NDJSON inbox / react to a kick | `mailbox read --session <id>` |
-| `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N --session <id>` (or just end the session) |
-| Check what you're watching | `mailbox status --session <id>` |
-| Send a peer-agent message (`agent-ipc`) | Publish/subscribe on a shared topic: `mailbox publish <topic>` / `mailbox subscribe <topic> --session <id>` (peer chat is topics too; the MVP demo is GitHub PRs) |
+| Start `gh-watch.sh OWNER/REPO N` in the background | `mailbox watch github-pr OWNER/REPO#N` |
+| Read the NDJSON inbox / react to a kick | `mailbox read` |
+| `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N` (or just end the session) |
+| Check what you're watching | `mailbox status` |
+| Send a peer-agent message (`agent-ipc`) | Publish/subscribe on a shared topic: `mailbox publish <topic>` / `mailbox subscribe <topic>` (peer chat is topics too; the MVP demo is GitHub PRs) |
 
 The four-verb loop — **subscribe → read → react → unsubscribe** — is documented
 in full in [04-usage.md § The four-verb agent loop](04-usage.md#3-the-four-verb-agent-loop).

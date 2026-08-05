@@ -36,18 +36,11 @@ read the two hard rules below.
 Violating either rule recreates the exact failure the mailbox was built to kill:
 zombie pollers and lost wakes.
 
-## Your session identity is automatic — do NOT pass `--session`
+## Your session identity is automatic
 
-`mailbox` figures out which session you are on its own, from the
-`$CLAUDE_CODE_SESSION_ID` that Claude Code sets for every command you run. So the
-commands below take **no `--session` flag** — just run them.
-
-> **Do not write `--session "$MAILBOX_SESSION_ID"`.** That variable is usually
-> **empty** in your shell (only the hooks set it), so it expands to `--session ""`
-> and binds a phantom empty session instead of you. Omit the flag and let `mailbox` resolve you correctly.
-
-Run `mailbox whoami` any time to confirm who you are. Pass `--session <id>` only
-when you deliberately want to act as a *different* session.
+`mailbox` knows which session you are, from the `$CLAUDE_CODE_SESSION_ID` that Claude
+Code sets for every command you run. There is **no `--session` flag** — just run the
+commands below. Run `mailbox whoami` any time to confirm who you are.
 
 ## Prerequisites (assume already set up; do not do these yourself)
 
@@ -187,7 +180,7 @@ Notes that matter:
 
 ## Quick reference
 
-Session identity is automatic — none of these take `--session`.
+Session identity is automatic; none of these take a session argument.
 
 | Verb | Command |
 |---|---|

@@ -65,8 +65,8 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
     let topic = "team.standup";
     let publisher = "s-pub";
     let peer = "s-peer";
-    env.run_ok(&["subscribe", topic, "--session", publisher], "sub pub");
-    env.run_ok(&["subscribe", topic, "--session", peer], "sub peer");
+    env.run_as_ok(publisher, &["subscribe", topic], "sub pub");
+    env.run_as_ok(peer, &["subscribe", topic], "sub peer");
 
     arm(&env, publisher);
     arm(&env, peer);
@@ -120,7 +120,7 @@ fn unread_mail_on_a_topic_never_blocks_publishing_to_it() {
 
     let topic = "team.plan";
     let agent = "s-behind";
-    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    env.run_as_ok(agent, &["subscribe", topic], "subscribe");
 
     // Someone else publishes. The agent is now behind on the topic.
     env.publish(topic);
@@ -159,7 +159,7 @@ fn a_publish_wakes_a_subscriber_that_is_already_far_behind() {
 
     let topic = "github.pr.o/r#7";
     let agent = "s-watcher";
-    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    env.run_as_ok(agent, &["subscribe", topic], "subscribe");
 
     env.publish(topic);
     env.publish(topic);
@@ -185,7 +185,7 @@ fn a_publish_either_succeeds_or_fails_because_the_bridge_is_down() {
 
     let topic = "team.codes";
     let agent = "s-codes";
-    env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
+    env.run_as_ok(agent, &["subscribe", topic], "subscribe");
     env.publish(topic); // the agent is behind — once grounds for a refusal.
 
     let out = env.run_as(agent, &["publish", topic]);

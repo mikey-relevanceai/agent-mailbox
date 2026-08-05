@@ -65,11 +65,14 @@ Code — pass `--settings <path>` to create one anyway.
 Then, from an agent session:
 
 ```bash
-mailbox watch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID"  # subscribe + start the poller
+mailbox watch github-pr owner/repo#42   # subscribe + start the poller
 # ... go idle; the hooks keep you armed ...
-mailbox read --session "$MAILBOX_SESSION_ID"                           # on wake
-mailbox unwatch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID" # when done
+mailbox read                            # on wake
+mailbox unwatch github-pr owner/repo#42 # when done
 ```
+
+No session argument: each command resolves the caller from the
+`$CLAUDE_CODE_SESSION_ID` Claude Code exports into every tool call.
 
 Full walkthrough (install, hooks, the four-verb loop, `mailbox status`):
 **[docs/04-usage.md](docs/04-usage.md)**.
