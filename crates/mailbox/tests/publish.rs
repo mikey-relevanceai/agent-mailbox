@@ -22,7 +22,7 @@
 //! anywhere) is exempt from rule 1, and **`send`** — which writes to a *peer's* inbox,
 //! a topic the sender does not subscribe to — is unaffected.
 //!
-//! Every test that spawns a waiter holds a [`LeakGuard`], so a leaked process fails
+//! Every test holds a [`LeakGuard`], so a leaked adapter process fails
 //! the test loudly rather than escaping into the runner.
 
 mod common;

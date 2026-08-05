@@ -2,17 +2,16 @@
 //!
 //! Everything here runs against a live `mailbox serve` daemon in a tempdir and
 //! real `mailbox` CLI client processes, with the fake harness driver (hook JSON on
-//! `harness arm` / `cleanup`'s stdin) standing in for Claude Code — the same seams
-//! the card 11/12 suites use. No agent ever runs an arm command, and no wake is
-//! simulated: the waiters are real blocked processes and the wakes are real
-//! process exits.
+//! `harness session-start` / `wake` / `cleanup`'s stdin) standing in for Claude
+//! Code — the same seams the card 11/12 suites use. No agent ever runs an arm
+//! command, and no wake is simulated: the sentinels are written by the real daemon
+//! and the wake decisions are real hook exits.
 //!
-//! The headline is [`round_trip_two_idle_agents_wake_each_other`]: two registered
-//! sessions, both idle on genuine waiters, message each other with no human in the
-//! loop.
+//! The headline is [`round_trip_two_idle_agents_wake_each_other`]: two registered,
+//! armed sessions message each other with no human in the loop.
 //!
-//! Every test scopes a [`LeakGuard`] to its own daemon subtree + waiters dir, so a
-//! leaked waiter fails the test loudly rather than escaping into the runner.
+//! Every test scopes a [`LeakGuard`] to its own daemon subtree, so a leaked adapter
+//! fails the test loudly rather than escaping into the runner.
 
 mod common;
 
@@ -50,9 +49,9 @@ fn agent_row(env: &Env, caller: &str, session: &str) -> Option<Value> {
 
 // ==== the headline: two idle agents poke each other, no human in the loop =======
 
-/// A and B are both registered and idle on REAL blocked waiters. A sends to B: B's
-/// waiter exits 2 with the payload-free reminder naming B's inbox topic; B reads
-/// the message and sees `from: A`; B replies; A's waiter wakes the same way.
+/// A and B are both registered and armed. A sends to B: the daemon writes B's
+/// sentinel with B's inbox topic (and nothing else — payload-free), B's wake hook
+/// exits 2, B reads the message and sees `from: A`; B replies; A wakes the same way.
 #[test]
 fn round_trip_two_idle_agents_wake_each_other() {
     let env = Env::new();
@@ -62,7 +61,7 @@ fn round_trip_two_idle_agents_wake_each_other() {
 
     let (a, b) = ("s-alice", "s-bob");
 
-    // Both sessions go idle. The hooks register each inbox and arm each waiter —
+    // Both sessions go idle. The hooks register each inbox and arm each sentinel —
     // the agents run nothing themselves.
     arm_idle(&env, a);
     arm_idle(&env, b);
@@ -73,8 +72,8 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "send a->b",
     );
 
-    // B's watcher bumps B's sentinel, naming only the topic — that file IS the
-    // wake wire now, so it is where payload-freeness has to hold.
+    // The daemon writes B's sentinel, naming only the topic — that file IS the wake
+    // wire, so it is where payload-freeness has to hold.
     let topics = poll_until("B's sentinel names its inbox", SETTLE, || {
         let topics = env.sentinel_topics(b);
         topics
@@ -287,7 +286,7 @@ fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
     arm_idle(&env, b);
     assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
 
-    // SessionEnd reaps the waiter, drops the subscription, and tombstones the id.
+    // SessionEnd removes the sentinel, drops the subscription, and tombstones the id.
     let _ = env.cleanup(b);
     assert!(
         agent_row(&env, "s-a", b).is_none(),

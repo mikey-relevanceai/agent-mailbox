@@ -10,23 +10,23 @@
 //!
 //! The guarantees proven end to end (the invariants in design/01 + AGENTS.md):
 //! - **No zombie pollers** — every scenario holds a [`LeakGuard`] that FAILS the
-//!   test if any adapter / waiter / serve process survives teardown (ac-12-3).
+//!   test if any adapter / serve process survives teardown (ac-12-3).
 //! - **Edge-triggered exactly-once** — scenario 1 asserts each transition
 //!   publishes exactly once across many polls.
 //! - **Independent per-subscriber cursors** — scenario 2 asserts two sessions
 //!   each read the same edge from their own cursor.
-//! - **Payload-free harness wake** — the wake-path tests wake an armed waiter and
+//! - **Payload-free harness wake** — the wake-path tests wake an armed session and
 //!   coalesce a publish storm into a single wake (ac-12-2).
 //!
 //! Unit-level proofs of the same machinery live in their own cards' suites
-//! (`supervision.rs` at the library boundary, `wake.rs` for the FIFO channel,
+//! (`supervision.rs` at the library boundary, `filechanged_wake.rs` for the wake path,
 //! `adapter_e2e.rs` at the adapter boundary); this suite deliberately does NOT
 //! re-derive them — it proves they compose through the shipped binaries. Shared
 //! harness lives in `tests/common/` so nothing is copy-pasted.
 //!
 //! Flakiness discipline: bounded polled deadlines (never a fixed sleep waiting for
 //! a state — the two fixed waits assert a *negative*, i.e. that nothing happens),
-//! a tempdir + scoped socket/db/waiters per test, and every child reaped on drop.
+//! a tempdir + scoped socket/db/sentinel root per test, and every child reaped on drop.
 
 mod common;
 
@@ -598,16 +598,15 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
     guard.assert_clean();
 }
 
-// ===== Wake path — the fake harness driver wakes an idle waiter (ac-12-2) ======
+// ===== Wake path — a supervised adapter's publish wakes an idle session (ac-12-2) ==
 
-/// A REAL supervised adapter's publish wakes an armed idle waiter: `watch stub`
-/// subscribes the session and starts the stub poller; the fake harness driver
-/// (`harness arm` fed hook JSON) launches the waiter; the stub's next publish
-/// kicks it → exit 2 with the payload-free topic reminder on stderr. This is the
-/// full watch → adapter → bridge → harness-wake chain the other suites don't drive
-/// end to end.
+/// A REAL supervised adapter's publish wakes an armed idle session: `watch stub`
+/// subscribes the session and starts the stub poller; `session-start` arms the
+/// sentinel; the stub's next publish makes the daemon write it → the wake hook exits
+/// 2 with the payload-free topic reminder on stderr. This is the full watch →
+/// adapter → bridge → harness-wake chain the other suites don't drive end to end.
 #[test]
-fn wake_supervised_adapter_publish_wakes_armed_waiter() {
+fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
@@ -639,7 +638,7 @@ fn wake_supervised_adapter_publish_wakes_armed_waiter() {
     guard.assert_clean();
 }
 
-/// Coalescing: a storm of publishes while a single waiter is armed produces ONE
+/// Coalescing: a storm of publishes against a single armed session produces ONE
 /// wake, and a later `read` still returns EVERY event (the wake advanced no
 /// cursor). Driven through the real CLI + the fake harness driver.
 #[test]
@@ -659,7 +658,7 @@ fn wake_many_publishes_coalesce_to_one_wake() {
         "nothing is pending before any publish"
     );
 
-    // Ten rapid publishes → the single armed waiter wakes exactly once.
+    // Ten rapid publishes → the armed session wakes exactly once.
     for _ in 0..10 {
         env.publish(topic);
     }
@@ -678,10 +677,10 @@ fn wake_many_publishes_coalesce_to_one_wake() {
 }
 
 /// Mid-turn surfacing through the COMPOSED path: a SUPERVISED adapter's edge that
-/// lands while NO waiter is armed (the agent is mid-turn) is not lost. The
+/// lands while the agent is mid-turn is not lost. The
 /// github-pr poller fires exactly one conflict edge; we confirm it is unread
 /// WITHOUT reading it (via `status`, which does not advance the cursor); then the
-/// next `harness arm`'s fresh waiter sees the still-unread edge and wakes (exit 2),
+/// next wake-hook run sees the still-unread edge and wakes (exit 2),
 /// delivered exactly once. Unlike a bare-`publish` version (which would duplicate
 /// `harness.rs`'s AC2), this proves the full watch → supervised adapter → bridge →
 /// next-arm composition.
@@ -709,8 +708,8 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
 
-    // The supervised poller fires its one conflict edge mid-turn (no waiter armed).
-    // Confirm it is unread WITHOUT reading it, so it stays pending for the waiter.
+    // The supervised poller fires its one conflict edge mid-turn. Confirm it is
+    // unread WITHOUT reading it, so it stays pending for the wake hook.
     poll_until("the supervised edge lands unread", SETTLE, || {
         (env.unread_total(s) >= 1).then_some(())
     });

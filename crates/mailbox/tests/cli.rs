@@ -65,6 +65,16 @@ fn spawn_serve(db_path: &Path, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = mailbox_command();
     cmd.arg("serve")
         .env("AGENT_MAILBOX_DB", db_path)
+        // The daemon writes each subscriber's wake sentinel, so it MUST be pointed
+        // at a tempdir — without this a test writes into the developer's real
+        // ~/.mailbox. Derived from the DB path so it follows every caller.
+        .env(
+            "MAILBOX_SENTINEL_ROOT",
+            db_path
+                .parent()
+                .expect("db path has a parent")
+                .join("sentinel"),
+        )
         .env("RUST_LOG", "error")
         .stdin(Stdio::null());
     for (k, v) in extra_env {
@@ -609,6 +619,7 @@ fn second_serve_on_same_db_fails_loudly() {
     let second = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()
@@ -687,6 +698,7 @@ fn hardening_failure_is_fatal() {
     let output = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()
@@ -884,7 +896,7 @@ fn human_publish_output_is_readable() {
 /// have come from. Card 16 moved this off clap's `env =` (which supports only one
 /// variable) into an explicit three-way resolution, so it is a runtime error
 /// rather than a clap usage error — and deliberately NOT exit 2, which is
-/// reserved for the waiter's wake signal.
+/// reserved for the wake hook's exit-2 signal.
 #[test]
 fn missing_session_everywhere_is_an_actionable_error() {
     let output = mailbox_command()

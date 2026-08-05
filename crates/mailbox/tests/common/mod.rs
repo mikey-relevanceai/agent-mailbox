@@ -159,8 +159,8 @@ pub const PR_MERGED: &str = r#"{"state":"MERGED","mergeable":"UNKNOWN","statusCh
 
 // ---- the test environment (tempdir + fake gh, survives a daemon restart) -------
 
-/// A self-contained test environment: an isolated tempdir DB + socket + waiters
-/// dir, plus the fake `gh` and its fixture dir. Owns everything a scenario needs
+/// A self-contained test environment: an isolated tempdir DB + socket + sentinel
+/// root, plus the fake `gh` and its fixture dir. Owns everything a scenario needs
 /// EXCEPT the daemon process, so a scenario can stop one daemon and start another
 /// on the SAME db (the bridge-restart scenario) without losing its fixtures.
 pub struct Env {
@@ -524,7 +524,7 @@ impl Env {
 
     /// The session's total unread count from `status`. Unlike [`Env::read_events`]
     /// this does NOT advance the cursor, so a test can confirm an edge landed while
-    /// still leaving it unread for a later waiter to wake on.
+    /// still leaving it unread for a later wake to fire on.
     pub fn unread_total(&self, session: &str) -> u64 {
         let value = self.status(session);
         value["unread"]

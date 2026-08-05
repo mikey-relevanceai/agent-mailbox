@@ -1,37 +1,23 @@
 //! Claude Code harness integration tests (card 11), driving the REAL `mailbox`
 //! binary end to end WITHOUT a live Claude Code.
 //!
-//! **Scope note (ADR-0008).** A fresh `install-hooks` no longer installs the
-//! ADR-0006 `arm`/`Stop`-re-arm wake path — the on-demand detached watcher +
-//! `FileChanged` wake is the live default, and its end-to-end tests live in
-//! `tests/filechanged_wake.rs`. This file now covers the **retained manual `arm`
-//! primitive** (`mailbox harness arm` / `mailbox wait`, still tested but no longer
-//! wired into the snippet) plus the `install-hooks`/`cleanup` behaviour shared by
-//! both. The snippet assertions here therefore also pin the ADR-0008 hook set
-//! (`session-start` / `ensure-watcher` / `wake` / `cleanup`).
+//! **Scope.** The wake path's own end-to-end tests live in
+//! `tests/filechanged_wake.rs`. What is left here is the SETUP half: the
+//! `install-hooks` / `install-skills` commands, and the `cleanup` and
+//! `session-start` behaviours that must hold with the bridge down. The snippet
+//! assertions pin the current hook set (`session-start` / `turn-end` /
+//! `turn-start` / `wake` / `cleanup`).
 //!
-//! Each test simulates the hook environment: it feeds the hook payload JSON on
-//! `mailbox harness arm` / `cleanup`'s stdin (exactly as Claude Code would) and
-//! runs everything against a real `mailbox serve` daemon in a tempdir. No agent
-//! ever runs an arm command — the hook launches the waiter, and (in the retained
-//! `arm` primitive) the waiter's exit-2 is what drives the next re-arm.
+//! The `install-hooks` tests are the ones with teeth: a settings file the merge
+//! cannot read, cannot parse, or reaches through a symlink must come back INTACT,
+//! because the alternative — silently replacing a user's model, permissions and key
+//! helper with a hooks-only document — was a real bug.
 //!
-//! Covered (the four acceptance criteria):
-//! - **AC1**: an idle *subscribed* session wakes (exit 2) on a publish, with no
-//!   agent-run arm. (Card 16 replaced the "not-subscribed arms nothing" half: arm
-//!   now registers the session's agent inbox first, so a live session always has a
-//!   subscription and always arms — the fail-safes are unchanged.)
-//! - **AC2**: a publish that lands while no waiter is armed surfaces on the NEXT
-//!   arm (the delivery cursor keeps it unread until read).
-//! - **AC3**: `cleanup` reaps the waiter (pid gone, process dead) AND drops the
-//!   session's interests/subscriptions (interest count 0).
-//! - **AC4** (rewritten for ADR-0006): every crossing of the waiter's max-block is a
-//!   **wake** (exit 2) carrying the benign re-arm notice — never a silent death — so
-//!   an idle session is never left armed by nobody; and a publish across that
-//!   boundary still wakes it. This is the regression test for the wake-lifetime bug:
-//!   the waiter used to re-exec itself at the boundary, which did NOT reset the hook
-//!   timeout, so the harness killed it — and an idle session fires no further `Stop`
-//!   to re-arm it.
+//! Each test simulates the hook environment: it feeds the hook payload JSON on the
+//! handler's stdin (exactly as Claude Code would) and runs everything against a real
+//! `mailbox serve` daemon in a tempdir. Every test that resolves a home or a sentinel
+//! root redirects both at a tempdir, so a run can never touch the developer's real
+//! `~/.claude` or `~/.mailbox`.
 //!
 //! Flakiness discipline (mirrors `tests/stub_e2e.rs`): poll for readiness with
 //! bounded deadlines rather than fixed sleeps; reap every child on drop.
@@ -106,6 +92,10 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
+            // The daemon writes each subscriber's wake sentinel, so it MUST be
+            // pointed at a tempdir — without this a test writes into the
+            // developer's real ~/.mailbox.
+            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
             .env("RUST_LOG", "error")
             .stdin(Stdio::null())

@@ -96,6 +96,10 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
+            // The daemon writes each subscriber's wake sentinel, so it MUST be
+            // pointed at a tempdir — without this a test writes into the
+            // developer's real ~/.mailbox.
+            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
             // The env override that makes `serve`'s stub resolver run the freshly
             // built binary instead of relying on it being installed on PATH.
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
@@ -122,17 +126,33 @@ impl Daemon {
             .expect("run mailbox client")
     }
 
-    /// Spawn a `mailbox wait --session <session>` child (does NOT block the test).
-    fn spawn_wait(&self, session: &str) -> Child {
-        mailbox_command()
-            .args(["wait", "--session", session])
+    /// The tempdir sentinel root this daemon writes wake sentinels under.
+    fn sentinel_root(&self) -> PathBuf {
+        self._dir.path().join("sentinel")
+    }
+
+    /// Run the `FileChanged` wake hook for `session`, feeding it the hook JSON on
+    /// stdin exactly as Claude Code would. Exit 2 = wake (stderr carries the
+    /// payload-free reminder), 0 = no wake.
+    fn wake_hook(&self, session: &str) -> Output {
+        let mut child = mailbox_command()
+            .args(["harness", "wake"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("RUST_LOG", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn mailbox wait")
+            .expect("spawn mailbox harness wake");
+        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"FileChanged"}}"#);
+        child
+            .stdin
+            .take()
+            .expect("wake stdin")
+            .write_all(payload.as_bytes())
+            .expect("write payload");
+        child.wait_with_output().expect("wake output")
     }
 }
 
@@ -386,15 +406,24 @@ fn ac09_2_two_subscribers_independent_cursors() {
     );
 }
 
-// ==== ac-09-2 #3: wake fires — `mailbox wait` exits 2 when the stub publishes ===
+// ==== ac-09-2 #3: wake fires — a supervised adapter's publish wakes the session ==
 
+/// A SUPERVISED adapter's publish drives the whole wake wire, not just the durable
+/// log: the daemon writes the session's sentinel with the stub's topic, and the
+/// `FileChanged` hook run against that state exits 2.
+///
+/// This test used to spawn `mailbox wait` and assert exit 2. `mailbox wait` was
+/// deleted with the ADR-0006 re-arm loop, so clap was rejecting an unknown
+/// subcommand — with exit code 2, which is also the wake code. It had been passing
+/// for entirely the wrong reason ever since. Driving the real hooks is what the
+/// assertion was always meant to mean.
 #[test]
-fn ac09_2_wait_wakes_with_exit_2_on_stub_publish() {
+fn ac09_2_a_stub_publish_wakes_the_subscribed_session() {
     let daemon = Daemon::start();
     let session = "s-wait";
 
     // Watching subscribes the session; the stub then publishes on its interval,
-    // and each publish fires the wake kick.
+    // and each publish makes the daemon write this session's sentinel.
     assert_ok(
         &daemon.run(&[
             "watch",
@@ -408,14 +437,34 @@ fn ac09_2_wait_wakes_with_exit_2_on_stub_publish() {
         "watch stub wake",
     );
 
-    // `mailbox wait` blocks on the wake channel and exits 2 ("you have mail") when
-    // the stub's publish kicks it — the asyncRewake contract, no agent re-arm.
-    let mut waiter = daemon.spawn_wait(session);
-    let exit = wait_with_timeout(&mut waiter, Duration::from_secs(10));
+    let sentinel = daemon
+        .sentinel_root()
+        .join("by-agent")
+        .join(session)
+        .join(".mailbox-wake");
+    poll_until(
+        "the daemon bumps the session's sentinel",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(&sentinel)
+                .ok()
+                .filter(|body| body.contains("stub.wake"))
+                .map(|_| ())
+        },
+    );
+
+    // ...and that state is a real wake: the FileChanged hook exits 2.
+    let wake = daemon.wake_hook(session);
     assert_eq!(
-        exit.code(),
+        wake.status.code(),
         Some(2),
-        "mailbox wait must exit 2 when the stub delivers mail"
+        "a supervised adapter's publish must wake the subscribed session; stderr: {}",
+        stderr(&wake)
+    );
+    assert!(
+        stderr(&wake).contains("mail on topic stub.wake"),
+        "the reminder names the topic (payload-free): {}",
+        stderr(&wake)
     );
 }
 

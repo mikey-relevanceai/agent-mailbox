@@ -3,14 +3,14 @@
 //! `SessionId` lives here — not in the bridge's storage layer — because two
 //! crates need the *same* branded type and the *same* filesystem encoding:
 //!
-//! - the bridge (`mailbox`) keys subscriptions, interests, and wake FIFOs by it;
-//! - the harness (`mailbox-harness`) reads it from the Claude Code hook payload
-//!   and writes a per-session waiter pidfile beside that FIFO.
+//! - the bridge (`mailbox`) keys subscriptions, interests, and the per-session
+//!   wake sentinel directory by it;
+//! - the harness (`mailbox-harness`) reads it from the Claude Code hook payload.
 //!
-//! The pidfile and the FIFO/lock MUST map a session id to the same filename stem,
-//! or a session's files scatter and the coordination in the wake loop breaks. A
-//! single shared [`SessionId::encode_filename`] guarantees they agree by
-//! construction (there is no second copy of the rule to drift).
+//! Every writer of a session's files MUST map an id to the same filename stem, or
+//! the daemon and the hooks address different directories and the session is
+//! silently unwakeable. A single shared [`SessionId::encode_filename`] guarantees
+//! they agree by construction (there is no second copy of the rule to drift).
 
 use serde::{Deserialize, Serialize};
 
@@ -41,9 +41,10 @@ impl SessionId {
 
     /// Encode this session id into a filesystem-safe, collision-free file stem.
     ///
-    /// The one authoritative rule shared by the wake FIFO/lock (`mailbox::wake`)
-    /// and the waiter pidfile (`mailbox-harness`): a session's files must key
-    /// identically or the wake loop's coordination breaks.
+    /// The one authoritative rule shared by everything that names a session on
+    /// disk — today the wake sentinel directory (`mailbox::sentinel`), written by
+    /// the daemon and read by every hook. They must key identically, or the daemon
+    /// bumps a file nobody is watching.
     ///
     /// Crucially the safe set excludes UPPERCASE ASCII letters: macOS's default
     /// APFS is case-INSENSITIVE, so `aB` and `Ab` would otherwise map to the same
