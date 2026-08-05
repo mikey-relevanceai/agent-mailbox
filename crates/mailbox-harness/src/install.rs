@@ -1,31 +1,31 @@
 //! Emitting (and merging) the Claude Code `settings.json` hooks snippet.
 //!
-//! `install-hooks` wires the ADR-0008 on-demand wake loop with four hooks and NO
-//! periodic re-arm WAKE (the `Stop` hook is a plain exit-0 liveness poke, never a wake):
+//! `install-hooks` wires the on-demand wake loop with five hooks. Exactly ONE of
+//! them can ever wake the session (`FileChanged`); the rest are plain exit-0 hooks:
 //!
 //! - `SessionStart` (matcher `""` — all sources) runs `mailbox harness session-start`,
-//!   a plain synchronous hook: it registers the inbox, prints the `watchPaths`
-//!   registering this session's sentinel, and spawns the detached watcher. It fires on
-//!   `startup` AND on `resume`/`clear`/`compact`, so a resumed session (a fresh process)
-//!   re-establishes all three — the gap ADR-0013 closes.
-//! - `Stop` (matcher `""`) runs `mailbox harness ensure-watcher`, a plain synchronous
-//!   hook (NEVER asyncRewake): the pessimistic Stop-liveness net — respawn the detached
-//!   watcher iff it is dead, and re-register the inbox (best-effort). It NEVER exits 2
-//!   (never wakes) — it exits 1 only on a config/stdin error and 0 otherwise — so it is
-//!   the primary recovery for a died watcher without ever costing a model turn.
+//!   a plain synchronous hook: it registers the inbox, ARMS this session's wake
+//!   sentinel, and prints the `watchPaths` registering it. It fires on `startup` AND on
+//!   `resume`/`clear`/`compact`, so a resumed session (a fresh process) re-establishes
+//!   all three — the gap ADR-0013 closes.
+//! - `Stop` (matcher `""`) runs `mailbox harness turn-end`, a plain synchronous hook
+//!   (NEVER asyncRewake): it closes the turn (ADR-0016), re-registers the inbox
+//!   (ADR-0013), and re-bumps the sentinel for mail that arrived while the session was
+//!   busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a config/stdin error and 0
+//!   otherwise — so it can never cost a model turn of its own.
+//! - `UserPromptSubmit` runs `mailbox harness turn-start`: the other half of the
+//!   turn-boundary pair, so `mailbox doctor` can tell a BUSY session from a deaf one
+//!   (ADR-0016).
 //! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
-//!   as an `asyncRewake` hook with a `timeout` (seconds): when the watcher bumps the
+//!   as an `asyncRewake` hook with a `timeout` (seconds): when the daemon writes the
 //!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
-//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a re-arm
-//!   timer.
-//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): reap
-//!   the watcher, remove the sentinel, drop interests/subscriptions.
+//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a timer.
+//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): remove
+//!   the sentinel, drop interests/subscriptions.
 //!
 //! This REPLACES the ADR-0006 `SessionStart`/`Stop` → `arm` → exit-2-re-arm loop,
-//! whose every re-arm cost a full model turn on a long idle. The `arm` command
-//! itself is retained as a primitive (and its timing knobs `--max-block-ms` /
-//! `--timeout-secs` still validated by [`HookInstallSpec::validate`]), but it is no
-//! longer wired into the snippet. See `docs/01-wake-and-rearm.md`, ADR-0008.
+//! whose every re-arm cost a full model turn on a long idle. See
+//! `docs/01-wake.md`, ADR-0008 and ADR-0017.
 //!
 //! # Where the hooks go, and why that is a TYPE
 //!
@@ -120,7 +120,7 @@ pub fn settings_target(explicit: Option<PathBuf>) -> SettingsTarget {
     resolve_settings_target(explicit, harness_home().as_deref(), |path| path.exists())
 }
 
-/// How to render the hooks snippet: the binary to invoke and the two timing knobs.
+/// How to render the hooks snippet: the binary to invoke, and the hook timeout.
 #[derive(Debug, Clone)]
 pub struct HookInstallSpec {
     /// Absolute path to the `mailbox` binary the hooks invoke. Absolute so the
@@ -128,10 +128,6 @@ pub struct HookInstallSpec {
     pub mailbox_bin: String,
     /// Claude Code's per-hook kill deadline, in **seconds** (the `timeout` field).
     pub timeout_secs: u64,
-    /// The waiter's max block before it yields for a re-arm, in **milliseconds**.
-    /// MUST be below `timeout_secs` (with a margin) so the re-arm exit always
-    /// precedes the harness's kill — see [`HookInstallSpec::validate`].
-    pub max_block_ms: u64,
 }
 
 /// The async-hook `timeout` the snippet writes by default: **1 hour**, well above
@@ -145,34 +141,6 @@ pub struct HookInstallSpec {
 /// verified-safe maximum we are willing to ship; both knobs stay tunable
 /// (`--timeout-secs`, `--max-block-ms`).
 pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 3600;
-
-/// The waiter max-block the snippet writes by default: **55 minutes**, i.e. 5
-/// minutes inside [`DEFAULT_HOOK_TIMEOUT_SECS`] — so the re-arm exit always
-/// precedes the harness's kill, with room to spare.
-pub const DEFAULT_MAX_BLOCK_MS: u64 = 3_300_000;
-
-/// Claude Code's OWN default `timeout` for a command hook (**600s**), which applies
-/// whenever a hook entry omits the field.
-///
-/// This is what `arm` must assume when the hook that launched it did not tell it
-/// otherwise — and it is precisely why [`DEFAULT_MAX_BLOCK_MS`] (55m) cannot be
-/// trusted blindly at the point of use: under a 600s deadline it would have the waiter
-/// killed mid-block, and an idle session fires no further `Stop` to re-arm it. A
-/// hand-edited `settings.json`, or an arm hook written without our `timeout`, lands
-/// exactly there. See [`resolve_max_block`].
-pub const CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
-
-/// The lower bound of the safety margin between `max_block_ms` and the hook
-/// `timeout` (10s). Enough for the waiter to notice its deadline, drop its pidfile
-/// and exit.
-const MIN_TIMING_MARGIN_MS: u64 = 10_000;
-
-/// The upper bound of that margin (5 minutes). Without a cap the 10% rule would
-/// scale the margin with the timeout — at `timeout = 3600s` it would demand 6
-/// minutes of slack and reject the shipped default (`max_block = 55m`), even though
-/// the waiter needs only milliseconds to yield. The margin covers a slow exit, not
-/// a proportion of the idle.
-const MAX_TIMING_MARGIN_MS: u64 = 300_000;
 
 /// Claude Code's kill deadline for the `FileChanged` wake hook, in **seconds**.
 ///
@@ -190,143 +158,28 @@ const MAX_TIMING_MARGIN_MS: u64 = 300_000;
 /// the damage to something a human would notice rather than mistake for a fault.
 pub const WAKE_HOOK_TIMEOUT_SECS: u64 = 30;
 
-/// The install spec is invalid — the timing knobs would defeat the re-arm exit.
-#[derive(Debug, thiserror::Error)]
-pub enum InstallError {
-    /// `max_block_ms` is not safely below the async-hook timeout, so Claude Code
-    /// would kill the waiter while it was still blocked — and a truly idle session
-    /// fires no further `Stop`, so nothing would ever re-arm it. That is the exact
-    /// silent-un-arm bug the re-arm exit exists to prevent, so we refuse loudly
-    /// rather than install a config that reintroduces it.
-    #[error(
-        "max_block_ms ({max_block_ms}) must be at least {margin_ms}ms below the async-hook timeout ({timeout_secs}s = {timeout_ms}ms), else Claude Code kills the waiter while it is still blocked — and an idle session fires no further Stop, so nothing would re-arm it (the session would go silently un-armed)"
-    )]
-    MaxBlockNotBelowTimeout {
-        max_block_ms: u64,
-        timeout_secs: u64,
-        timeout_ms: u64,
-        margin_ms: u64,
-    },
-}
-
-/// The safety margin a `max_block` must leave below a hook `timeout`: 10% of the
-/// timeout, clamped to [`MIN_TIMING_MARGIN_MS`]..=[`MAX_TIMING_MARGIN_MS`].
-fn timing_margin_ms(timeout_ms: u64) -> u64 {
-    (timeout_ms / 10).clamp(MIN_TIMING_MARGIN_MS, MAX_TIMING_MARGIN_MS)
-}
-
-/// The largest `max_block_ms` that is safely below `timeout_secs` — i.e. the biggest
-/// value [`HookInstallSpec::validate`] would accept.
-///
-/// Floored at 1s: a hook `timeout` so small that no positive max-block is safe (≤10s)
-/// is a broken configuration with no good outcome, and of the two bad ones we pick the
-/// LOUD one. A tiny max-block re-arms noisily and visibly; refusing to arm at all
-/// would be silent, permanent deafness — the bug this whole design exists to prevent.
-pub fn max_safe_max_block_ms(timeout_secs: u64) -> u64 {
-    let timeout_ms = timeout_secs.saturating_mul(1000);
-    timeout_ms
-        .saturating_sub(timing_margin_ms(timeout_ms))
-        .max(1_000)
-}
-
-/// What `arm` will actually block for, given the hook `timeout` it runs under and the
-/// `max_block` it was asked for.
-///
-/// The `max_block < timeout` invariant is load-bearing (ADR-0006) and used to be
-/// checked ONLY at install time — where the value is written, not where it is used. So
-/// a hand-edited `settings.json`, or an arm hook whose entry omits `timeout` (Claude
-/// Code then applies its own 600s default, under which our 55m default max-block is
-/// lethal), silently restored the original catastrophic bug. This is the same rule,
-/// enforced at the point of use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaxBlockDecision {
-    /// The requested max-block is safely below the timeout: use it as asked.
-    AsRequested(u64),
-    /// The requested max-block would have let Claude Code kill the waiter mid-block.
-    /// CLAMPED down to the largest safe value, loudly — clamping keeps the session
-    /// armed (a waiter that yields early is harmless), whereas refusing to arm would
-    /// be the very deafness the invariant protects against.
-    Clamped {
-        requested: u64,
-        resolved: u64,
-        timeout_secs: u64,
-    },
-}
-
-impl MaxBlockDecision {
-    /// The max-block to actually pass to the waiter.
-    pub fn resolved(self) -> u64 {
-        match self {
-            MaxBlockDecision::AsRequested(ms) => ms,
-            MaxBlockDecision::Clamped { resolved, .. } => resolved,
-        }
-    }
-}
-
-/// Enforce `max_block < timeout` at the point of use (see [`MaxBlockDecision`]).
-pub fn resolve_max_block(timeout_secs: u64, requested_ms: u64) -> MaxBlockDecision {
-    let spec_ok = HookInstallSpec {
-        mailbox_bin: String::new(),
-        timeout_secs,
-        max_block_ms: requested_ms,
-    }
-    .validate()
-    .is_ok();
-    if spec_ok {
-        return MaxBlockDecision::AsRequested(requested_ms);
-    }
-    MaxBlockDecision::Clamped {
-        requested: requested_ms,
-        resolved: max_safe_max_block_ms(timeout_secs),
-        timeout_secs,
-    }
-}
-
 impl HookInstallSpec {
-    /// Reject a spec whose `max_block_ms` is not safely below the async-hook
-    /// `timeout`. The waiter must reach its max-block AND exit 2 before Claude
-    /// Code's kill deadline, so we require a margin (10% of the timeout, clamped to
-    /// [`MIN_TIMING_MARGIN_MS`]..=[`MAX_TIMING_MARGIN_MS`]).
-    ///
-    /// This is the load-bearing invariant (ADR-0006): a `max_block >= timeout`
-    /// silently reintroduces the un-armed-forever bug, so it is a hard install-time
-    /// failure and never a warning. `arm` enforces the SAME rule at the point of use
-    /// ([`resolve_max_block`]), because settings.json can also be written by hand.
-    pub fn validate(&self) -> Result<(), InstallError> {
-        let timeout_ms = self.timeout_secs.saturating_mul(1000);
-        let margin_ms = timing_margin_ms(timeout_ms);
-        if self.max_block_ms.saturating_add(margin_ms) > timeout_ms {
-            return Err(InstallError::MaxBlockNotBelowTimeout {
-                max_block_ms: self.max_block_ms,
-                timeout_secs: self.timeout_secs,
-                timeout_ms,
-                margin_ms,
-            });
-        }
-        Ok(())
-    }
-
     /// The `session-start` hook command (`<bin> harness session-start`). A
-    /// short-lived, synchronous hook (ADR-0008): it registers the inbox, prints the
-    /// `watchPaths`, and spawns the detached watcher, then exits 0. NOT asyncRewake —
-    /// it never wakes the session itself.
+    /// short-lived, synchronous hook: it registers the inbox, arms the wake sentinel,
+    /// and prints the `watchPaths`, then exits 0. NOT asyncRewake — it never wakes the
+    /// session itself.
     fn session_start_command(&self) -> String {
         format!("{} harness session-start", self.mailbox_bin)
     }
 
     /// The `wake` hook command (`<bin> harness wake`). The `FileChanged` hook
     /// (ADR-0008): it wakes the session (exit 2) only when there is genuine unread
-    /// mail, else exits 0.
+    /// mail, else exits 0. The ONLY hook that can wake anything.
     fn wake_command(&self) -> String {
         format!("{} harness wake", self.mailbox_bin)
     }
 
-    /// The `ensure-watcher` hook command (`<bin> harness ensure-watcher`). The
-    /// `Stop`-liveness hook (ADR-0008): a plain hook that respawns the detached watcher
-    /// iff it is dead and re-registers the inbox (best-effort, ADR-0013). NOT
-    /// asyncRewake — it never wakes the session.
-    fn ensure_watcher_command(&self) -> String {
-        format!("{} harness ensure-watcher", self.mailbox_bin)
+    /// The `turn-end` hook command (`<bin> harness turn-end`). The `Stop` hook: a
+    /// plain hook that closes the turn (ADR-0016), re-registers the inbox (ADR-0013)
+    /// and re-arms/re-triggers the wake sentinel (ADR-0012). NOT asyncRewake — it never
+    /// wakes the session.
+    fn turn_end_command(&self) -> String {
+        format!("{} harness turn-end", self.mailbox_bin)
     }
 
     /// The `turn-start` hook command (`<bin> harness turn-start`). The
@@ -342,28 +195,28 @@ impl HookInstallSpec {
     }
 }
 
-/// Build the `{ "hooks": { … } }` snippet for the ADR-0008 on-demand wake loop.
+/// Build the `{ "hooks": { … } }` snippet for the on-demand wake loop.
 ///
-/// Four hooks, and NO periodic re-arm WAKE (that is the whole point — it eliminates the
-/// spurious re-arm model turns of ADR-0006). The `Stop` hook is NOT a re-arm wake: it
-/// is a plain, exit-0 liveness poke.
+/// Five hooks, exactly one of which can wake the session:
 ///
 /// - `SessionStart` (matcher `""`, all sources) runs `session-start` (plain,
-///   synchronous): register the inbox, print the `watchPaths` registering this session's
-///   sentinel, spawn the detached watcher. Firing on every source (not just `startup`)
-///   is what re-establishes all three on a resume (ADR-0013).
-/// - `Stop` runs `ensure-watcher` (plain, synchronous, NEVER asyncRewake): the
-///   pessimistic Stop-liveness net (ADR-0008 FIX 3) — respawn the detached watcher iff
-///   it is dead, and re-register the inbox (best-effort, restoring ADR-0007's
-///   register-on-every-Stop invariant). It NEVER exits 2 (never wakes) — it exits 1 only
-///   on a config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
-///   NEVER a model turn. This is the primary recovery for a watcher that died.
+///   synchronous): register the inbox, arm the wake sentinel, print the `watchPaths`
+///   registering it. Firing on every source (not just `startup`) is what re-establishes
+///   all three on a resume (ADR-0013).
+/// - `Stop` runs `turn-end` (plain, synchronous, NEVER asyncRewake): close the turn
+///   (ADR-0016), re-register the inbox (restoring ADR-0007's register-on-every-Stop
+///   invariant), re-arm a missing sentinel, and re-trigger for mail that arrived while
+///   the session was busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a
+///   config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
+///   NEVER a model turn.
+/// - `UserPromptSubmit` runs `turn-start`: the turn-opened stamp `mailbox doctor` needs
+///   to tell BUSY from deaf (ADR-0016).
 /// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
-///   basename ([`WAKE_SENTINEL_BASENAME`]): when the watcher bumps the sentinel, this
+///   basename ([`WAKE_SENTINEL_BASENAME`]): when the daemon writes the sentinel, this
 ///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
-///   It carries `timeout_secs` as its kill deadline — it is a fast read-only peek, so
-///   the timeout is only a backstop.
-/// - `SessionEnd` runs `cleanup` (plain): reap the watcher, remove the sentinel, drop
+///   It carries its own short kill deadline — it is a fast read-only peek, so the
+///   timeout is only a backstop.
+/// - `SessionEnd` runs `cleanup` (plain): remove the sentinel, drop
 ///   subscriptions/interests.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
@@ -382,14 +235,14 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.session_start_command(),
                 }],
             })],
-            // Stop fires at every turn boundary: a plain (NOT asyncRewake) liveness poke
-            // that respawns a dead watcher and re-prints watchPaths, exiting 0 always so
-            // it can never itself wake the session (ADR-0008 Stop-liveness).
+            // Stop fires at every turn boundary: a plain (NOT asyncRewake) hook that
+            // closes the turn, re-registers the inbox and re-triggers for busy-window
+            // mail, exiting 0 always so it can never itself wake the session.
             "Stop": [json!({
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
-                    "command": spec.ensure_watcher_command(),
+                    "command": spec.turn_end_command(),
                 }],
             })],
             // UserPromptSubmit opens a turn. Paired with Stop's turn-ended stamp it
@@ -403,7 +256,7 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.turn_start_command(),
                 }],
             })],
-            // FileChanged fires when the watcher bumps the sentinel. The matcher is
+            // FileChanged fires when the daemon writes the sentinel. The matcher is
             // the sentinel BASENAME (Claude Code matches FileChanged by basename);
             // per-session isolation comes from the absolute path SessionStart
             // registered via watchPaths.
@@ -420,8 +273,7 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "timeout": WAKE_HOOK_TIMEOUT_SECS,
                 }],
             })],
-            // SessionEnd tears the watcher down, removes the sentinel, and drops
-            // interests/subscriptions.
+            // SessionEnd removes the sentinel and drops interests/subscriptions.
             "SessionEnd": [json!({
                 "matcher": "",
                 "hooks": [{
@@ -517,15 +369,19 @@ fn is_our_command(command: &str) -> bool {
         && tokens.next() == Some("harness")
         && matches!(
             tokens.next(),
-            // Current (ADR-0008) hooks, plus the retired `arm` so it is swept on
-            // upgrade, plus `watch` for symmetry (never installed as a hook, but ours).
+            // Current hooks, plus every subcommand we have EVER installed as one, so
+            // an upgrade REPLACES the old group instead of leaving a hook pointing at
+            // a subcommand this binary no longer has: `arm` (ADR-0006),
+            // `ensure-watcher` (renamed to `turn-end`), and `watch` (the deleted
+            // detached watcher, ADR-0017).
             Some("session-start")
                 | Some("wake")
-                | Some("ensure-watcher")
+                | Some("turn-end")
                 | Some("turn-start")
+                | Some("cleanup")
+                | Some("ensure-watcher")
                 | Some("watch")
                 | Some("arm")
-                | Some("cleanup")
         )
 }
 
@@ -814,12 +670,11 @@ mod tests {
         HookInstallSpec {
             mailbox_bin: "/opt/mailbox".to_string(),
             timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
-            max_block_ms: DEFAULT_MAX_BLOCK_MS,
         }
     }
 
     #[test]
-    fn snippet_is_valid_and_wires_the_adr0008_hooks() {
+    fn snippet_is_valid_and_wires_the_wake_hooks() {
         let snippet = hooks_snippet(&spec());
         let hooks = &snippet["hooks"];
 
@@ -835,15 +690,15 @@ mod tests {
             "session-start must NOT be asyncRewake"
         );
 
-        // The Stop hook is the ADR-0008 Stop-liveness poke: `ensure-watcher`, plain
-        // (NOT asyncRewake, no timeout), so it can never itself wake the session.
+        // The Stop hook is the turn boundary: `turn-end`, plain (NOT asyncRewake, no
+        // timeout), so it can never itself wake the session.
         let stop = &hooks["Stop"][0];
         assert_eq!(stop["matcher"], "");
-        let ew = &stop["hooks"][0];
-        assert_eq!(ew["command"], "/opt/mailbox harness ensure-watcher");
+        let te = &stop["hooks"][0];
+        assert_eq!(te["command"], "/opt/mailbox harness turn-end");
         assert!(
-            ew.get("asyncRewake").is_none(),
-            "the Stop-liveness hook must NOT be asyncRewake (it never wakes)"
+            te.get("asyncRewake").is_none(),
+            "the Stop hook must NOT be asyncRewake (it never wakes)"
         );
 
         // FileChanged: matcher = the sentinel basename, asyncRewake wake with timeout.
@@ -869,110 +724,6 @@ mod tests {
     /// default that failed `validate` would make `install-hooks` refuse its own
     /// snippet, and a default with `max_block >= timeout` would reintroduce the
     /// silent-un-arm bug on every install.
-    #[test]
-    fn the_shipped_defaults_validate_with_a_rearm_margin() {
-        let s = spec();
-        assert!(s.max_block_ms < s.timeout_secs * 1000);
-        s.validate().expect("the default spec must be valid");
-        // 5 minutes of slack for an exit that takes milliseconds.
-        assert_eq!(s.timeout_secs * 1000 - s.max_block_ms, MAX_TIMING_MARGIN_MS);
-    }
-
-    /// The previous defaults (10-minute timeout, 9-minute block) are still a legal
-    /// hand-configured spec: raising the default must not invalidate a user who
-    /// pinned the old knobs.
-    #[test]
-    fn the_previous_defaults_are_still_a_valid_spec() {
-        HookInstallSpec {
-            mailbox_bin: "/opt/mailbox".to_string(),
-            timeout_secs: 600,
-            max_block_ms: 540_000,
-        }
-        .validate()
-        .expect("600s/540s must remain valid");
-    }
-
-    #[test]
-    fn validate_rejects_max_block_at_or_above_timeout() {
-        // A max-block at (or above) the timeout is the bug itself: Claude Code kills
-        // the waiter mid-block, and an idle session never fires the Stop that would
-        // re-arm it. Refused at install time, loudly.
-        let bad = HookInstallSpec {
-            mailbox_bin: "/opt/mailbox".to_string(),
-            timeout_secs: 600,
-            max_block_ms: 600_000,
-        };
-        assert!(matches!(
-            bad.validate(),
-            Err(InstallError::MaxBlockNotBelowTimeout { .. })
-        ));
-        // Above the timeout, likewise.
-        assert!(
-            HookInstallSpec {
-                max_block_ms: 900_000,
-                ..bad.clone()
-            }
-            .validate()
-            .is_err()
-        );
-        // Just inside the margin is also rejected (the block AND the exit must fit).
-        assert!(
-            HookInstallSpec {
-                max_block_ms: 599_000,
-                ..bad
-            }
-            .validate()
-            .is_err()
-        );
-    }
-
-    /// The invariant, enforced where it is USED. `install-hooks` validating at write
-    /// time protects nothing if `arm` is launched from a hand-edited settings.json —
-    /// or from a hook entry with no `timeout` field at all, where Claude Code applies
-    /// its own 600s default and our 55-minute max-block becomes lethal.
-    #[test]
-    fn resolve_max_block_clamps_a_max_block_that_is_not_safely_below_the_timeout() {
-        // The shipped pairing passes through untouched.
-        assert_eq!(
-            resolve_max_block(DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS),
-            MaxBlockDecision::AsRequested(DEFAULT_MAX_BLOCK_MS)
-        );
-
-        // The trap: the shipped default max-block under Claude Code's OWN default
-        // timeout. Left alone this is the original bug — the waiter is killed at 600s,
-        // 50 minutes before it would have yielded, and an idle session fires no further
-        // Stop to re-arm it.
-        let decision =
-            resolve_max_block(CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS, DEFAULT_MAX_BLOCK_MS);
-        assert_eq!(
-            decision,
-            MaxBlockDecision::Clamped {
-                requested: DEFAULT_MAX_BLOCK_MS,
-                resolved: 540_000, // 600s - the 60s margin
-                timeout_secs: CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS,
-            }
-        );
-        // And the clamped value is one `validate` itself accepts — the two rules agree.
-        HookInstallSpec {
-            mailbox_bin: String::new(),
-            timeout_secs: CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_SECS,
-            max_block_ms: decision.resolved(),
-        }
-        .validate()
-        .expect("the clamped max-block must satisfy the install-time rule");
-    }
-
-    /// A timeout too small for ANY safe max-block has no good outcome. We pick the loud
-    /// one: a floor of 1s, so the waiter re-arms noisily and visibly. Refusing to arm
-    /// would be silent, permanent deafness — the failure mode this design exists to
-    /// prevent.
-    #[test]
-    fn an_absurdly_small_timeout_still_arms_with_a_floored_max_block() {
-        assert_eq!(max_safe_max_block_ms(5), 1_000);
-        assert_eq!(resolve_max_block(5, DEFAULT_MAX_BLOCK_MS).resolved(), 1_000);
-        assert!(resolve_max_block(5, DEFAULT_MAX_BLOCK_MS).resolved() > 0);
-    }
-
     #[test]
     fn merge_into_empty_settings_yields_the_snippet_hooks() {
         let merged = merge_into_settings(json!({}), &hooks_snippet(&spec()));
@@ -1346,37 +1097,6 @@ mod tests {
     /// `target/`, again from `~/.local/bin`) must REPLACE our hook group, not append
     /// a second one pointing at a binary that may no longer exist.
     #[test]
-    fn re_merging_with_a_different_binary_replaces_our_hooks_instead_of_appending() {
-        let first = hooks_snippet(&HookInstallSpec {
-            mailbox_bin: "/tmp/target/debug/mailbox".to_string(),
-            timeout_secs: 600,
-            max_block_ms: 540_000,
-        });
-        let second = hooks_snippet(&HookInstallSpec {
-            mailbox_bin: "/home/u/.local/bin/mailbox".to_string(),
-            timeout_secs: 300,
-            max_block_ms: 120_000,
-        });
-
-        let once = merge_into_settings(json!({}), &first);
-        let twice = merge_into_settings(once, &second);
-
-        // Exactly ONE session-start and ONE wake hook — the first bin's hooks are
-        // REPLACED, not appended (a stale hook would point at a deleted binary).
-        let start = hook_commands(&twice, "SessionStart");
-        assert_eq!(start.len(), 1, "exactly ONE session-start hook: {start:?}");
-        assert_eq!(start[0], "/home/u/.local/bin/mailbox harness session-start");
-        let wake = hook_commands(&twice, "FileChanged");
-        assert_eq!(wake.len(), 1, "exactly ONE wake hook: {wake:?}");
-        assert_eq!(wake[0], "/home/u/.local/bin/mailbox harness wake");
-        let end = hook_commands(&twice, "SessionEnd");
-        assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
-    }
-
-    /// An UPGRADE from the old ADR-0006 re-arm hooks must sweep the stale `arm`
-    /// groups (SessionStart + Stop) and install the ADR-0008 hooks in their place —
-    /// leaving no hook pointing at the retired mechanism.
-    #[test]
     fn re_merging_over_the_old_arm_hooks_replaces_them_with_the_new_loop() {
         let old = json!({
             "hooks": {
@@ -1387,8 +1107,8 @@ mod tests {
         });
         let merged = merge_into_settings(old, &hooks_snippet(&spec()));
 
-        // The stale Stop → arm hook is swept and REPLACED by the Stop-liveness hook
-        // (ensure-watcher) — the retired exit-2 re-arm must not survive.
+        // The stale Stop → arm hook is swept and REPLACED by the turn-end hook — the
+        // retired exit-2 re-arm must not survive.
         let stop = hook_commands(&merged, "Stop");
         assert!(
             !stop.iter().any(|c| c.contains("harness arm")),
@@ -1396,8 +1116,8 @@ mod tests {
         );
         assert_eq!(
             stop,
-            vec!["/opt/mailbox harness ensure-watcher"],
-            "the Stop event now carries the ADR-0008 Stop-liveness hook: {stop:?}"
+            vec!["/opt/mailbox harness turn-end"],
+            "the Stop event now carries the turn-end hook: {stop:?}"
         );
         // SessionStart now runs session-start, FileChanged runs wake — the new loop.
         assert_eq!(
@@ -1435,11 +1155,14 @@ mod tests {
     fn our_commands_are_recognised_whatever_the_binary_path_or_flags() {
         assert!(is_our_command("/opt/mailbox harness session-start"));
         assert!(is_our_command("mailbox harness wake"));
+        assert!(is_our_command("mailbox harness turn-end"));
+        // The retired names are still recognised, so an UPGRADE replaces them rather
+        // than leaving a hook pointing at a subcommand this binary no longer has.
         assert!(is_our_command("mailbox harness ensure-watcher"));
+        assert!(is_our_command("mailbox harness watch --session x"));
         assert!(is_our_command("/a/b/c/mailbox harness cleanup"));
         // The retired `arm` is still recognised, so an upgrade sweeps it.
         assert!(is_our_command("/opt/mailbox harness arm --max-block-ms 1"));
-        assert!(is_our_command("mailbox harness watch --session x"));
         // Not ours: another tool, and our own non-hook commands.
         assert!(!is_our_command("echo other"));
         assert!(!is_our_command("/opt/mailbox read --session x"));
@@ -1462,5 +1185,30 @@ mod tests {
                 .is_none(),
             "a print-only run must expose no path to write to"
         );
+    }
+    #[test]
+    fn re_merging_with_a_different_binary_replaces_our_hooks_instead_of_appending() {
+        let first = hooks_snippet(&HookInstallSpec {
+            mailbox_bin: "/tmp/target/debug/mailbox".to_string(),
+            timeout_secs: 600,
+        });
+        let second = hooks_snippet(&HookInstallSpec {
+            mailbox_bin: "/home/u/.local/bin/mailbox".to_string(),
+            timeout_secs: 300,
+        });
+
+        let once = merge_into_settings(json!({}), &first);
+        let twice = merge_into_settings(once, &second);
+
+        // Exactly ONE session-start and ONE wake hook — the first bin's hooks are
+        // REPLACED, not appended (a stale hook would point at a deleted binary).
+        let start = hook_commands(&twice, "SessionStart");
+        assert_eq!(start.len(), 1, "exactly ONE session-start hook: {start:?}");
+        assert_eq!(start[0], "/home/u/.local/bin/mailbox harness session-start");
+        let wake = hook_commands(&twice, "FileChanged");
+        assert_eq!(wake.len(), 1, "exactly ONE wake hook: {wake:?}");
+        assert_eq!(wake[0], "/home/u/.local/bin/mailbox harness wake");
+        let end = hook_commands(&twice, "SessionEnd");
+        assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
     }
 }

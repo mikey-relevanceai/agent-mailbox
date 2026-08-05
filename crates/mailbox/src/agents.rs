@@ -30,8 +30,22 @@
 //! trust boundary (one user, one machine — ADR-0007). The `from` stamp is
 //! *provenance*, not authority: a message body remains untrusted data and must
 //! never be treated as an instruction to obey (ADR-0001).
+//!
+//! # Why a message may have NO `from`
+//!
+//! `from` is a **reply address**, not a permission and not a requirement. A sender
+//! that is itself a session has one, and it is stamped. A HUMAN running `mailbox
+//! send` in an ordinary terminal has no session id and therefore no address to reply
+//! to — and refusing that send would mean losing the manual poke rather than losing a
+//! courtesy. So such a message is delivered with the [`FROM_FIELD`] key **absent**.
+//!
+//! Absent, not `null` and not a placeholder: a reader asking "can I reply?" then gets
+//! its answer from whether the key exists, and every placeholder we could invent
+//! ("human", "-", "") is a string that `mailbox send` would happily accept as a
+//! target and fail on. A receiving agent must therefore treat `from` as optional:
+//! when it is missing, act on the content and do not try to reply.
 
-use std::path::Path;
+use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -41,7 +55,6 @@ use mailbox_protocol::{AdapterId, Event, Timestamp, Topic, TopicError, inbox_top
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{SessionId, Storage, StorageError};
-use crate::wake::waiter_alive;
 
 /// The body key carrying the sender's session id. The receiver replies by
 /// `send`ing back to this value, so it is a documented part of the (bus-opaque)
@@ -99,11 +112,16 @@ pub struct AgentInbox {
     pub session: SessionId,
     /// Its inbox topic.
     pub inbox: Topic,
-    /// Whether a waiter is blocked for it right now (idle and listening). See
-    /// [`crate::wake::waiter_alive`] for exactly what this does and does not
-    /// claim — it is a live-waiter probe, not a heartbeat.
-    pub live_waiter: bool,
-    /// Whether this is the caller itself.
+    /// Whether a Claude Code process is still running for this session
+    /// ([`crate::doctor::live_claude_sessions`]).
+    ///
+    /// It says the agent EXISTS, not that it is idle, healthy, or reachable — a
+    /// live process may be mid-turn, and `mailbox doctor` is the command that
+    /// actually proves wakeability. A `send` to an agent that reads `false` still
+    /// lands durably in its inbox; it simply has nobody left to collect it.
+    pub live: bool,
+    /// Whether this is the caller itself. `false` for every row when there is no
+    /// caller (a human listing the fleet is not one of the agents in it).
     pub is_self: bool,
 }
 
@@ -125,25 +143,37 @@ pub struct Sent {
 /// deterministic mistake — messaging an agent that never registered — fails
 /// loudly instead of silently vanishing.
 ///
-/// The `from` stamp is written last and overwrites any caller-supplied `from`, so
+/// The [`FROM_FIELD`] is written last and overwrites any caller-supplied `from`, so
 /// the field always means "the session this bridge accepted the message from" —
 /// provenance a receiver can rely on for *routing a reply*, never authority
 /// (ADR-0001).
+///
+/// `from` is `None` for a sender that is not a session at all (a human at a
+/// terminal). The key is then REMOVED rather than stamped — including from a body
+/// that arrived carrying one, so an anonymous sender cannot forge a reply address
+/// the bridge did not verify. See the module docs for why absent beats a
+/// placeholder.
 pub async fn send(
     bus: &Bus,
     storage: &Storage,
-    from: SessionId,
+    from: Option<SessionId>,
     to: SessionId,
     mut body: Map<String, Value>,
 ) -> Result<Sent, SendError> {
     let topic = inbox_topic(&to)?;
+    // One rendering of "who sent this" for every log line below; a send with no
+    // session is a real case, so it gets a legible label rather than a blank.
+    let sender = from
+        .as_ref()
+        .map(SessionId::as_str)
+        .unwrap_or("(no session)");
 
     if !is_registered(storage, &to).await? {
         // Log the rejection server-side (identifiers only, NEVER the body): the
         // daemon's generic request log shows `topic="-"` for a send, so without
         // this a refused send leaves no trace of who tried to reach whom or why.
         warn!(
-            from = from.as_str(),
+            from = sender,
             to = to.as_str(),
             "rejected a send: target has no registered inbox"
         );
@@ -152,10 +182,19 @@ pub async fn send(
         });
     }
 
-    body.insert(
-        FROM_FIELD.to_string(),
-        Value::String(from.as_str().to_string()),
-    );
+    match &from {
+        Some(from) => {
+            body.insert(
+                FROM_FIELD.to_string(),
+                Value::String(from.as_str().to_string()),
+            );
+        }
+        // No reply address to give. Say that by absence, and drop any `from` the
+        // caller supplied: an unstamped message must not claim a sender.
+        None => {
+            body.remove(FROM_FIELD);
+        }
+    }
 
     // A normal publish: durable append, then the payload-free kick to every
     // subscriber of the inbox topic (the recipient's waiter).
@@ -169,7 +208,7 @@ pub async fn send(
         .await?;
 
     info!(
-        from = from.as_str(),
+        from = sender,
         to = to.as_str(),
         topic = topic.as_str(),
         offset = event.offset.0,
@@ -190,13 +229,23 @@ async fn is_registered(storage: &Storage, session: &SessionId) -> Result<bool, S
 
 /// Every registered agent inbox, with liveness, marking `caller` as itself.
 ///
-/// `waiters_dir` is the directory holding the per-session waiter pidfiles (the
-/// daemon's own, derived from the storage path), which is where liveness comes
-/// from.
+/// `live` is the set of session ids that currently have a Claude Code process, as
+/// read from the process table by [`crate::doctor::live_claude_sessions`]. It is
+/// passed in rather than scanned here so the whole listing is measured in ONE `ps`
+/// call, and so this function stays a pure projection a test can drive directly.
+///
+/// A session missing from `live` reads as `live: false`. That understates when the
+/// process table could not be read at all — the same direction the pidfile probe
+/// this replaces erred in, and the safe one: never claim an agent is there.
+///
+/// `caller` is `None` when the lister is not a session — a human at a terminal.
+/// Marking a row is the ONLY thing the caller is used for, so the listing is
+/// otherwise identical and simply marks nobody. Discovery is not privileged: who
+/// is addressable is the same question whoever asks it.
 pub async fn list(
     storage: &Storage,
-    waiters_dir: &Path,
-    caller: &SessionId,
+    live: &BTreeSet<String>,
+    caller: Option<&SessionId>,
 ) -> Result<Vec<AgentInbox>, SendError> {
     let sessions = storage.list_agent_inboxes().await?;
     let mut agents = Vec::with_capacity(sessions.len());
@@ -206,8 +255,8 @@ pub async fn list(
         // `expect` keeps the impossible case a value, not a panic.
         let inbox = inbox_topic(&session)?;
         agents.push(AgentInbox {
-            live_waiter: waiter_alive(waiters_dir, &session),
-            is_self: &session == caller,
+            live: live.contains(session.as_str()),
+            is_self: caller.is_some_and(|caller| caller == &session),
             session,
             inbox,
         });
@@ -248,7 +297,7 @@ mod tests {
         let sent = send(
             &bus,
             &storage,
-            a.clone(),
+            Some(a.clone()),
             b.clone(),
             body.as_object().unwrap().clone(),
         )
@@ -276,7 +325,7 @@ mod tests {
         send(
             &bus,
             &storage,
-            a,
+            Some(a),
             b.clone(),
             body.as_object().unwrap().clone(),
         )
@@ -287,6 +336,68 @@ mod tests {
         assert_eq!(delivered.events()[0].body[FROM_FIELD], "s-a");
     }
 
+    /// A send with no sender session — a human at a terminal — delivers, and the
+    /// recipient's copy has **no `from` key at all**.
+    ///
+    /// The assertion is on the key's ABSENCE rather than on some sentinel value,
+    /// because that is the contract a receiving agent branches on: `from` present
+    /// means "you can reply to this"; `from` missing means "there is nobody to reply
+    /// to". A `null`, an empty string, or a "human" placeholder would each be a value
+    /// an agent might hand straight back to `mailbox send`.
+    #[tokio::test]
+    async fn a_send_with_no_session_omits_the_from_key_entirely() {
+        let (bus, storage, _dir) = fresh().await;
+        let b = SessionId::new("s-b");
+        register(&bus, &b).await;
+
+        let body = serde_json::json!({ "text": "poked by a human" });
+        send(
+            &bus,
+            &storage,
+            None,
+            b.clone(),
+            body.as_object().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+
+        let delivered = bus.read(b, None).await.unwrap();
+        let body = &delivered.events()[0].body;
+        assert_eq!(body["text"], serde_json::json!("poked by a human"));
+        assert!(
+            body.get(FROM_FIELD).is_none(),
+            "an unattributed message must omit `from`, not carry a placeholder: {body}"
+        );
+    }
+
+    /// The anonymous path must not let a caller SUPPLY the reply address the bridge
+    /// could not verify. Without this, `--body '{"from":"s-victim"}'` from any local
+    /// process would be a forged `from` — the exact hole the stamp-last rule closes
+    /// on the attributed path.
+    #[tokio::test]
+    async fn a_send_with_no_session_strips_a_caller_supplied_from() {
+        let (bus, storage, _dir) = fresh().await;
+        let b = SessionId::new("s-b");
+        register(&bus, &b).await;
+
+        let body = serde_json::json!({ "from": "s-somebody-else" });
+        send(
+            &bus,
+            &storage,
+            None,
+            b.clone(),
+            body.as_object().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+
+        let delivered = bus.read(b, None).await.unwrap();
+        assert!(
+            delivered.events()[0].body.get(FROM_FIELD).is_none(),
+            "an unattributed send must not carry a `from` the bridge did not stamp"
+        );
+    }
+
     #[tokio::test]
     async fn send_to_an_unregistered_agent_fails_and_publishes_nothing() {
         let (bus, storage, _dir) = fresh().await;
@@ -295,7 +406,7 @@ mod tests {
         let err = send(
             &bus,
             &storage,
-            SessionId::new("s-a"),
+            Some(SessionId::new("s-a")),
             ghost.clone(),
             Map::new(),
         )
@@ -322,9 +433,15 @@ mod tests {
         register(&bus, &b).await;
         storage.end_session(b.clone(), now_millis()).await.unwrap();
 
-        let err = send(&bus, &storage, SessionId::new("s-a"), b.clone(), Map::new())
-            .await
-            .unwrap_err();
+        let err = send(
+            &bus,
+            &storage,
+            Some(SessionId::new("s-a")),
+            b.clone(),
+            Map::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, SendError::InboxNotRegistered { .. }));
     }
 
@@ -334,7 +451,7 @@ mod tests {
         // auto-inbox re-registration (an arm's Subscribe) within the guard window is
         // refused, so the dead session never reappears in `agents` (FIX 1). Only the
         // AutoInbox path is guarded — the path the doomed arm actually uses.
-        let (bus, storage, dir) = fresh().await;
+        let (bus, storage, _dir) = fresh().await;
         let b = SessionId::new("s-b");
         register(&bus, &b).await;
         storage.end_session(b.clone(), now_millis()).await.unwrap();
@@ -348,16 +465,18 @@ mod tests {
             crate::storage::SubscribeOutcome::RefusedSessionRecentlyEnded
         );
 
-        let waiters = dir.path().join("waiters");
         assert!(
-            list(&storage, &waiters, &b).await.unwrap().is_empty(),
+            list(&storage, &BTreeSet::new(), Some(&b))
+                .await
+                .unwrap()
+                .is_empty(),
             "a tombstoned session must not be listed as an agent"
         );
     }
 
     #[tokio::test]
     async fn list_reports_registered_inboxes_and_marks_self() {
-        let (bus, storage, dir) = fresh().await;
+        let (bus, storage, _dir) = fresh().await;
         let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
         register(&bus, &a).await;
         register(&bus, &b).await;
@@ -367,8 +486,7 @@ mod tests {
             .await
             .unwrap();
 
-        let waiters = dir.path().join("waiters");
-        let agents = list(&storage, &waiters, &a).await.unwrap();
+        let agents = list(&storage, &BTreeSet::new(), Some(&a)).await.unwrap();
         assert_eq!(
             agents
                 .iter()
@@ -378,7 +496,68 @@ mod tests {
         );
         assert!(agents[0].is_self, "the caller is marked");
         assert!(!agents[1].is_self);
-        // No waiter processes exist in this unit test, so nothing is live.
-        assert!(agents.iter().all(|x| !x.live_waiter));
+    }
+
+    /// With NO caller — a human listing the fleet from a terminal — the listing is
+    /// the same listing, and nobody is marked as self. Discovery is not privileged:
+    /// the answer to "who is addressable" does not depend on who is asking.
+    #[tokio::test]
+    async fn list_with_no_caller_lists_everyone_and_marks_nobody() {
+        let (bus, storage, _dir) = fresh().await;
+        let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
+        register(&bus, &a).await;
+        register(&bus, &b).await;
+
+        let anonymous = list(&storage, &BTreeSet::new(), None).await.unwrap();
+        assert_eq!(
+            anonymous
+                .iter()
+                .map(|x| x.session.as_str())
+                .collect::<Vec<_>>(),
+            ["s-a", "s-b"],
+            "every agent is listed to a caller that is not one of them"
+        );
+        assert!(
+            anonymous.iter().all(|x| !x.is_self),
+            "no row may be marked as self when there is no self"
+        );
+
+        // The rows are otherwise identical to what a session sees, so a human and an
+        // agent are reading the same fleet — only the marking differs.
+        let as_a = list(&storage, &BTreeSet::new(), Some(&a)).await.unwrap();
+        assert_eq!(
+            anonymous
+                .iter()
+                .map(|x| (&x.session, &x.inbox, x.live))
+                .collect::<Vec<_>>(),
+            as_a.iter()
+                .map(|x| (&x.session, &x.inbox, x.live))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Liveness is exactly membership of the live-session set — nothing is inferred
+    /// from the mailbox's own state. That is the whole point of the signal: a
+    /// session's subscriptions, sentinel and interests all outlive the Claude Code
+    /// process they belong to, so only the process table can answer this.
+    #[tokio::test]
+    async fn liveness_is_membership_of_the_live_session_set() {
+        let (bus, storage, _dir) = fresh().await;
+        let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
+        register(&bus, &a).await;
+        register(&bus, &b).await;
+
+        let live = BTreeSet::from(["s-a".to_string()]);
+        let agents = list(&storage, &live, Some(&a)).await.unwrap();
+        assert!(agents[0].live, "s-a has a live Claude Code process");
+        assert!(
+            !agents[1].live,
+            "s-b is registered and addressable, but nobody is running it"
+        );
+
+        // An empty set (including the "could not read the process table" case) never
+        // claims an agent is there.
+        let agents = list(&storage, &BTreeSet::new(), Some(&a)).await.unwrap();
+        assert!(agents.iter().all(|x| !x.live));
     }
 }

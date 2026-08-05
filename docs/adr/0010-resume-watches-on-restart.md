@@ -1,12 +1,23 @@
 # ADR-0010: A daemon restart resumes the watches of live sessions
 
-- Status: Accepted
+- Status: **Accepted — but the liveness probe below is amended by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md).** The decision (resume a watch iff
+  an interested session is still alive) is in force. The `waiter_alive` pidfile
+  probe it names is not: that file no longer exists.
 - Date: 2026-07-17
 - Amends: design/01 rule 6 (bridge restart), whose deferred session-liveness probe
   this supplies from [ADR-0009](0009-interest-liveness-from-the-waiter-pidfile.md).
   Second instance of the same class of bug as ADR-0009: a fail-safe whose safety
   depended on a live session doing something, in a system where
   [ADR-0008](0008-on-demand-wake-filechanged.md) guarantees it does nothing.
+
+> **Amended by [ADR-0017](0017-daemon-bumps-the-sentinel.md) (2026-08-05).** The
+> DECISION here — resume a watch iff an interested session is still alive — is
+> unchanged. Only the liveness probe changed: it was the detached watcher's pidfile
+> (ADR-0009), and that watcher no longer exists. `reconcile_startup` now takes the set
+> of sessions with a live Claude Code process, read once from the process table. It is
+> also strictly more accurate: an orphaned watcher's pidfile used to make a dead
+> session look alive, so its poller was resumed for nobody.
 
 ## Context
 

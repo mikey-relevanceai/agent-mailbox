@@ -4,27 +4,17 @@
 //!
 //! The single-writer rule (ADR-0003) says only the bridge mutates the database,
 //! and everything else speaks the protocol. But wake has a genuinely separate
-//! actor: the **waiter** is its own process (a background hook launched with
-//! `asyncRewake`, see docs/01-wake-and-rearm.md), and before it blocks it must
-//! answer one question — "does this session have unread mail right now?" — so a
-//! publish that landed *before* the waiter started still fires (the missed-kick
-//! safety). ADR-0003 explicitly permits this: "reads used for wake/delivery ...
-//! stay read-only and never mutate."
+//! actor: the Claude Code **hooks** are their own one-shot processes, and each must
+//! answer one question — "does this session have unread mail right now?" — without a
+//! daemon socket, because a hook that could not answer while the bridge was down
+//! would wake the agent (or refuse to) on no evidence at all. ADR-0003 explicitly
+//! permits this: "reads used for wake/delivery ... stay read-only and never mutate."
 //!
 //! So this type opens the SQLite file with [`OpenFlags::SQLITE_OPEN_READ_ONLY`]
 //! and **no** create flag: it cannot write, cannot create the file, and never
 //! advances a cursor. Advancing a session's cursor is the exclusive job of the
 //! agent's later `read` through the single writer — checking unread here is
-//! deliberately non-destructive so the waiter can peek without consuming.
-//!
-//! # The second reader: `mailbox dashboard` (ADR-0015)
-//!
-//! The waiter is no longer the only actor with that shape. `mailbox dashboard` is a
-//! health view whose whole job is to be readable when things are broken — including
-//! when the `serve` daemon is the broken thing — so routing it through the socket
-//! would take the view away in one of the failure modes it exists to diagnose. It
-//! reads through [`ReadOnlyStore::fleet`] under the same rule: read-only open, no
-//! create, no mutation, no cursor ever advanced.
+//! deliberately non-destructive so a hook can peek without consuming.
 
 use std::path::Path;
 
@@ -56,49 +46,9 @@ const UNREAD_PREDICATE: &str = "e.offset > COALESCE(
      WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
     -1)";
 
-/// One instant's view of the whole bus, as [`ReadOnlyStore::fleet`] returns it.
-///
-/// Deliberately plain data with no behaviour: the dashboard layer decides how to
-/// rank, filter and render it, and storage stays a data layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fleet {
-    /// Every session with at least one subscription, in session-id order.
-    pub sessions: Vec<FleetSession>,
-    /// Every watch the bridge knows about, with its interest refcount.
-    pub watches: Vec<FleetWatch>,
-    /// Total events in the durable log.
-    pub events: u64,
-}
-
-/// One session's row in a [`Fleet`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FleetSession {
-    pub session: String,
-    /// How many topics it subscribes to.
-    pub subscriptions: u64,
-    /// Whether `agent.<session-id>` is among them — i.e. whether peers can `send`
-    /// to it at all.
-    pub inbox_registered: bool,
-    /// Total unread across those topics, on the `status` definition.
-    pub unread: u64,
-    /// How many watches it holds interest in.
-    pub watch_interest: u64,
-}
-
-/// One watch's row in a [`Fleet`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct FleetWatch {
-    pub kind: String,
-    pub repo: String,
-    pub pr: u64,
-    pub state: String,
-    pub child_pid: Option<u32>,
-    pub interest: u64,
-}
-
 /// A read-only view of the durable store, opened as a side connection.
 ///
-/// Held by the waiter process. Every method is a plain `SELECT`; there is no
+/// Held by the hook processes. Every method is a plain `SELECT`; there is no
 /// path from here to a mutation.
 #[derive(Debug)]
 pub struct ReadOnlyStore {
@@ -110,8 +60,8 @@ impl ReadOnlyStore {
     ///
     /// Uses `SQLITE_OPEN_READ_ONLY` with **no** create flag, so a missing file
     /// is an error ([`StorageError::Open`]) rather than a silently-created empty
-    /// DB — a waiter with no bridge/store behind it has nothing to wait on, and
-    /// we would rather say so than invent an empty database. A `busy_timeout`
+    /// DB — a hook with no bridge/store behind it has nothing to report, and we
+    /// would rather say so than invent an empty database. A `busy_timeout`
     /// is set as a defensive backstop; with WAL the reader does not contend with
     /// the writer, so it should never fire.
     ///
@@ -140,7 +90,7 @@ impl ReadOnlyStore {
     /// cursor row exists yet — any event (cursor treated as `-1`, since offsets
     /// start at 0). This is the read-only twin of `do_read_unread`'s predicate;
     /// it reports which topics *would* deliver without advancing anything.
-    /// The waiter both decides whether to wake (non-empty ⇒ wake) and names the
+    /// The wake hook both decides whether to wake (non-empty ⇒ wake) and names the
     /// topics for the reminder from this one call, so a separate `has_unread`
     /// boolean would be redundant.
     pub fn topics_with_unread(&self, session: &SessionId) -> Result<Vec<Topic>, StorageError> {
@@ -158,130 +108,6 @@ impl ReadOnlyStore {
     /// have already re-triggered a wake for" from "mail newer than that".
     pub fn unread(&self, session: &SessionId) -> Result<Unread, StorageError> {
         query_unread(&self.conn, session.as_str())
-    }
-
-    /// Every session the store knows about, with its subscription count, total
-    /// unread, and whether its agent inbox is registered — plus every watch and its
-    /// interest count. The one read behind `mailbox dashboard` (ADR-0015).
-    ///
-    /// # One snapshot, not four
-    ///
-    /// The parts are gathered inside a single DEFERRED transaction so they describe
-    /// one instant. Assembled from separate statements, a fleet view could show a
-    /// session's unread count from before a publish and its watch state from after —
-    /// and a dashboard whose rows disagree with each other is worse than no dashboard,
-    /// because the disagreement looks like a bug in the thing being diagnosed.
-    ///
-    /// "Unread" is [`UNREAD_PREDICATE`], the same condition the wake path and `status`
-    /// use, so the dashboard's number is the one the agent sees and the one it will be
-    /// woken for — three views that used to be able to disagree (ADR-0014).
-    pub fn fleet(&self) -> Result<Fleet, StorageError> {
-        // Read-only, so this can never block a writer; it exists purely to pin one
-        // consistent read view across the statements below.
-        let tx = self.conn.unchecked_transaction()?;
-
-        let mut sessions: std::collections::BTreeMap<String, FleetSession> = tx
-            .prepare(
-                "SELECT session_id,
-                        COUNT(*),
-                        MAX(topic = 'agent.' || session_id)
-                 FROM subscription
-                 GROUP BY session_id",
-            )?
-            .query_map([], |row| {
-                Ok(FleetSession {
-                    session: row.get::<_, String>(0)?,
-                    subscriptions: row.get::<_, i64>(1)?.max(0) as u64,
-                    inbox_registered: row.get::<_, i64>(2)? != 0,
-                    unread: 0,
-                    watch_interest: 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|s| (s.session.clone(), s))
-            .collect();
-
-        for (session, unread) in tx
-            .prepare(&format!(
-                "SELECT s.session_id, COUNT(*)
-                 FROM subscription s
-                 JOIN event e ON e.topic = s.topic
-                 WHERE {UNREAD_PREDICATE}
-                 GROUP BY s.session_id",
-            ))?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            if let Some(entry) = sessions.get_mut(&session) {
-                entry.unread = unread;
-            }
-        }
-
-        for (session, count) in tx
-            .prepare("SELECT session_id, COUNT(*) FROM watch_interest GROUP BY session_id")?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        {
-            if let Some(entry) = sessions.get_mut(&session) {
-                entry.watch_interest = count;
-            }
-        }
-
-        let watches = tx
-            .prepare(
-                "SELECT w.kind, w.repo, w.pr, w.state, w.child_pid, COUNT(wi.session_id)
-                 FROM watch w
-                 LEFT JOIN watch_interest wi ON wi.watch_id = w.id
-                 GROUP BY w.id
-                 ORDER BY w.kind, w.repo, w.pr",
-            )?
-            .query_map([], |row| {
-                Ok(FleetWatch {
-                    kind: row.get(0)?,
-                    repo: row.get(1)?,
-                    pr: row.get::<_, i64>(2)?.max(0) as u64,
-                    state: row.get(3)?,
-                    child_pid: row.get::<_, Option<i64>>(4)?.map(|p| p as u32),
-                    interest: row.get::<_, i64>(5)?.max(0) as u64,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let events: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))?;
-
-        Ok(Fleet {
-            sessions: sessions.into_values().collect(),
-            watches,
-            events: events.max(0) as u64,
-        })
-    }
-
-    /// Whether `session` currently has at least one subscription.
-    ///
-    /// The waiter-side "arm-iff-subscribed" re-check (card 11): distinct from
-    /// [`topics_with_unread`](Self::topics_with_unread), which is empty both when
-    /// the session has NO subscription AND when it is subscribed but caught up.
-    /// This asks the narrower question — "is there anything to be woken about at
-    /// all?" — so a waiter that raced a `SessionEnd`/unsubscribe (interest already
-    /// dropped) can self-exit instead of blocking forever as an orphan.
-    pub fn has_subscription(&self, session: &SessionId) -> Result<bool, StorageError> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM subscription WHERE session_id = ?1)",
-            [session.as_str()],
-            |row| row.get(0),
-        )?;
-        Ok(exists)
     }
 }
 
@@ -388,15 +214,6 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_event_by(conn: &Connection, topic: &str, offset: i64, author: &str) {
-        conn.execute(
-            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
-             VALUES (?1, ?2, ?3, 'a', 0, '{}', ?4)",
-            params![topic, offset, format!("evt-{topic}-{offset}"), author],
-        )
-        .unwrap();
-    }
-
     fn set_cursor(conn: &Connection, session: &str, topic: &str, offset: i64) {
         conn.execute(
             "INSERT INTO delivery_cursor (session_id, topic, offset) VALUES (?1, ?2, ?3)
@@ -406,39 +223,31 @@ mod tests {
         .unwrap();
     }
 
-    /// Authorship does not enter the unread predicate (ADR-0014): your own event is
-    /// mail to you exactly as a peer's is, so the wake path and `status` agree on one
-    /// definition of "unread". Only the delivery cursor makes mail go quiet.
+    /// Authorship does not enter the unread predicate — there is no authorship on an
+    /// event any more (ADR-0018), and there was already none in this query (ADR-0014).
+    /// One definition of "unread" for the wake path and for `status`: subscribed, and
+    /// beyond the delivery cursor. **Only the cursor makes mail go quiet.**
     #[test]
-    fn an_event_you_authored_wakes_you_just_like_a_peers_does() {
+    fn every_subscriber_has_the_same_event_unread_until_it_reads() {
         let conn = migrated();
         subscribe(&conn, "s", "t.a");
         subscribe(&conn, "peer", "t.a");
 
-        insert_event_by(&conn, "t.a", 0, "s");
-        assert_eq!(
-            query_topics_with_unread(&conn, "s").unwrap().len(),
-            1,
-            "your own event is mail to you too"
-        );
+        insert_event(&conn, "t.a", 0);
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
+        assert_eq!(query_topics_with_unread(&conn, "peer").unwrap().len(), 1);
+
+        insert_event(&conn, "t.a", 1);
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
+
+        // Caught up (the cursor covers both) => quiet, for this session only.
+        set_cursor(&conn, "s", "t.a", 1);
+        assert!(query_topics_with_unread(&conn, "s").unwrap().is_empty());
         assert_eq!(
             query_topics_with_unread(&conn, "peer").unwrap().len(),
             1,
-            "and it IS mail for the peer"
+            "one session reading must not quiet another's mail"
         );
-
-        // A peer's event wakes you.
-        insert_event_by(&conn, "t.a", 1, "peer");
-        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
-
-        // Caught up again (the cursor covers both) => quiet.
-        set_cursor(&conn, "s", "t.a", 1);
-        assert!(query_topics_with_unread(&conn, "s").unwrap().is_empty());
-
-        // An anonymous publish (adapter / `--no-session`) wakes EVERY subscriber,
-        // including a session that happens to have spawned the publisher.
-        insert_event(&conn, "t.a", 2);
-        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
     }
 
     #[test]
@@ -582,23 +391,6 @@ mod tests {
         assert!(
             second.high_water() > first,
             "a newer event on another topic must advance the watermark, despite its offset 0"
-        );
-    }
-
-    /// A self-authored event advances the watermark like any other (ADR-0014), so the
-    /// ADR-0012 turn-boundary re-trigger treats it as genuinely new mail and nudges
-    /// the session once for it.
-    #[test]
-    fn a_self_authored_event_advances_the_watermark_like_any_other() {
-        let conn = migrated();
-        subscribe(&conn, "s", "t.a");
-        insert_event_by(&conn, "t.a", 0, "peer");
-        let before = pending(&conn, "s").high_water();
-
-        insert_event_by(&conn, "t.a", 1, "s");
-        assert!(
-            pending(&conn, "s").high_water() > before,
-            "your own event is mail, so it advances your watermark"
         );
     }
 

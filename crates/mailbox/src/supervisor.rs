@@ -38,8 +38,9 @@
 //! # Bridge restart (resume iff a live session wants it)
 //!
 //! [`reconcile_startup`] restores the invariant on daemon start: it resumes a
-//! watch iff some session holding an interest in it has a live watcher pidfile
-//! (ADR-0009's probe), and marks the rest `Stopped`, clearing their stale pids.
+//! watch iff some session holding an interest in it still has a live Claude Code
+//! process (ADR-0017's probe), and marks the rest `Stopped`, clearing their stale
+//! pids.
 //! That is design/01 rule 6 as written — the rule always wanted this and only
 //! defaulted to "never resume" for want of a liveness probe. Resuming nothing is
 //! not a fail-safe under ADR-0008: an idle session takes zero turns, so it can
@@ -53,9 +54,8 @@
 //! concrete adapter — tests inject a fixture, card 10 injects the real
 //! `github-pr` poller.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,7 +75,6 @@ use crate::host::{AdapterConfig, AdapterExit, AdapterHost, BaselineSink};
 use crate::storage::{
     Pid, Storage, StorageError, Watch, WatchId, WatchKind, WatchState, WatchTarget,
 };
-use crate::wake::waiter_alive;
 
 /// Capacity of the supervisor command channel. Commands are small; a modest
 /// buffer absorbs a burst of watch/unwatch ops plus monitor exit reports without
@@ -243,22 +242,22 @@ impl Supervisor {
         .await
     }
 
-    /// Run one TTL sweep: refresh the interests of every session with a live
-    /// waiter under `waiters_dir`, drop the interests left older than `ttl`, and
-    /// stop any adapter whose interest thereby reached zero. Returns the watches
-    /// that were swept to zero.
+    /// Run one TTL sweep: refresh the interests of every session in `live`, drop
+    /// the interests left older than `ttl`, and stop any adapter whose interest
+    /// thereby reached zero. Returns the watches that were swept to zero.
+    ///
+    /// `live` is the set of session ids that currently have a Claude Code process
+    /// ([`crate::doctor::live_claude_sessions`]), read ONCE by the caller and handed
+    /// in: the scan shells out to `ps`, so doing it per session would turn one sweep
+    /// into one process spawn per interested session.
     pub async fn sweep(
         &self,
         ttl: Duration,
-        waiters_dir: impl Into<PathBuf>,
+        live: BTreeSet<String>,
     ) -> Result<Vec<WatchId>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Sweep {
-                ttl,
-                waiters_dir: waiters_dir.into(),
-                reply,
-            })
+            .send(Command::Sweep { ttl, live, reply })
             .await
             .map_err(|_| SupervisorError::Gone)?;
         rx.await.map_err(|_| SupervisorError::Gone)?
@@ -324,19 +323,21 @@ impl Supervisor {
 /// notice. Observed in production (2026-07-17): a restart stopped all four PR
 /// pollers; three had live sessions still waiting on them.
 ///
-/// [ADR-0009](../../docs/adr/0009-interest-liveness-from-the-waiter-pidfile.md)
-/// supplies the probe rule 6 was waiting for: a session is alive iff its detached
-/// watcher's pidfile names a live process ([`waiter_alive`]) — the same signal the
-/// TTL sweeper now trusts, and the same one that is reaped at `SessionEnd`. Rule
-/// 6's condition is therefore now decidable, and this implements it as written.
+/// [ADR-0017](../../docs/adr/0017-daemon-bumps-the-sentinel.md) supplies the probe
+/// rule 6 was waiting for: a session is alive iff a Claude Code process still
+/// carries its id in argv ([`crate::doctor::live_claude_sessions`]) — the same
+/// signal the TTL sweeper trusts. Rule 6's condition is therefore now decidable,
+/// and this implements it as written. (ADR-0009 answered the same question from the
+/// detached watcher's pidfile; that watcher is gone, and its pidfile routinely
+/// outlived the agent it belonged to.)
 ///
 /// # What it does
 ///
-/// A watch is resumed iff some session holding an interest in it has a live
-/// waiter. That covers both a watch left `Running` by the previous daemon and one
-/// left `Stopped` **with interest still attached** — an inconsistent state that
-/// the old no-resume path itself created, and which would otherwise never heal,
-/// since `Stopped` means "torn down, last interest gone" and this contradicts it.
+/// A watch is resumed iff some session holding an interest in it is in `live`. That
+/// covers both a watch left `Running` by the previous daemon and one left `Stopped`
+/// **with interest still attached** — an inconsistent state that the old no-resume
+/// path itself created, and which would otherwise never heal, since `Stopped` means
+/// "torn down, last interest gone" and this contradicts it.
 ///
 /// A watch left `Running` that is NOT resumed is marked `Stopped`, clearing the
 /// previous daemon's stale pid — the unchanged fail-safe: an interest whose
@@ -349,14 +350,13 @@ impl Supervisor {
 /// restart budget and gave up, and a daemon restart is not evidence the adapter
 /// stopped crashing. Re-`watch` is the deliberate way back.
 ///
-/// A false positive from `waiter_alive` (PID reuse — see its docs) costs one
-/// adapter that the TTL sweep then reclaims once the pidfile ages out. That is
-/// strictly the cheaper error: the failure this replaces was silent, permanent
-/// deafness.
+/// An over-broad `live` set costs one adapter that the TTL sweep then reclaims on
+/// the next pass. That is strictly the cheaper error: the failure this replaces was
+/// silent, permanent deafness.
 pub async fn reconcile_startup(
     storage: &Storage,
     supervisor: &Supervisor,
-    waiters_dir: &Path,
+    live: &BTreeSet<String>,
 ) -> Result<(), SupervisorError> {
     for watch in storage.list_watches().await? {
         if matches!(watch.state, WatchState::Failed) {
@@ -370,9 +370,9 @@ pub async fn reconcile_startup(
         }
 
         let sessions = storage.list_watch_interest_sessions(watch.id).await?;
-        let live = sessions.iter().any(|s| waiter_alive(waiters_dir, s));
+        let wanted = sessions.iter().any(|s| live.contains(s.as_str()));
 
-        if live {
+        if wanted {
             // `ensure_running` owns the state transition (and is idempotent), so
             // the stale pid is replaced by the new child's rather than cleared.
             supervisor.ensure_running(watch.id).await?;
@@ -382,7 +382,7 @@ pub async fn reconcile_startup(
                 repo = %watch.target.repo_column(),
                 pr = watch.target.pr_column(),
                 interested = sessions.len(),
-                "resumed watch on startup; an interested session's watcher is alive (design/01 rule 6)"
+                "resumed watch on startup; an interested session is still running (design/01 rule 6)"
             );
         } else if let WatchState::Running { pid } = watch.state {
             // Write the state first, then log what happened — never log the write
@@ -397,7 +397,7 @@ pub async fn reconcile_startup(
                 pr = watch.target.pr_column(),
                 pid = pid.get(),
                 interested = sessions.len(),
-                "stopped a watch on startup; no interested session has a live watcher (cleared its stale pid)"
+                "stopped a watch on startup; no interested session is still running (cleared its stale pid)"
             );
         } else {
             // Desired / already-Stopped and not live: carries no stale pid, so it is
@@ -489,10 +489,10 @@ enum Command {
     },
     Sweep {
         ttl: Duration,
-        /// Where the per-session waiter pidfiles live — the sweep's liveness
+        /// The sessions with a live Claude Code process — the sweep's liveness
         /// evidence. Passed per-call for the same reason `ttl` is: it is the
-        /// caller's policy input, not supervisor state.
-        waiters_dir: PathBuf,
+        /// caller's measurement, not supervisor state.
+        live: BTreeSet<String>,
         reply: oneshot::Sender<Result<Vec<WatchId>, SupervisorError>>,
     },
     RunningPid {
@@ -576,12 +576,8 @@ impl Actor {
                         error!(watch = watch_id.get(), error = %err, "supervisor restart failed");
                     }
                 }
-                Command::Sweep {
-                    ttl,
-                    waiters_dir,
-                    reply,
-                } => {
-                    let result = self.sweep(ttl, &waiters_dir).await;
+                Command::Sweep { ttl, live, reply } => {
+                    let result = self.sweep(ttl, &live).await;
                     let _ = reply.send(result);
                 }
                 Command::RunningPid { watch_id, reply } => {
@@ -1018,34 +1014,32 @@ impl Actor {
         Ok(())
     }
 
-    /// Refresh the interests of every session whose waiter is still alive, then
-    /// sweep what is left stale and stop the adapter of any watch swept to zero.
+    /// Refresh the interests of every session that still has a Claude Code process,
+    /// then sweep what is left stale and stop the adapter of any watch swept to zero.
     ///
-    /// The refresh pass is what makes the TTL safe (ADR-0009). Under ADR-0008 an
-    /// idle session is SILENT by design — zero turns, zero requests — so silence
-    /// carries no information about whether it is alive, and a TTL keyed on the
-    /// session's own traffic reaps exactly the healthy idle sessions ADR-0008
-    /// exists to enable. Liveness therefore comes from the one artefact that
-    /// tracks the session rather than its chatter: the detached watcher's pidfile,
-    /// which exists for as long as the session is wakeable and is reaped at
-    /// `SessionEnd`. Probing it here (a `kill(pid, 0)` — no agent cooperation, no
-    /// timer in the harness, no model turn) makes the invariant *an interest lives
-    /// iff its session's watcher lives*, and leaves the TTL as what it was always
+    /// The refresh pass is what makes the TTL safe (ADR-0009, superseded by
+    /// ADR-0017). An idle session is SILENT by design — zero turns, zero requests —
+    /// so silence carries no information about whether it is alive, and a TTL keyed
+    /// on the session's own traffic reaps exactly the healthy idle sessions the
+    /// on-demand wake exists to enable. Liveness therefore comes from the process
+    /// table: Claude Code carries the session id in its own argv, so "is this agent
+    /// still running?" is answerable from outside with no agent cooperation, no timer
+    /// in the harness and no model turn. That makes the invariant *an interest lives
+    /// iff its session's agent lives*, and leaves the TTL as what it was always
     /// documented to be: the backstop for a session that hard-died without a
     /// `SessionEnd`.
     ///
-    /// The TTL doubles as the grace period for a transiently-absent pidfile — the
-    /// spawn race, and ADR-0008's exit-window respawn transient. Because the sweep
-    /// interval is far shorter than the TTL, a session gets many probes before it
-    /// can age out, so a single missed probe can never reap a live watch.
+    /// The signal it replaces — the detached watcher's pidfile — was strictly worse:
+    /// an orphaned watcher outlives the agent it belongs to, so a dead session read
+    /// as alive and its poller was kept running indefinitely.
     async fn sweep(
         &mut self,
         ttl: Duration,
-        waiters_dir: &Path,
+        live: &BTreeSet<String>,
     ) -> Result<Vec<WatchId>, SupervisorError> {
         let now = now_millis();
         for session in self.storage.list_interest_sessions().await? {
-            if waiter_alive(waiters_dir, &session) {
+            if live.contains(session.as_str()) {
                 let refreshed = self
                     .storage
                     .touch_session_interests(session.clone(), now)
@@ -1073,7 +1067,7 @@ impl Actor {
         // After reclaiming dead interests, give the still-wanted `Failed` watches
         // another chance. Runs last so a watch whose only session just aged out
         // above is not retried.
-        self.retry_failed_watches(waiters_dir).await?;
+        self.retry_failed_watches(live).await?;
         Ok(emptied)
     }
 
@@ -1087,7 +1081,7 @@ impl Actor {
     /// silent, manual-recovery failure ADR-0010 set out to kill, re-entering
     /// through the one state ADR-0010 deliberately does not resume.
     ///
-    /// The sweeper already proves session liveness from the watcher pidfile, so it
+    /// The sweeper already proves session liveness from the process table, so it
     /// is the natural owner of a slow retry: once per sweep it re-attempts each
     /// `Failed` watch that still has a live interested session. [`ensure_running`]
     /// starts a fresh attempt — the failure streak was cleared at give-up — so a
@@ -1097,13 +1091,16 @@ impl Actor {
     /// interval, and stop entirely the moment the session ends and its interest is
     /// reclaimed. A `Failed` watch with no live interested session is left alone —
     /// no zombie retries, the same liveness invariant as the TTL sweep itself.
-    async fn retry_failed_watches(&mut self, waiters_dir: &Path) -> Result<(), SupervisorError> {
+    async fn retry_failed_watches(
+        &mut self,
+        live: &BTreeSet<String>,
+    ) -> Result<(), SupervisorError> {
         for watch in self.storage.list_watches().await? {
             if !matches!(watch.state, WatchState::Failed) {
                 continue;
             }
             let sessions = self.storage.list_watch_interest_sessions(watch.id).await?;
-            if sessions.iter().any(|s| waiter_alive(waiters_dir, s)) {
+            if sessions.iter().any(|s| live.contains(s.as_str())) {
                 // Log after the retry is issued, not before — never claim a retry
                 // that a propagated error would abort (mirrors `reconcile_startup`).
                 self.ensure_running(watch.id).await?;

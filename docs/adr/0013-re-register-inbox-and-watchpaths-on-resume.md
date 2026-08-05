@@ -1,6 +1,8 @@
 # ADR-0013: Re-register the inbox and watchPaths on session resume
 
-- Status: Accepted
+- Status: **Accepted — both decisions stand; the hook they live in was renamed by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md)** (`ensure-watcher` → `turn-end`,
+  because there is no watcher to ensure). See the amendment below.
 - Date: 2026-07-21
 - Relates to: [ADR-0007](0007-always-on-agent-inboxes.md) (always-on inbox),
   [ADR-0008](0008-on-demand-wake-filechanged.md) (on-demand wake). Resolves the
@@ -13,6 +15,15 @@
   pure watcher-liveness poke into the session's per-turn self-healing point — so
   `ensure-watcher` now registers the inbox (here) **before** it checks watcher liveness
   and then re-triggers (0012). That order is load-bearing; see below.
+
+> **Amended by [ADR-0017](0017-daemon-bumps-the-sentinel.md) (2026-08-05).** Both
+> decisions stand: `SessionStart` still uses matcher `""` so it re-fires on resume, and
+> the `Stop` hook still re-registers the inbox every turn. The hook is now called
+> `turn-end` rather than `ensure-watcher`, because the watcher it used to ensure has
+> been deleted — so every mention of respawning one below is history. The ordering
+> argument survives in a weaker form: registering the inbox first is still what makes
+> the turn boundary's other work (the sentinel re-arm and the ADR-0012 re-trigger) act
+> on a session that is actually subscribed.
 
 ## Context
 

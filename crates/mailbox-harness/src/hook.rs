@@ -35,7 +35,7 @@ pub enum HookError {
          `session_id`) from stdin. To run one by hand — e.g. to re-register a session \
          whose inbox lapsed — pipe it a payload:\n    \
          echo '{{\"session_id\":\"<your-session-id>\"}}' | mailbox harness session-start\n\
-         (`mailbox whoami` prints your session id.)"
+         (`mailbox status` prints your session id, with or without a bridge.)"
     )]
     NoPayload,
 

@@ -10,23 +10,23 @@
 //!
 //! The guarantees proven end to end (the invariants in design/01 + AGENTS.md):
 //! - **No zombie pollers** — every scenario holds a [`LeakGuard`] that FAILS the
-//!   test if any adapter / waiter / serve process survives teardown (ac-12-3).
+//!   test if any adapter / serve process survives teardown (ac-12-3).
 //! - **Edge-triggered exactly-once** — scenario 1 asserts each transition
 //!   publishes exactly once across many polls.
 //! - **Independent per-subscriber cursors** — scenario 2 asserts two sessions
 //!   each read the same edge from their own cursor.
-//! - **Payload-free harness wake** — the wake-path tests wake an armed waiter and
+//! - **Payload-free harness wake** — the wake-path tests wake an armed session and
 //!   coalesce a publish storm into a single wake (ac-12-2).
 //!
 //! Unit-level proofs of the same machinery live in their own cards' suites
-//! (`supervision.rs` at the library boundary, `wake.rs` for the FIFO channel,
+//! (`supervision.rs` at the library boundary, `filechanged_wake.rs` for the wake path,
 //! `adapter_e2e.rs` at the adapter boundary); this suite deliberately does NOT
 //! re-derive them — it proves they compose through the shipped binaries. Shared
 //! harness lives in `tests/common/` so nothing is copy-pasted.
 //!
 //! Flakiness discipline: bounded polled deadlines (never a fixed sleep waiting for
 //! a state — the two fixed waits assert a *negative*, i.e. that nothing happens),
-//! a tempdir + scoped socket/db/waiters per test, and every child reaped on drop.
+//! a tempdir + scoped socket/db/sentinel root per test, and every child reaped on drop.
 
 mod common;
 
@@ -34,8 +34,30 @@ use std::time::{Duration, Instant};
 
 use common::{
     Env, LeakGuard, PR_CONFLICTING_CI_FAILURE, PR_CONFLICTING_CI_SUCCESS, PR_MERGED, count_edges,
-    descendant_pids, drain_stderr, pid_alive, poll_until, wait_within,
+    descendant_pids, pid_alive, poll_until,
 };
+
+/// Start `session` through the production `SessionStart` hook, which registers its
+/// inbox and arms its wake sentinel.
+fn arm(env: &Env, session: &str) {
+    env.arm(session);
+}
+
+/// Block until `session`'s sentinel names `topic`, then confirm the `FileChanged`
+/// hook turns that into a real wake (exit 2). This pair IS the wake wire.
+fn assert_woken_for(env: &Env, session: &str, topic: &str) {
+    poll_until("the sentinel names the topic", SETTLE, || {
+        env.sentinel_topics(session)
+            .iter()
+            .any(|t| t == topic)
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(session).status.code(),
+        Some(2),
+        "{session} must be woken for {topic}"
+    );
+}
 
 /// A generous bound for "the supervisor spawned/settled the adapter", well above
 /// its ~1s restart backoff, so the suite stays green under parallel load.
@@ -60,16 +82,9 @@ fn scenario_1_conflict_review_ci_each_publish_exactly_once() {
 
     let s = "s1";
     let spec = env.pr_spec(1);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -113,10 +128,7 @@ fn scenario_1_conflict_review_ci_each_publish_exactly_once() {
     );
 
     // Teardown: the last interest leaves → the poller is torn down (no zombie).
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped after unwatch", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -139,16 +151,9 @@ fn scenario_1b_merge_surfaces_exactly_once() {
 
     let s = "s1";
     let spec = env.pr_spec(1);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -179,10 +184,7 @@ fn scenario_1b_merge_surfaces_exactly_once() {
         "a merged PR re-fires nothing — the merge edge is terminal end to end"
     );
 
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped after unwatch", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -205,28 +207,14 @@ fn scenario_2_two_sessions_share_one_child_with_independent_cursors() {
 
     let spec = env.pr_spec(2);
     let topic = env.pr_topic(2);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "a",
-        ],
+    env.run_as_ok(
+        "a",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch a",
     );
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "b",
-        ],
+    env.run_as_ok(
+        "b",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch b",
     );
 
@@ -268,14 +256,8 @@ fn scenario_2_two_sessions_share_one_child_with_independent_cursors() {
     );
 
     // Teardown: both leave → the shared child is torn down.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "a"],
-        "unwatch a",
-    );
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "b"],
-        "unwatch b",
-    );
+    env.run_as_ok("a", &["unwatch", "github-pr", &spec], "unwatch a");
+    env.run_as_ok("b", &["unwatch", "github-pr", &spec], "unwatch b");
     poll_until("shared child reaped after last interest", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -297,37 +279,20 @@ fn scenario_3_first_session_leaves_child_survives_second_still_woken() {
 
     let spec = env.pr_spec(3);
     let topic = env.pr_topic(3);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "a",
-        ],
+    env.run_as_ok(
+        "a",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch a",
     );
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            "b",
-        ],
+    env.run_as_ok(
+        "b",
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch b",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid("a"));
 
     // First session leaves: the child MUST keep running for the second.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "a"],
-        "unwatch a",
-    );
+    env.run_as_ok("a", &["unwatch", "github-pr", &spec], "unwatch a");
     let (state, interest) = poll_until("interest drops to 1", SETTLE, || {
         env.watch_state_interest("b")
     });
@@ -353,10 +318,7 @@ fn scenario_3_first_session_leaves_child_survives_second_still_woken() {
     );
 
     // Last session leaves → child gone.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", "b"],
-        "unwatch b",
-    );
+    env.run_as_ok("b", &["unwatch", "github-pr", &spec], "unwatch b");
     poll_until("child reaped once the last interest leaves", SETTLE, || {
         (!pid_alive(pid)).then_some(())
     });
@@ -382,16 +344,9 @@ fn scenario_4_last_session_leaves_child_gone_and_no_further_api_calls() {
 
     let s = "solo";
     let spec = env.pr_spec(4);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -401,10 +356,7 @@ fn scenario_4_last_session_leaves_child_gone_and_no_further_api_calls() {
     });
 
     // Last interest gone → child torn down, watch stopped.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("child reaped", SETTLE, || (!pid_alive(pid)).then_some(()));
     poll_until("watch stopped", SETTLE, || {
         (env.watch_state_interest(s)?.0 == "stopped").then_some(())
@@ -438,16 +390,9 @@ fn scenario_5_kill_adapter_restarts_once_then_stays_stopped() {
 
     let s = "s5";
     let spec = env.pr_spec(5);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid1 = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -481,10 +426,7 @@ fn scenario_5_kill_adapter_restarts_once_then_stays_stopped() {
     }
 
     // Interest 0 → reaped and stays stopped.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("restarted adapter reaped on last interest", SETTLE, || {
         (!pid_alive(pid2)).then_some(())
     });
@@ -516,16 +458,9 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
 
     let s = "s6";
     let spec = env.pr_spec(6);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid1 = poll_until("adapter running", SETTLE, || env.watch_pid(s));
@@ -576,61 +511,40 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
     guard.assert_clean();
 }
 
-// ===== Wake path — the fake harness driver wakes an idle waiter (ac-12-2) ======
+// ===== Wake path — a supervised adapter's publish wakes an idle session (ac-12-2) ==
 
-/// A REAL supervised adapter's publish wakes an armed idle waiter: `watch stub`
-/// subscribes the session and starts the stub poller; the fake harness driver
-/// (`harness arm` fed hook JSON) launches the waiter; the stub's next publish
-/// kicks it → exit 2 with the payload-free topic reminder on stderr. This is the
-/// full watch → adapter → bridge → harness-wake chain the other suites don't drive
-/// end to end.
+/// A REAL supervised adapter's publish wakes an armed idle session: `watch stub`
+/// subscribes the session and starts the stub poller; `session-start` arms the
+/// sentinel; the stub's next publish makes the daemon write it → the wake hook exits
+/// 2 with the payload-free topic reminder on stderr. This is the full watch →
+/// adapter → bridge → harness-wake chain the other suites don't drive end to end.
 #[test]
-fn wake_supervised_adapter_publish_wakes_armed_waiter() {
+fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
     let s = "waker";
-    env.run_ok(
-        &[
-            "watch",
-            "stub",
-            "wake",
-            "--interval-ms",
-            "150",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "stub", "wake", "--interval-ms", "150"],
         "watch stub",
     );
 
-    // The SessionStart/Stop hook launches the waiter (the agent runs nothing).
-    let mut arm = env.spawn_arm(s, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
-        env.waiter_pidfile(s).exists().then_some(())
-    });
+    // The SessionStart hook launches the watcher (the agent runs nothing).
+    arm(&env, s);
 
-    // The supervised stub's publish kicks the waiter → exit 2 (you have mail).
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "a publish must wake the armed waiter"
-    );
-    assert!(
-        drain_stderr(&mut arm).contains("mail on topic stub.wake"),
-        "the wake reminder names the topic (payload-free)"
-    );
-    drop(arm);
+    // The supervised stub's publish bumps the sentinel → the wake hook exits 2.
+    assert_woken_for(&env, s, "stub.wake");
 
     // Teardown: stop the poller + drop the session (SessionEnd), leaving nothing.
-    env.run_ok(&["unwatch", "stub", "wake", "--session", s], "unwatch stub");
+    env.run_as_ok(s, &["unwatch", "stub", "wake"], "unwatch stub");
     let _ = env.cleanup(s);
     guard.assert_clean();
 }
 
-/// Coalescing: a storm of publishes while a single waiter is armed produces ONE
+/// Coalescing: a storm of publishes against a single armed session produces ONE
 /// wake, and a later `read` still returns EVERY event (the wake advanced no
 /// cursor). Driven through the real CLI + the fake harness driver.
 #[test]
@@ -642,24 +556,19 @@ fn wake_many_publishes_coalesce_to_one_wake() {
 
     let s = "coalesce";
     let topic = "t.coalesce";
-    env.run_ok(&["subscribe", topic, "--session", s], "subscribe");
+    env.run_as_ok(s, &["subscribe", topic], "subscribe");
 
-    let mut arm = env.spawn_arm(s, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
-        env.waiter_pidfile(s).exists().then_some(())
-    });
+    arm(&env, s);
     assert!(
-        arm.try_wait().expect("try_wait").is_none(),
-        "the waiter blocks before any publish"
+        env.sentinel_topics(s).is_empty(),
+        "nothing is pending before any publish"
     );
 
-    // Ten rapid publishes → the single armed waiter wakes exactly once.
+    // Ten rapid publishes → the armed session wakes exactly once.
     for _ in 0..10 {
         env.publish(topic);
     }
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(status.code(), Some(2), "a publish storm wakes the waiter");
-    drop(arm);
+    assert_woken_for(&env, s, topic);
 
     // The wake advanced no cursor, so a read now drains all ten durable events.
     let events = env.read_events(s);
@@ -674,10 +583,10 @@ fn wake_many_publishes_coalesce_to_one_wake() {
 }
 
 /// Mid-turn surfacing through the COMPOSED path: a SUPERVISED adapter's edge that
-/// lands while NO waiter is armed (the agent is mid-turn) is not lost. The
+/// lands while the agent is mid-turn is not lost. The
 /// github-pr poller fires exactly one conflict edge; we confirm it is unread
 /// WITHOUT reading it (via `status`, which does not advance the cursor); then the
-/// next `harness arm`'s fresh waiter sees the still-unread edge and wakes (exit 2),
+/// next wake-hook run sees the still-unread edge and wakes (exit 2),
 /// delivered exactly once. Unlike a bare-`publish` version (which would duplicate
 /// `harness.rs`'s AC2), this proves the full watch → supervised adapter → bridge →
 /// next-arm composition.
@@ -691,35 +600,23 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
 
     let s = "midturn";
     let spec = env.pr_spec(7);
-    env.run_ok(
-        &[
-            "watch",
-            "github-pr",
-            &spec,
-            "--interval",
-            "1",
-            "--session",
-            s,
-        ],
+    env.run_as_ok(
+        s,
+        &["watch", "github-pr", &spec, "--interval", "1"],
         "watch github-pr",
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
 
-    // The supervised poller fires its one conflict edge mid-turn (no waiter armed).
-    // Confirm it is unread WITHOUT reading it, so it stays pending for the waiter.
+    // The supervised poller fires its one conflict edge mid-turn. Confirm it is
+    // unread WITHOUT reading it, so it stays pending for the wake hook.
     poll_until("the supervised edge lands unread", SETTLE, || {
         (env.unread_total(s) >= 1).then_some(())
     });
 
-    // The next arm's fresh waiter sees the still-unread edge immediately and wakes.
-    let mut arm = env.spawn_arm(s, &[]);
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "a supervised edge from before the waiter armed still wakes it (cursor kept it unread)"
-    );
-    drop(arm);
+    // A fresh watcher sees the still-unread edge immediately and bumps for it.
+    arm(&env, s);
+    let topic = format!("github.pr.{spec}");
+    assert_woken_for(&env, s, &topic);
 
     // Delivered exactly once, then the cursor advances (no redelivery).
     let events = env.read_events(s);
@@ -735,10 +632,7 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
     );
 
     // Teardown.
-    env.run_ok(
-        &["unwatch", "github-pr", &spec, "--session", s],
-        "unwatch github-pr",
-    );
+    env.run_as_ok(s, &["unwatch", "github-pr", &spec], "unwatch github-pr");
     poll_until("adapter reaped", SETTLE, || (!pid_alive(pid)).then_some(()));
     let _ = env.cleanup(s);
     guard.assert_clean();
@@ -748,20 +642,14 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
 
 /// The load-bearing guard must not be a no-op that always passes. This deliberately
 /// leaks live processes into the two scopes the guard watches — a descendant of a
-/// tracked "daemon" root, and a pid named by a waiter pidfile — and asserts the
-/// guard REPORTS them (would flip a scenario red), then reports clean once they are
-/// reaped. If the guard could not see these, every scenario's `assert_clean` would
-/// be worthless.
+/// tracked "daemon" root — and asserts the guard REPORTS it (would flip a scenario
+/// red), then reports clean once it is reaped. If the guard could not see this,
+/// every scenario's `assert_clean` would be worthless.
 #[test]
 fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
     use std::process::{Command, Stdio};
-    use tempfile::TempDir;
 
-    // ---- daemon-descendant scope: a live child of a tracked root is caught -----
-    let dir = TempDir::new().unwrap();
-    let waiters = dir.path().join("waiters");
-    std::fs::create_dir_all(&waiters).unwrap();
-
+    // A live child of a tracked root must be caught.
     // `sh -c 'sleep 60; true'` stays alive as the PARENT of a `sleep` child (the
     // trailing command defeats sh's exec-optimization), so `sleep` is a genuine
     // descendant of a UNIQUE root we own — never another test's process.
@@ -773,7 +661,7 @@ fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
         .spawn()
         .expect("spawn sh root");
 
-    let mut guard = LeakGuard::new(waiters.clone());
+    let mut guard = LeakGuard::default();
     guard.track_daemon(root.id());
 
     let leaks = poll_until("guard sees the descendant leak", SETTLE, || {
@@ -795,34 +683,5 @@ fn leak_guard_detects_a_surviving_process_and_clears_when_reaped() {
     let _ = root.wait();
     poll_until("guard clears once the subtree is reaped", SETTLE, || {
         guard.find_leaks().is_empty().then_some(())
-    });
-
-    // ---- waiter-pidfile scope: a live pid named by a pidfile is caught ---------
-    let dir2 = TempDir::new().unwrap();
-    let waiters2 = dir2.path().join("waiters");
-    std::fs::create_dir_all(&waiters2).unwrap();
-
-    let mut waiter = Command::new("sleep")
-        .arg("60")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn fake waiter");
-    std::fs::write(waiters2.join("proof.waiter.pid"), waiter.id().to_string()).unwrap();
-
-    let guard2 = LeakGuard::new(waiters2); // no daemon tracked — only the pidfile scope
-    let found = guard2.find_leaks();
-    assert!(
-        found
-            .iter()
-            .any(|l| l.source == "waiter-pidfile" && l.pid == waiter.id()),
-        "the guard must catch a live waiter named by a pidfile; got {found:?}"
-    );
-
-    let _ = waiter.kill();
-    let _ = waiter.wait();
-    poll_until("guard clears once the waiter is reaped", SETTLE, || {
-        guard2.find_leaks().is_empty().then_some(())
     });
 }

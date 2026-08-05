@@ -156,6 +156,10 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
+            // The daemon writes each subscriber's wake sentinel, so it MUST be
+            // pointed at a tempdir — without this a test writes into the
+            // developer's real ~/.mailbox.
+            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
             // The github-pr resolver runs the freshly built adapter...
             .env("MAILBOX_GH_ADAPTER_BIN", github_pr_adapter_bin())
             // ...and the adapter (inheriting serve's env) reaches the FAKE gh.
@@ -175,10 +179,14 @@ impl Daemon {
         daemon
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    /// Run a one-shot `mailbox` client command **as `session`**, via the env var
+    /// Claude Code exports into every tool call. That is the only way a command
+    /// learns whose session it is — there is no `--session` flag.
+    fn run_as(&self, session: &str, args: &[&str]) -> Output {
         mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("CLAUDE_CODE_SESSION_ID", session)
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
@@ -231,7 +239,7 @@ fn parse_json(text: &str) -> serde_json::Value {
 
 /// Read `session`'s unread events (advancing its cursor) as a JSON array.
 fn read_events(daemon: &Daemon, session: &str) -> Vec<serde_json::Value> {
-    let out = daemon.run(&["--json", "read", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "read"]);
     assert_ok(&out, "read");
     let value = parse_json(&String::from_utf8_lossy(&out.stdout));
     value["events"].as_array().cloned().unwrap_or_default()
@@ -247,7 +255,7 @@ fn count_conflicts(events: &[serde_json::Value]) -> usize {
 /// The single watch's running adapter pid from `status`, or `None` if it is not
 /// currently `running` with a pid.
 fn adapter_pid(daemon: &Daemon, session: &str) -> Option<u64> {
-    let out = daemon.run(&["--json", "status", "--session", session]);
+    let out = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&out, "status");
     let value = parse_json(&String::from_utf8_lossy(&out.stdout));
     value["watches"].as_array()?.first()?["pid"].as_u64()
@@ -277,15 +285,16 @@ fn github_pr_conflict_surfaces_once_and_baseline_round_trips() {
 
     // Full production path: watch → serve → supervisor → resolver → spawn adapter.
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "github-pr",
-            "octocat/hello-world#42",
-            "--interval",
-            "1",
-            "--session",
+        &daemon.run_as(
             session,
-        ]),
+            &[
+                "watch",
+                "github-pr",
+                "octocat/hello-world#42",
+                "--interval",
+                "1",
+            ],
+        ),
         "watch github-pr",
     );
 
@@ -352,15 +361,16 @@ fn no_refire_across_a_real_adapter_restart() {
     let session = "s1";
 
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "github-pr",
-            "octocat/hello-world#42",
-            "--interval",
-            "1",
-            "--session",
+        &daemon.run_as(
             session,
-        ]),
+            &[
+                "watch",
+                "github-pr",
+                "octocat/hello-world#42",
+                "--interval",
+                "1",
+            ],
+        ),
         "watch github-pr",
     );
 

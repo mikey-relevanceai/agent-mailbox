@@ -65,6 +65,16 @@ fn spawn_serve(db_path: &Path, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = mailbox_command();
     cmd.arg("serve")
         .env("AGENT_MAILBOX_DB", db_path)
+        // The daemon writes each subscriber's wake sentinel, so it MUST be pointed
+        // at a tempdir — without this a test writes into the developer's real
+        // ~/.mailbox. Derived from the DB path so it follows every caller.
+        .env(
+            "MAILBOX_SENTINEL_ROOT",
+            db_path
+                .parent()
+                .expect("db path has a parent")
+                .join("sentinel"),
+        )
         .env("RUST_LOG", "error")
         .stdin(Stdio::null());
     for (k, v) in extra_env {
@@ -131,6 +141,19 @@ impl Daemon {
         mailbox_command()
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("RUST_LOG", "error")
+            .output()
+            .expect("run mailbox client")
+    }
+
+    /// Run a one-shot `mailbox` client command **as `session`**, via the env var
+    /// Claude Code exports into every tool call. That is the only way a command
+    /// learns whose session it is — there is no `--session` flag.
+    fn run_as(&self, session: &str, args: &[&str]) -> Output {
+        mailbox_command()
+            .args(args)
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("CLAUDE_CODE_SESSION_ID", session)
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
@@ -230,10 +253,7 @@ fn ac1_publish_read_round_trip_via_binary() {
 
     // Subscribe BEFORE publishing — baseline-on-subscribe means a subscription
     // created after the publish would baseline past it and see nothing.
-    assert_ok(
-        &daemon.run(&["subscribe", "--session", session, topic]),
-        "subscribe",
-    );
+    assert_ok(&daemon.run_as(session, &["subscribe", topic]), "subscribe");
 
     let publish = daemon.run(&[
         "publish",
@@ -243,7 +263,7 @@ fn ac1_publish_read_round_trip_via_binary() {
     ]);
     assert_ok(&publish, "publish");
 
-    let read = daemon.run(&["--json", "read", "--session", session]);
+    let read = daemon.run_as(session, &["--json", "read"]);
     assert_ok(&read, "read");
     let value = parse_json(&stdout(&read));
     assert_eq!(value["result"], "read");
@@ -254,7 +274,7 @@ fn ac1_publish_read_round_trip_via_binary() {
     assert_eq!(events[0]["body"]["n"], 7);
 
     // A second read has advanced past it: nothing unread now (advance-on-read).
-    let read2 = daemon.run(&["--json", "read", "--session", session]);
+    let read2 = daemon.run_as(session, &["--json", "read"]);
     assert_ok(&read2, "second read");
     assert_eq!(
         parse_json(&stdout(&read2))["events"]
@@ -273,11 +293,12 @@ fn ac2_client_fails_loudly_when_bridge_is_down() {
     let db_path = dir.path().join("mailbox.db");
 
     let output = mailbox_command()
-        .args(["status", "--session", "s"])
+        .args(["read"])
+        .env("CLAUDE_CODE_SESSION_ID", "s")
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
         .output()
-        .expect("run status with no daemon");
+        .expect("run read with no daemon");
 
     assert!(
         !output.status.success(),
@@ -294,13 +315,68 @@ fn ac2_client_fails_loudly_when_bridge_is_down() {
     );
 }
 
+/// **`status` degrades instead of going blank when the bridge is down.**
+///
+/// A session's id and inbox topic are derivable locally, so `status` answers "who am
+/// I, and what is my address" with no daemon at all — which is the one property the
+/// deleted `whoami` command had that `status` did not. It still exits NON-ZERO
+/// (ADR-0004: a socket client fails loud), because the rest of what `status` reports —
+/// watches, subscriptions, unread — is genuinely missing, and it says so.
+#[test]
+fn status_still_answers_who_am_i_when_the_bridge_is_down() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("mailbox.db");
+
+    let output = mailbox_command()
+        .args(["status"])
+        .env("CLAUDE_CODE_SESSION_ID", "s-alone")
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run status with no daemon");
+
+    assert!(
+        !output.status.success(),
+        "the bridge being down is still a loud failure"
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("session: s-alone") && out.contains("inbox: agent.s-alone"),
+        "the identity fields are always knowable; got: {out}"
+    );
+    assert!(
+        out.contains("UNREACHABLE"),
+        "it must say what it could NOT tell you, not imply an empty mailbox; got: {out}"
+    );
+    assert!(
+        stderr(&output).contains("mailbox serve"),
+        "stderr keeps the actionable remedy"
+    );
+
+    // `--json` stays ONE document: the error shape a consumer already expects, with
+    // the identity keys added.
+    let output = mailbox_command()
+        .args(["--json", "status"])
+        .env("CLAUDE_CODE_SESSION_ID", "s-alone")
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run json status with no daemon");
+    let value = parse_json(&stdout(&output));
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["session"], "s-alone");
+    assert_eq!(value["inbox_topic"], "agent.s-alone");
+    assert_eq!(value["bridge"], "unreachable");
+}
+
 #[test]
 fn bridge_down_json_mode_emits_error_object() {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("mailbox.db");
 
     let output = mailbox_command()
-        .args(["--json", "status", "--session", "s"])
+        .args(["--json", "status"])
+        .env("CLAUDE_CODE_SESSION_ID", "s")
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
         .output()
@@ -328,11 +404,10 @@ fn no_session_json_mode_emits_error_object() {
     let db_path = dir.path().join("mailbox.db");
 
     let output = mailbox_command()
-        .args(["--json", "status"]) // no --session
+        .args(["--json", "status"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
-        // Ensure neither the test env nor a real Claude Code session leaks in.
-        .env_remove("MAILBOX_SESSION_ID")
+        // Ensure a real Claude Code session cannot leak in from the test runner.
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .output()
         .expect("run json status with no session");
@@ -347,9 +422,9 @@ fn no_session_json_mode_emits_error_object() {
     let value = parse_json(&stdout(&output));
     assert_eq!(value["result"], "error");
     let message = value["message"].as_str().unwrap_or_default();
-    // The message names every place we looked, so the agent can fix it.
+    // The message names the ONE place a session id comes from, so it is fixable.
     assert!(
-        message.contains("--session") && message.contains("MAILBOX_SESSION_ID"),
+        message.contains("CLAUDE_CODE_SESSION_ID"),
         "json error message should be actionable; got: {message}"
     );
 }
@@ -364,19 +439,20 @@ fn ac3_status_shows_watch_with_interest_count() {
     let session = "sess-watch";
 
     assert_ok(
-        &daemon.run(&[
-            "watch",
-            "github-pr",
-            "octocat/hello-world#42",
-            "--interval",
-            "30",
-            "--session",
+        &daemon.run_as(
             session,
-        ]),
+            &[
+                "watch",
+                "github-pr",
+                "octocat/hello-world#42",
+                "--interval",
+                "30",
+            ],
+        ),
         "watch",
     );
 
-    let status = daemon.run(&["--json", "status", "--session", session]);
+    let status = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&status, "status");
     let value = parse_json(&stdout(&status));
     assert_eq!(value["result"], "status");
@@ -408,22 +484,22 @@ fn two_sessions_share_one_watch_refcounted() {
     let pr = "octocat/hello-world#7";
 
     assert_ok(
-        &daemon.run(&["watch", "github-pr", pr, "--session", "s1"]),
+        &daemon.run_as("s1", &["watch", "github-pr", pr]),
         "watch s1",
     );
     assert_ok(
-        &daemon.run(&["watch", "github-pr", pr, "--session", "s2"]),
+        &daemon.run_as("s2", &["watch", "github-pr", pr]),
         "watch s2",
     );
 
-    let status = daemon.run(&["--json", "status", "--session", "s1"]);
+    let status = daemon.run_as("s1", &["--json", "status"]);
     assert_ok(&status, "status");
     let value = parse_json(&stdout(&status));
     let watches = value["watches"].as_array().unwrap();
     assert_eq!(watches.len(), 1, "still ONE shared watch");
     assert_eq!(watches[0]["interest"], 2, "two interested sessions");
 
-    let unwatch = daemon.run(&["--json", "unwatch", "github-pr", pr, "--session", "s1"]);
+    let unwatch = daemon.run_as("s1", &["--json", "unwatch", "github-pr", pr]);
     assert_ok(&unwatch, "unwatch s1");
     let uv = parse_json(&stdout(&unwatch));
     assert_eq!(uv["result"], "unwatched");
@@ -443,18 +519,15 @@ fn status_reports_how_many_subscriptions_a_session_has() {
 
     // A session on nothing reports an honest 0 — a present key, not an absent one,
     // so the status line needs no fallback for the un-armed case.
-    let before = daemon.run(&["--json", "status", "--session", session]);
+    let before = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&before, "status before subscribing");
     assert_eq!(parse_json(&stdout(&before))["subscription_count"], 0);
 
     for topic in ["test.count.alpha", "test.count.beta"] {
-        assert_ok(
-            &daemon.run(&["subscribe", topic, "--session", session]),
-            "subscribe",
-        );
+        assert_ok(&daemon.run_as(session, &["subscribe", topic]), "subscribe");
     }
 
-    let status = daemon.run(&["--json", "status", "--session", session]);
+    let status = daemon.run_as(session, &["--json", "status"]);
     assert_ok(&status, "status");
     let value = parse_json(&stdout(&status));
     assert_eq!(value["subscription_count"], 2);
@@ -466,7 +539,7 @@ fn status_reports_how_many_subscriptions_a_session_has() {
 
     // The human line carries the same number, so the two modes never tell a
     // different story about the same session.
-    let human = daemon.run(&["status", "--session", session]);
+    let human = daemon.run_as(session, &["status"]);
     assert_ok(&human, "human status");
     let text = stdout(&human);
     assert!(
@@ -498,7 +571,7 @@ fn oversized_frame_is_rejected_and_daemon_survives() {
 
     // The daemon did not OOM or die: a well-formed request still works.
     assert_ok(
-        &daemon.run(&["subscribe", "test.after.oversize", "--session", "s"]),
+        &daemon.run_as("s", &["subscribe", "test.after.oversize"]),
         "subscribe after oversized frame",
     );
 }
@@ -517,10 +590,7 @@ fn non_utf8_frame_is_rejected() {
             .contains("UTF-8"),
         "expected a UTF-8 error: {reply}"
     );
-    assert_ok(
-        &daemon.run(&["status", "--session", "s"]),
-        "status after non-utf8",
-    );
+    assert_ok(&daemon.run_as("s", &["status"]), "status after non-utf8");
 }
 
 // ==== A2: half-open client is timed out; connection cap is enforced ============
@@ -547,10 +617,7 @@ fn half_open_client_is_timed_out_by_the_daemon() {
     );
 
     // And the daemon is still healthy for real clients.
-    assert_ok(
-        &daemon.run(&["status", "--session", "s"]),
-        "status after timeout",
-    );
+    assert_ok(&daemon.run_as("s", &["status"]), "status after timeout");
 }
 
 #[test]
@@ -609,6 +676,7 @@ fn second_serve_on_same_db_fails_loudly() {
     let second = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()
@@ -649,10 +717,7 @@ fn stale_socket_is_reclaimed_on_restart() {
         _dir: dir,
     };
     wait_for_socket(&daemon.socket_path, Duration::from_secs(10));
-    assert_ok(
-        &daemon.run(&["status", "--session", "s"]),
-        "status after reclaim",
-    );
+    assert_ok(&daemon.run_as("s", &["status"]), "status after reclaim");
 }
 
 // ==== B4: socket + dir are owner-only; a hardening failure is fatal ============
@@ -687,6 +752,7 @@ fn hardening_failure_is_fatal() {
     let output = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()
@@ -786,7 +852,7 @@ fn malformed_frames_are_rejected_and_daemon_keeps_serving() {
         );
 
         // Isolation: a concurrent well-formed request still works.
-        let status = daemon.run(&["--json", "status", "--session", "iso"]);
+        let status = daemon.run_as("iso", &["--json", "status"]);
         assert_ok(&status, "status after a bad frame");
         assert_eq!(parse_json(&stdout(&status))["result"], "status");
     }
@@ -802,7 +868,7 @@ fn client_disconnecting_before_sending_is_handled() {
     }
     // Still serving.
     assert_ok(
-        &daemon.run(&["status", "--session", "s"]),
+        &daemon.run_as("s", &["status"]),
         "status after abrupt disconnect",
     );
 }
@@ -810,7 +876,7 @@ fn client_disconnecting_before_sending_is_handled() {
 #[test]
 fn unknown_session_read_returns_empty_not_error() {
     let daemon = Daemon::start();
-    let read = daemon.run(&["--json", "read", "--session", "never-seen"]);
+    let read = daemon.run_as("never-seen", &["--json", "read"]);
     assert_ok(&read, "read for unknown session");
     let value = parse_json(&stdout(&read));
     assert_eq!(value["result"], "read");
@@ -879,17 +945,17 @@ fn human_publish_output_is_readable() {
     );
 }
 
-/// With no `--session` and neither session env var set, a session-scoped command
-/// fails with an actionable error (exit 1) that names every place the id could
-/// have come from. Card 16 moved this off clap's `env =` (which supports only one
-/// variable) into an explicit three-way resolution, so it is a runtime error
-/// rather than a clap usage error — and deliberately NOT exit 2, which is
-/// reserved for the waiter's wake signal.
+/// A session-scoped command run outside a Claude Code session fails with an
+/// actionable error (exit 1) naming the ONE variable it needs. Deliberately NOT exit
+/// 2, which is reserved for the wake hook's wake signal.
+///
+/// There is no `--session` flag and no `MAILBOX_SESSION_ID` any more: identity comes
+/// from `$CLAUDE_CODE_SESSION_ID` and nowhere else, so there is one thing to name here
+/// instead of a precedence order to explain.
 #[test]
-fn missing_session_everywhere_is_an_actionable_error() {
+fn a_command_run_outside_a_session_is_an_actionable_error() {
     let output = mailbox_command()
         .args(["read"])
-        .env_remove("MAILBOX_SESSION_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .output()
@@ -901,95 +967,59 @@ fn missing_session_everywhere_is_an_actionable_error() {
         stderr(&output)
     );
     let stderr = stderr(&output);
-    assert!(stderr.contains("--session"), "stderr: {stderr}");
-    assert!(stderr.contains("MAILBOX_SESSION_ID"), "stderr: {stderr}");
     assert!(
         stderr.contains("CLAUDE_CODE_SESSION_ID"),
         "stderr: {stderr}"
     );
 }
 
-/// `CLAUDE_CODE_SESSION_ID` is the LAST fallback: Claude Code exports it into
-/// every tool call, so an agent can address itself with nothing installed but the
-/// binary. `MAILBOX_SESSION_ID` (which the harness hooks set) still wins over it.
+/// The session comes from `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into
+/// every tool call — so an agent addresses itself with nothing installed but the
+/// binary, and passes no flag to do it.
 #[test]
-fn claude_code_session_env_is_the_last_fallback() {
-    // `whoami` is a local command (identity does not depend on the bridge), so no
-    // daemon is needed to exercise the resolution order end to end.
+fn the_session_comes_from_the_claude_code_env_var() {
+    // `status`'s identity half needs no bridge, so no daemon is needed to exercise
+    // resolution end to end.
     let out = mailbox_command()
-        .args(["--json", "whoami"])
-        .env_remove("MAILBOX_SESSION_ID")
+        .args(["--json", "status"])
         .env("CLAUDE_CODE_SESSION_ID", "s-claude")
+        .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .output()
-        .expect("run whoami");
+        .expect("run status");
     let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
     assert_eq!(value["session"], "s-claude");
     assert_eq!(value["inbox_topic"], "agent.s-claude");
-
-    // MAILBOX_SESSION_ID wins over it...
-    let out = mailbox_command()
-        .args(["--json", "whoami"])
-        .env("MAILBOX_SESSION_ID", "s-mailbox")
-        .env("CLAUDE_CODE_SESSION_ID", "s-claude")
-        .output()
-        .expect("run whoami");
-    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
-    assert_eq!(value["session"], "s-mailbox");
-
-    // ...and the explicit flag wins over both.
-    let out = mailbox_command()
-        .args(["--json", "whoami", "--session", "s-flag"])
-        .env("MAILBOX_SESSION_ID", "s-mailbox")
-        .env("CLAUDE_CODE_SESSION_ID", "s-claude")
-        .output()
-        .expect("run whoami");
-    let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
-    assert_eq!(value["session"], "s-flag");
 }
 
-#[test]
-fn session_env_fallback_is_used_when_flag_absent() {
-    let daemon = Daemon::start();
-    let output = mailbox_command()
-        .args(["subscribe", "test.topic.env"])
-        .env("AGENT_MAILBOX_DB", &daemon.db_path)
-        .env("MAILBOX_SESSION_ID", "from-env")
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run subscribe with env session");
-    assert_ok(&output, "subscribe via env session");
-    assert!(stdout(&output).contains("subscribed to test.topic.env"));
-}
-
-/// **The empty-`--session` trap must be VISIBLE (verifier FIX 5).**
+/// **An empty session id must name NOBODY, loudly.**
 ///
-/// `--session "$MAILBOX_SESSION_ID"` with that var unset expands to `--session ""`, and
-/// an explicit flag wins the precedence — so the command silently binds a *different*
-/// session (whatever the env says) than the one the caller believes they named. The
-/// diagnostic for that used to be a `tracing::warn!`, which the default filter (ERROR)
-/// swallowed for exactly the commands where the trap bites: `mailbox publish --session
-/// ""` printed nothing at all. It must be a real stderr line at DEFAULT verbosity —
-/// no RUST_LOG, no flags.
+/// This is what the deleted `--session` flag got wrong: `--session
+/// "$MAILBOX_SESSION_ID"` — which the skill had to warn agents away from — expands to
+/// `--session ""` in an agent's shell, and an explicit flag won the precedence, so the
+/// command bound a phantom empty session the agent could never be woken on. With one
+/// env var and no flag, an empty value simply means "no session", which is an error
+/// the agent can see rather than a wrong session it cannot.
 #[test]
-fn an_empty_session_flag_warns_on_stderr_at_default_verbosity() {
+fn an_empty_session_env_value_is_refused_rather_than_bound() {
     let out = mailbox_command()
-        .args(["--json", "whoami", "--session", ""])
-        .env("CLAUDE_CODE_SESSION_ID", "s-real")
-        // NO RUST_LOG: the default filter is what swallowed this before.
+        .args(["--json", "status"])
+        .env("CLAUDE_CODE_SESSION_ID", "")
+        .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .env_remove("RUST_LOG")
         .output()
-        .expect("run whoami");
+        .expect("run status");
 
-    let stderr = stderr(&out);
     assert!(
-        stderr.contains("empty --session"),
-        "the ignored empty --session must be reported on stderr at default verbosity; got: \
-         {stderr:?}"
+        !out.status.success(),
+        "an empty session id must not resolve to a phantom empty session"
     );
-    // And it says what it fell back to, so the agent can see which session it really is.
     let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
-    assert_eq!(
-        value["session"], "s-real",
-        "the empty flag is ignored, not bound as a phantom empty session"
+    assert_eq!(value["result"], "error");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("CLAUDE_CODE_SESSION_ID"),
+        "the error must name the variable to set; got {value}"
     );
 }

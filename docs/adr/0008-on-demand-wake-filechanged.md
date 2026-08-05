@@ -1,11 +1,32 @@
-# ADR-0008: On-demand wake via a detached watcher + FileChanged hook
+# ADR-0008: On-demand wake via a sentinel file + FileChanged hook
 
-- Status: Accepted
+- Status: Accepted **in its conclusion, not in its mechanism** — see the amendment
+  below.
 - Date: 2026-07-16
 - Supersedes: the **periodic re-arm** of [ADR-0006](0006-harness-self-respawn.md)
-  (the `Stop` → `arm` → exit-2-at-`max_block` loop). ADR-0006's other decisions —
-  the single-waiter lock, the waiter-owned pidfile, arm-iff-subscribed, the
-  publish rules — still stand and are reused here.
+  (the `Stop` → `arm` → exit-2-at-`max_block` loop).
+- Amended by: [ADR-0012](0012-level-triggered-wake-at-the-turn-boundary.md) (the
+  busy-window edge loss), [ADR-0016](0016-prove-wakeability-with-an-active-probe.md)
+  (the wake hook gains an ack), and
+  [**ADR-0017**](0017-daemon-bumps-the-sentinel.md) (the detached watcher is
+  deleted).
+
+> **Amendment (ADR-0017, 2026-08-05).** Everything below about the SENTINEL, the
+> `FileChanged` hook, the exit-2 wake, the anti-loop store re-check and per-session
+> isolation via `watchPaths` still holds, and is the design in force.
+>
+> What no longer exists is the **detached per-session watcher** and the FIFO it
+> blocked on. The `serve` daemon writes the sentinel itself, inside the publish it is
+> already serving. So every reference below to "the watcher" — the single-waiter
+> lock, the waiter pidfile, arm-iff-subscribed, the kick, the missed-kick ordering,
+> the EINTR retry, the `Stop`-hook respawn — describes machinery that has been
+> deleted. Read those sections as history: they explain why the watcher was built and
+> what it had to defend against, which is exactly the cost that justified removing it.
+>
+> Two of its jobs moved rather than vanishing: `session-start` now ARMS the sentinel
+> (the watcher's prime step, and the reason the file exists before the watch is
+> registered on it), and the `Stop` hook re-arms a MISSING sentinel (the honest
+> remainder of its respawn duty).
 
 ## Context
 

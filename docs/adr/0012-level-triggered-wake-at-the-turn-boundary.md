@@ -1,10 +1,28 @@
 # ADR-0012: Level-triggered wake at the turn boundary (the busy-window deafness fix)
 
-- Status: Accepted
+- Status: **Accepted — the requirement stands, the mechanism described here does
+  not.** See [ADR-0017](0017-daemon-bumps-the-sentinel.md).
 - Date: 2026-07-21
 - Amends: [ADR-0008](0008-on-demand-wake-filechanged.md) (the `Stop`-liveness hook E′
   gains a second job). Nothing in ADR-0008 is reversed — the watcher, the sentinel,
   the `FileChanged` wake hook and its anti-loop all stand exactly as they are.
+- Amended by: [ADR-0017](0017-daemon-bumps-the-sentinel.md) (the watcher is deleted
+  and the hook is renamed).
+
+> **Amendment ([ADR-0017](0017-daemon-bumps-the-sentinel.md), 2026-08-05).** The
+> DECISION here is unchanged and is live: the wake is an edge, an edge only reaches
+> an IDLE session, so the turn boundary must re-check the durable state and re-bump
+> the sentinel for mail the session was too busy to be woken for — bounded by the
+> `event_row_id` watermark in `.mailbox-retriggered`. That is exactly what runs
+> today.
+>
+> What is gone is the hook it hung off. `mailbox harness ensure-watcher` is now
+> `mailbox harness turn-end`, because the detached watcher it ensured has been
+> deleted along with the FIFO it blocked on. So "the `Stop`-liveness hook gains a
+> second job", "the watcher is untouched" and every other mention of a watcher below
+> describe machinery that no longer exists. The `Stop` hook's remaining jobs are:
+> close the turn (ADR-0016), re-register the inbox (ADR-0013), re-arm a MISSING
+> sentinel (ADR-0017), and then the re-trigger decided here.
 
 ## Context
 

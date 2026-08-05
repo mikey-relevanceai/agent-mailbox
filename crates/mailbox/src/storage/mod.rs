@@ -44,15 +44,13 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, PublishAttempt, ReadPage, SessionId, SubscribeKind, SubscribeOutcome,
-    TopicSummary, Unread, WakeWatermark, Watch, WatchId, WatchKind, WatchSpec, WatchState,
-    WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
+    Unread, WakeWatermark, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
 // `wake` module.
 pub(crate) use reader::ReadOnlyStore;
-pub use reader::{Fleet, FleetSession, FleetWatch};
 
 use writer::Command;
 
@@ -64,17 +62,10 @@ const ENV_HOME: &str = "AGENT_MAILBOX_HOME";
 /// Directory (under home) and file name of the default database.
 const DEFAULT_DIR: &str = ".agent-mailbox";
 const DEFAULT_FILE: &str = "mailbox.db";
-/// Subdirectory (beside the database file) that holds per-session waiter FIFOs.
-/// Deriving it from the resolved DB path — rather than re-resolving HOME — means
-/// the wake FIFOs automatically follow every storage override (`AGENT_MAILBOX_DB`,
-/// `AGENT_MAILBOX_HOME`, or a test's explicit path) and can never drift from the
-/// database they signal about.
-const WAITERS_SUBDIR: &str = "waiters";
 /// File name (beside the database file) of the user-scoped Unix socket the
-/// `serve` daemon binds. Derived from the resolved DB path for the same reason as
-/// [`WAITERS_SUBDIR`]: the CLI clients and the daemon must agree on one path
-/// under every storage override, with no separate env to keep in sync (card 06,
-/// ADR-0004).
+/// `serve` daemon binds. Derived from the resolved DB path — rather than from a
+/// separate env var — so the CLI clients and the daemon agree on one path under
+/// every storage override, with nothing to keep in sync (card 06, ADR-0004).
 const SOCKET_FILE: &str = "mailbox.sock";
 /// File name (beside the database file) of the daemon's exclusive lockfile. The
 /// `serve` daemon holds an advisory `flock` on this for its whole life BEFORE it
@@ -82,10 +73,9 @@ const SOCKET_FILE: &str = "mailbox.sock";
 /// writers (the real cross-process single-writer guard — ADR-0003/0004).
 const LOCK_FILE: &str = "mailbox.lock";
 
-/// The append-only log every detached/hook-run command writes to, beside the
-/// database. It is the only durable record of the wake path's decisions, which is
-/// why `mailbox dashboard` reads it back to tell a session whose wake works from
-/// one that is silently deaf ([`crate::dashboard`]).
+/// The append-only log every hook-run command writes to, beside the database. It is
+/// the only durable record of the wake path's decisions, and so the only place to
+/// reconstruct why a given session was — or was not — woken.
 const HARNESS_LOG_FILE: &str = "harness.log";
 
 /// Capacity of the writer command channel.
@@ -137,25 +127,12 @@ impl StorageConfig {
         &self.path
     }
 
-    /// The directory that holds per-session waiter FIFOs, beside the database
-    /// file (`<db-parent>/waiters`). Derived from the resolved DB path so the
-    /// wake channel follows the same env overrides as storage (see
-    /// [`WAITERS_SUBDIR`]). Falls back to a bare relative `waiters` only if the
-    /// DB path has no parent (a bare filename), matching how [`Storage::open`]
-    /// treats an empty parent.
-    pub fn waiters_dir(&self) -> PathBuf {
-        match self.path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(WAITERS_SUBDIR),
-            _ => PathBuf::from(WAITERS_SUBDIR),
-        }
-    }
-
     /// The user-scoped Unix socket the `serve` daemon binds and CLI clients
     /// connect to (`<db-parent>/mailbox.sock`). Derived from the resolved DB path
-    /// exactly like [`waiters_dir`](Self::waiters_dir) so daemon and clients agree
-    /// on one location under every storage override without a separate env var
-    /// (card 06 / ADR-0004). Falls back to a bare relative name only if the DB
-    /// path has no parent, matching how [`Storage::open`] treats an empty parent.
+    /// so daemon and clients agree on one location under every storage override
+    /// without a separate env var (card 06 / ADR-0004). Falls back to a bare
+    /// relative name only if the DB path has no parent, matching how
+    /// [`Storage::open`] treats an empty parent.
     pub fn socket_path(&self) -> PathBuf {
         self.sibling(SOCKET_FILE)
     }
@@ -175,9 +152,9 @@ impl StorageConfig {
         self.sibling(LOCK_FILE)
     }
 
-    /// The directory that holds the database, socket, lockfile, and waiters. The
-    /// daemon creates it `0700` so every user-scoped resource beneath it is
-    /// owner-only from creation.
+    /// The directory that holds the database, socket, and lockfile. The daemon
+    /// creates it `0700` so every user-scoped resource beneath it is owner-only
+    /// from creation.
     pub fn dir(&self) -> PathBuf {
         match self.path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -281,37 +258,6 @@ impl Storage {
             adapter,
             timestamp,
             body,
-            reply,
-        })
-        .await
-    }
-
-    /// Append an event published BY a session (an agent), rather than by an adapter.
-    ///
-    /// One atomic writer command, because the caller-aware rules and the append must
-    /// agree on one view of the log (see [`PublishAttempt`]):
-    ///
-    /// - refuse ([`PublishAttempt::RefusedUnread`], nothing written) when `publisher`
-    ///   is subscribed to `topic` and has unread events on it — be caught up to speak;
-    /// - otherwise append, and — if `publisher` is subscribed — advance its own
-    ///   delivery cursor past its own event, so it is never unread against itself.
-    ///
-    /// The adapter path ([`Storage::publish`]) is deliberately left alone: an adapter
-    /// has no session, no cursor and no unread, and its contract must not change.
-    pub async fn publish_as_session(
-        &self,
-        topic: Topic,
-        adapter: AdapterId,
-        timestamp: Timestamp,
-        body: Value,
-        publisher: SessionId,
-    ) -> Result<PublishAttempt, StorageError> {
-        self.call(|reply| Command::PublishAsSession {
-            topic,
-            adapter,
-            timestamp,
-            body,
-            publisher,
             reply,
         })
         .await

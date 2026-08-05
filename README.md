@@ -10,18 +10,22 @@ woken when one of them changes. Things worth waking on:
 - monitoring of those changes in production
 - a peer agent handing off work
 
-The key idea: **the agent never polls and never re-arms.** Claude Code *hooks*
-keep a waiter armed; a local *bridge daemon* supervises the pollers. The whole
-agent-facing contract is four verbs — **subscribe → read → react →
+The key idea: **the agent never polls and never re-arms.** A local *bridge daemon*
+supervises the pollers and, when mail lands, writes a per-session **sentinel file**
+that Claude Code is watching; a `FileChanged` *hook* turns that write into a wake.
+The whole agent-facing contract is four verbs — **subscribe → read → react →
 unsubscribe** — and that's it.
 
 ```text
 Adapters (detect world changes)
         ↓ publish
-Bridge (durable events + subscriptions + wake kicks)
-        ↓ harness wake
+Bridge (durable events + subscriptions; writes each subscriber's wake sentinel)
+        ↓ FileChanged hook → exit 2
 Agent sessions (react, never poll)
 ```
+
+Three links, two live components and a file. There is no per-session watcher
+process and nothing on a timer ([ADR-0017](docs/adr/0017-daemon-bumps-the-sentinel.md)).
 
 ## Quickstart
 
@@ -34,8 +38,9 @@ scripts/demo.sh
 ```
 
 The demo starts a private daemon in a tempdir and walks the whole loop —
-subscribe/read, an idle wake, a supervised poller, and teardown — asserting the
-idle waiter wakes. Captured output is in [docs/demo.md](docs/demo.md).
+subscribe/read, an idle wake, a supervised poller, and teardown — asserting that
+the daemon writes the sentinel and that the wake hook exits 2 on it. Captured
+output is in [docs/demo.md](docs/demo.md).
 
 To actually use it:
 
@@ -65,11 +70,16 @@ Code — pass `--settings <path>` to create one anyway.
 Then, from an agent session:
 
 ```bash
-mailbox watch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID"  # subscribe + start the poller
+mailbox watch github-pr owner/repo#42   # subscribe + start the poller
 # ... go idle; the hooks keep you armed ...
-mailbox read --session "$MAILBOX_SESSION_ID"                           # on wake
-mailbox unwatch github-pr owner/repo#42 --session "$MAILBOX_SESSION_ID" # when done
+mailbox read                            # on wake
+mailbox unwatch github-pr owner/repo#42 # when done
 ```
+
+No session argument, and no `--session` flag: the session-scoped commands resolve
+*you* from the `$CLAUDE_CODE_SESSION_ID` Claude Code exports into every tool call.
+(`publish` resolves no caller at all — it goes to the topic and wakes every
+subscriber, its author included: [ADR-0018](docs/adr/0018-publish-has-one-rule.md).)
 
 Full walkthrough (install, hooks, the four-verb loop, `mailbox status`):
 **[docs/04-usage.md](docs/04-usage.md)**.
@@ -80,7 +90,8 @@ Full walkthrough (install, hooks, the four-verb loop, `mailbox status`):
 crates/
   mailbox/            # bridge CLI + daemon binary
   mailbox-protocol/   # shared publish/subscribe types
-  mailbox-harness/    # Claude Code hook wake helpers (arm / cleanup / install)
+  mailbox-harness/    # Claude Code integration: the hook set (session-start /
+                      # turn-start / turn-end / wake / cleanup) + hooks & skills install
 adapters/
   stub-adapter/       # reference adapter (synthetic edges; demo/tests)
   github-pr-adapter/  # the real GitHub PR poller (via `gh`)
@@ -113,7 +124,7 @@ guidance lives in [AGENTS.md](AGENTS.md).
 
 **Design:**
 
-- [Wake and re-arm](docs/01-wake-and-rearm.md)
+- [Wake](docs/01-wake.md) — the sentinel, the hooks, and why nothing re-arms
 - [Tech stack](docs/02-tech-stack.md)
 - [Working agreements](docs/03-working-agreements.md) — ADRs, designs, PRs, mikey-in-a-box install
 - [ADRs](docs/adr/README.md) · [Designs](docs/design/README.md) · [MVP GitHub watch](docs/design/01-mvp-github-watch.md)

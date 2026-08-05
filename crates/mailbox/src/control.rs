@@ -57,23 +57,16 @@ pub enum Request {
     /// Publish an event to a topic. The daemon stamps the timestamp, exactly as the
     /// durable bridge does; provenance is the [`AdapterId`] (a name, not authority).
     ///
-    /// `session` is the CALLER, when there is one — an agent's `mailbox publish`
-    /// resolves it from the environment like every other session-scoped command. It
-    /// is `Option` because the original publisher, an **adapter**, genuinely has no
-    /// session, and its contract must not change: no session → no unread rule. With a
-    /// session, one rule applies (see [`crate::serve`]): the publish is REFUSED if
-    /// that session has unread events on the topic that it did not itself write
-    /// ("be caught up to speak"). Either way every subscriber is kicked, the publisher
-    /// included (ADR-0014).
-    ///
-    /// `#[serde(default)]` so a frame from an older client (which had no such field)
-    /// still decodes as the session-less adapter publish it was.
+    /// It carries no caller: **every publisher is the same publisher** (ADR-0018).
+    /// An adapter, an agent and a script an agent spawned all append to the topic and
+    /// wake every subscriber, author included. The frame used to carry an optional
+    /// `session` so the daemon could refuse a publish from a caller with unread mail
+    /// on the topic; that rule is deleted, and an extra field a rule no longer reads
+    /// is a place for the rule to grow back.
     Publish {
         topic: Topic,
         adapter: AdapterId,
         body: Value,
-        #[serde(default)]
-        session: Option<SessionId>,
     },
     /// Subscribe `session` to `topic` (baseline-on-subscribe). `kind` distinguishes
     /// an explicit user/agent subscribe from the automatic `harness arm` inbox
@@ -126,14 +119,25 @@ pub enum Request {
     /// The body is a JSON **object** on the wire (a `Map`, not a `Value`), so
     /// "there is somewhere to stamp `from`" is a type-level guarantee rather than
     /// a runtime check. It stays opaque to the bus either way (ADR-0001).
+    ///
+    /// **`from` is OPTIONAL**, because the caller's identity is not what `send`
+    /// exists for: its job is to deliver, and `from` is only the reply address it
+    /// stamps on the way. An agent messaging a peer has one and it is stamped; a
+    /// HUMAN poking an agent from an ordinary terminal has none, and refusing to
+    /// deliver would be trading a working poke for a missing courtesy. `None` means
+    /// "this message has no reply address", which the daemon states by omitting the
+    /// `from` key entirely rather than inventing a placeholder.
     Send {
-        from: SessionId,
+        from: Option<SessionId>,
         to: SessionId,
         body: serde_json::Map<String, Value>,
     },
     /// List the sessions with a registered agent inbox (card-16 discovery).
-    /// `session` is the *caller*, so the reply can mark which agent is itself.
-    Agents { session: SessionId },
+    /// `session` is the *caller*, so the reply can mark which agent is itself —
+    /// and it is OPTIONAL for that reason: marking a row is all it does. A human
+    /// listing the fleet from a terminal is not one of the agents, so with `None`
+    /// every agent is listed and no row is marked.
+    Agents { session: Option<SessionId> },
     /// List known topics with subscriber/event counts, optionally filtered to a
     /// prefix (card-16 discovery).
     Topics { prefix: Option<String> },
@@ -209,15 +213,6 @@ pub enum Response {
         interests_dropped: u64,
         adapters_stopped: u64,
     },
-    /// A publish was REFUSED because the caller is not caught up on the topic: it has
-    /// `unread` event(s) there that someone else wrote. **Nothing was written.**
-    ///
-    /// This is its own response (and its own CLI exit code) rather than a generic
-    /// [`Response::Error`] because it is not a failure: it is a "retry after reading"
-    /// instruction with a defined remedy, and a scripted publisher must be able to
-    /// tell it apart from "the bridge is down" — which it could not when both exited
-    /// 1 with a string.
-    PublishRefused { topic: Topic, unread: u64 },
     /// The command was well-formed but could not be serviced (bad topic, storage
     /// error, …). Human-readable detail only; not machine-dispatched on.
     Error { message: String },
@@ -291,13 +286,17 @@ pub struct AgentSummary {
     /// Its inbox topic (`agent.<session-id>`), carried explicitly so a consumer
     /// never has to re-derive the grammar.
     pub inbox: Topic,
-    /// Whether a waiter is blocked for this session right now — i.e. the agent is
-    /// idle and a `send` will wake it immediately. `false` means it is busy
-    /// (mid-turn) or never armed; a message still lands durably in its inbox and
-    /// surfaces on its next read. This is NOT a heartbeat (see
-    /// [`mailbox::wake::waiter_alive`]).
-    pub live_waiter: bool,
-    /// Whether this row is the caller itself.
+    /// Whether a Claude Code process is still running for this session, read from
+    /// the process table ([`mailbox::doctor::live_claude_sessions`]).
+    ///
+    /// It says the agent EXISTS, not that it is idle or reachable: a live agent may
+    /// be mid-turn, and only `mailbox doctor` proves wakeability. `false` means
+    /// nobody is running that session any more; a message still lands durably in its
+    /// inbox, it just has nobody left to collect it.
+    pub live: bool,
+    /// Whether this row is the caller itself. Always `false` when the request
+    /// carried no caller (a human at a terminal is not one of these agents), so
+    /// "nobody is marked" and "I am not listed" read the same — which they are.
     pub is_self: bool,
 }
 
@@ -531,14 +530,6 @@ mod tests {
             topic: Topic::parse("github.pr.o/r#1").unwrap(),
             adapter: AdapterId("cli".to_string()),
             body: serde_json::json!({ "hello": "world" }),
-            session: None,
-        });
-        // The session-aware (agent) publish carries the caller.
-        round_trip_request(Request::Publish {
-            topic: Topic::parse("github.pr.o/r#1").unwrap(),
-            adapter: AdapterId("cli".to_string()),
-            body: serde_json::json!({ "hello": "world" }),
-            session: Some(SessionId::new("s-pub")),
         });
         round_trip_request(Request::Subscribe {
             session: SessionId::new("s1"),
@@ -563,24 +554,22 @@ mod tests {
         });
     }
 
-    /// A publish frame with NO `session` key — what an older client, or any encoder
-    /// that predates the caller-aware publish, emits — must still decode as the
-    /// session-less adapter publish it is, rather than failing the frame.
+    /// The two ops whose caller is optional survive the wire in BOTH shapes. A
+    /// missing caller has to be a real value on the frame, not an encoding that
+    /// happens to decode — otherwise "a human sent this" would be indistinguishable
+    /// from a truncated frame.
     #[test]
-    fn a_publish_frame_without_a_session_decodes_as_session_less() {
-        let line = format!(
-            r#"{{"version":{PROTOCOL_VERSION},"op":"publish","topic":"t.a","adapter":"gh","body":{{}}}}"#
-        );
-        let decoded: Request = decode_frame(&line).expect("legacy publish frame must decode");
-        assert_eq!(
-            decoded,
-            Request::Publish {
-                topic: Topic::parse("t.a").unwrap(),
-                adapter: AdapterId("gh".to_string()),
-                body: serde_json::json!({}),
-                session: None,
-            }
-        );
+    fn send_and_agents_round_trip_with_and_without_a_caller() {
+        for from in [Some(SessionId::new("s-a")), None] {
+            round_trip_request(Request::Send {
+                from,
+                to: SessionId::new("s-b"),
+                body: serde_json::Map::new(),
+            });
+        }
+        for session in [Some(SessionId::new("s-a")), None] {
+            round_trip_request(Request::Agents { session });
+        }
     }
 
     #[test]

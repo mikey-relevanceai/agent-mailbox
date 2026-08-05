@@ -7,7 +7,7 @@
 - Related ADRs: [0001](../adr/0001-rust-bridge-subprocess-adapters.md),
   [0002](../adr/0002-mvp-crate-stack.md),
   [0003](../adr/0003-single-writer-sqlite.md)
-- Related: [01-wake-and-rearm](../01-wake-and-rearm.md), prior skill
+- Related: [01-wake](../01-wake.md), prior skill
   `agent-ipc` / `agent-ipc-github`
 
 > **Card 09 status note.** The `stub` watch kind + its resolver landed as the
@@ -69,12 +69,12 @@ Parity with `agent-ipc-github`, plus CI:
 │ adapter         │                          │ (single SQLite   │
 │ (subprocess)    │  supervised by bridge    │  writer)         │
 └─────────────────┘                          └────────┬─────────┘
-                                                      │ kick
+                                          writes the sentinel
                                                       ▼
                                              ┌──────────────────┐
                                              │ Claude harness   │
-                                             │ asyncRewake      │
-                                             │ waiter           │
+                                             │ FileChanged →    │
+                                             │ asyncRewake wake │
                                              └──────────────────┘
 ```
 
@@ -83,7 +83,8 @@ Parity with `agent-ipc-github`, plus CI:
 - **Adapter** only polls and publishes; it does not wake agents or touch SQLite.
 - **Bridge** owns durability, subscriptions, delivery cursors, and **adapter
   process lifecycle**.
-- **Harness** owns arm/re-arm via hooks ([01-wake-and-rearm](../01-wake-and-rearm.md)).
+- **Harness** owns the wake hooks — arming the sentinel at `SessionStart` and
+  turning a change to it into a wake. Nothing re-arms ([01-wake](../01-wake.md)).
 
 ## Adapter lifecycle (no zombies)
 
@@ -127,9 +128,9 @@ MVP rules:
    stopped.
 6. **Bridge restart.** Resume a watch only if at least one interested session is
    still alive; otherwise mark stopped (fail safe: missed events > zombie API
-   load). The session-liveness probe is the session's **watcher pidfile**
-   ([ADR-0009](../adr/0009-interest-liveness-from-the-waiter-pidfile.md)) — the
-   same signal the TTL sweeper trusts. **Resolved (ADR-0010):** this rule
+   load). The session-liveness probe is a **live Claude Code process carrying that
+   session id** ([ADR-0017](../adr/0017-daemon-bumps-the-sentinel.md), superseding
+   ADR-0009's watcher pidfile) — the same signal the TTL sweeper trusts. **Resolved (ADR-0010):** this rule
    originally deferred the probe and defaulted to "do not resume orphan watches";
    that default stopped being fail-safe once ADR-0008 made an idle session take
    zero turns, because the re-`watch` it assumed can never happen.
@@ -196,7 +197,7 @@ No `ipc-arm.sh` step.
 | Bridge down | Publish/watch commands fail; no silent orphan writers |
 | One of N sessions dies | That session’s interest dropped; adapter keeps running for the rest |
 | Last session dies / hard kill | Reconcile / TTL sweeper drops dead interests; stop adapter when count hits 0 |
-| Mid-turn publishes | Delivery cursor + Stop re-arm ([01](../01-wake-and-rearm.md)) |
+| Mid-turn publishes | Delivery cursor + the `turn-end` re-trigger at the turn boundary ([01](../01-wake.md), [ADR-0012](../adr/0012-level-triggered-wake-at-the-turn-boundary.md)) |
 
 ## Test plan
 
@@ -209,22 +210,23 @@ No `ipc-arm.sh` step.
 4. Last session unwatch / SessionEnd → child gone; no further API calls.
 5. Kill adapter process → one restart while interest > 0; stop when interest is 0.
 6. Bridge restart with no live interested sessions → watch not resumed (no zombie);
-   with a live interested session (its watcher pidfile alive) → watch resumed.
+   with a live interested session (its Claude Code process still running) → watch resumed.
 
 > **Card 12 status note — AUTOMATED.** All six scenarios above are now encoded as
 > the cross-component suite `crates/mailbox/tests/e2e.rs` (`scenario_1…6_*`),
 > driven end to end through the real `mailbox serve` daemon + `mailbox` CLI + a
 > real supervised adapter (the `github-pr` poller against a recorded fake `gh`, and
 > the reference stub) + the fake harness driver (hook JSON fed to `mailbox harness
-> arm`/`cleanup`). The wake path (waiter wake, coalescing, mid-turn surfacing) is
-> covered by the same suite's `wake_*` tests. The headline **no-zombie-pollers**
-> guarantee is ENFORCED by a `LeakGuard` (`tests/common/mod.rs`): it fails the test
-> if any adapter / waiter / serve process scoped to that test's daemon subtree +
-> waiters dir survives teardown, and a dedicated test
+> session-start`/`turn-end`/`cleanup`). The wake path (sentinel write, mid-turn
+> surfacing) is covered by the same suite's `wake_*` tests. The headline
+> **no-zombie-pollers** guarantee is ENFORCED by a `LeakGuard` (`tests/common/mod.rs`):
+> it fails the test if any adapter / serve process scoped to that test's daemon
+> subtree survives teardown, and a dedicated test
 > (`leak_guard_detects_a_surviving_process_and_clears_when_reaped`) proves the guard
 > actually catches a leak. Runs in `cargo test --workspace` / CI with no network or
 > real GitHub. Unit-level proofs still live in their own suites
-> (`tests/supervision.rs`, `tests/wake.rs`, `adapters/github-pr-adapter/tests/adapter_e2e.rs`).
+> (`tests/supervision.rs`, `tests/filechanged_wake.rs`,
+> `adapters/github-pr-adapter/tests/adapter_e2e.rs`).
 
 ## Open questions
 
@@ -238,9 +240,12 @@ No `ipc-arm.sh` step.
   and cards 09/10 landed the real adapters — `serve`'s `DefaultResolver` now
   spawns the `stub` and `github-pr` pollers, so a live watch reads `running` with
   a child pid.
-- ~~How Claude session identity is named for interest rows.~~ **Settled (card
-  06):** the `SessionId` comes from `--session <id>`, falling back to the
-  `MAILBOX_SESSION_ID` env var (the harness hooks set the env — card 11).
+- ~~How Claude session identity is named for interest rows.~~ **Settled:** the
+  `SessionId` comes from `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into
+  every tool call, and nowhere else. (The `--session` flag and the
+  `MAILBOX_SESSION_ID` fallback this originally named are both gone — nothing acted
+  as another session, and the flag mostly let agents bind a phantom empty one.) The
+  harness hooks are separate: each reads `session_id` from its own stdin payload.
 - **Deferred (post-MVP):** whether peer agent→agent messaging ships in the same
   slice as GitHub watch. The MVP demo is GitHub PR watching; peer messaging is
   already expressible as plain publish/subscribe on a shared topic (the bus does

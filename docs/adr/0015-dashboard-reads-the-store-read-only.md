@@ -1,6 +1,13 @@
 # ADR-0015: `mailbox dashboard` reads the store read-only
 
-- Status: Accepted
+- Status: **Superseded by [ADR-0016](0016-prove-wakeability-with-an-active-probe.md);
+  the command it describes has been REMOVED.** `mailbox dashboard` inferred wake health
+  from `harness.log`. Measured against ADR-0016's active probe on 19 live idle sessions
+  that inference was wrong 9 times, in both directions (6 false alarms, 3 false
+  reassurances), so it was deleted rather than kept alongside a view that asks the
+  question directly. The read-only-store exception it established is still in force —
+  `mailbox doctor` relies on the same principle that a health check must work when the
+  daemon is the broken thing.
 - Date: 2026-07-21
 - Amends: [ADR-0003](0003-single-writer-sqlite.md) / [ADR-0004](0004-cli-serve-daemon-and-socket.md).
   The single-writer rule is untouched. The "every command except `wait` is a socket

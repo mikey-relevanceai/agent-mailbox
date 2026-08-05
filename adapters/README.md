@@ -40,9 +40,9 @@ clean.
 
 ```sh
 mailbox serve &                                   # the daemon
-mailbox watch stub demo --interval-ms 500 --session s1
-mailbox read --session s1                          # see the synthetic events
-mailbox unwatch stub demo --session s1             # tears the adapter down
+mailbox watch stub demo --interval-ms 500
+mailbox read                          # see the synthetic events
+mailbox unwatch stub demo             # tears the adapter down
 ```
 
 `watch stub <label>` keys the watch by `(kind=stub, label)`, publishes on
@@ -149,7 +149,7 @@ network or auth. `serve` resolves the adapter binary via **`MAILBOX_GH_ADAPTER_B
 
 ```sh
 mailbox serve &
-mailbox watch github-pr octocat/hello-world#42 --interval 60 --session s1
-mailbox read --session s1      # conflict / review / CI edges as they happen
-mailbox unwatch github-pr octocat/hello-world#42 --session s1
+mailbox watch github-pr octocat/hello-world#42 --interval 60
+mailbox read      # conflict / review / CI edges as they happen
+mailbox unwatch github-pr octocat/hello-world#42
 ```

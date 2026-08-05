@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Agent mailbox bridge CLI — durable topics, subscriptions, and wake kicks"
+description = "Agent mailbox bridge CLI — durable topics, subscriptions, and idle-agent wake"
 # Two bin targets exist (the real CLI + a test-only adapter fixture), so name the
 # one `cargo run -p mailbox` should default to. Keeps the documented
 # `cargo run -p mailbox -- --help` unambiguous.

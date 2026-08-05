@@ -2,17 +2,16 @@
 //!
 //! Everything here runs against a live `mailbox serve` daemon in a tempdir and
 //! real `mailbox` CLI client processes, with the fake harness driver (hook JSON on
-//! `harness arm` / `cleanup`'s stdin) standing in for Claude Code — the same seams
-//! the card 11/12 suites use. No agent ever runs an arm command, and no wake is
-//! simulated: the waiters are real blocked processes and the wakes are real
-//! process exits.
+//! `harness session-start` / `wake` / `cleanup`'s stdin) standing in for Claude
+//! Code — the same seams the card 11/12 suites use. No agent ever runs an arm
+//! command, and no wake is simulated: the sentinels are written by the real daemon
+//! and the wake decisions are real hook exits.
 //!
-//! The headline is [`round_trip_two_idle_agents_wake_each_other`]: two registered
-//! sessions, both idle on genuine waiters, message each other with no human in the
-//! loop.
+//! The headline is [`round_trip_two_idle_agents_wake_each_other`]: two registered,
+//! armed sessions message each other with no human in the loop.
 //!
-//! Every test scopes a [`LeakGuard`] to its own daemon subtree + waiters dir, so a
-//! leaked waiter fails the test loudly rather than escaping into the runner.
+//! Every test scopes a [`LeakGuard`] to its own daemon subtree, so a leaked adapter
+//! fails the test loudly rather than escaping into the runner.
 
 mod common;
 
@@ -20,27 +19,22 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::{Env, drain_stderr, poll_until, wait_within};
+use common::{Env, FakeClaude, poll_until};
 
 /// Generous bound for a real process to arm / wake / exit under CI load. Every
 /// wait is a bounded poll, never a fixed sleep.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// Arm `session` (registering its inbox, ADR-0007) and block until its waiter is
-/// genuinely live — the pidfile is written only AFTER the waiter takes the
-/// single-waiter lock, so its presence means "blocked and listening", not merely
-/// "process spawned".
-fn arm_idle(env: &Env, session: &str) -> common::ArmChild {
-    let arm = env.spawn_arm(session, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
-        env.waiter_pidfile(session).exists().then_some(())
-    });
-    arm
+/// Start `session` through the production `SessionStart` hook: register its inbox
+/// (ADR-0007) and arm its wake sentinel. Both are synchronous, so when this returns
+/// the session is genuinely addressable and wakeable.
+fn arm_idle(env: &Env, session: &str) {
+    env.arm(session);
 }
 
 /// `mailbox agents --json` as seen by `caller`.
 fn agents(env: &Env, caller: &str) -> Vec<Value> {
-    let out = env.run_ok(&["--json", "agents", "--session", caller], "agents");
+    let out = env.run_as_ok(caller, &["--json", "agents"], "agents");
     let value: Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("agents json");
     value["agents"].as_array().cloned().unwrap_or_default()
@@ -55,9 +49,9 @@ fn agent_row(env: &Env, caller: &str, session: &str) -> Option<Value> {
 
 // ==== the headline: two idle agents poke each other, no human in the loop =======
 
-/// A and B are both registered and idle on REAL blocked waiters. A sends to B: B's
-/// waiter exits 2 with the payload-free reminder naming B's inbox topic; B reads
-/// the message and sees `from: A`; B replies; A's waiter wakes the same way.
+/// A and B are both registered and armed. A sends to B: the daemon writes B's
+/// sentinel with B's inbox topic (and nothing else — payload-free), B's wake hook
+/// exits 2, B reads the message and sees `from: A`; B replies; A wakes the same way.
 #[test]
 fn round_trip_two_idle_agents_wake_each_other() {
     let env = Env::new();
@@ -67,28 +61,36 @@ fn round_trip_two_idle_agents_wake_each_other() {
 
     let (a, b) = ("s-alice", "s-bob");
 
-    // Both sessions go idle. The hooks register each inbox and arm each waiter —
+    // Both sessions go idle. The hooks register each inbox and arm each sentinel —
     // the agents run nothing themselves.
-    let mut arm_a = arm_idle(&env, a);
-    let mut arm_b = arm_idle(&env, b);
+    arm_idle(&env, a);
+    arm_idle(&env, b);
 
     // --- A → B ---------------------------------------------------------------
-    env.run_ok(
-        &["send", b, "--text", "please review PR 42", "--session", a],
+    env.run_as_ok(
+        a,
+        &["send", b, "--text", "please review PR 42"],
         "send a->b",
     );
 
-    let status = wait_within(&mut arm_b, SETTLE).expect("B's waiter must wake");
-    assert_eq!(status.code(), Some(2), "a peer message wakes B (exit 2)");
-    let reminder = drain_stderr(&mut arm_b);
+    // The daemon writes B's sentinel, naming only the topic — that file IS the wake
+    // wire, so it is where payload-freeness has to hold.
+    let topics = poll_until("B's sentinel names its inbox", SETTLE, || {
+        let topics = env.sentinel_topics(b);
+        topics
+            .iter()
+            .any(|t| t == &format!("agent.{b}"))
+            .then_some(topics)
+    });
     assert!(
-        reminder.contains(&format!("mail on topic agent.{b}")),
-        "the wake names B's inbox topic and nothing else: {reminder:?}"
+        !topics.iter().any(|t| t.contains("please review PR 42")),
+        "the wake must not carry the body: {topics:?}"
     );
-    // Payload-free: the message text NEVER crosses the wake boundary.
-    assert!(
-        !reminder.contains("please review PR 42"),
-        "the wake must not carry the body: {reminder:?}"
+    // ...and the FileChanged hook turns that into a real wake (exit 2).
+    assert_eq!(
+        env.wake_hook(b).status.code(),
+        Some(2),
+        "a peer message wakes B"
     );
 
     // B reads its mail and can see who to reply to.
@@ -99,17 +101,15 @@ fn round_trip_two_idle_agents_wake_each_other() {
     assert_eq!(events[0]["body"]["text"], "please review PR 42");
 
     // --- B → A (the reply) ----------------------------------------------------
-    env.run_ok(
-        &["send", a, "--text", "done, approved", "--session", b],
-        "send b->a",
-    );
+    env.run_as_ok(b, &["send", a, "--text", "done, approved"], "send b->a");
 
-    let status = wait_within(&mut arm_a, SETTLE).expect("A's waiter must wake");
-    assert_eq!(status.code(), Some(2), "B's reply wakes A (exit 2)");
-    assert!(
-        drain_stderr(&mut arm_a).contains(&format!("mail on topic agent.{a}")),
-        "A's wake names A's inbox"
-    );
+    poll_until("A's sentinel names its inbox", SETTLE, || {
+        env.sentinel_topics(a)
+            .iter()
+            .any(|t| t == &format!("agent.{a}"))
+            .then_some(())
+    });
+    assert_eq!(env.wake_hook(a).status.code(), Some(2), "B's reply wakes A");
 
     let events = env.read_events(a);
     assert_eq!(events.len(), 1);
@@ -117,10 +117,111 @@ fn round_trip_two_idle_agents_wake_each_other() {
     assert_eq!(events[0]["body"]["text"], "done, approved");
 
     // Teardown: both SessionEnds; nothing may survive.
-    drop(arm_a);
-    drop(arm_b);
     let _ = env.cleanup(a);
     let _ = env.cleanup(b);
+    guard.assert_clean();
+}
+
+// ==== the human manual poke: no session in the environment at all ==============
+
+/// A HUMAN in an ordinary terminal — no `$CLAUDE_CODE_SESSION_ID` anywhere — can
+/// look at the fleet and poke an agent. Both commands ran through `Env::run`, which
+/// strips the variable, so this is the literal `env -u CLAUDE_CODE_SESSION_ID` case.
+///
+/// This is a regression guard. Making `$CLAUDE_CODE_SESSION_ID` the single source of
+/// a session's identity was right for the session-scoped commands, but it was applied
+/// to `agents` and `send` too, and both then refused to run outside a Claude Code
+/// session — advising the human to invent a `CLAUDE_CODE_SESSION_ID`, which for these
+/// two commands is nonsense. Neither needs an identity to do its job: `agents` only
+/// marks which row is the caller, and `send` only stamps a reply address.
+#[test]
+fn a_human_with_no_session_can_list_agents_and_poke_one() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let b = "s-bob";
+    arm_idle(&env, b);
+
+    // 1. Discovery, with no caller: the agent is listed, and NO row is marked self.
+    let out = env.run_ok(&["--json", "agents"], "agents with no session");
+    let value: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("agents json");
+    let rows = value["agents"].as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "the registered agent is listed: {rows:?}");
+    assert_eq!(rows[0]["session"], b);
+    assert_eq!(rows[0]["inbox"], format!("agent.{b}"));
+    assert!(
+        rows.iter().all(|r| r["is_self"] == Value::Bool(false)),
+        "with no caller there is no self to mark: {rows:?}"
+    );
+
+    let out = env.run_ok(&["agents"], "agents (human, no session)");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("1 agent(s):"), "{text}");
+    assert!(text.contains(&format!("inbox=agent.{b}")), "{text}");
+    assert!(
+        !text.contains("<- you"),
+        "nobody may be marked as the caller when there is no caller: {text}"
+    );
+
+    // 2. The poke itself lands, and the sender is told it carries no reply address.
+    let out = env.run_ok(&["send", b, "--text", "please rebase"], "send, no session");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("no `from`"),
+        "the sender is told the message has no reply address: {stderr}"
+    );
+
+    // 3. It wakes B exactly like a peer's message does — the wake path is unchanged.
+    poll_until("B's sentinel names its inbox", SETTLE, || {
+        env.sentinel_topics(b)
+            .iter()
+            .any(|t| t == &format!("agent.{b}"))
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(b).status.code(),
+        Some(2),
+        "a human's message wakes B like any other"
+    );
+
+    // 4. B reads it. The content is there; `from` is ABSENT, not null and not a
+    //    placeholder — which is how B knows there is nobody to reply to.
+    let events = env.read_events(b);
+    assert_eq!(events.len(), 1, "B has exactly one message");
+    assert_eq!(events[0]["body"]["text"], "please rebase");
+    assert!(
+        events[0]["body"].get("from").is_none(),
+        "a human's message must carry no `from` key at all: {}",
+        events[0]["body"]
+    );
+
+    let _ = env.cleanup(b);
+    guard.assert_clean();
+}
+
+/// The refusal that DOES survive with no session: an unregistered target is still a
+/// hard error. Tolerating a missing caller is not tolerating an undeliverable send.
+#[test]
+fn a_human_send_to_an_unregistered_agent_still_fails() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let out = env.run(&["send", "s-ghost", "--text", "hello?"]);
+    assert!(
+        !out.status.success(),
+        "a human's send to an unregistered agent must still exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no registered inbox"),
+        "the same actionable error a peer gets: {stderr}"
+    );
+
     guard.assert_clean();
 }
 
@@ -136,7 +237,7 @@ fn send_to_an_unregistered_agent_fails_loudly_and_publishes_nothing() {
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    let out = env.run(&["send", "s-ghost", "--text", "hello?", "--session", "s-a"]);
+    let out = env.run_as("s-a", &["send", "s-ghost", "--text", "hello?"]);
     assert!(
         !out.status.success(),
         "sending to an unregistered agent must exit non-zero"
@@ -195,12 +296,13 @@ fn send_to_a_session_without_an_inbox_still_fails() {
     guard.track_daemon(daemon.pid());
 
     // A session that subscribed to something, but never armed (so never registered).
-    env.run_ok(
-        &["subscribe", "some.other.topic", "--session", "s-hookless"],
+    env.run_as_ok(
+        "s-hookless",
+        &["subscribe", "some.other.topic"],
         "subscribe",
     );
 
-    let out = env.run(&["send", "s-hookless", "--text", "hi", "--session", "s-a"]);
+    let out = env.run_as("s-a", &["send", "s-hookless", "--text", "hi"]);
     assert!(
         !out.status.success(),
         "a session with no INBOX is not addressable, even though it has subscriptions"
@@ -226,10 +328,7 @@ fn generic_publish_to_an_inbox_topic_is_rejected() {
 
     let b = "s-b";
     // B registers its inbox (a subscribe to its own inbox IS registration).
-    env.run_ok(
-        &["subscribe", &format!("agent.{b}"), "--session", b],
-        "register",
-    );
+    env.run_as_ok(b, &["subscribe", &format!("agent.{b}")], "register");
 
     // A forged publish straight into B's inbox is refused, non-zero, and points at
     // the sanctioned path.
@@ -256,7 +355,7 @@ fn generic_publish_to_an_inbox_topic_is_rejected() {
     );
 
     // The sanctioned path is unaffected: a peer `send` still delivers.
-    env.run_ok(&["send", b, "--text", "legit", "--session", "s-a"], "send");
+    env.run_as_ok("s-a", &["send", b, "--text", "legit"], "send");
     assert_eq!(
         env.unread_total(b),
         1,
@@ -283,28 +382,23 @@ fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
 
     let b = "s-b";
     // B registers + arms via the real hook (the auto-inbox path), then goes idle.
-    let arm = arm_idle(&env, b);
+    arm_idle(&env, b);
     assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
 
-    // SessionEnd reaps the waiter, drops the subscription, and tombstones the id.
-    drop(arm);
+    // SessionEnd removes the sentinel, drops the subscription, and tombstones the id.
     let _ = env.cleanup(b);
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "an ended session is no longer an agent"
     );
 
-    // A racing arm re-registration within the guard window is refused: the inbox
-    // subscribe is rejected, so arm finds no subscription and does NOT spawn a
-    // waiter — the process just exits without arming.
-    let mut rearm = env.spawn_arm(b, &[]);
-    let _status = poll_until("the racing re-arm exits without arming", SETTLE, || {
-        rearm.try_wait().ok().flatten()
-    });
-    assert!(
-        !env.waiter_pidfile(b).exists(),
-        "no waiter is armed: the auto-registration was refused"
-    );
+    // A racing SessionStart within the guard window is refused: the inbox subscribe
+    // is rejected, so the session is not resurrected as an agent. (The sentinel is
+    // still written — it is a file, not a claim of registration — and `SessionEnd`
+    // has already removed the directory once; a doomed re-arm leaves nothing but a
+    // path `mailbox doctor` will report as never having answered.)
+    let out = env.session_start(b);
+    assert!(out.status.success(), "session-start still exits 0");
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "the dead session must not be resurrected as an agent"
@@ -329,16 +423,13 @@ fn an_explicit_subscribe_by_a_resumed_session_within_guard_delivers() {
     let b = "s-resumed";
     let topic = "team.updates";
     // B subscribes explicitly, then its session ends (tombstone written).
-    env.run_ok(&["subscribe", topic, "--session", b], "subscribe");
+    env.run_as_ok(b, &["subscribe", topic], "subscribe");
     let _ = env.cleanup(b);
 
     // Within the guard window the resumed session re-subscribes explicitly. It must
     // NOT be refused (that is the whole bug): an explicit subscribe is a live-turn
     // action, never the doomed post-teardown arm.
-    let out = env.run_ok(
-        &["subscribe", topic, "--session", b],
-        "explicit re-subscribe",
-    );
+    let out = env.run_as_ok(b, &["subscribe", topic], "explicit re-subscribe");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         !text.contains("refused"),
@@ -403,9 +494,13 @@ fn publish_namespace_near_misses_are_allowed_but_a_real_inbox_is_rejected() {
 
 // ==== discovery: agents (liveness + self) and topics ===========================
 
-/// `agents` lists registered inboxes, marks the caller, and reports live-waiter
-/// liveness honestly — live while the peer is idle on a waiter, not live once that
-/// waiter is gone. Both the human and `--json` shapes are checked.
+/// `agents` lists registered inboxes, marks the caller, and reports liveness
+/// honestly — live while the peer's Claude Code process exists, not live once it has
+/// exited. Both the human and `--json` shapes are checked.
+///
+/// Liveness is driven with real processes, not a planted file: the bridge reads it
+/// from the process table, so anything a test could plant would be testing a
+/// different mechanism than production uses.
 #[test]
 fn agents_reports_registration_liveness_and_self() {
     let env = Env::new();
@@ -413,9 +508,13 @@ fn agents_reports_registration_liveness_and_self() {
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    let (a, b) = ("s-a", "s-b");
-    let arm_a = arm_idle(&env, a);
-    let arm_b = arm_idle(&env, b);
+    // Session ids long enough to be recognised as ids (the parser's guard against
+    // counting an id quoted inside an unrelated command line).
+    let (a, b) = ("agent-alpha", "agent-bravo");
+    arm_idle(&env, a);
+    arm_idle(&env, b);
+    let claude_a = FakeClaude::running(a);
+    let claude_b = FakeClaude::running(b);
 
     // --json: both registered, both live, and A is marked as itself.
     let rows = agents(&env, a);
@@ -425,30 +524,35 @@ fn agents_reports_registration_liveness_and_self() {
     assert_eq!(row_a["inbox"], format!("agent.{a}"));
     assert_eq!(row_a["is_self"], true);
     assert_eq!(row_b["is_self"], false, "B is not the caller");
-    assert_eq!(row_a["live_waiter"], true, "A is idle on a live waiter");
-    assert_eq!(row_b["live_waiter"], true, "B is idle on a live waiter");
+    assert_eq!(row_a["live"], true, "A's agent process is running");
+    assert_eq!(row_b["live"], true, "B's agent process is running");
 
     // human: names both agents, their inbox topics, and marks the caller.
-    let out = env.run_ok(&["agents", "--session", a], "agents (human)");
+    let out = env.run_as_ok(a, &["agents"], "agents (human)");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("2 agent(s):"), "{text}");
     assert!(text.contains(&format!("inbox=agent.{a}")), "{text}");
     assert!(text.contains(&format!("inbox=agent.{b}")), "{text}");
     assert!(text.contains("<- you"), "the caller is marked: {text}");
 
-    // Kill B's waiter (as a busy, mid-turn agent has none): B stays REGISTERED and
-    // addressable, but is no longer reported as idle-and-listening.
-    drop(arm_b);
-    poll_until("B's waiter is gone", SETTLE, || {
+    // B's agent exits (a closed terminal, a killed process — no `SessionEnd` runs).
+    // B stays REGISTERED and addressable; it is simply no longer running.
+    claude_b.stop(b);
+    poll_until("B's agent process is gone", SETTLE, || {
         let row = agent_row(&env, a, b).expect("B stays registered");
-        (row["live_waiter"] == Value::Bool(false)).then_some(())
+        (row["live"] == Value::Bool(false)).then_some(())
     });
     assert!(
         agent_row(&env, a, b).is_some(),
-        "a busy agent is still addressable"
+        "an agent that has exited is still addressable"
+    );
+    assert_eq!(
+        agent_row(&env, a, a).expect("A is listed")["live"],
+        Value::Bool(true),
+        "A is unaffected by B exiting"
     );
 
-    drop(arm_a);
+    claude_a.stop(a);
     let _ = env.cleanup(a);
     let _ = env.cleanup(b);
     guard.assert_clean();
@@ -466,14 +570,11 @@ fn topics_reports_counts_and_filters_by_prefix() {
     let (a, b) = ("s-a", "s-b");
     // Register two inboxes WITHOUT arming (subscribe is what registration is).
     for s in [a, b] {
-        env.run_ok(
-            &["subscribe", &format!("agent.{s}"), "--session", s],
-            "register inbox",
-        );
+        env.run_as_ok(s, &["subscribe", &format!("agent.{s}")], "register inbox");
     }
-    env.run_ok(&["subscribe", "team.ci", "--session", a], "subscribe");
-    env.run_ok(&["send", b, "--text", "one", "--session", a], "send");
-    env.run_ok(&["send", b, "--text", "two", "--session", a], "send");
+    env.run_as_ok(a, &["subscribe", "team.ci"], "subscribe");
+    env.run_as_ok(a, &["send", b, "--text", "one"], "send");
+    env.run_as_ok(a, &["send", b, "--text", "two"], "send");
 
     let out = env.run_ok(&["--json", "topics"], "topics");
     let value: Value =
@@ -529,10 +630,10 @@ fn topics_reports_counts_and_filters_by_prefix() {
     guard.assert_clean();
 }
 
-// ==== whoami / status surface the session's own address ========================
+// ==== status surfaces the session's own address ================================
 
 #[test]
-fn whoami_and_status_surface_the_inbox_topic() {
+fn status_surfaces_this_sessions_own_address() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
@@ -541,29 +642,28 @@ fn whoami_and_status_surface_the_inbox_topic() {
     let s = "s-me";
 
     // Before registration, `status` says plainly that peers cannot reach us.
-    let out = env.run_ok(&["status", "--session", s], "status");
+    let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains(&format!("inbox: agent.{s} (NOT registered")),
         "an unregistered session is told so: {text}"
     );
 
-    let arm = arm_idle(&env, s);
+    arm_idle(&env, s);
 
-    let out = env.run_ok(&["--json", "whoami", "--session", s], "whoami");
+    let out = env.run_as_ok(s, &["--json", "status"], "status");
     let value: Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("whoami json");
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("status json");
     assert_eq!(value["session"], s);
-    assert_eq!(value["inbox_topic"], format!("agent.{s}"));
+    assert_eq!(value["inbox"], format!("agent.{s}"));
 
-    let out = env.run_ok(&["status", "--session", s], "status");
+    let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         text.contains(&format!("inbox: agent.{s} (registered)")),
         "an armed session's status shows its live address: {text}"
     );
 
-    drop(arm);
     let _ = env.cleanup(s);
     guard.assert_clean();
 }

@@ -45,7 +45,7 @@ test plan). Use ADRs for “what we chose and why we rejected alternatives.”
 
 Index and expectations: [`docs/design/README.md`](design/README.md).
 
-Numbered overview docs (`01-wake-and-rearm`, `02-tech-stack`, …) stay as the
+Numbered overview docs (`01-wake`, `02-tech-stack`, …) stay as the
 high-level narrative; designs go deeper per subsystem.
 
 ## mikey-in-a-box

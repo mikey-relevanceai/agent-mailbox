@@ -7,9 +7,11 @@ per PR — this is how to move off them.
 
 The headline change: **the agent stops owning the wake loop.** No more
 `ipc-arm.sh` after every message, no more background `gh-watch.sh` pollers piling
-up. The Claude Code *hooks* keep the waiter armed, and the *bridge daemon*
-supervises the PR pollers (one per PR, refcounted, torn down when the last
-interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
+up. A Claude Code *hook* arms a wake sentinel file once per session and another
+turns a change to it into a wake, while the *bridge daemon* writes that file when
+mail lands and supervises the PR pollers (one per PR, refcounted, torn down when
+the last interested session leaves). There is no waiter process and nothing to
+re-arm. See [01-wake](01-wake.md) and
 [design/01](design/01-mvp-github-watch.md) for the why.
 
 ---
@@ -18,8 +20,9 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 
 | Old skill loop | New agent-mailbox flow |
 |---|---|
-| Agent runs `ipc-arm.sh` in the background after each turn to re-arm the wake | **Nothing.** `SessionStart`/`Stop` hooks run `mailbox harness arm`; the agent never re-arms |
-| One arm = one wake; agent must re-arm after reading | Hooks keep the waiter armed across wakes; the waiter yields (a benign re-arm wake) before the hook timeout would kill it, so the next `Stop` arms a fresh one |
+| Agent runs `ipc-arm.sh` in the background after each turn to re-arm the wake | **Nothing.** `SessionStart`/`Stop` hooks run `mailbox harness session-start` / `turn-end`; the agent never re-arms |
+| One arm = one wake; agent must re-arm after reading | Arming is a FILE, not a process: `SessionStart` writes the session's wake sentinel and Claude Code watches it for the whole session. Nothing expires, so nothing has to be re-armed |
+| A per-agent FIFO with a blocked reader process | No per-session process at all — the `serve` daemon writes the sentinel itself when mail lands (ADR-0017) |
 | Agent spawns `gh-watch.sh` per PR with `run_in_background`, must remember to kill it | `mailbox watch github-pr OWNER/REPO#N` — the **daemon** owns the poller; one per PR, shared across sessions |
 | Watcher state in `~/.claude/agent-ipc/watchers/*.state` files | Baseline persists centrally in the bridge's SQLite (`adapter_baseline`), round-tripped via the protocol |
 | Durable NDJSON inbox + FIFO kick, per agent | Durable topic log + per-subscriber cursors in the bridge; multi-subscriber topics |
@@ -30,11 +33,11 @@ interested session leaves). See [01-wake-and-rearm](01-wake-and-rearm.md) and
 | You used to… | Now run… |
 |---|---|
 | `ipc-arm.sh` (background, re-run after each turn) | *nothing* — install the hooks once (`mailbox harness install-hooks`, which merges into `~/.claude/settings.json`) |
-| Start `gh-watch.sh OWNER/REPO N` in the background | `mailbox watch github-pr OWNER/REPO#N --session <id>` |
-| Read the NDJSON inbox / react to a kick | `mailbox read --session <id>` |
-| `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N --session <id>` (or just end the session) |
-| Check what you're watching | `mailbox status --session <id>` |
-| Send a peer-agent message (`agent-ipc`) | Publish/subscribe on a shared topic: `mailbox publish <topic>` / `mailbox subscribe <topic> --session <id>` (peer chat is topics too; the MVP demo is GitHub PRs) |
+| Start `gh-watch.sh OWNER/REPO N` in the background | `mailbox watch github-pr OWNER/REPO#N` |
+| Read the NDJSON inbox / react to a kick | `mailbox read` |
+| `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N` (or just end the session) |
+| Check what you're watching | `mailbox status` |
+| Send a peer-agent message (`agent-ipc`) | `mailbox send <peer-session-id> --text "…"` — every live session is automatically given an `agent.<session-id>` inbox, so there is nothing to arrange first. `mailbox agents` lists who is addressable. (A shared `mailbox subscribe` / `mailbox publish` topic still works for broadcast.) |
 
 The four-verb loop — **subscribe → read → react → unsubscribe** — is documented
 in full in [04-usage.md § The four-verb agent loop](04-usage.md#3-the-four-verb-agent-loop).
@@ -43,8 +46,9 @@ in full in [04-usage.md § The four-verb agent loop](04-usage.md#3-the-four-verb
 
 ## The two rules that changed
 
-1. **Agents never re-arm.** Delete every `ipc-arm.sh` call. Arming is a
-   `SessionStart`/`Stop` hook now (`mailbox harness arm`), installed once.
+1. **Agents never re-arm.** Delete every `ipc-arm.sh` call. Arming is the
+   `SessionStart`/`Stop` hooks now (`mailbox harness session-start` / `turn-end`),
+   installed once.
 2. **Agents never spawn a background poller.** Delete every backgrounded
    `gh-watch.sh` (and any `while true; gh …; sleep` loop). Declare a `watch`
    instead; the bridge daemon runs and supervises the poller.

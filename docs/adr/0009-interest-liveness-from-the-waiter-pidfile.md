@@ -1,10 +1,27 @@
 # ADR-0009: Interest liveness comes from the waiter pidfile, not a TTL clock
 
-- Status: Accepted
+- Status: **Superseded by [ADR-0017](0017-daemon-bumps-the-sentinel.md)** — the
+  premise stands, the chosen signal does not.
 - Date: 2026-07-17
 - Amends: [ADR-0008](0008-on-demand-wake-filechanged.md) (the zero-idle-turn wake
   design, whose success condition this bug turned into a kill condition) and the
   card-08 TTL sweeper introduced with watch supervision.
+
+> **Superseded (ADR-0017, 2026-08-05).** The *diagnosis* below is correct and still
+> load-bearing: an idle session is SILENT by design, so a TTL keyed on the session's
+> own traffic reaps exactly the healthy idle sessions on-demand wake exists to enable.
+> Liveness must come from something that tracks the session rather than its chatter.
+>
+> The *signal it chose* — the detached watcher's pidfile — has been deleted along
+> with the watcher, and it was the wrong signal anyway, in the damaging direction: an
+> ORPHANED watcher outlives the agent it belongs to, so a session whose Claude Code
+> process had exited read as alive and its adapter was kept polling for nobody. There
+> were 125 such watchers on one machine.
+>
+> Liveness now comes from the process table (`doctor::live_claude_sessions`): Claude
+> Code carries the session id in its own argv, so the question "is this agent still
+> running?" is answered about the agent itself. Read this ADR for WHY the TTL needs a
+> refresh signal at all; read ADR-0017 for what supplies it.
 
 ## Context
 

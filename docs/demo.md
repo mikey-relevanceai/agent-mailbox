@@ -24,94 +24,104 @@ touches your real `~/.agent-mailbox` or `~/.claude`), then walks four steps:
 0. **start the daemon** — `mailbox serve`, wait for its socket.
 1. **four-verb core** — `subscribe` → `publish` (standing in for an adapter) →
    `read`.
-2. **wake an idle waiter** — start `mailbox wait` with no mail pending so it
-   *blocks* (exactly what the `SessionStart`/`Stop` hook does), then `publish`
-   and watch it exit **2** with a payload-free `mail on topic X` reminder. This
-   is the asyncRewake contract that the harness turns into a session wake.
+2. **wake an idle session** — run the `SessionStart` hook so it ARMS the session's
+   sentinel (exactly what Claude Code does), then `publish` and see the DAEMON
+   rewrite that sentinel with the topic NAME only. Running the `FileChanged` hook on
+   that change exits **2** with a payload-free `mail on topic X` reminder — the
+   asyncRewake contract the harness turns into a session wake. There are no sleeps in
+   this step: the daemon writes the sentinel before it answers the publish.
 3. **supervised adapter** — `watch stub` records interest and the daemon spawns
    the reference stub poller; `status` shows it `running` with a child pid;
    `read` drains its synthetic edges. The agent never launched this loop.
 4. **teardown** — `unwatch` drops the last interest and the supervisor stops the
    adapter; `status` shows `stopped`, no child. **No zombie poller.**
 
-The script asserts the idle waiter woke with exit 2 and fails loudly otherwise,
-so it doubles as a smoke test of the whole path.
+The script asserts the wake hook exited 2 (and that `SessionStart` armed the
+sentinel at all) and fails loudly otherwise, so it doubles as a smoke test of the
+whole path.
 
 ### Expected output
 
-Captured from a clean run on macOS (`SKIP_BUILD=1 scripts/demo.sh`; paths and
-pids vary, ANSI colour stripped):
+Captured from a clean run on macOS (`SKIP_BUILD=1 scripts/demo.sh`, ANSI colour
+stripped). Three things legitimately differ run to run, so do not read them as a
+contract: the **tempdir path and pids**; the **absolute binary path** the script
+echoes on each `$` line, abbreviated to `mailbox` below; and the **number of stub
+events** in step 3, since the stub publishes on a 500 ms timer and how many have
+landed by the time `read` runs is a race (2 and 3 are both normal).
 
 ```text
-demo workdir: /var/folders/.../mailbox-demo.EzyeKX
+demo workdir: /var/folders/.../mailbox-demo.wFPR9y
 
 == 0. start the bridge daemon (mailbox serve) ==
-daemon up (pid 23379), socket at /var/folders/.../mailbox-demo.EzyeKX/mailbox.sock
+daemon up (pid 47854), socket at /var/folders/.../mailbox-demo.wFPR9y/mailbox.sock
 
 == 1. four-verb core: subscribe, publish, read ==
-$ mailbox subscribe demo.hello --session demo-session
+$ mailbox subscribe demo.hello
 subscribed to demo.hello (new, empty topic (no baseline))
 $ mailbox publish demo.hello --body '{"msg":"first"}'
 published event evt-1 at offset 0
-$ mailbox read --session demo-session
+$ mailbox read
 1 unread event(s):
   [demo.hello] offset=0 id=evt-1 body={"msg":"first"}
 
-== 2. wake an idle waiter (the asyncRewake contract) ==
-starting a blocking waiter (no mail yet) ...
-publishing while the waiter is idle ...
+== 2. wake an idle session (the FileChanged contract) ==
+running the SessionStart hook (arms the sentinel) ...
+  watchPaths registered with the harness:
+    {"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<workdir>/sentinel/by-agent/demo-session/.mailbox-wake"]}}
+publishing while the session is idle ...
 $ mailbox publish demo.hello --body '{"msg":"wake up"}'
 published event evt-2 at offset 1
-waiter exit code: 2   (2 = woken; the harness turns this into a wake)
-waiter reminder (stderr, payload-free):
+the daemon bumped the sentinel (topic NAMES only, never a body):
+    demo.hello
+running the FileChanged hook, as Claude Code would on that change ...
+wake hook exit code: 2   (2 = wake this session)
+wake reminder (stderr, payload-free):
     mail on topic demo.hello
-    wake reason: kicked
-$ mailbox read --session demo-session
+$ mailbox read
 1 unread event(s):
   [demo.hello] offset=1 id=evt-2 body={"msg":"wake up"}
 
 == 3. supervised adapter: watch stub, see it running, read its edges ==
-$ mailbox watch stub demo --interval-ms 500 --session demo-session
+$ mailbox watch stub demo --interval-ms 500
 watching stub.demo (interest=1, subscription: new, empty topic (no baseline))
-$ mailbox status --session demo-session
+$ mailbox status
 session: demo-session
-inbox: agent.demo-session (NOT registered — peers cannot send to this session)
+inbox: agent.demo-session (registered)
 watches:
-  stub demo  state=running interest=1 interval=500ms child=pid 23407
-subscriptions (2):
+  stub demo  state=running interest=1 interval=500ms child=pid 47934
+subscriptions (3):
+  agent.demo-session
   demo.hello
   stub.demo
 unread:
-  [stub.demo] 2
-$ mailbox read --session demo-session --limit 5
-2 unread event(s):
+  [stub.demo] 3
+$ mailbox read --limit 5
+3 unread event(s):
   [stub.demo] offset=0 id=evt-3 body={"seq":0,"source":"stub"}
   [stub.demo] offset=1 id=evt-4 body={"seq":1,"source":"stub"}
+  [stub.demo] offset=2 id=evt-5 body={"seq":2,"source":"stub"}
 
 == 4. unwatch -> the supervisor stops the adapter (no zombie poller) ==
-$ mailbox unwatch stub demo --session demo-session
+$ mailbox unwatch stub demo
 unwatched stub.demo (remaining interest=0)
-$ mailbox status --session demo-session
+$ mailbox status
 session: demo-session
-inbox: agent.demo-session (NOT registered — peers cannot send to this session)
+inbox: agent.demo-session (registered)
 watches:
   stub demo  state=stopped interest=0 interval=500ms child=stopped
-subscriptions (1):
+subscriptions (2):
+  agent.demo-session
   demo.hello
 unread: none
 
 OK — subscribe/read, idle-wake, supervised watch, and teardown all worked.
+For the real GitHub-PR wake on a live Claude Code session, see docs/demo.md.
 ```
 
-(The `inbox: … (NOT registered)` line is expected here: the demo drives the CLI
-by hand with no Claude Code hooks, and it is `mailbox harness arm` — the
-`SessionStart`/`Stop` hook — that registers a session's inbox. In a real session
-with the hooks installed it reads `inbox: agent.<id> (registered)`, and peers can
-`mailbox send` to it; see [04-usage §4](04-usage.md#4-agent-to-agent-messaging).)
-
-(The `wake reason: kicked` line is a diagnostic the script opts into via
-`MAILBOX_WAIT_DEBUG=1`; a real wake surfaces only the payload-free
-`mail on topic …` reminder.)
+(The inbox is registered from step 2 onward because that is where the demo runs
+`mailbox harness session-start` by hand — the same `SessionStart` hook Claude Code
+runs for you. Once it is registered, peers can `mailbox send` to the session; see
+[04-usage §4](04-usage.md#4-agent-to-agent-messaging).)
 
 ---
 
@@ -139,26 +149,26 @@ local stack can stand in for.
    mailbox serve
    ```
 
-2. **In a Claude Code session**, have the agent watch the PR. With the hooks
-   installed the session id comes from Claude Code; from a shell you pass it
-   explicitly:
+2. **In a Claude Code session**, have the agent watch the PR. The session id comes
+   from `$CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command it runs;
+   from a plain shell, set it yourself (`CLAUDE_CODE_SESSION_ID=<id> mailbox …`):
 
    ```bash
-   mailbox watch github-pr OWNER/REPO#N --interval 60 --session "$MAILBOX_SESSION_ID"
+   mailbox watch github-pr OWNER/REPO#N --interval 60
    ```
 
    `status` should now show the watch `running` with a child pid:
 
    ```bash
-   mailbox status --session "$MAILBOX_SESSION_ID"
+   mailbox status
    #   github-pr REPO#N  state=running interest=1 interval=60s child=pid <...>
    ```
 
    The adapter **baselines on its first poll** — it publishes nothing for state
    that already exists, only for *transitions* after it starts watching.
 
-3. **Let the session go idle.** The `Stop` hook arms a waiter. Do not run any
-   arm command — that is the whole point.
+3. **Let the session go idle.** The hooks keep it armed. Do not run any arm
+   command — that is the whole point.
 
 4. **Trigger an edge** on the PR (any one of these):
    - **Merge** — merge the PR, so GitHub flips its state to `MERGED` (the edge
@@ -171,11 +181,11 @@ local stack can stand in for.
      checks).
 
 5. **Watch the idle session wake.** Within ~one poll interval the adapter
-   publishes the edge, the bridge kicks the waiter, and Claude Code surfaces a
+   publishes the edge, the daemon bumps the session's sentinel, and Claude Code surfaces a
    system reminder (`mail on topic github.pr.OWNER/REPO#N`). The agent then:
 
    ```bash
-   mailbox read --session "$MAILBOX_SESSION_ID"
+   mailbox read
    #   1 unread event(s):
    #     [github.pr.OWNER/REPO#N] offset=… id=… body={"source":"github-pr","edge":"mergeable_conflicting","repo":"OWNER/REPO","pr":N}
    ```
@@ -191,7 +201,7 @@ local stack can stand in for.
 6. **Done — clean up:**
 
    ```bash
-   mailbox unwatch github-pr OWNER/REPO#N --session "$MAILBOX_SESSION_ID"
+   mailbox unwatch github-pr OWNER/REPO#N
    ```
 
    or just end the session — `SessionEnd` drops the interest and stops the poller

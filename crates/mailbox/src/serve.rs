@@ -52,7 +52,7 @@
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
-use mailbox::storage::{PublishAttempt, SessionId, Storage, StorageConfig, SubscribeKind};
+use mailbox::storage::{SessionId, Storage, StorageConfig, SubscribeKind};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
@@ -106,11 +106,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Interests older than this are swept. The sweeper refreshes the last-seen of
-/// every session whose waiter pidfile is alive (ADR-0009), so an interest only
-/// ages out once the session's watcher has been gone for the whole TTL — i.e.
+/// every session that still has a live Claude Code process (ADR-0017), so an
+/// interest only ages out once its agent has been gone for the whole TTL — i.e.
 /// once the session has genuinely died without a `SessionEnd`. Generous by
-/// design: it doubles as the grace period for a transiently-absent pidfile, and
-/// missing a slow cleanup beats dropping a live session's watch.
+/// design: it doubles as the grace period for a momentarily unreadable process
+/// table, and missing a slow cleanup beats dropping a live session's watch.
 const DEFAULT_INTEREST_TTL: Duration = Duration::from_secs(3600);
 
 /// Runtime-tunable daemon limits. Defaults are the constants above; each may be
@@ -155,9 +155,6 @@ struct Ctx {
     bus: Bus,
     storage: Storage,
     supervisor: Supervisor,
-    /// The per-session waiter FIFOs/pidfiles directory — the source of the
-    /// live-waiter liveness `agents` reports (card 16).
-    waiters_dir: Arc<PathBuf>,
 }
 
 /// Run the daemon until a termination signal (SIGINT/SIGTERM) arrives.
@@ -171,10 +168,14 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    Held for the daemon's whole life (released on drop at end of `run`).
     let _lock = acquire_daemon_lock(&config.lock_path())?;
 
-    // 3. Now it is safe to open the single writer + wake channel.
+    // 3. Now it is safe to open the single writer + wake channel. The sentinel root
+    //    is resolved ONCE here: a daemon that cannot resolve it could never wake
+    //    anybody, and a bridge that cannot do its job fails loudly rather than
+    //    serving a bus whose whole point is silently missing (ADR-0004).
     let storage = Storage::open(config.clone()).await?;
-    let waker = Waker::new(config.waiters_dir());
-    let bus = Bus::with_waker(storage.clone(), waker);
+    let sentinel_root = mailbox::sentinel::root_from_env()
+        .map_err(|e| anyhow::anyhow!("could not resolve the wake sentinel root: {e}"))?;
+    let bus = Bus::with_waker(storage.clone(), Waker::new(&sentinel_root));
 
     // 4. Build the watch supervisor with the default resolver: a `stub` watch
     //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the
@@ -188,12 +189,22 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         RestartPolicy::default(),
     );
 
-    // 5. Reconcile the previous daemon's watches: resume the ones an alive session
-    //    still wants (proved by its watcher pidfile — ADR-0009's probe), stop the
-    //    rest. Must run AFTER the supervisor exists, since resuming spawns through
-    //    it. Under ADR-0008 an idle session takes zero turns and can never
-    //    re-`watch`, so a watch not resumed here stays dead for that session's life.
-    reconcile_startup(&storage, &supervisor, &config.waiters_dir()).await?;
+    // 5. Reconcile the previous daemon's watches: resume the ones a live session
+    //    still wants (proved by its Claude Code process — ADR-0017's probe), stop
+    //    the rest. Must run AFTER the supervisor exists, since resuming spawns
+    //    through it. An idle session takes zero turns and can never re-`watch`, so a
+    //    watch not resumed here stays dead for that session's life.
+    //
+    //    An unreadable process table means we cannot prove ANY session alive. Doing
+    //    the reconcile anyway would stop every watch on a `ps` hiccup, so we skip it
+    //    loudly instead and let the first successful sweep reconcile.
+    match mailbox::doctor::live_claude_sessions() {
+        Some(live) => reconcile_startup(&storage, &supervisor, &live).await?,
+        None => warn!(
+            "could not read the process table, so no watch could be proven wanted; \
+             skipped the startup reconcile (the periodic sweep will reconcile instead)"
+        ),
+    }
 
     // 6. We hold the lock, so any leftover socket node is provably stale.
     let socket_path = config.socket_path();
@@ -205,22 +216,24 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         version = crate::cli::LONG_VERSION,
         socket = %socket_path.display(),
         db = %config.path().display(),
+        // Where wakes land. Worth a line: it is the one path a "why didn't my agent
+        // wake?" investigation has to check agrees with what `watchPaths` registered.
+        sentinel_root = %sentinel_root.display(),
         max_connections = limits.max_connections,
         "bridge serving (single writer + waker + supervisor); Ctrl-C or SIGTERM to stop"
     );
 
     // 7. Periodically sweep stale interests so a hard-killed session's watch is
     //    reconciled and its adapter stopped when its interest hits zero. The
-    //    sweep probes waiter pidfiles for liveness first, so a live-but-silent
-    //    session is never swept out from under itself (ADR-0009).
-    let sweeper = spawn_sweeper(supervisor.clone(), config.waiters_dir());
+    //    sweep reads the process table for liveness first, so a live-but-silent
+    //    session is never swept out from under itself (ADR-0017).
+    let sweeper = spawn_sweeper(supervisor.clone());
 
     // 8. Serve until a shutdown signal, capping concurrent handlers.
     let ctx = Ctx {
         bus,
         storage,
         supervisor: supervisor.clone(),
-        waiters_dir: Arc::new(config.waiters_dir()),
     };
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     let result = accept_loop(&listener, &ctx, &connections, limits).await;
@@ -249,7 +262,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 /// The interval must stay well below the TTL: the sweep is also the liveness
 /// refresh, so a session needs several probes inside one TTL window for a single
 /// missed probe to be harmless.
-fn spawn_sweeper(supervisor: Supervisor, waiters_dir: PathBuf) -> tokio::task::JoinHandle<()> {
+fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
     let interval = env_var("MAILBOX_SWEEP_INTERVAL_MS")
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_SWEEP_INTERVAL);
@@ -259,7 +272,15 @@ fn spawn_sweeper(supervisor: Supervisor, waiters_dir: PathBuf) -> tokio::task::J
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            match supervisor.sweep(ttl, waiters_dir.clone()).await {
+            // ONE `ps` per sweep, not one per interested session. An unreadable
+            // process table would look like "every session is dead", so it skips the
+            // sweep entirely rather than reap live agents' watches on a hiccup — the
+            // TTL is generous enough to absorb several missed sweeps.
+            let Some(live) = mailbox::doctor::live_claude_sessions() else {
+                warn!("could not read the process table; skipped this TTL sweep");
+                continue;
+            };
+            match supervisor.sweep(ttl, live).await {
                 Ok(swept) if !swept.is_empty() => {
                     info!(
                         count = swept.len(),
@@ -483,11 +504,9 @@ fn request_op(request: &Request) -> &'static str {
 /// The session a request is for, if any.
 fn request_session(request: &Request) -> Option<&SessionId> {
     match request {
-        // A publish MAY carry a session (an agent) or not (an adapter, whose
-        // provenance is its adapter id instead); `topics` is a global read with no
-        // session at all.
-        Request::Publish { session, .. } => session.as_ref(),
-        Request::Topics { .. } => None,
+        // A publish names no session at all — every publisher is the same publisher
+        // (ADR-0018), and its provenance is its adapter id. `topics` is a global read.
+        Request::Publish { .. } | Request::Topics { .. } => None,
         Request::Subscribe { session, .. }
         | Request::Unsubscribe { session, .. }
         | Request::Read { session, .. }
@@ -496,11 +515,12 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
         | Request::Status { session }
-        | Request::Agents { session }
         | Request::EndSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
-        // logged by the agents module with both ends).
-        Request::Send { from, .. } => Some(from),
+        // logged by the agents module with both ends) — and there may be none, when
+        // a human sent it. `agents` marks its caller and otherwise ignores it, so it
+        // too may arrive without one. Both log as `session="-"`, like a publish.
+        Request::Send { from: session, .. } | Request::Agents { session } => session.as_ref(),
     }
 }
 
@@ -531,15 +551,13 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         bus,
         storage,
         supervisor,
-        waiters_dir,
     } = ctx;
     match request {
         Request::Publish {
             topic,
             adapter,
             body,
-            session,
-        } => publish(bus, topic, adapter, body, session).await,
+        } => publish(bus, topic, adapter, body).await,
         Request::Subscribe {
             session,
             topic,
@@ -566,7 +584,7 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         }
         Request::Status { session } => status(storage, session).await,
         Request::Send { from, to, body } => send(bus, storage, from, to, body).await,
-        Request::Agents { session } => agents(storage, waiters_dir, session).await,
+        Request::Agents { session } => agents(storage, session).await,
         Request::Topics { prefix } => topics(storage, prefix).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
     }
@@ -574,10 +592,14 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
 
 /// Thin translation over [`mailbox::agents::send`] (card 16): publish to the
 /// target's inbox, refusing loudly if that agent has no registered inbox.
+///
+/// `from` is optional: it is the reply address stamped into the body, not a right
+/// to send. A human poking an agent from a terminal has none, and the message is
+/// delivered without a `from` key rather than refused.
 async fn send(
     bus: &Bus,
     storage: &Storage,
-    from: SessionId,
+    from: Option<SessionId>,
     to: SessionId,
     body: serde_json::Map<String, serde_json::Value>,
 ) -> Response {
@@ -593,15 +615,24 @@ async fn send(
 }
 
 /// Thin translation over [`mailbox::agents::list`] (card-16 discovery).
-async fn agents(storage: &Storage, waiters_dir: &Path, caller: SessionId) -> Response {
-    match mailbox::agents::list(storage, waiters_dir, &caller).await {
+///
+/// The live-session scan happens HERE, once per request: it shells out to `ps`, so
+/// it must not be repeated per listed agent. An unreadable process table yields an
+/// empty set, i.e. every agent reads `live: false` — an understatement, never a
+/// claim that an absent agent is there.
+///
+/// `caller` is optional and only decides which row is marked `is_self`; a human
+/// listing the fleet sees the same fleet with nothing marked.
+async fn agents(storage: &Storage, caller: Option<SessionId>) -> Response {
+    let live = mailbox::doctor::live_claude_sessions().unwrap_or_default();
+    match mailbox::agents::list(storage, &live, caller.as_ref()).await {
         Ok(agents) => Response::Agents {
             agents: agents
                 .into_iter()
                 .map(|agent| AgentSummary {
                     session: agent.session,
                     inbox: agent.inbox,
-                    live_waiter: agent.live_waiter,
+                    live: agent.live,
                     is_self: agent.is_self,
                 })
                 .collect(),
@@ -622,23 +653,12 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
 
 /// Publish an event.
 ///
-/// Two callers, two contracts, kept apart by whether a `session` came with the
-/// request:
-///
-/// - **An adapter** (no session — including an agent's own `publish --no-session`)
-///   publishes exactly as it always has: no unread rule, every subscriber kicked, no
-///   author stamped. Adapters are the original publisher and have no session id to
-///   resolve — changing this path would break them.
-/// - **An agent** (a session) is held to the caller-aware rules: it must be caught up
-///   on the topic to publish to it, and it is never woken by its own event (see
-///   [`Bus::publish_as_session`]).
-async fn publish(
-    bus: &Bus,
-    topic: Topic,
-    adapter: AdapterId,
-    body: serde_json::Value,
-    session: Option<SessionId>,
-) -> Response {
+/// One caller, one contract (ADR-0018): the event goes to the topic and every
+/// subscriber is woken, its author included. An adapter, an agent and a script an
+/// agent spawned are indistinguishable here, deliberately — the daemon used to route
+/// on whether a session came with the request, so it could refuse a publish from a
+/// caller with unread mail on the topic.
+async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
     // An agent inbox is writable ONLY through `mailbox send`, which stamps
     // provenance (`from`) and refuses an unregistered target (ADR-0007). The
     // generic publish path does neither, so allowing it here would let any caller
@@ -656,30 +676,11 @@ async fn publish(
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
     let timestamp = Timestamp(mailbox::clock::now_millis());
 
-    let Some(session) = session else {
-        return match bus.publish(topic, adapter, timestamp, body).await {
-            Ok(event) => Response::Published {
-                id: event.id,
-                offset: event.offset,
-            },
-            Err(err) => Response::error(err.to_string()),
-        };
-    };
-
-    match bus
-        .publish_as_session(session, topic.clone(), adapter, timestamp, body)
-        .await
-    {
-        Ok(PublishAttempt::Published(event)) => Response::Published {
+    match bus.publish(topic, adapter, timestamp, body).await {
+        Ok(event) => Response::Published {
             id: event.id,
             offset: event.offset,
         },
-        // Be caught up to speak. A TYPED refusal, not an `Error`: nothing failed and
-        // nothing was written, so a scripted publisher must be able to tell this
-        // ("read, then retry") from a real error ("the bridge is down") — which it
-        // could not while both came back as a string and exit 1. The CLI renders it
-        // with the one command that fixes it, and exits with its own code.
-        Ok(PublishAttempt::RefusedUnread { unread }) => Response::PublishRefused { topic, unread },
         Err(err) => Response::error(err.to_string()),
     }
 }

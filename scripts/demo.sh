@@ -4,8 +4,10 @@
 # loop. It proves, on your machine with no GitHub and no Claude Code, that:
 #
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
-#   2. an *idle* waiter wakes when mail lands (the asyncRewake contract:
-#      `mailbox wait` exits 2 with a payload-free "mail on topic X" reminder);
+#   2. an *idle* session wakes when mail lands (the asyncRewake contract: the
+#      daemon bumps that session's sentinel as part of the publish, and
+#      `mailbox harness wake` exits 2 with a payload-free "mail on topic X"
+#      reminder);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
 #   4. `unwatch` / end-session tears the adapter down (no zombie pollers).
@@ -47,13 +49,18 @@ export AGENT_MAILBOX_DB="${WORK_DIR}/mailbox.db"
 # Point the supervisor's stub resolver at the binary we just built (the normal
 # install co-locates it beside `mailbox`, so this override is a dev convenience).
 export MAILBOX_STUB_ADAPTER_BIN="${STUB_ADAPTER}"
-# Ask `mailbox wait` to append its wake reason to stderr, so the demo can show
-# *why* it woke. This is a diagnostic-only opt-in; the reminder itself stays
-# payload-free.
-export MAILBOX_WAIT_DEBUG=1
+# Keep the wake sentinels inside the throwaway dir, so the demo never touches
+# the real ~/.mailbox tree.
+export MAILBOX_SENTINEL_ROOT="${WORK_DIR}/sentinel"
 export RUST_LOG="${RUST_LOG:-error}"
 
 SESSION="demo-session"
+# The session every client command below runs as. There is no `--session` flag:
+# a command learns whose session it is from `$CLAUDE_CODE_SESSION_ID`, which Claude
+# Code exports into every tool call — so exporting it here is exactly the shape an
+# agent's own shell has. (`serve` and the harness hooks ignore it: the daemon has no
+# session, and a hook reads `session_id` from its payload on stdin.)
+export CLAUDE_CODE_SESSION_ID="${SESSION}"
 SERVE_PID=""
 
 cleanup() {
@@ -94,51 +101,68 @@ echo "daemon up (pid ${SERVE_PID}), socket at ${SOCK}"
 # --- 1. the four-verb loop, by hand -------------------------------------------
 # subscribe -> publish (stands in for an adapter) -> read.
 step "1. four-verb core: subscribe, publish, read"
-run "${MAILBOX} subscribe demo.hello --session ${SESSION}"
+run "${MAILBOX} subscribe demo.hello"
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"first\"}'"
-run "${MAILBOX} read --session ${SESSION}"
+run "${MAILBOX} read"
 
-# --- 2. wake an IDLE waiter ----------------------------------------------------
-# This is the load-bearing mechanic: start `mailbox wait` with NO mail pending,
-# so it blocks (exactly what the SessionStart/Stop hook does in a real session),
-# then publish and watch it exit 2 with a payload-free reminder.
-step "2. wake an idle waiter (the asyncRewake contract)"
-echo "starting a blocking waiter (no mail yet) ..."
-set +e
-"${MAILBOX}" wait --session "${SESSION}" --max-block-ms 10000 >"${WORK_DIR}/wait.out" 2>"${WORK_DIR}/wait.err" &
-WAIT_PID=$!
-set -e
-sleep 0.5   # let the waiter reach its blocking read
-echo "publishing while the waiter is idle ..."
-run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
-set +e
-wait "${WAIT_PID}"; WAIT_RC=$?
-set -e
-echo "waiter exit code: ${WAIT_RC}   (2 = woken; the harness turns this into a wake)"
-echo "waiter reminder (stderr, payload-free):"
-sed 's/^/    /' "${WORK_DIR}/wait.err"
-if [[ "${WAIT_RC}" -ne 2 ]]; then
-  echo "error: expected the waiter to wake with exit 2, got ${WAIT_RC}" >&2
+# --- 2. wake an IDLE session ---------------------------------------------------
+# This is the load-bearing mechanic, and it is exactly what Claude Code does. The
+# SessionStart hook ARMS the session's sentinel file and registers a watch on it;
+# a publish makes the DAEMON rewrite that file as part of serving the publish;
+# Claude Code's FileChanged hook fires on the change even though the session is
+# idle, and `mailbox harness wake` exits 2 iff there is genuine unread mail. Here
+# we drive the same three steps by hand — with no sleeps, because there is no
+# third process whose scheduling we would have to wait on.
+step "2. wake an idle session (the FileChanged contract)"
+echo "running the SessionStart hook (arms the sentinel) ..."
+echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
+  | "${MAILBOX}" harness session-start >"${WORK_DIR}/watchpaths.json"
+echo "  watchPaths registered with the harness:"
+sed 's/^/    /' "${WORK_DIR}/watchpaths.json"
+
+SENTINEL="${MAILBOX_SENTINEL_ROOT}/by-agent/${SESSION}/.mailbox-wake"
+if [[ ! -f "${SENTINEL}" ]]; then
+  echo "error: SessionStart did not arm the sentinel at ${SENTINEL}" >&2
   exit 1
 fi
-run "${MAILBOX} read --session ${SESSION}"
+
+echo "publishing while the session is idle ..."
+run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
+
+echo "the daemon bumped the sentinel (topic NAMES only, never a body):"
+sed 's/^/    /' "${SENTINEL}"
+
+echo "running the FileChanged hook, as Claude Code would on that change ..."
+set +e
+echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"FileChanged\"}" \
+  | "${MAILBOX}" harness wake >"${WORK_DIR}/wake.out" 2>"${WORK_DIR}/wake.err"
+WAKE_RC=$?
+set -e
+echo "wake hook exit code: ${WAKE_RC}   (2 = wake this session)"
+echo "wake reminder (stderr, payload-free):"
+sed 's/^/    /' "${WORK_DIR}/wake.err"
+if [[ "${WAKE_RC}" -ne 2 ]]; then
+  echo "error: expected the wake hook to exit 2, got ${WAKE_RC}" >&2
+  exit 1
+fi
+run "${MAILBOX} read"
 
 # --- 3. a bridge-SUPERVISED adapter (no agent-owned poller) -------------------
 # `watch stub` records interest, subscribes the session, and the daemon spawns
 # the stub adapter, which publishes a synthetic edge every --interval-ms. The
 # agent NEVER launches this loop itself.
 step "3. supervised adapter: watch stub, see it running, read its edges"
-run "${MAILBOX} watch stub demo --interval-ms 500 --session ${SESSION}"
+run "${MAILBOX} watch stub demo --interval-ms 500"
 sleep 1.2   # let the supervisor spawn the adapter and it publish a couple edges
-run "${MAILBOX} status --session ${SESSION}"
-run "${MAILBOX} read --session ${SESSION} --limit 5"
+run "${MAILBOX} status"
+run "${MAILBOX} read --limit 5"
 
 # --- 4. teardown: no zombie pollers -------------------------------------------
 # Dropping the last interest stops the adapter. `status` shows no running child.
 step "4. unwatch -> the supervisor stops the adapter (no zombie poller)"
-run "${MAILBOX} unwatch stub demo --session ${SESSION}"
+run "${MAILBOX} unwatch stub demo"
 sleep 0.5
-run "${MAILBOX} status --session ${SESSION}"
+run "${MAILBOX} status"
 
 echo
 echo "OK — subscribe/read, idle-wake, supervised watch, and teardown all worked."

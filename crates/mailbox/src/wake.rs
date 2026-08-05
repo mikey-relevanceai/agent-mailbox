@@ -1,274 +1,77 @@
-//! The wake kick: signalling a blocked waiter that mail has arrived.
+//! The wake path: telling an idle Claude Code session that mail has arrived.
+//!
+//! # The whole mechanism, in one line
+//!
+//! `publish` → the `serve` daemon writes the subscriber's sentinel file → Claude
+//! Code's `FileChanged` hook fires → `mailbox harness wake` exits 2 → the idle
+//! session takes a turn.
+//!
+//! That is two live components (the daemon and Claude Code) and one file. It used
+//! to be five: a per-session FIFO, a detached watcher process blocked on it, a
+//! single-waiter advisory lock, a waiter pidfile, and the sentinel. The watcher
+//! existed only to turn a kick into a file write — work the daemon can do itself,
+//! in the same process that just committed the event — and every one of those
+//! pieces could fail silently, leaving the agent deaf with nothing reporting it
+//! (ADR-0017).
 //!
 //! # What crosses the boundary (and what does not)
 //!
-//! Wake is **payload-free** (ADR-0001, docs/01-wake-and-rearm.md): the kick
-//! carries a single meaningless byte, and the woken waiter reports at most the
-//! *topic name(s)* with unread mail on its stderr. The event body never crosses
-//! this boundary — it stays in the durable log and is read later by the agent's
-//! `read`. Wake is ingress, not authority.
+//! Wake is **payload-free** (ADR-0001, docs/01-wake.md): the sentinel
+//! carries topic NAMES only, and the woken hook reports at most those names on its
+//! stderr. The event body never crosses this boundary — it stays in the durable log
+//! and is read later by the agent's `read`. Wake is ingress, not authority.
 //!
-//! # Chosen primitive: a per-session FIFO
+//! # Two sides, two types
 //!
-//! Layout: `<waiters-dir>/<session>.fifo`, where `<waiters-dir>` sits beside the
-//! database file (see [`crate::storage::StorageConfig::waiters_dir`]). A FIFO was
-//! chosen over the alternatives (orchestrator DECISION, card 05) because it is
-//! self-contained: no daemon or socket server exists yet (that lands in later
-//! cards), a waiter is just a child process a hook can launch, and both targets
-//! (macOS + Linux, per AGENTS.md) support FIFOs. Everything here is deliberately
-//! behind [`Waker`] / [`Waiter`] so the primitive can be swapped for a Unix
-//! socket later without touching callers (the bus, the CLI).
+//! - [`Waker`] is the DAEMON side: given a session and its currently-unread topics,
+//!   write them into that session's sentinel. Held by the [`crate::bus`], used on
+//!   every publish.
+//! - [`SessionMail`] is the HOOK side: a read-only view of one session's unread
+//!   mail, used by the `FileChanged` wake hook to decide whether to wake (exit 2),
+//!   by `SessionStart` to arm the sentinel, and by the `Stop` hook for the ADR-0012
+//!   turn-boundary re-trigger.
 //!
-//! # Single waiter per session
-//!
-//! Exactly one waiter may be live per session. Two waiters sharing one FIFO would
-//! *steal* each other's kick bytes — a single kick reaches only one reader, so
-//! the other (perhaps the harness's tracked waiter) would be stranded and its
-//! wake lost. [`Waiter::wait`] therefore takes an exclusive advisory lock on a
-//! per-session lockfile before doing anything else; a second waiter fails fast
-//! with [`WakeError::AlreadyWaiting`] rather than silently attaching to the FIFO.
-//!
-//! # The missed-kick race, and why the ordering closes it
-//!
-//! A waiter that starts *after* a publish must still fire. The waiter therefore
-//! does **open FIFO → check unread → block**, never check-then-open:
-//!
-//! - A kick that arrives *after* the waiter opened the FIFO is buffered in the
-//!   pipe, so the subsequent blocking wait returns immediately.
-//! - A publish that landed *before* the waiter opened is caught by the unread
-//!   check (the event is durable), so the waiter exits without ever blocking.
-//!
-//! Those two windows are exhaustive and overlap: because a publish appends to
-//! the durable log *before* it kicks, there is no interleaving in which the kick
-//! is lost *and* the unread check misses the event. See [`Waiter::wait`] for the
-//! step-by-step argument.
-//!
-//! The waiter opens the FIFO **read-write, non-blocking** (`O_RDWR | O_NONBLOCK`)
-//! and blocks with `poll`, then drains with non-blocking reads. `O_RDWR` keeps a
-//! writer attached (itself), so `poll` never reports a spurious hang-up and a
-//! read never returns a phantom EOF the moment no external writer is attached.
-//! `O_RDWR` on a FIFO is not POSIX-specified, but behaves this way on both of our
-//! targets (Linux, macOS).
+//! They never talk to each other; the durable store and the sentinel file are the
+//! only things between them.
 
-use std::io::{self, Read};
-use std::os::fd::AsFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
-use tracing::{debug, info, trace, warn};
-
-// nix gives us SAFE wrappers for the Unix primitives wake needs (`mkfifo`,
-// `flock`, `poll`, plus the `O_NONBLOCK`/errno constants it re-exports from
-// libc). The workspace `unsafe_code = "deny"` lint forbids calling the raw
-// `libc` equivalents directly, so nix is the way to reach these (ADR-0002).
-use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::stat::{Mode, SFlag};
+use tracing::{info, warn};
 
 use mailbox_protocol::Topic;
 
 use crate::sentinel::{RetriggerRecord, Sentinel, SentinelError};
 use crate::storage::{ReadOnlyStore, SessionId, StorageError, Unread, WakeWatermark};
 
-/// The lone byte a kick writes into a FIFO.
-///
-/// Its *value* is meaningless — only its arrival matters. Making the wake a
-/// single fixed byte is what enforces payload-free wake structurally: there is
-/// no field in which a body could ever be smuggled across the kick. Exposed so
-/// tests can assert the channel carries exactly this and nothing else.
-pub const WAKE_BYTE: u8 = 1;
+/// The process exit code that asks the Claude Code harness to wake the idle session
+/// (the `asyncRewake` contract, docs/01-wake.md). A `u8` so the sole
+/// consumer maps it to a `std::process::ExitCode` without a lossy cast.
+pub const WAKE_EXIT_CODE: u8 = 2;
 
-/// Something went wrong setting up or operating a wake FIFO.
+/// The payload-free stderr reminder the `FileChanged` wake hook writes on exit 2.
 ///
-/// Note that a *kick* never surfaces these to the publisher — [`Waker::kick`]
-/// reports a [`KickOutcome`] instead and never fails a publish (a missing reader
-/// is normal, not an error). These are for the waiter side, where a failure
-/// means the process cannot do its job and should exit loudly (non-zero).
+/// Topic NAMES only — never a body — so it is safe to surface verbatim as a system
+/// reminder. It is a function rather than a format string at the call site so there
+/// is ONE definition of the wake wire's content, and one place for the test that
+/// pins it payload-free.
+pub fn reminder(topics: &[Topic]) -> String {
+    let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
+    format!("mail on topic {}", names.join(", "))
+}
+
+/// Something went wrong reading a session's unread mail.
+///
+/// Only the READ side has an error type: writing a sentinel yields a
+/// [`SentinelError`], which every caller reports rather than propagates — a hook
+/// that failed loudly, or slowly, would cost a model turn on every session.
 #[derive(Debug, thiserror::Error)]
 pub enum WakeError {
-    /// The waiter directory could not be created.
-    #[error("could not create waiter directory {path}: {source}")]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    /// The FIFO node could not be created (and did not already exist).
-    #[error("could not create wake FIFO {path}: {source}")]
-    Mkfifo {
-        path: PathBuf,
-        #[source]
-        source: Errno,
-    },
-
-    /// A node exists at the FIFO path but it is NOT a FIFO (e.g. a regular file
-    /// left there). Opening and reading it would busy-spin on phantom EOF, so we
-    /// refuse loudly instead of degrading into a hot loop.
-    #[error("path {path} exists but is not a FIFO; refusing to wait on it")]
-    NotAFifo { path: PathBuf },
-
-    /// Another waiter already holds this session's lock. Only one waiter may be
-    /// live per session (see the module docs); a second must not attach.
-    #[error("another waiter is already running for this session (lock held at {path})")]
-    AlreadyWaiting { path: PathBuf },
-
-    /// The per-session lockfile could not be opened or locked.
-    #[error("could not acquire waiter lock {path}: {source}")]
-    Lock {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    /// The FIFO could not be opened.
-    #[error("could not open wake FIFO {path}: {source}")]
-    OpenFifo {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    /// A poll/read on the FIFO failed.
-    #[error("could not read wake FIFO {path}: {source}")]
-    ReadFifo {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    /// The waiter pidfile could not be written (the waiter cannot make itself
-    /// reap-able by `cleanup`, so this is a real error rather than best-effort).
-    #[error("could not write waiter pidfile {path}: {source}")]
-    Pidfile {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
     /// The read-only unread check against the durable store failed.
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
 
-/// The result of one [`Waker::kick`]: did the wake byte reach a listening waiter?
-///
-/// Returned (rather than discarded) so [`Waker::kick_all`] can report real
-/// delivered/no-reader/error counts — "why didn't my agent wake?" is answerable
-/// from the logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KickOutcome {
-    /// The wake byte was written to a waiter that had the FIFO open for reading.
-    Delivered,
-    /// No live waiter: either no FIFO node exists, or none is open for reading
-    /// (`ENXIO`). Normal — the waiter's unread check covers this case.
-    NoReader,
-    /// The kick failed for some other reason (logged). Never fails the publish.
-    Error,
-}
-
-/// Why a waiter woke. Both outcomes mean the same thing to the harness (exit 2
-/// → wake the idle session); the distinction exists only so the reason can be
-/// logged honestly, and surfaced to tests behind an opt-in debug flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeReason {
-    /// Unread mail already existed when the waiter checked, before it ever
-    /// blocked (the missed-kick safety path, AC2).
-    ExistingUnread,
-    /// The waiter was blocked and a kick arrived (the steady-state path, AC1).
-    Kicked,
-}
-
-impl WakeReason {
-    /// Stable label for logs and the opt-in debug line.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WakeReason::ExistingUnread => "existing-unread",
-            WakeReason::Kicked => "kicked",
-        }
-    }
-}
-
-/// Which pass of the check-then-block loop we are on. A two-state enum rather
-/// than a bare `bool` so the meaning is legible at the branch (enum-over-bool
-/// discipline, AGENTS.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pass {
-    /// The very first unread check, before the waiter has ever blocked.
-    FirstCheck,
-    /// A check performed after waking from a kick.
-    AfterKick,
-}
-
-/// Why one `poll` on the FIFO returned: a kick byte arrived (drain + re-check),
-/// or the bounded block elapsed with no kick (the re-arm boundary, ADR-0006).
-/// A named enum, not a `bool`, so the branch reads plainly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Blocked {
-    /// The FIFO became readable — a kick arrived and was drained.
-    Kicked,
-    /// The `max_block` budget elapsed before any kick (bounded waits only).
-    TimedOut,
-}
-
-/// The result of a [`Waiter::wait`]: how a blocking wait ended.
-///
-/// A three-way outcome, so the harness's arm-iff-subscribed and re-arm
-/// coordination are both representable and exhaustively handled at the call site
-/// (no `unreachable!`): see docs/01-wake-and-rearm.md and ADR-0006.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// The session has unread mail; exit 2 and surface the reminder.
-    Woken(WakeOutcome),
-    /// No mail within `max_block`: the waiter has reached its re-arm boundary and
-    /// must hand back to the harness. The caller exits **2** with the benign
-    /// [`REARM_NOTICE`] on stderr — a wake with no mail — so the session's next
-    /// `Stop` runs `arm` and a FRESH hook process (with a FRESH `timeout`) takes
-    /// over. Only ever returned when a `max_block` was supplied (an unbounded wait
-    /// blocks forever).
-    ///
-    /// Why exit rather than re-exec (the card-11 design, now retired — ADR-0006): the waiter's
-    /// life is hard-bounded by Claude Code's per-hook `timeout`, and `execv` does
-    /// NOT reset that clock (it preserves the PID, and the deadline is per-process).
-    /// A waiter therefore cannot outrun the timeout — it can only *yield* before it,
-    /// which is what this outcome is. See ADR-0006.
-    TimedOut,
-    /// The session has NO subscriptions, so there is nothing to be woken about —
-    /// exit cleanly WITHOUT waking. This is the waiter-side half of
-    /// arm-iff-subscribed: an `arm` that raced a `SessionEnd`/unsubscribe (interest
-    /// already dropped) starts a waiter that finds nothing and self-exits, so no
-    /// orphan waiter survives (card 11 HIGH#2 fix).
-    Unsubscribed,
-}
-
-/// How the detached watcher ([`Waiter::watch_sentinel`]) ended.
-///
-/// The watcher has essentially one clean exit — it either self-exits because the
-/// session subscribes to nothing, or it blocks forever until `SIGTERM` (which the
-/// OS delivers as process death, not a value). A named single-variant enum, rather
-/// than `()`, so a later reason can be added without changing the signature and so
-/// the call site reads intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatchOutcome {
-    /// The session has NO subscriptions, so there is nothing to be woken about — the
-    /// watcher removed its pidfile and exited without ever arming a sentinel (the
-    /// arm-iff-subscribed re-check, mirroring [`WaitOutcome::Unsubscribed`]).
-    Unsubscribed,
-}
-
-/// The stderr line a re-arm exit writes (exit 2, no mail).
-///
-/// It MUST NOT look like mail: the agent that sees it has nothing to read, and its
-/// only correct response is to do nothing and end its turn — which fires `Stop`,
-/// which re-arms a fresh waiter. Kept beside [`WakeOutcome::reminder`] so the two
-/// stderr wire strings — the only things wake ever writes — are defined together
-/// and stay obviously distinct. Payload-free, like every other wake.
-pub const REARM_NOTICE: &str = "mailbox: re-arming the waiter (no new mail) — nothing to read; \
-                                just end your turn and the Stop hook will re-arm it";
-
-/// How one [`Waiter::retrigger_if_unread`] ended (ADR-0012).
+/// How one [`SessionMail::retrigger_if_unread`] ended (ADR-0012).
 ///
 /// Returned rather than logged in place so the `Stop` hook can report it in one
 /// exhaustive `match` — and so a test can assert the ANTI-LOOP branch directly
@@ -297,7 +100,7 @@ pub enum RetriggerOutcome {
         error: SentinelError,
     },
     /// The sentinel could not be written, so no wake will fire from this turn. The
-    /// mail stays durable and surfaces on the next kick.
+    /// mail stays durable and surfaces on the next publish.
     BumpFailed { error: SentinelError },
 }
 
@@ -317,389 +120,153 @@ pub fn needs_retrigger(record: RetriggerRecord, high_water: WakeWatermark) -> bo
     }
 }
 
-/// The result of a completed [`Waiter::wait`]: the session has mail and should
-/// be woken.
+/// The DAEMON side of wake: writes a session's unread topic set into its sentinel,
+/// which is what makes that session's `FileChanged` hook fire.
 ///
-/// A dedicated type (rather than a bare `Vec<Topic>`) names the protocol — the
-/// waiter's contract is "exit 2, topic names on stderr" — and keeps the
-/// exit-code and reminder-line construction in one place so callers cannot get
-/// them subtly wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WakeOutcome {
-    topics: Vec<Topic>,
-    reason: WakeReason,
-}
-
-impl WakeOutcome {
-    /// The process exit code that asks the Claude Code harness to wake the idle
-    /// session (the `asyncRewake` contract, docs/01-wake-and-rearm.md). A `u8` so
-    /// the sole consumer maps it to a `std::process::ExitCode` without a lossy
-    /// cast.
-    pub const EXIT_CODE: u8 = 2;
-
-    /// The subscribed topics that currently have unread mail.
-    pub fn topics(&self) -> &[Topic] {
-        &self.topics
-    }
-
-    /// Why the waiter woke.
-    pub fn reason(&self) -> WakeReason {
-        self.reason
-    }
-
-    /// The payload-free stderr reminder line. Topic names only — never a body —
-    /// so it is safe to surface verbatim as a system reminder.
-    pub fn reminder(&self) -> String {
-        let names: Vec<&str> = self.topics.iter().map(Topic::as_str).collect();
-        format!("mail on topic {}", names.join(", "))
-    }
-}
-
-/// The path of a session's FIFO under `waiters_dir`.
-///
-/// The filename stem is [`SessionId::encode_filename`] — the ONE shared encoder
-/// (in `mailbox-protocol`), so the FIFO, the lock, and the harness's pidfile all
-/// key a session identically (card 11 coordination).
-fn fifo_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
-    waiters_dir.join(format!("{}.fifo", session.encode_filename()))
-}
-
-/// The path of a session's advisory lockfile under `waiters_dir`.
-fn lock_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
-    waiters_dir.join(format!("{}.lock", session.encode_filename()))
-}
-
-/// The path of a session's waiter pidfile under `waiters_dir`.
-///
-/// The waiter (not `arm`) owns this: it is written only AFTER the single-waiter
-/// lock is acquired, so the pidfile always names the one live lock-holding waiter
-/// — the source of truth `cleanup` reaps (card 11, ADR-0006).
-pub fn pidfile_path(waiters_dir: &Path, session: &SessionId) -> PathBuf {
-    waiters_dir.join(format!("{}.waiter.pid", session.encode_filename()))
-}
-
-/// Whether a session currently has a LIVE waiter blocked on its FIFO.
-///
-/// A best-effort probe, because `mailbox agents` reports it and must not
-/// overclaim: this reads the session's pidfile and probes that PID with
-/// `kill(pid, 0)`. Post-ADR-0006 the pidfile is written by the waiter itself,
-/// only after it takes the single-waiter lock, so it reliably names the one
-/// lock-holding waiter for the session. A live PID therefore *suggests* "this
-/// agent is idle and listening — a publish to its topics should wake it".
-///
-/// What it is NOT: a heartbeat, or proof the *agent* is healthy — and it cannot
-/// even rule out a false positive. `kill(pid, 0)` only asks "is SOME process
-/// alive under this PID"; a `Woken` waiter exits leaving its pidfile in place, so
-/// after PID reuse this can name an unrelated process and read `true` for a waiter
-/// that is gone. `false` only means no such PID is alive at this instant —
-/// typically because the session is mid-turn (busy), or never armed. Either way a
-/// message published to a subscribed session is still durably delivered; it
-/// surfaces on that session's next read/arm. There is no liveness signal beyond
-/// this, and we deliberately do not invent one.
-pub fn waiter_alive(waiters_dir: &Path, session: &SessionId) -> bool {
-    let Ok(text) = std::fs::read_to_string(pidfile_path(waiters_dir, session)) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<i32>() else {
-        // A half-written or garbage pidfile names no waiter (same tolerance as
-        // `mailbox_harness::arm::read_pidfile`).
-        return false;
-    };
-    // Signal 0 probes liveness without delivering anything: Ok => alive, ESRCH => gone.
-    matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Ok(())
-    )
-}
-
-/// The kick side of wake, held by whoever publishes (the bridge / bus).
-///
-/// Cheap to clone; it holds only the waiters directory path. It never opens the
-/// database — it is handed the list of sessions to kick.
+/// Cheap to clone; it holds only the sentinel root. It never opens the database —
+/// it is handed the sessions to wake and what they have unread.
 #[derive(Debug, Clone)]
 pub struct Waker {
-    waiters_dir: PathBuf,
+    sentinel_root: PathBuf,
 }
 
 impl Waker {
-    /// Build a waker that signals FIFOs under `waiters_dir`.
-    pub fn new(waiters_dir: impl Into<PathBuf>) -> Self {
+    /// Build a waker over the resolved sentinel root (`~/.mailbox` by default; see
+    /// [`crate::sentinel`]). The root is resolved ONCE, by the daemon at startup,
+    /// rather than re-read from the environment per publish.
+    pub fn new(sentinel_root: impl Into<PathBuf>) -> Self {
         Self {
-            waiters_dir: waiters_dir.into(),
+            sentinel_root: sentinel_root.into(),
         }
     }
 
-    /// Kick every session in `sessions` that is subscribed to `topic`, then log
-    /// the aggregate outcome.
+    /// Write `unread` into `session`'s sentinel, bumping its mtime so the session's
+    /// `FileChanged` hook fires.
     ///
-    /// Payload-free: `topic` is used only for the log line, never written into
-    /// any FIFO. With zero sessions this logs `delivered=0 no_reader=0` — an
-    /// honest "nothing to wake", not a misleading "kicked" claim.
-    pub fn kick_all(&self, sessions: &[SessionId], topic: &Topic) {
-        let mut delivered = 0usize;
-        let mut no_reader = 0usize;
-        let mut errors = 0usize;
-        for session in sessions {
-            match self.kick(session) {
-                KickOutcome::Delivered => delivered += 1,
-                KickOutcome::NoReader => no_reader += 1,
-                KickOutcome::Error => errors += 1,
+    /// **Unconditional**: there is deliberately no coalescing (ADR-0008, revised).
+    /// We do not compare the topic set to what the sentinel already holds, so every
+    /// publish to a subscribed topic advances the mtime and no message can be
+    /// silently dropped. The three lost-wake bugs this design retired all lived in
+    /// the coalescing logic; there is now none that CAN be wrong.
+    ///
+    /// It creates the per-session directory if needed. That is exactly what the
+    /// detached watcher did, and it means a session that subscribed without ever
+    /// running `SessionStart` still gets a sentinel — one Claude Code is not
+    /// watching, but which `mailbox doctor` can then see and report on.
+    pub fn wake(&self, session: &SessionId, unread: &[Topic]) -> Result<(), SentinelError> {
+        Sentinel::under_root(&self.sentinel_root, session).write_topics(unread)
+    }
+
+    /// Wake every session in `unread_by_session`, then log the aggregate outcome.
+    ///
+    /// Payload-free: `topic` is used only for the log line. With zero sessions this
+    /// logs `bumped=0` — an honest "nothing to wake", not a misleading claim.
+    ///
+    /// A failure to write one session's sentinel is logged and skipped: the event is
+    /// already durable, so it must never fail a publish, and the other subscribers
+    /// still get their wake.
+    pub fn wake_all(&self, unread_by_session: &[(SessionId, Vec<Topic>)], topic: &Topic) {
+        let mut bumped = 0usize;
+        let mut failed = 0usize;
+        for (session, unread) in unread_by_session {
+            match self.wake(session, unread) {
+                Ok(()) => bumped += 1,
+                Err(err) => {
+                    failed += 1;
+                    warn!(
+                        session = session.as_str(),
+                        error = %err,
+                        "could not write a subscriber's wake sentinel; it will not wake for \
+                         this event (the event is durable and surfaces on its next read)"
+                    );
+                }
             }
         }
-        // Log after the decision point: which topic drove the kicks, and how many
-        // subscribers we actually woke vs had no live waiter. Never the body.
+        // Log after the decision point: which topic drove the writes, and how many
+        // subscribers we actually bumped. Never the body.
         info!(
             topic = topic.as_str(),
-            delivered, no_reader, errors, "kicked subscribed sessions after publish"
+            bumped, failed, "bumped subscribers' wake sentinels after publish"
         );
-    }
-
-    /// Kick one session's FIFO. Best-effort by design:
-    ///
-    /// - The FIFO is opened **write-only, non-blocking**, so the publisher never
-    ///   blocks waiting for a reader to appear.
-    /// - If no waiter currently holds the FIFO open for reading, the OS reports
-    ///   `ENXIO`; if no FIFO node exists at all, `NotFound`. Both are normal (a
-    ///   session may have no live waiter) and yield [`KickOutcome::NoReader`]. The
-    ///   waiter's open→check→block ordering covers the "published before I
-    ///   blocked" case, so a dropped kick is never a lost wake.
-    /// - Any other failure yields [`KickOutcome::Error`] and is logged: a kick
-    ///   must never fail a publish (the event is already durable).
-    pub fn kick(&self, session: &SessionId) -> KickOutcome {
-        let path = fifo_path(&self.waiters_dir, session);
-        // O_WRONLY | O_NONBLOCK: returns immediately, with ENXIO if no reader.
-        let open = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(&path);
-
-        let mut file = match open {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                debug!(
-                    session = session.as_str(),
-                    "no waiter FIFO; kick is a no-op"
-                );
-                return KickOutcome::NoReader;
-            }
-            Err(err) if err.raw_os_error() == Some(nix::libc::ENXIO) => {
-                debug!(
-                    session = session.as_str(),
-                    "no waiter listening on FIFO; kick is a no-op"
-                );
-                return KickOutcome::NoReader;
-            }
-            Err(err) => {
-                warn!(
-                    session = session.as_str(),
-                    error = %err,
-                    "could not open waiter FIFO to kick; skipping (publish already durable)"
-                );
-                return KickOutcome::Error;
-            }
-        };
-
-        use io::Write;
-        match file.write_all(&[WAKE_BYTE]) {
-            Ok(()) => {
-                debug!(session = session.as_str(), "delivered wake byte");
-                KickOutcome::Delivered
-            }
-            Err(err) => {
-                // A reader that just vanished (EPIPE) or a full pipe (EAGAIN) is
-                // harmless: coalescing means one delivered byte is enough, and a
-                // vanished reader has nothing to wake.
-                debug!(
-                    session = session.as_str(),
-                    error = %err,
-                    "wake byte not written (pipe full or reader gone)"
-                );
-                KickOutcome::Error
-            }
-        }
     }
 }
 
-/// The block side of wake, run by the waiter process.
+/// The HOOK side of wake: a read-only view of one session's unread mail.
 ///
-/// Holds the FIFO path, the per-session lock path, and the database path (opened
-/// read-only inside [`Waiter::wait`]).
-///
-/// # Residual risk (documented, out of scope here)
-///
-/// The unread check reads the database read-only across processes; that relies
-/// on the bridge/writer process being live so WAL is present. The "bridge down"
-/// window — where the read-only open would fail — is owned by later
-/// process-lifecycle cards, not this one.
+/// Holds the session id and the database path (opened read-only per call). Every
+/// read here is non-destructive — consuming mail is the exclusive job of the agent's
+/// `read` through the single writer, and a wake must never advance a cursor.
 #[derive(Debug)]
-pub struct Waiter {
+pub struct SessionMail {
     session: SessionId,
-    fifo_path: PathBuf,
-    lock_path: PathBuf,
-    pidfile_path: PathBuf,
     db_path: PathBuf,
 }
 
-impl Waiter {
-    /// Build a waiter for `session`, using FIFOs/locks/pidfiles under
-    /// `waiters_dir` and the read-only store at `db_path`.
-    pub fn new(
-        waiters_dir: impl AsRef<Path>,
-        db_path: impl Into<PathBuf>,
-        session: SessionId,
-    ) -> Self {
-        let waiters_dir = waiters_dir.as_ref();
-        let fifo_path = fifo_path(waiters_dir, &session);
-        let lock_path = lock_path(waiters_dir, &session);
-        let pidfile_path = pidfile_path(waiters_dir, &session);
+impl SessionMail {
+    /// Build a view of `session`'s mail in the store at `db_path`.
+    pub fn new(db_path: impl Into<PathBuf>, session: SessionId) -> Self {
         Self {
             session,
-            fifo_path,
-            lock_path,
-            pidfile_path,
             db_path: db_path.into(),
         }
     }
 
-    /// The resolved FIFO path (exposed for tests and diagnostics).
-    pub fn fifo_path(&self) -> &Path {
-        &self.fifo_path
-    }
-
-    /// The resolved waiter pidfile path (exposed for tests and diagnostics).
-    pub fn pidfile_path(&self) -> &Path {
-        &self.pidfile_path
-    }
-
-    /// Block until this session has unread mail, then return the outcome.
-    ///
-    /// The ordering is load-bearing (see the module docs and ADR-0006):
-    ///
-    /// 0. Acquire the per-session exclusive lock (single-waiter-per-session); a
-    ///    second waiter fails fast with [`WakeError::AlreadyWaiting`] and — never
-    ///    having reached the pidfile step — leaves the pidfile untouched, so it
-    ///    keeps naming the LIVE lock-holding waiter (card 11 HIGH#1 fix).
-    /// 1. Write the pidfile (our pid) — the waiter, not `arm`, owns it, written
-    ///    only AFTER the lock so the pidfile is always the one live waiter's.
-    /// 2. Ensure + open the FIFO (`O_RDWR | O_NONBLOCK`) — from here any kick is
-    ///    either buffered in this pipe or already reflected in the durable log.
-    /// 3. Open the read-only store and **re-check the session still has a
-    ///    subscription** — an `arm` that raced `SessionEnd` finds none and exits
-    ///    [`WaitOutcome::Unsubscribed`] (no orphan; card 11 HIGH#2 fix).
-    /// 4. Loop: check unread. If there is mail, return `Woken`. Otherwise `poll`
-    ///    until a kick (drain + re-check) or, with a `max_block`, the budget
-    ///    elapses → `TimedOut` (the caller exits 2 to force a fresh re-arm).
-    ///
-    /// `max_block = None` blocks indefinitely (the original card-05 contract, so a
-    /// bare `mailbox wait` never times out). `Some(budget)` is a per-block bound:
-    /// the re-arm boundary that keeps a long idle armed by handing back to the
-    /// harness *before* its per-hook `timeout` would kill this process (see
-    /// docs/01-wake-and-rearm.md and ADR-0006). The same open→check→block ordering
-    /// runs on every fresh waiter, so a publish during the re-arm gap is caught by
-    /// the next waiter's unread check, not missed.
-    ///
-    /// The pidfile is removed on the `Unsubscribed` and `TimedOut` exits (while the
-    /// lock is still held, so no concurrent waiter can have written a fresh one) —
-    /// this process is about to die, and a pidfile naming a dead pid is exactly what
-    /// made the old failure invisible. On `Woken` it is deliberately LEFT in place:
-    /// `cleanup` may still race the exit and must find something to reap, and the
-    /// next `arm`'s waiter overwrites it under lock (and reaps a stale one).
-    pub fn wait(&self, max_block: Option<Duration>) -> Result<WaitOutcome, WakeError> {
-        // Step 0: single-waiter lock. Held for the whole call; released on drop
-        // (any return path). `_lock` must stay bound so it is not dropped early.
-        let _lock = self.acquire_lock()?;
-
-        // Step 1: record ourselves as the live waiter, now that we hold the lock.
-        self.write_pidfile()?;
-
-        // Step 2: open the FIFO FIRST. O_RDWR|O_NONBLOCK keeps the open and the
-        // reads non-blocking; we block explicitly with poll below.
-        let mut fifo = self.open_wake_fifo()?;
-
-        // Step 3: read-only view of the durable store, and the arm-iff-subscribed
-        // re-check. If the session unsubscribed (or a SessionEnd raced us), there
-        // is nothing to wake about: drop the pidfile (under lock) and self-exit.
-        let store = ReadOnlyStore::open(&self.db_path)?;
-        if !store.has_subscription(&self.session)? {
-            self.remove_pidfile();
-            info!(
-                session = self.session.as_str(),
-                "waiter found no subscriptions; exiting without waking"
-            );
-            return Ok(WaitOutcome::Unsubscribed);
-        }
-
-        // Step 4: check-then-block loop.
-        let mut pass = Pass::FirstCheck;
-        loop {
-            let topics = store.topics_with_unread(&self.session)?;
-            if !topics.is_empty() {
-                let reason = match pass {
-                    Pass::FirstCheck => WakeReason::ExistingUnread,
-                    Pass::AfterKick => WakeReason::Kicked,
-                };
-                let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
-                info!(
-                    session = self.session.as_str(),
-                    reason = reason.as_str(),
-                    // Topic names are payload-free (they cross to stderr anyway),
-                    // so logging them is safe and makes "why did it wake" concrete.
-                    topics = names.join(","),
-                    "waiter woke; session has unread mail (exiting 2)"
-                );
-                return Ok(WaitOutcome::Woken(WakeOutcome { topics, reason }));
-            }
-            pass = Pass::AfterKick;
-
-            // No unread yet: block until a kick byte arrives (or the budget
-            // elapses), then drain and re-check.
-            match self.block_for_kick(&mut fifo, max_block)? {
-                Blocked::Kicked => continue,
-                Blocked::TimedOut => {
-                    // Re-check once before giving up: a publish may have landed
-                    // during this block without a delivered kick (the same durable
-                    // safety the first-pass check relies on). If still nothing, we
-                    // hand back to the harness for a fresh re-arm.
-                    if !store.topics_with_unread(&self.session)?.is_empty() {
-                        continue;
-                    }
-                    // This process is about to exit, so drop the pidfile (still
-                    // under the lock): leaving one that names a soon-dead pid is
-                    // what made a killed waiter look alive.
-                    self.remove_pidfile();
-                    // A `None` (unbounded) wait never reaches here (its poll blocks
-                    // forever), so this is only ever the bounded case.
-                    info!(
-                        session = self.session.as_str(),
-                        max_block_ms = max_block.unwrap_or_default().as_millis(),
-                        "waiter reached its max-block with no mail; exiting 2 to force a fresh re-arm"
-                    );
-                    return Ok(WaitOutcome::TimedOut);
-                }
-            }
-        }
-    }
-
-    /// Peek at the session's currently-unread topics WITHOUT blocking, arming, or
-    /// consuming anything — the read the `FileChanged` wake hook makes to decide
-    /// whether a sentinel change reflects genuine mail (exit 2) or a stray touch
-    /// (exit 0). Opens the store read-only, so it needs no daemon socket; a missing
-    /// or unreadable store surfaces as an error the caller treats as "nothing to
-    /// wake about" (the anti-loop-safe default).
+    /// Peek at the session's currently-unread topics WITHOUT consuming anything —
+    /// the read the `FileChanged` wake hook makes to decide whether a sentinel change
+    /// reflects genuine mail (exit 2) or a stray touch (exit 0). Opens the store
+    /// read-only, so it needs no daemon socket; a missing or unreadable store surfaces
+    /// as an error the caller treats as "nothing to wake about" (the anti-loop-safe
+    /// default).
     pub fn peek_unread(&self) -> Result<Vec<Topic>, WakeError> {
         let store = ReadOnlyStore::open(&self.db_path)?;
         Ok(store.topics_with_unread(&self.session)?)
     }
 
-    /// The same non-blocking peek, carrying the [`WakeWatermark`] as well — the read
-    /// the ADR-0012 turn-boundary re-trigger makes to decide whether the session is
-    /// sitting on mail it has NOT yet been re-triggered for.
+    /// The same peek, carrying the [`WakeWatermark`] as well — the read the ADR-0012
+    /// turn-boundary re-trigger makes to decide whether the session is sitting on mail
+    /// it has NOT yet been re-triggered for.
     ///
-    /// Kept beside [`Waiter::peek_unread`] because they must never disagree: both are
-    /// the one read-only unread predicate, asked with and without the watermark.
+    /// Kept beside [`SessionMail::peek_unread`] because they must never disagree: both
+    /// are the one read-only unread predicate, asked with and without the watermark.
     pub fn peek_unread_state(&self) -> Result<Unread, WakeError> {
         let store = ReadOnlyStore::open(&self.db_path)?;
         Ok(store.unread(&self.session)?)
+    }
+
+    /// ARM the session's wake sentinel: write its currently-unread topic set,
+    /// creating the file if it does not exist. Returns what was written.
+    ///
+    /// # Why arming is a separate step from the daemon's bump
+    ///
+    /// Claude Code watches a PATH. The daemon rewrites that file on every publish,
+    /// which is a MODIFY — but the first write for a session that has never been armed
+    /// is a CREATE, and a create is a different event the watch may not deliver at
+    /// all. So the `SessionStart` hook writes the file itself, before printing the
+    /// `watchPaths` registration that puts a watch on it.
+    ///
+    /// It doubles as the level-triggered arm the wake path requires (AGENTS.md): mail
+    /// that landed while no process owned this session is written into the sentinel
+    /// here, so a session that starts (or resumes) on top of unread mail wakes for it
+    /// instead of waiting for the next publish.
+    ///
+    /// A store it cannot read does NOT leave the session unarmed: it arms with an
+    /// empty topic set, because an existing-but-empty sentinel is watchable and a
+    /// missing one is not.
+    pub fn arm(&self, sentinel: &Sentinel) -> Result<Vec<Topic>, SentinelError> {
+        let topics = match self.peek_unread() {
+            Ok(topics) => topics,
+            Err(err) => {
+                warn!(
+                    session = self.session.as_str(),
+                    error = %err,
+                    "could not read unread mail while arming the wake sentinel; arming with an \
+                     empty topic set (the file must EXIST to be watchable, and the daemon \
+                     rewrites it on the next publish)"
+                );
+                Vec::new()
+            }
+        };
+        sentinel.write_topics(&topics).map(|()| topics)
     }
 
     /// The ADR-0012 TURN-BOUNDARY re-trigger: re-bump `sentinel` if this session is
@@ -707,18 +274,17 @@ impl Waiter {
     ///
     /// # Why this exists
     ///
-    /// The steady-state wake is an EDGE (publish → kick → [`Waiter::watch_sentinel`]
-    /// bumps → `FileChanged` → the wake hook exits 2), and an edge only reaches an
-    /// IDLE session. Mail published while the agent is mid-turn bumps the sentinel to
-    /// no effect — the hook does not even run — and nothing bumps it again, so the
+    /// The steady-state wake is an EDGE (publish → the daemon writes the sentinel →
+    /// `FileChanged` → the wake hook exits 2), and an edge only reaches an IDLE
+    /// session. Mail published while the agent is mid-turn bumps the sentinel to no
+    /// effect — the hook does not even run — and nothing bumps it again, so the
     /// session goes idle DEAF on top of unread mail. This is the level check that
     /// closes that window, run from the `Stop` hook because a turn boundary is the
-    /// only moment the bridge learns a turn ended.
+    /// only moment the harness learns a turn ended.
     ///
-    /// It lives here, next to [`Waiter::sync_sentinel_to_unread`], because "read the
-    /// unread state, then bump the sentinel" is this type's job — the hook layer
-    /// should only decide WHEN to ask and how to report the answer. Both bump paths
-    /// therefore share one choke point.
+    /// It lives here, next to [`SessionMail::arm`], because "read the unread state,
+    /// then write the sentinel" is this type's job — the hook layer should only decide
+    /// WHEN to ask and how to report the answer.
     ///
     /// # Bounded, so it cannot loop
     ///
@@ -764,364 +330,6 @@ impl Waiter {
             }),
         }
     }
-
-    /// Run the DETACHED WATCHER loop (ADR-0008): block on the FIFO forever and, on
-    /// every real-mail kick, write the unread topic name(s) into `sentinel` so its
-    /// mtime changes and the session's `FileChanged` hook fires. This is what
-    /// REPLACES the ADR-0006 exit-2-at-max_block re-arm — the watcher never wakes the
-    /// agent itself and never exits on a timer; it runs until `SIGTERM`'d at
-    /// `SessionEnd`, so an idle session costs zero model turns.
-    ///
-    /// It reuses the whole single-waiter machinery [`Waiter::wait`] relies on, in the
-    /// same load-bearing order:
-    ///
-    /// 0. Acquire the per-session exclusive lock — a second watcher (a racing
-    ///    `SessionStart`) loses it and exits [`WakeError::AlreadyWaiting`], leaving the
-    ///    live watcher's pidfile untouched.
-    /// 1. Write the pidfile (own pid) AFTER the lock, so it always names the one live
-    ///    lock-holding watcher — the pid `cleanup` reaps at `SessionEnd`.
-    /// 2. Ensure + open the FIFO (`O_RDWR | O_NONBLOCK`) — from here any kick is either
-    ///    buffered in the pipe or already reflected in the durable log.
-    /// 3. Open the read-only store and re-check `has_subscription`: an unsubscribed
-    ///    session (or one whose `SessionEnd` raced this start) yields
-    ///    [`WatchOutcome::Unsubscribed`] (pidfile removed, clean exit) — no orphan.
-    /// 4. Prime the sentinel once from any EXISTING unread (a publish that landed
-    ///    before the watcher armed — the missed-kick safety), then loop: block for a
-    ///    kick and **unconditionally** write the current unread topic set into the
-    ///    sentinel (see [`Waiter::sync_sentinel_to_unread`]). EVERY kick bumps the
-    ///    sentinel's mtime — there is no coalescing — so no real message can ever be
-    ///    suppressed. An empty kick writes the empty set (a benign `FileChanged`; the
-    ///    wake hook re-checks the store, finds nothing, and exits 0).
-    ///
-    /// The sentinel carries topic NAMES only (payload-free). A sentinel write failure
-    /// is logged and the loop continues: losing one wake-trigger is far better than
-    /// the watcher dying and the session going permanently deaf.
-    ///
-    /// # Resilience (ADR-0008 FIX 2)
-    ///
-    /// A signal-interrupted `poll` (EINTR) is retried, not treated as an error
-    /// ([`Waiter::block_for_kick`]) — a normal kick, by contrast, is a writer that
-    /// writes and closes its end, which (because the watcher holds the FIFO `O_RDWR`,
-    /// so it is always its own writer) surfaces as a buffered read then `WouldBlock`,
-    /// i.e. [`Blocked::Kicked`], never an EOF. On a genuinely unrecoverable error the
-    /// loop exits and the watcher **removes its pidfile** so the state is unambiguous;
-    /// the per-session **Stop-liveness hook** then respawns it (that hook, not an
-    /// elaborate in-loop reopen, is the recovery mechanism — see ADR-0008). This keeps
-    /// the watcher simple and pushes recovery to the one place that also covers a
-    /// watcher killed by the OS.
-    ///
-    /// On ANY exit — clean, `Unsubscribed`, or a hard error — the pidfile is removed
-    /// (previously only the `Unsubscribed` path cleaned up), so the Stop hook sees a
-    /// clean "no live watcher" state and respawns unambiguously.
-    ///
-    /// Never returns on its own except [`WatchOutcome::Unsubscribed`] or a hard
-    /// [`WakeError`]; steady state is an unbounded block, reaped by `SIGTERM`.
-    pub fn watch_sentinel(&self, sentinel: &Sentinel) -> Result<WatchOutcome, WakeError> {
-        // Steps 0–1: single-watcher lock, then the pidfile under it. A lock LOSER
-        // returns here (AlreadyWaiting) BEFORE writing the pidfile, so it never
-        // disturbs the live watcher's pidfile — only the winner (which owns it) cleans
-        // up below.
-        let _lock = self.acquire_lock()?;
-        self.write_pidfile()?;
-
-        // From here we own the pidfile under the lock, so remove it on EVERY exit path
-        // (see the resilience note above). The lock is still held while we do so, so no
-        // concurrent watcher can have written a fresh one.
-        let outcome = self.watch_sentinel_locked(sentinel);
-        self.remove_pidfile();
-        outcome
-    }
-
-    /// The body of [`Waiter::watch_sentinel`], run with the single-watcher lock held
-    /// and the pidfile written. Split out so its caller can remove the pidfile on
-    /// every return path (clean, orphan, or fatal) in one place.
-    fn watch_sentinel_locked(&self, sentinel: &Sentinel) -> Result<WatchOutcome, WakeError> {
-        // Step 2: open the FIFO before checking, so a kick is never lost.
-        let mut fifo = self.open_wake_fifo()?;
-
-        // Step 3: arm-iff-subscribed re-check (fixes the raced-SessionEnd orphan).
-        let store = ReadOnlyStore::open(&self.db_path)?;
-        if !store.has_subscription(&self.session)? {
-            info!(
-                session = self.session.as_str(),
-                "watcher found no subscriptions; exiting without arming a sentinel"
-            );
-            return Ok(WatchOutcome::Unsubscribed);
-        }
-
-        // Step 4: prime from existing unread, then block-on-kick forever.
-        //
-        // The prime writes the current unread set unconditionally. On a WATCHER RESTART
-        // this overwrites whatever stale set a previous (crashed) watcher left behind
-        // with the real one (or empty), and it bumps the mtime — so if a message arrived
-        // on an already-read topic while the watcher was dead, the respawn wakes the agent
-        // for it (the dead-window case). There is no coalescing to reconcile.
-        self.sync_sentinel_to_unread(&store, sentinel);
-        info!(
-            session = self.session.as_str(),
-            sentinel = %sentinel.path().display(),
-            "watcher armed; blocking on the mail FIFO (no re-arm, no timer)"
-        );
-        loop {
-            // `None` = block indefinitely; the watcher has no max-block and never
-            // times out. Both arms re-write the unread set (a TimedOut cannot occur with
-            // a None budget, but handling it keeps the match exhaustive and harmless).
-            // A hard error ends the loop; the wrapper removes the pidfile and the
-            // Stop-liveness hook respawns the watcher (ADR-0008 FIX 2/3).
-            match self.block_for_kick(&mut fifo, None)? {
-                Blocked::Kicked | Blocked::TimedOut => {
-                    self.sync_sentinel_to_unread(&store, sentinel);
-                }
-            }
-        }
-    }
-
-    /// Ensure the FIFO node exists (and is genuinely a FIFO) and open it
-    /// `O_RDWR | O_NONBLOCK`. Shared by [`Waiter::wait`] and the watcher's reopen path.
-    fn open_wake_fifo(&self) -> Result<std::fs::File, WakeError> {
-        self.ensure_fifo()?;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(nix::libc::O_NONBLOCK)
-            .open(&self.fifo_path)
-            .map_err(|source| WakeError::OpenFifo {
-                path: self.fifo_path.clone(),
-                source,
-            })
-    }
-
-    /// Write the session's currently-unread topic set into the sentinel — bumping its
-    /// mtime so the `FileChanged` hook fires — **unconditionally, on every call**.
-    ///
-    /// There is deliberately NO coalescing (ADR-0008, revised): the watcher does not
-    /// compare the unread set to what the sentinel already holds, and it tracks no
-    /// read-progress signal. It reads `topics_with_unread` and writes it — empty or not.
-    /// [`Sentinel::write_topics`] truncates and rewrites, so the mtime always advances.
-    ///
-    /// Correctness follows directly and simply: EVERY kick writes the sentinel, so every
-    /// real message (which always kicks a live watcher) advances the mtime → `FileChanged`
-    /// fires → the wake hook exits 2 iff there is genuine unread. **No message can be
-    /// coalesced away — a lost wake is structurally impossible.** An empty kick writes the
-    /// empty set: a benign `FileChanged` the wake hook answers with exit 0. The only cost
-    /// is that a burst of N messages yields up to N `FileChanged` events; the wake hook's
-    /// anti-loop (exit 0 once caught up) bounds actual model wakes to ~1-2 per burst.
-    ///
-    /// The three lost-wake ("silent deafness") bugs this design retired all lived in the
-    /// removed coalescing logic (a set-comparison skip plus a lossy read-progress proxy).
-    /// Removing it removes the whole class: there is no longer any coalescing that CAN be
-    /// wrong.
-    ///
-    /// A best-effort helper: a store or sentinel failure is logged, never fatal to the
-    /// watcher (a dead watcher is the failure this whole design prevents).
-    fn sync_sentinel_to_unread(&self, store: &ReadOnlyStore, sentinel: &Sentinel) {
-        let topics = match store.topics_with_unread(&self.session) {
-            Ok(topics) => topics,
-            Err(err) => {
-                warn!(
-                    session = self.session.as_str(),
-                    error = %err,
-                    "watcher could not read unread topics; skipping this sentinel write"
-                );
-                return;
-            }
-        };
-        let names: Vec<&str> = topics.iter().map(Topic::as_str).collect();
-        match sentinel.write_topics(&topics) {
-            Ok(()) => info!(
-                session = self.session.as_str(),
-                topics = names.join(","),
-                "watcher wrote the wake sentinel (FileChanged will fire; wake hook wakes iff unread)"
-            ),
-            Err(err) => warn!(
-                session = self.session.as_str(),
-                error = %err,
-                "watcher could not write the wake sentinel; the session may miss this wake until the next kick"
-            ),
-        }
-    }
-
-    /// Record our own pid in the pidfile (called after the lock is acquired).
-    /// Creates the waiters dir if needed; a write failure is a real error (the
-    /// waiter cannot make itself reap-able) so it surfaces rather than being
-    /// swallowed.
-    fn write_pidfile(&self) -> Result<(), WakeError> {
-        self.ensure_dir()?;
-        std::fs::write(&self.pidfile_path, std::process::id().to_string()).map_err(|source| {
-            WakeError::Pidfile {
-                path: self.pidfile_path.clone(),
-                source,
-            }
-        })
-    }
-
-    /// Remove the pidfile, ignoring a missing file. Best-effort: only called on the
-    /// clean `Unsubscribed` / `TimedOut` exits, while still holding the lock.
-    fn remove_pidfile(&self) {
-        if let Err(err) = std::fs::remove_file(&self.pidfile_path)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            warn!(
-                session = self.session.as_str(),
-                path = %self.pidfile_path.display(),
-                error = %err,
-                "could not remove waiter pidfile on clean exit"
-            );
-        }
-    }
-
-    /// Block (via `poll`) until the FIFO is readable or `max_block` elapses, then
-    /// drain every buffered byte with non-blocking reads.
-    ///
-    /// Draining fully means coalesced kicks leave nothing behind for a later
-    /// iteration to misread. A read of `Ok(0)` is EOF — impossible for a live
-    /// FIFO we hold `O_RDWR` on, so it means the node is not (or no longer) a
-    /// working FIFO — and is surfaced as an error rather than looped on, which is
-    /// the second guard against the hot-spin failure mode.
-    ///
-    /// With `max_block = None` the poll blocks indefinitely (card-05 behaviour);
-    /// with `Some(budget)` it returns [`Blocked::TimedOut`] when the budget
-    /// elapses before any kick — the re-arm boundary (ADR-0006).
-    fn block_for_kick(
-        &self,
-        fifo: &mut std::fs::File,
-        max_block: Option<Duration>,
-    ) -> Result<Blocked, WakeError> {
-        // Scope the poll so the BorrowedFd it holds is released before the drain
-        // loop needs `fifo` mutably.
-        let ready = {
-            // NONE = block indefinitely; a bounded timeout returns 0 ready fds when
-            // it elapses. A kick or existing buffered byte makes the fd readable.
-            let timeout = match max_block {
-                None => PollTimeout::NONE,
-                Some(budget) => PollTimeout::try_from(budget).unwrap_or(PollTimeout::MAX),
-            };
-            // EINTR retry: a signal delivered while we are blocked interrupts `poll`,
-            // which is NOT a failure — the FIFO is untouched and we simply re-enter the
-            // wait. Treating it as fatal would kill the detached watcher on any stray
-            // signal and leave a truly-idle session permanently deaf (ADR-0008 FIX 2).
-            loop {
-                let mut poll_fds = [PollFd::new(fifo.as_fd(), PollFlags::POLLIN)];
-                match poll(&mut poll_fds, timeout) {
-                    Ok(ready) => break ready,
-                    Err(Errno::EINTR) => continue,
-                    Err(errno) => {
-                        return Err(WakeError::ReadFifo {
-                            path: self.fifo_path.clone(),
-                            source: io::Error::from_raw_os_error(errno as i32),
-                        });
-                    }
-                }
-            }
-        };
-
-        // `poll` returned 0 ready fds => the timeout elapsed with no kick.
-        if ready == 0 {
-            return Ok(Blocked::TimedOut);
-        }
-
-        // Drain all currently-available bytes; their count and value are
-        // irrelevant (payload-free), we only care that a kick arrived.
-        let mut buf = [0u8; 64];
-        loop {
-            match fifo.read(&mut buf) {
-                Ok(0) => {
-                    return Err(WakeError::NotAFifo {
-                        path: self.fifo_path.clone(),
-                    });
-                }
-                Ok(_) => continue,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(source) => {
-                    return Err(WakeError::ReadFifo {
-                        path: self.fifo_path.clone(),
-                        source,
-                    });
-                }
-            }
-        }
-        trace!(session = self.session.as_str(), "waiter drained a kick");
-        Ok(Blocked::Kicked)
-    }
-
-    /// Acquire the per-session exclusive advisory lock. Non-blocking: if another
-    /// waiter holds it, return [`WakeError::AlreadyWaiting`] immediately rather
-    /// than queueing. The returned [`Flock`] releases the lock on drop.
-    fn acquire_lock(&self) -> Result<Flock<std::fs::File>, WakeError> {
-        self.ensure_dir()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&self.lock_path)
-            .map_err(|source| WakeError::Lock {
-                path: self.lock_path.clone(),
-                source,
-            })?;
-
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => Ok(flock),
-            Err((_file, errno)) if errno == Errno::EAGAIN || errno == Errno::EWOULDBLOCK => {
-                Err(WakeError::AlreadyWaiting {
-                    path: self.lock_path.clone(),
-                })
-            }
-            Err((_file, errno)) => Err(WakeError::Lock {
-                path: self.lock_path.clone(),
-                source: io::Error::from_raw_os_error(errno as i32),
-            }),
-        }
-    }
-
-    /// Create the waiter directory and the FIFO node if they do not already
-    /// exist, and verify an existing node is genuinely a FIFO.
-    ///
-    /// `mkfifo` returning `EEXIST` only tells us *a* node exists, not that it is a
-    /// FIFO. A regular file left at the path would make `open(O_RDWR).read()`
-    /// return `Ok(0)` (EOF) forever, hot-spinning the wait loop — so we `stat`
-    /// and reject a non-FIFO node loudly ([`WakeError::NotAFifo`]).
-    fn ensure_fifo(&self) -> Result<(), WakeError> {
-        self.ensure_dir()?;
-        // 0600: a wake FIFO is a user-scoped resource; no other user need signal
-        // or observe it.
-        let mode = Mode::S_IRUSR | Mode::S_IWUSR;
-        match nix::unistd::mkfifo(&self.fifo_path, mode) {
-            Ok(()) => Ok(()),
-            Err(Errno::EEXIST) => self.verify_is_fifo(),
-            Err(source) => Err(WakeError::Mkfifo {
-                path: self.fifo_path.clone(),
-                source,
-            }),
-        }
-    }
-
-    /// `stat` the existing FIFO-path node and confirm it is a FIFO.
-    fn verify_is_fifo(&self) -> Result<(), WakeError> {
-        let stat = nix::sys::stat::stat(&self.fifo_path).map_err(|source| WakeError::Mkfifo {
-            path: self.fifo_path.clone(),
-            source,
-        })?;
-        let file_type = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
-        if file_type == SFlag::S_IFIFO {
-            Ok(())
-        } else {
-            Err(WakeError::NotAFifo {
-                path: self.fifo_path.clone(),
-            })
-        }
-    }
-
-    /// Create the waiters directory (idempotent). Shared by the lock and FIFO
-    /// setup so either can be the first to run.
-    fn ensure_dir(&self) -> Result<(), WakeError> {
-        if let Some(parent) = self.fifo_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| WakeError::CreateDir {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1154,112 +362,94 @@ mod tests {
         assert!(needs_retrigger(RetriggerRecord::Unreadable, mark(1)));
     }
 
-    // The session-id filename encoding is now shared and authoritatively tested in
-    // `mailbox_protocol::session`; here we only assert the per-session file paths
-    // are built from it and sit under the waiters dir.
-    #[test]
-    fn per_session_paths_share_one_encoded_stem_under_waiters_dir() {
-        let dir = Path::new("/tmp/mb/waiters");
-        let s = SessionId::new("s1");
-        assert_eq!(fifo_path(dir, &s), PathBuf::from("/tmp/mb/waiters/s1.fifo"));
-        assert_eq!(lock_path(dir, &s), PathBuf::from("/tmp/mb/waiters/s1.lock"));
-        assert_eq!(
-            pidfile_path(dir, &s),
-            PathBuf::from("/tmp/mb/waiters/s1.waiter.pid")
-        );
-        // An unsafe id keys all three files identically (the FIFO/lock/pidfile
-        // coordination the wake loop relies on).
-        let unsafe_id = SessionId::new("a/b");
-        assert_eq!(
-            fifo_path(dir, &unsafe_id)
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "a%2Fb"
-        );
-    }
-
-    #[test]
-    fn waiter_alive_probes_the_pidfile() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let waiters = dir.path();
-
-        // Absent pidfile => no live waiter.
-        let session = SessionId::new("s-alive");
-        assert!(!waiter_alive(waiters, &session));
-
-        // A pidfile naming THIS live process => alive (kill(pid,0) succeeds).
-        std::fs::write(
-            pidfile_path(waiters, &session),
-            std::process::id().to_string(),
-        )
-        .unwrap();
-        assert!(waiter_alive(waiters, &session));
-
-        // A pidfile naming an almost-certainly-dead PID => not alive. 2_000_000_000
-        // is well above any platform PID_MAX, so the probe gets ESRCH (or EINVAL),
-        // never a false positive.
-        let dead = SessionId::new("s-dead");
-        std::fs::write(pidfile_path(waiters, &dead), "2000000000").unwrap();
-        assert!(!waiter_alive(waiters, &dead));
-
-        // A garbage (unparseable) pidfile names no waiter.
-        let garbage = SessionId::new("s-garbage");
-        std::fs::write(pidfile_path(waiters, &garbage), "not-a-pid").unwrap();
-        assert!(!waiter_alive(waiters, &garbage));
-    }
-
-    #[test]
-    fn a_writer_close_on_a_kick_is_drained_as_kicked_not_a_fatal_eof() {
-        // The normal kick path: a writer opens the FIFO, writes a byte, and CLOSES its
-        // end. Because the waiter holds the FIFO `O_RDWR` (it is always its own writer),
-        // that close is NOT an EOF — the read returns the byte then `WouldBlock`, i.e.
-        // `Blocked::Kicked`. This is the regression guard for "the watcher dies on the
-        // first kick" (a spurious `Ok(0)` → `NotAFifo`): it must survive kick after kick.
-        let dir = tempfile::TempDir::new().unwrap();
-        let waiters = dir.path();
-        let session = SessionId::new("s-kick");
-        let waiter = Waiter::new(waiters, dir.path().join("mailbox.db"), session.clone());
-        let mut fifo = waiter.open_wake_fifo().unwrap();
-        let waker = Waker::new(waiters);
-
-        for _ in 0..3 {
-            assert_eq!(waker.kick(&session), KickOutcome::Delivered);
-            assert_eq!(
-                waiter
-                    .block_for_kick(&mut fifo, Some(Duration::from_secs(2)))
-                    .unwrap(),
-                Blocked::Kicked,
-                "a writer-close kick must read as Kicked, never a fatal EOF"
-            );
-        }
-    }
-
     #[test]
     fn reminder_lists_only_topic_names() {
-        let outcome = WakeOutcome {
-            topics: vec![
-                Topic::parse("github.pr.o/r#1").unwrap(),
-                Topic::parse("github.pr.o/r#2").unwrap(),
-            ],
-            reason: WakeReason::Kicked,
-        };
-        assert_eq!(
-            outcome.reminder(),
-            "mail on topic github.pr.o/r#1, github.pr.o/r#2"
+        let topics = [
+            Topic::parse("github.pr.o/r#1").unwrap(),
+            Topic::parse("github.pr.o/r#2").unwrap(),
+        ];
+        let line = reminder(&topics);
+        assert_eq!(line, "mail on topic github.pr.o/r#1, github.pr.o/r#2");
+        // The wake wire is payload-free by construction: there is no field in which a
+        // body could be smuggled, and this pins that the line carries none.
+        assert!(!line.contains('{'), "the reminder must be payload-free");
+    }
+
+    /// The daemon's bump writes topic NAMES into the session's OWN sentinel — the
+    /// per-session isolation the `watchPaths` registration depends on (the
+    /// `FileChanged` matcher is the shared basename, so nothing but the path keeps one
+    /// session's bump out of another session's hook).
+    #[test]
+    fn waking_writes_topic_names_into_that_session_and_no_other() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let waker = Waker::new(dir.path());
+        let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
+        let topic = Topic::parse("agent.s-a").unwrap();
+
+        waker.wake(&a, std::slice::from_ref(&topic)).unwrap();
+
+        let sentinel_a = Sentinel::under_root(dir.path(), &a);
+        assert_eq!(sentinel_a.read_topics(), vec!["agent.s-a".to_string()]);
+        let raw = std::fs::read_to_string(sentinel_a.path()).unwrap();
+        assert!(
+            !raw.contains('{'),
+            "the sentinel must be payload-free: {raw:?}"
+        );
+        assert!(
+            !Sentinel::under_root(dir.path(), &b).path().exists(),
+            "waking A must not touch B's sentinel"
         );
     }
 
-    /// The re-arm exit is a wake with NO mail, so its notice must never be
-    /// mistakable for the mail reminder — an agent that "reads" on it would find
-    /// nothing and learn to distrust the wake wire. The two strings are the whole
-    /// stderr contract, so the distinction is asserted, not assumed.
+    /// Every wake rewrites the file even when the topic set is identical, so a second
+    /// message on an already-unread topic still advances the mtime. This is the whole
+    /// no-coalescing guarantee: a lost wake is structurally impossible.
     #[test]
-    fn the_rearm_notice_is_benign_and_never_claims_mail() {
-        assert!(!REARM_NOTICE.contains("mail on topic"), "{REARM_NOTICE}");
-        assert!(REARM_NOTICE.contains("re-arming"), "{REARM_NOTICE}");
-        // Payload-free like every other wake: it names no topic and carries no body.
-        assert!(!REARM_NOTICE.contains('{'), "{REARM_NOTICE}");
+    fn waking_twice_with_the_same_topics_still_advances_the_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let waker = Waker::new(dir.path());
+        let session = SessionId::new("s-a");
+        let topics = [Topic::parse("t.a").unwrap()];
+        let sentinel = Sentinel::under_root(dir.path(), &session);
+        let mtime = || {
+            std::fs::metadata(sentinel.path())
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+
+        waker.wake(&session, &topics).unwrap();
+        let first = mtime();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waker.wake(&session, &topics).unwrap();
+
+        assert!(
+            mtime() > first,
+            "an unconditional write must always bump the mtime, even for an identical set"
+        );
+    }
+
+    /// Arming must CREATE the sentinel even with nothing unread — and even with no
+    /// store at all. A file that does not exist is not watchable, and the whole point
+    /// of arming is to give `watchPaths` something to register before the daemon's
+    /// first bump.
+    #[test]
+    fn arming_creates_the_sentinel_even_with_no_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = SessionId::new("s-unarmed");
+        let sentinel = Sentinel::under_root(dir.path(), &session);
+        let mail = SessionMail::new(dir.path().join("nonexistent.db"), session);
+
+        let topics = mail.arm(&sentinel).unwrap();
+
+        assert!(
+            topics.is_empty(),
+            "no store means nothing is known to be unread"
+        );
+        assert!(
+            sentinel.path().exists(),
+            "arming must leave a watchable file behind, store or no store"
+        );
     }
 }
