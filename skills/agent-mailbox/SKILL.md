@@ -40,7 +40,8 @@ zombie pollers and lost wakes.
 
 `mailbox` knows which session you are, from the `$CLAUDE_CODE_SESSION_ID` that Claude
 Code sets for every command you run. There is **no `--session` flag** — just run the
-commands below. Run `mailbox whoami` any time to confirm who you are.
+commands below. `mailbox status` shows who you are (and works even if the bridge is
+down, though it can only tell you your identity then).
 
 ## Prerequisites (assume already set up; do not do these yourself)
 
@@ -120,8 +121,14 @@ just `mailbox read` as usual. You still never re-arm, and you never need to poll
 mailbox status
 ```
 
-Shows your watches (and whether each poller is `running` with a pid), your
+Shows **who you are** (your session id and your `agent.<id>` inbox — the address a
+peer sends to), your watches (and whether each poller is `running` with a pid), your
 subscriptions, and per-topic unread counts. It does not consume events.
+
+If the bridge is down it still prints your identity and says
+`bridge: UNREACHABLE`, so "who am I" is always answerable — but it **exits
+non-zero**, because the rest of the report is genuinely missing. That is the case to
+tell the user about, not to retry.
 
 ### When done
 
@@ -147,7 +154,7 @@ The loop: **discover → send → the peer wakes → it reads → it replies.**
 
 ```bash
 # 1. Who am I, and who can I reach?
-mailbox whoami
+mailbox status
 mailbox agents
 
 # 2. Poke a peer (bare session id, or its full agent.* topic).
@@ -184,7 +191,6 @@ Session identity is automatic; none of these take a session argument.
 
 | Verb | Command |
 |---|---|
-| who am I | `mailbox whoami` |
 | list peer agents | `mailbox agents` |
 | message a peer | `mailbox send PEER_ID --text "..."` |
 | watch a PR | `mailbox watch github-pr OWNER/REPO#N` |
@@ -192,7 +198,7 @@ Session identity is automatic; none of these take a session argument.
 | publish to a topic | `mailbox publish TOPIC --body '{...}'` |
 | list topics | `mailbox topics [--prefix agent.]` |
 | read on wake | `mailbox read` |
-| check state | `mailbox status` |
+| who am I / check state | `mailbox status` |
 | stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N` |
 | unsubscribe | `mailbox unsubscribe TOPIC` |
 

@@ -527,10 +527,10 @@ fn topics_reports_counts_and_filters_by_prefix() {
     guard.assert_clean();
 }
 
-// ==== whoami / status surface the session's own address ========================
+// ==== status surfaces the session's own address ================================
 
 #[test]
-fn whoami_and_status_surface_the_inbox_topic() {
+fn status_surfaces_this_sessions_own_address() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
@@ -548,11 +548,11 @@ fn whoami_and_status_surface_the_inbox_topic() {
 
     arm_idle(&env, s);
 
-    let out = env.run_as_ok(s, &["--json", "whoami"], "whoami");
+    let out = env.run_as_ok(s, &["--json", "status"], "status");
     let value: Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("whoami json");
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("status json");
     assert_eq!(value["session"], s);
-    assert_eq!(value["inbox_topic"], format!("agent.{s}"));
+    assert_eq!(value["inbox"], format!("agent.{s}"));
 
     let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

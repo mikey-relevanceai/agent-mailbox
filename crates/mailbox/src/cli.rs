@@ -94,10 +94,9 @@ pub enum Command {
     Watch(WatchArgs),
     /// Drop interest in a watch.
     Unwatch(UnwatchArgs),
-    /// Show watches (interest + child pid) and this session's unread counts.
+    /// Show this session's identity (id + inbox topic), its watches, its
+    /// subscriptions and its unread counts. The identity half needs no bridge.
     Status,
-    /// Print this session's own id and inbox topic. Needs no bridge.
-    Whoami,
     /// Message a peer agent: publish to its inbox, stamped with your session id.
     Send(SendArgs),
     /// List the agents with a registered inbox (who you can `send` to).
@@ -365,7 +364,6 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitC
         Command::Watch(args) => run_watch(format, args).await,
         Command::Unwatch(args) => run_unwatch(format, args).await,
         Command::Status => run_status(format).await,
-        Command::Whoami => run_whoami(format),
         Command::Send(args) => run_send(format, args).await,
         Command::Agents => run_agents(format).await,
         Command::Topics(args) => run_topics(format, args).await,
@@ -438,26 +436,6 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCo
         },
     )
     .await
-}
-
-/// `whoami`: this session's id and its inbox topic — the address a peer uses to
-/// `send` to it. Deliberately NOT a socket call: identity does not depend on the
-/// bridge, so an agent can always answer "who am I" even when the daemon is down.
-fn run_whoami(format: OutputFormat) -> anyhow::Result<ExitCode> {
-    let session = resolve_session_or_fail(format)?;
-    let inbox = inbox_topic(&session)
-        .with_context(|| format!("session {:?} cannot form an inbox topic", session.as_str()))?;
-
-    if format.is_json() {
-        println!(
-            "{}",
-            serde_json::json!({ "session": session.as_str(), "inbox_topic": inbox.as_str() })
-        );
-    } else {
-        println!("session: {}", session.as_str());
-        println!("inbox:   {}", inbox.as_str());
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// `send`: message a peer agent. The body the bridge publishes is
@@ -576,14 +554,77 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
     request(format, req).await
 }
 
+/// `status`: this session's identity, plus everything the bridge knows about it.
+///
+/// **The identity half never depends on the bridge.** A session's id and its inbox
+/// topic are derivable locally, so when the daemon is down `status` still answers
+/// "who am I, and what is my address" — and says plainly that the rest (watches,
+/// subscriptions, unread counts) is unknown because the bridge is unreachable. That is
+/// what the separate `whoami` command used to be for; it was otherwise a strict subset
+/// of this output, so it is gone.
+///
+/// It still exits NON-ZERO when the bridge is down (ADR-0004: socket clients fail
+/// loud). The degradation is in what it can tell you, not in whether it admits the
+/// failure — most of what `status` reports is genuinely missing, and exiting 0 would
+/// report "fine" for a command whose primary content is absent.
 async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
-    request(
-        format,
-        Request::Status {
-            session: resolve_session_or_fail(format)?,
-        },
-    )
-    .await
+    let session = resolve_session_or_fail(format)?;
+    let request = Request::Status {
+        session: session.clone(),
+    };
+    let config = StorageConfig::from_env().context("resolving storage path")?;
+
+    let response = match client::send(&config.socket_path(), &request).await {
+        Ok(response) => response,
+        Err(err) => return Err(status_without_bridge(format, &session, &err.to_string())),
+    };
+
+    if let Response::Error { message } = &response {
+        return Err(fail(format, message));
+    }
+    if format.is_json() {
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        render_human(&response);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Render the bridge-down `status`: the identity fields that are always knowable, and
+/// an explicit statement that the bridge could not be reached.
+///
+/// In JSON mode this is ONE object carrying both — the `result: "error"` shape a
+/// `--json` consumer already expects, with the identity keys added — rather than an
+/// identity object followed by an error object, which would make stdout two documents.
+fn status_without_bridge(
+    format: OutputFormat,
+    session: &SessionId,
+    message: &str,
+) -> anyhow::Error {
+    let inbox = inbox_topic(session).ok();
+    if format.is_json() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "result": "error",
+                "message": message,
+                "session": session.as_str(),
+                "inbox_topic": inbox.as_ref().map(Topic::as_str),
+                "bridge": "unreachable",
+            })
+        );
+    } else {
+        println!("session: {}", session.as_str());
+        match &inbox {
+            Some(inbox) => println!("inbox: {}", inbox.as_str()),
+            None => println!("inbox: none (this session id cannot form an inbox topic)"),
+        }
+        println!(
+            "bridge: UNREACHABLE — watches, subscriptions and unread counts are unknown \
+             (start it with `mailbox serve`)"
+        );
+    }
+    anyhow::anyhow!("{message}").context(format!("status for {}", session.as_str()))
 }
 
 /// Send one request to the daemon and render the reply.

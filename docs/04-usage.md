@@ -312,7 +312,7 @@ turn**. If you are on an older binary (or need it back immediately), re-run the
 `SessionStart` handler by hand with a synthetic payload:
 
 ```bash
-# Claude Code exports CLAUDE_CODE_SESSION_ID into every tool call; `mailbox whoami`
+# Claude Code exports CLAUDE_CODE_SESSION_ID into every tool call; `mailbox status`
 # prints the same id if you want to eyeball it first.
 echo "{\"session_id\":\"$CLAUDE_CODE_SESSION_ID\"}" | mailbox harness session-start
 ```
@@ -421,7 +421,7 @@ Run `mailbox <cmd> --help` for the authoritative flags.
 **Session identity is automatic, and there is no flag for it.** The session-scoped
 commands resolve *you* from `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into
 every tool call — that is the single source of a session's own identity. Just run
-them; `mailbox whoami` confirms who you are.
+them; `mailbox status` confirms who you are.
 
 To run a command **as a named session** from a script or by hand (there is nothing in
 the agent loop that needs this), set the variable for that one command:
@@ -449,7 +449,6 @@ Add global `--json` for machine-readable stdout.
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
 | `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). |
-| `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
 | `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). |
 | `mailbox agents [--json]` | List the agents you can `send` to. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
@@ -505,7 +504,7 @@ replies.**
 
 ```bash
 # 1. Who am I, and who can I reach?
-mailbox whoami
+mailbox status
 mailbox agents
 ```
 
@@ -570,7 +569,7 @@ only thing it could do is lose your message silently.
 > **This error does not mean the id is wrong.** It says the *inbox* is
 > unregistered, which a live session with a perfectly valid id can be. Do not
 > conclude the peer "restarted with a new session id" — a resumed session keeps its
-> id (`mailbox whoami`), and only its registration lapses. The earlier wording here
+> id (`mailbox status`), and only its registration lapses. The earlier wording here
 > read "unknown agent", and a real agent took it as an identity problem and burned
 > ~20 minutes retrying a wrong theory while its report never arrived. If a peer is
 > unreachable, the fix is on *their* side (their next `SessionStart`/`Stop` hook
@@ -603,8 +602,9 @@ subscribers and no events (a fresh inbox) is listed just as honestly as a busy o
 
 ## 5. `mailbox status` for humans
 
-`status` is the human-facing window into a session. It never consumes events (it
-counts, it does not `read`):
+`status` is the human-facing window into a session — **and the answer to "who am
+I"**, which is why there is no separate `whoami`. It never consumes events (it counts,
+it does not `read`):
 
 ```bash
 mailbox status
@@ -622,8 +622,8 @@ unread:
   [github.pr.me/myrepo#42] 1
 ```
 
-- **inbox** — this session's peer-messaging address, and whether it is
-  `registered` (the `SessionStart` hook does that). If it says
+- **session / inbox** — who this session is, and its peer-messaging address, plus
+  whether that address is `registered` (the `SessionStart` hook does that). If it says
   `NOT registered`, peers cannot `send` to this session — check the hooks are
   installed and the daemon is up.
 - **watches** — each supervised watch, its `state`
@@ -636,6 +636,14 @@ unread:
   subscription, and the `inbox` line above says whether it is registered.
 - **unread** — per-topic count of events past this session's cursor. `read`
   drains these.
+
+**With the bridge down**, `status` still prints the two identity lines — they are
+derived locally, not fetched — and replaces the rest with an explicit
+`bridge: UNREACHABLE`. It still exits non-zero
+([ADR-0004](adr/0004-cli-serve-daemon-and-socket.md)): most of the report is genuinely
+missing, so exiting 0 would report "fine" for a command whose main content is absent.
+In `--json` that is one object — the usual `"result": "error"` shape with `session`,
+`inbox_topic` and `"bridge": "unreachable"` added.
 
 ### Putting the subscription count in a Claude Code status line
 

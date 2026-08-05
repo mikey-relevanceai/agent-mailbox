@@ -293,12 +293,12 @@ fn ac2_client_fails_loudly_when_bridge_is_down() {
     let db_path = dir.path().join("mailbox.db");
 
     let output = mailbox_command()
-        .args(["status"])
+        .args(["read"])
         .env("CLAUDE_CODE_SESSION_ID", "s")
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
         .output()
-        .expect("run status with no daemon");
+        .expect("run read with no daemon");
 
     assert!(
         !output.status.success(),
@@ -313,6 +313,60 @@ fn ac2_client_fails_loudly_when_bridge_is_down() {
         stdout(&output).trim().is_empty(),
         "human-mode error must not write to stdout"
     );
+}
+
+/// **`status` degrades instead of going blank when the bridge is down.**
+///
+/// A session's id and inbox topic are derivable locally, so `status` answers "who am
+/// I, and what is my address" with no daemon at all — which is the one property the
+/// deleted `whoami` command had that `status` did not. It still exits NON-ZERO
+/// (ADR-0004: a socket client fails loud), because the rest of what `status` reports —
+/// watches, subscriptions, unread — is genuinely missing, and it says so.
+#[test]
+fn status_still_answers_who_am_i_when_the_bridge_is_down() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("mailbox.db");
+
+    let output = mailbox_command()
+        .args(["status"])
+        .env("CLAUDE_CODE_SESSION_ID", "s-alone")
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run status with no daemon");
+
+    assert!(
+        !output.status.success(),
+        "the bridge being down is still a loud failure"
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("session: s-alone") && out.contains("inbox: agent.s-alone"),
+        "the identity fields are always knowable; got: {out}"
+    );
+    assert!(
+        out.contains("UNREACHABLE"),
+        "it must say what it could NOT tell you, not imply an empty mailbox; got: {out}"
+    );
+    assert!(
+        stderr(&output).contains("mailbox serve"),
+        "stderr keeps the actionable remedy"
+    );
+
+    // `--json` stays ONE document: the error shape a consumer already expects, with
+    // the identity keys added.
+    let output = mailbox_command()
+        .args(["--json", "status"])
+        .env("CLAUDE_CODE_SESSION_ID", "s-alone")
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run json status with no daemon");
+    let value = parse_json(&stdout(&output));
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["session"], "s-alone");
+    assert_eq!(value["inbox_topic"], "agent.s-alone");
+    assert_eq!(value["bridge"], "unreachable");
 }
 
 #[test]
@@ -924,13 +978,14 @@ fn a_command_run_outside_a_session_is_an_actionable_error() {
 /// binary, and passes no flag to do it.
 #[test]
 fn the_session_comes_from_the_claude_code_env_var() {
-    // `whoami` is a local command (identity does not depend on the bridge), so no
-    // daemon is needed to exercise resolution end to end.
+    // `status`'s identity half needs no bridge, so no daemon is needed to exercise
+    // resolution end to end.
     let out = mailbox_command()
-        .args(["--json", "whoami"])
+        .args(["--json", "status"])
         .env("CLAUDE_CODE_SESSION_ID", "s-claude")
+        .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .output()
-        .expect("run whoami");
+        .expect("run status");
     let value: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json");
     assert_eq!(value["session"], "s-claude");
     assert_eq!(value["inbox_topic"], "agent.s-claude");
@@ -947,11 +1002,12 @@ fn the_session_comes_from_the_claude_code_env_var() {
 #[test]
 fn an_empty_session_env_value_is_refused_rather_than_bound() {
     let out = mailbox_command()
-        .args(["--json", "whoami"])
+        .args(["--json", "status"])
         .env("CLAUDE_CODE_SESSION_ID", "")
+        .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .env_remove("RUST_LOG")
         .output()
-        .expect("run whoami");
+        .expect("run status");
 
     assert!(
         !out.status.success(),
