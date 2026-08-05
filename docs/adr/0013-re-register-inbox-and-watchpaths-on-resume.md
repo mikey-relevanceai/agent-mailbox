@@ -1,6 +1,8 @@
 # ADR-0013: Re-register the inbox and watchPaths on session resume
 
-- Status: Accepted
+- Status: **Accepted — both decisions stand; the hook they live in was renamed by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md)** (`ensure-watcher` → `turn-end`,
+  because there is no watcher to ensure). See the amendment below.
 - Date: 2026-07-21
 - Relates to: [ADR-0007](0007-always-on-agent-inboxes.md) (always-on inbox),
   [ADR-0008](0008-on-demand-wake-filechanged.md) (on-demand wake). Resolves the

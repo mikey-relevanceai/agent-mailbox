@@ -1,10 +1,16 @@
 # ADR-0011: A give-up is not permanent — the sweep retries failed watches
 
-- Status: Accepted
+- Status: **Accepted — but the liveness probe below is amended by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md).** The decision (retry a `Failed`
+  watch once per sweep while an interested session lives) is in force. Every
+  reference below to "the watcher-pidfile liveness probe (ADR-0009)" now reads the
+  process table instead — `doctor::live_claude_sessions`. There is no watcher and no
+  pidfile.
 - Date: 2026-07-20
 - Amends: design/01 rule 7 (adapter crash → give up after N failures), and
   [ADR-0010](0010-resume-watches-on-restart.md), whose `Failed`-is-terminal carve-out
   this softens for a watch whose session is still alive.
+- Amended by: [ADR-0017](0017-daemon-bumps-the-sentinel.md) (the liveness signal).
 
 ## Context
 

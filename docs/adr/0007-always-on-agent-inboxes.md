@@ -1,6 +1,13 @@
 # ADR-0007: Always-on agent inboxes (inter-agent messaging)
 
-- Status: Accepted
+- Status: **Accepted — the decision stands; two of its mechanisms are superseded.**
+  The always-on `agent.<session-id>` inbox, the tombstone guard, the hard `send`
+  refusal and discovery-as-a-read are all in force. What changed is *who registers
+  the inbox* — `mailbox harness arm` is gone, and `session-start` / `turn-end` do it
+  now ([ADR-0008](0008-on-demand-wake-filechanged.md),
+  [ADR-0013](0013-re-register-inbox-and-watchpaths-on-resume.md)) — and *what proves
+  liveness*: decision 5's live-waiter pidfile probe is replaced by the process table
+  ([ADR-0017](0017-daemon-bumps-the-sentinel.md)). See the note on decision 5.
 - Date: 2026-07-13
 
 ## Context
@@ -123,6 +130,16 @@ names the one blocked waiter — meaning "this agent is idle and a send wakes it
 now". It does **not** mean the agent is healthy, and `false` does not mean the
 message will be lost (it lands durably and surfaces on the agent's next read). We
 did not invent a heartbeat we do not have, and the CLI says exactly this.
+
+> **Superseded ([ADR-0017](0017-daemon-bumps-the-sentinel.md), 2026-08-05).** The
+> *shape* of decision 5 stands — liveness is a probe, never a heartbeat, and it
+> answers "does this agent exist", not "is it healthy". The *signal* does not: there
+> is no waiter and no pidfile. `agents` now asks the process table
+> (`doctor::live_claude_sessions`, which reads Claude Code's own `--session-id` /
+> `--resume` argv), and the answer is strictly better — an orphaned waiter used to
+> outlive the agent it belonged to, so a dead session read as alive. It reports
+> `running` / `not running`, and even `running` does not mean *wakeable*: only
+> `mailbox doctor` proves that ([ADR-0016](0016-prove-wakeability-with-an-active-probe.md)).
 
 ## Consequences
 

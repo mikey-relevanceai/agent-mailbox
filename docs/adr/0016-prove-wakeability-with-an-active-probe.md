@@ -1,10 +1,30 @@
 # ADR-0016: Prove wakeability with an active probe and a hook ack
 
-- Status: Accepted
+- Status: **Accepted — in force, with one clause overtaken by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md).** `mailbox doctor` is exactly as
+  decided here; decision 6's "the third such command after `wait` and `dashboard`"
+  is not — both of those are gone, so `doctor` is now the ONLY read-only,
+  socket-free command.
 - Date: 2026-07-27
 - Amends: [ADR-0008](0008-on-demand-wake-filechanged.md) (the `FileChanged` wake hook
   gains an ack side effect) and [ADR-0015](0015-dashboard-reads-the-store-read-only.md)
   (log-derived wake health stays, but is no longer the best signal available).
+- Amended by: [ADR-0017](0017-daemon-bumps-the-sentinel.md).
+
+> **Amendment (ADR-0017, 2026-08-05).** Two clauses below have been overtaken, and
+> neither weakens the decision:
+>
+> - **`doctor` is now the only read-only socket-free command** (decision 6). `wait`
+>   and `mailbox dashboard` were both deleted. ADR-0015's reason for the exception —
+>   a health check must work when the daemon is the broken thing — is what keeps it.
+> - **"ADR-0015's log-derived view stays"** (last consequence) is no longer true: the
+>   `dashboard` command was removed outright, on the measurement recorded in
+>   ADR-0015's own Status. Nothing speaks about the *past* any more; `doctor` and
+>   `harness.log` are what is left.
+>
+> Decision 4's liveness source — `doctor::live_claude_sessions`, added here — did the
+> opposite of ageing out: ADR-0017 promoted it to the ONE liveness signal for the
+> whole system, replacing the watcher pidfile everywhere.
 
 ## Context
 

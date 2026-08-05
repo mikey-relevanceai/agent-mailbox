@@ -1,6 +1,11 @@
 # ADR-0004: `serve` daemon + Unix-socket CLI clients
 
-- Status: Accepted
+- Status: **Accepted — with the `wait` carve-out void.** The daemon, the socket, the
+  fail-loud-when-down rule and the single-writer `flock` are all in force. `mailbox
+  wait` was deleted with the waiter ([ADR-0017](0017-daemon-bumps-the-sentinel.md)),
+  so the read-only exception it named is now `mailbox doctor`
+  ([ADR-0016](0016-prove-wakeability-with-an-active-probe.md)) — same principle, a
+  health check must work when the daemon is the broken thing.
 - Date: 2026-07-10
 
 ## Context
@@ -40,6 +45,13 @@ a write connection, so there is no cross-process second-writer race) and makes
 (`ReadOnlyStore` + blocking FIFO), never touches the socket, and keeps its
 card-05 exit-code contract (exit 2 on mail). ADR-0003 already permits read-only
 side opens for wake.
+
+> **Amendment (ADR-0017, 2026-08-05).** `mailbox wait` no longer exists — it went
+> with the waiter and the FIFO. The exception survives its original holder: the
+> read-only direct opener today is **`mailbox doctor`**
+> ([ADR-0016](0016-prove-wakeability-with-an-active-probe.md)), and the harness wake
+> hook also reads the store read-only ([ADR-0008](0008-on-demand-wake-filechanged.md)).
+> Everywhere else, "every command is a socket client" is now literally true.
 
 **Naming: `watch` / `unwatch`,** not `adapter start`/`stop` — user-facing,
 intent-declaring, matching `design/01`. This resolves that design's open

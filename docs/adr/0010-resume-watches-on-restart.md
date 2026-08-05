@@ -1,6 +1,9 @@
 # ADR-0010: A daemon restart resumes the watches of live sessions
 
-- Status: Accepted
+- Status: **Accepted — but the liveness probe below is amended by
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md).** The decision (resume a watch iff
+  an interested session is still alive) is in force. The `waiter_alive` pidfile
+  probe it names is not: that file no longer exists.
 - Date: 2026-07-17
 - Amends: design/01 rule 6 (bridge restart), whose deferred session-liveness probe
   this supplies from [ADR-0009](0009-interest-liveness-from-the-waiter-pidfile.md).
