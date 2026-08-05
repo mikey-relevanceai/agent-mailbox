@@ -38,7 +38,7 @@
 //! `--session` / `MAILBOX_SESSION_ID`. That settles the previously-open "how does
 //! a session name itself" question.
 
-pub mod arm;
+pub mod pidfile;
 pub mod atomic;
 pub mod cleanup;
 pub mod home;

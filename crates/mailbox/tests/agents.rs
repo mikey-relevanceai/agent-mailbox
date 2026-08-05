@@ -20,22 +20,22 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::{Env, drain_stderr, poll_until, wait_within};
+use common::{Env, poll_until};
 
 /// Generous bound for a real process to arm / wake / exit under CI load. Every
 /// wait is a bounded poll, never a fixed sleep.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// Arm `session` (registering its inbox, ADR-0007) and block until its waiter is
-/// genuinely live — the pidfile is written only AFTER the waiter takes the
-/// single-waiter lock, so its presence means "blocked and listening", not merely
-/// "process spawned".
-fn arm_idle(env: &Env, session: &str) -> common::ArmChild {
-    let arm = env.spawn_arm(session, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
+/// Start `session` through the production `SessionStart` hook (registering its
+/// inbox, ADR-0007) and block until its detached watcher is genuinely live — the
+/// pidfile is written only AFTER the watcher takes the single-waiter lock, so its
+/// presence means "blocked and listening", not merely "process spawned".
+fn arm_idle(env: &Env, session: &str) {
+    let out = env.session_start(session);
+    assert!(out.status.success(), "session-start must exit 0");
+    poll_until("watcher pidfile appears", SETTLE, || {
         env.waiter_pidfile(session).exists().then_some(())
     });
-    arm
 }
 
 /// `mailbox agents --json` as seen by `caller`.
@@ -69,8 +69,8 @@ fn round_trip_two_idle_agents_wake_each_other() {
 
     // Both sessions go idle. The hooks register each inbox and arm each waiter —
     // the agents run nothing themselves.
-    let mut arm_a = arm_idle(&env, a);
-    let mut arm_b = arm_idle(&env, b);
+    arm_idle(&env, a);
+    arm_idle(&env, b);
 
     // --- A → B ---------------------------------------------------------------
     env.run_ok(
@@ -78,17 +78,21 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "send a->b",
     );
 
-    let status = wait_within(&mut arm_b, SETTLE).expect("B's waiter must wake");
-    assert_eq!(status.code(), Some(2), "a peer message wakes B (exit 2)");
-    let reminder = drain_stderr(&mut arm_b);
+    // B's watcher bumps B's sentinel, naming only the topic — that file IS the
+    // wake wire now, so it is where payload-freeness has to hold.
+    let topics = poll_until("B's sentinel names its inbox", SETTLE, || {
+        let topics = env.sentinel_topics(b);
+        topics.iter().any(|t| t == &format!("agent.{b}")).then_some(topics)
+    });
     assert!(
-        reminder.contains(&format!("mail on topic agent.{b}")),
-        "the wake names B's inbox topic and nothing else: {reminder:?}"
+        !topics.iter().any(|t| t.contains("please review PR 42")),
+        "the wake must not carry the body: {topics:?}"
     );
-    // Payload-free: the message text NEVER crosses the wake boundary.
-    assert!(
-        !reminder.contains("please review PR 42"),
-        "the wake must not carry the body: {reminder:?}"
+    // ...and the FileChanged hook turns that into a real wake (exit 2).
+    assert_eq!(
+        env.wake_hook(b).status.code(),
+        Some(2),
+        "a peer message wakes B"
     );
 
     // B reads its mail and can see who to reply to.
@@ -104,11 +108,16 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "send b->a",
     );
 
-    let status = wait_within(&mut arm_a, SETTLE).expect("A's waiter must wake");
-    assert_eq!(status.code(), Some(2), "B's reply wakes A (exit 2)");
-    assert!(
-        drain_stderr(&mut arm_a).contains(&format!("mail on topic agent.{a}")),
-        "A's wake names A's inbox"
+    poll_until("A's sentinel names its inbox", SETTLE, || {
+        env.sentinel_topics(a)
+            .iter()
+            .any(|t| t == &format!("agent.{a}"))
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(a).status.code(),
+        Some(2),
+        "B's reply wakes A"
     );
 
     let events = env.read_events(a);
@@ -117,8 +126,6 @@ fn round_trip_two_idle_agents_wake_each_other() {
     assert_eq!(events[0]["body"]["text"], "done, approved");
 
     // Teardown: both SessionEnds; nothing may survive.
-    drop(arm_a);
-    drop(arm_b);
     let _ = env.cleanup(a);
     let _ = env.cleanup(b);
     guard.assert_clean();
@@ -283,28 +290,24 @@ fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
 
     let b = "s-b";
     // B registers + arms via the real hook (the auto-inbox path), then goes idle.
-    let arm = arm_idle(&env, b);
+    arm_idle(&env, b);
     assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
 
     // SessionEnd reaps the waiter, drops the subscription, and tombstones the id.
-    drop(arm);
     let _ = env.cleanup(b);
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "an ended session is no longer an agent"
     );
 
-    // A racing arm re-registration within the guard window is refused: the inbox
-    // subscribe is rejected, so arm finds no subscription and does NOT spawn a
-    // waiter — the process just exits without arming.
-    let mut rearm = env.spawn_arm(b, &[]);
-    let _status = poll_until("the racing re-arm exits without arming", SETTLE, || {
-        rearm.try_wait().ok().flatten()
+    // A racing SessionStart within the guard window is refused: the inbox subscribe
+    // is rejected, so the watcher finds no subscription and self-exits rather than
+    // arming a session that has already ended.
+    let out = env.session_start(b);
+    assert!(out.status.success(), "session-start still exits 0");
+    poll_until("the racing watcher exits without arming", SETTLE, || {
+        (!env.waiter_pidfile(b).exists()).then_some(())
     });
-    assert!(
-        !env.waiter_pidfile(b).exists(),
-        "no waiter is armed: the auto-registration was refused"
-    );
     assert!(
         agent_row(&env, "s-a", b).is_none(),
         "the dead session must not be resurrected as an agent"
@@ -414,8 +417,8 @@ fn agents_reports_registration_liveness_and_self() {
     guard.track_daemon(daemon.pid());
 
     let (a, b) = ("s-a", "s-b");
-    let arm_a = arm_idle(&env, a);
-    let arm_b = arm_idle(&env, b);
+    arm_idle(&env, a);
+    arm_idle(&env, b);
 
     // --json: both registered, both live, and A is marked as itself.
     let rows = agents(&env, a);
@@ -436,10 +439,18 @@ fn agents_reports_registration_liveness_and_self() {
     assert!(text.contains(&format!("inbox=agent.{b}")), "{text}");
     assert!(text.contains("<- you"), "the caller is marked: {text}");
 
-    // Kill B's waiter (as a busy, mid-turn agent has none): B stays REGISTERED and
+    // Kill B's watcher (as a busy, mid-turn agent has none): B stays REGISTERED and
     // addressable, but is no longer reported as idle-and-listening.
-    drop(arm_b);
-    poll_until("B's waiter is gone", SETTLE, || {
+    let pid: u32 = std::fs::read_to_string(env.waiter_pidfile(b))
+        .expect("B's watcher pidfile")
+        .trim()
+        .parse()
+        .expect("pid");
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    poll_until("B's watcher is gone", SETTLE, || {
         let row = agent_row(&env, a, b).expect("B stays registered");
         (row["live_waiter"] == Value::Bool(false)).then_some(())
     });
@@ -448,7 +459,6 @@ fn agents_reports_registration_liveness_and_self() {
         "a busy agent is still addressable"
     );
 
-    drop(arm_a);
     let _ = env.cleanup(a);
     let _ = env.cleanup(b);
     guard.assert_clean();
@@ -548,7 +558,7 @@ fn whoami_and_status_surface_the_inbox_topic() {
         "an unregistered session is told so: {text}"
     );
 
-    let arm = arm_idle(&env, s);
+    arm_idle(&env, s);
 
     let out = env.run_ok(&["--json", "whoami", "--session", s], "whoami");
     let value: Value =
@@ -563,7 +573,6 @@ fn whoami_and_status_surface_the_inbox_topic() {
         "an armed session's status shows its live address: {text}"
     );
 
-    drop(arm);
     let _ = env.cleanup(s);
     guard.assert_clean();
 }

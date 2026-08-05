@@ -18,7 +18,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use crate::arm::{pidfile_path, read_pidfile};
+use crate::pidfile::{pidfile_path, read_pidfile};
 
 /// What reaping a session's waiter did — for an honest teardown log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub fn reap_waiter(waiters_dir: &Path, session: &SessionId) -> ReapOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arm::write_pidfile_for_test;
+    use crate::pidfile::write_pidfile_for_test;
 
     fn sess() -> SessionId {
         SessionId::new("s")

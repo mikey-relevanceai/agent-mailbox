@@ -46,15 +46,7 @@ fn main() -> ExitCode {
     init_tracing(&cli.command);
 
     match cli.command {
-        // `wait` runs synchronously (no runtime) and owns its own exit codes:
-        // 2 = wake the session (mail, or the benign re-arm boundary), 1 = waiter
-        // error, 0 = nothing to wake about (no subscriptions).
-        Command::Wait(args) => cli::run_wait(&args),
-        // `dashboard` is the second read-only, socket-free command (ADR-0015): it
-        // reads the store directly so it still renders when the daemon is down, and
-        // it drives the terminal itself, so no async runtime is involved.
-        Command::Dashboard(args) => cli::run_dashboard(cli::output_format(cli.json), &args),
-        // `doctor` is read-only and socket-free for the same reason (ADR-0016): it
+        // `doctor` is read-only and socket-free (ADR-0016): it
         // proves wakeability from sentinel files and the process table, and a health
         // check must still work when the daemon is the thing that is broken.
         Command::Doctor(args) => cli::run_doctor(cli::output_format(cli.json), &args),
@@ -99,25 +91,21 @@ fn main() -> ExitCode {
 /// Whether this command's tracing must be kept OFF stderr and sent to
 /// `harness.log` instead. Two reasons a harness command qualifies:
 ///
-/// - its stderr is a WAKE WIRE — `wait` and the ADR-0008 `harness wake` hook write
-///   the payload-free reminder there on exit 2, so a tracing line would pollute it;
+/// - its stderr is a WAKE WIRE — the ADR-0008 `harness wake` hook writes the
+///   payload-free reminder there on exit 2, so a tracing line would pollute it;
 /// - its stdout is a HOOK CONTRACT or it is a DETACHED daemon — `harness
 ///   session-start` prints the `watchPaths` JSON on stdout, and `harness watch` runs
 ///   detached with no terminal; both want their lifecycle in `harness.log`, not on a
 ///   channel Claude Code reads (or a stderr nobody sees).
-///
-/// `harness arm` remains here as the superseded-but-retained re-arm primitive.
 fn is_wire_stderr(command: &Command) -> bool {
     matches!(
         command,
-        Command::Wait(_)
-            | Command::Harness(cli::HarnessArgs {
-                command: HarnessCommand::Arm(_)
-                    | HarnessCommand::Wake
-                    | HarnessCommand::Watch(_)
-                    | HarnessCommand::SessionStart
-                    | HarnessCommand::EnsureWatcher
-            })
+        Command::Harness(cli::HarnessArgs {
+            command: HarnessCommand::Wake
+                | HarnessCommand::Watch(_)
+                | HarnessCommand::SessionStart
+                | HarnessCommand::EnsureWatcher
+        })
     )
 }
 

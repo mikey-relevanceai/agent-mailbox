@@ -77,19 +77,15 @@ fn session_start_prints_watchpaths_registers_inbox_and_spawns_the_watcher() {
         env.sentinel_path(session).display().to_string(),
         "watchPaths must register this session's absolute sentinel path"
     );
-    // ...and the shared root, so the watch survives an identity change (ADR-0016).
-    // A session that forks mints a NEW id and a NEW sentinel directory; a watch that
-    // names only the old path is left watching a file nothing writes to any more.
-    // This second entry names no session, so it cannot be stranded that way.
-    assert_eq!(
-        hso["watchPaths"][1],
-        env.sentinel_root().join("by-agent").display().to_string(),
-        "watchPaths must also register the shared by-agent root"
-    );
+    // EXACTLY one registration. The shared `by-agent` root was registered here too
+    // for a while; because the FileChanged matcher is the shared sentinel basename,
+    // that made every session's bump fire every other session's wake hook (a measured
+    // 16:1 stray-to-genuine ratio). Registering anything wider than this session's own
+    // absolute path re-breaks per-session isolation, so the count is asserted.
     assert_eq!(
         hso["watchPaths"].as_array().map(Vec::len),
-        Some(2),
-        "exactly two registrations: the session's own sentinel, then the shared root"
+        Some(1),
+        "exactly one registration: this session's own sentinel, and nothing wider"
     );
 
     // The always-on inbox was registered (card 16 / ADR-0007).

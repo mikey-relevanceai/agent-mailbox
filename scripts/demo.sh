@@ -5,7 +5,8 @@
 #
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
 #   2. an *idle* waiter wakes when mail lands (the asyncRewake contract:
-#      `mailbox wait` exits 2 with a payload-free "mail on topic X" reminder);
+#      the watcher bumps the sentinel and `mailbox harness wake` exits 2 with a
+#      payload-free "mail on topic X" reminder);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
 #   4. `unwatch` / end-session tears the adapter down (no zombie pollers).
@@ -47,10 +48,9 @@ export AGENT_MAILBOX_DB="${WORK_DIR}/mailbox.db"
 # Point the supervisor's stub resolver at the binary we just built (the normal
 # install co-locates it beside `mailbox`, so this override is a dev convenience).
 export MAILBOX_STUB_ADAPTER_BIN="${STUB_ADAPTER}"
-# Ask `mailbox wait` to append its wake reason to stderr, so the demo can show
-# *why* it woke. This is a diagnostic-only opt-in; the reminder itself stays
-# payload-free.
-export MAILBOX_WAIT_DEBUG=1
+# Keep the wake sentinels inside the throwaway dir, so the demo never touches
+# the real ~/.mailbox tree.
+export MAILBOX_SENTINEL_ROOT="${WORK_DIR}/sentinel"
 export RUST_LOG="${RUST_LOG:-error}"
 
 SESSION="demo-session"
@@ -98,27 +98,39 @@ run "${MAILBOX} subscribe demo.hello --session ${SESSION}"
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"first\"}'"
 run "${MAILBOX} read --session ${SESSION}"
 
-# --- 2. wake an IDLE waiter ----------------------------------------------------
-# This is the load-bearing mechanic: start `mailbox wait` with NO mail pending,
-# so it blocks (exactly what the SessionStart/Stop hook does in a real session),
-# then publish and watch it exit 2 with a payload-free reminder.
-step "2. wake an idle waiter (the asyncRewake contract)"
-echo "starting a blocking waiter (no mail yet) ..."
-set +e
-"${MAILBOX}" wait --session "${SESSION}" --max-block-ms 10000 >"${WORK_DIR}/wait.out" 2>"${WORK_DIR}/wait.err" &
-WAIT_PID=$!
-set -e
-sleep 0.5   # let the waiter reach its blocking read
-echo "publishing while the waiter is idle ..."
+# --- 2. wake an IDLE session ---------------------------------------------------
+# This is the load-bearing mechanic, and it is exactly what Claude Code does. The
+# SessionStart hook spawns a DETACHED watcher; a publish makes that watcher bump
+# the session's sentinel file; Claude Code's FileChanged hook fires on the change
+# even though the session is idle, and `mailbox harness wake` exits 2 iff there is
+# genuine unread mail. Here we drive the same three steps by hand.
+step "2. wake an idle session (the FileChanged contract)"
+echo "running the SessionStart hook (spawns the detached watcher) ..."
+echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
+  | "${MAILBOX}" harness session-start >"${WORK_DIR}/watchpaths.json"
+echo "  watchPaths registered with the harness:"
+sed 's/^/    /' "${WORK_DIR}/watchpaths.json"
+sleep 0.5   # let the watcher reach its blocking read
+
+echo "publishing while the session is idle ..."
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
+sleep 0.5   # let the watcher observe the kick and bump the sentinel
+
+SENTINEL="${MAILBOX_SENTINEL_ROOT}/by-agent/${SESSION}/.mailbox-wake"
+echo "the watcher bumped the sentinel (topic NAMES only, never a body):"
+sed 's/^/    /' "${SENTINEL}"
+
+echo "running the FileChanged hook, as Claude Code would on that change ..."
 set +e
-wait "${WAIT_PID}"; WAIT_RC=$?
+echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"FileChanged\"}" \
+  | "${MAILBOX}" harness wake >"${WORK_DIR}/wake.out" 2>"${WORK_DIR}/wake.err"
+WAKE_RC=$?
 set -e
-echo "waiter exit code: ${WAIT_RC}   (2 = woken; the harness turns this into a wake)"
-echo "waiter reminder (stderr, payload-free):"
-sed 's/^/    /' "${WORK_DIR}/wait.err"
-if [[ "${WAIT_RC}" -ne 2 ]]; then
-  echo "error: expected the waiter to wake with exit 2, got ${WAIT_RC}" >&2
+echo "wake hook exit code: ${WAKE_RC}   (2 = wake this session)"
+echo "wake reminder (stderr, payload-free):"
+sed 's/^/    /' "${WORK_DIR}/wake.err"
+if [[ "${WAKE_RC}" -ne 2 ]]; then
+  echo "error: expected the wake hook to exit 2, got ${WAKE_RC}" >&2
   exit 1
 fi
 run "${MAILBOX} read --session ${SESSION}"

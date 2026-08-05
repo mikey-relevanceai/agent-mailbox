@@ -29,18 +29,35 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Env, drain_stderr, poll_until, wait_within};
+use common::{Env, poll_until};
 
 /// How long to wait for a wake that SHOULD happen.
 const WAKE: Duration = Duration::from_secs(10);
 
-/// Arm `session` (the `Stop` hook) and block until its waiter is really listening.
-fn arm(env: &Env, session: &str) -> common::ArmChild {
-    let child = env.spawn_arm(session, &["--max-block-ms", "60000"]);
-    poll_until("the waiter arms", WAKE, || {
+/// Start `session` through the production `SessionStart` hook and block until its
+/// detached watcher is really listening (the pidfile lands after it takes the lock).
+fn arm(env: &Env, session: &str) {
+    let out = env.session_start(session);
+    assert!(out.status.success(), "session-start must exit 0");
+    poll_until("the watcher arms", WAKE, || {
         env.waiter_pidfile(session).exists().then_some(())
     });
-    child
+}
+
+/// Block until `session`'s sentinel names `topic` — the modern wake wire: the
+/// watcher writes the topic there and the `FileChanged` hook turns it into a wake.
+fn assert_woken_for(env: &Env, session: &str, topic: &str) {
+    poll_until(&format!("{session}'s sentinel names {topic}"), WAKE, || {
+        env.sentinel_topics(session)
+            .iter()
+            .any(|t| t == topic)
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(session).status.code(),
+        Some(2),
+        "{session} must be woken for {topic}"
+    );
 }
 
 // ==== rule 2: every subscriber is woken, publisher included ====================
@@ -62,8 +79,8 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
     env.run_ok(&["subscribe", topic, "--session", publisher], "sub pub");
     env.run_ok(&["subscribe", topic, "--session", peer], "sub peer");
 
-    let mut publisher_waiter = arm(&env, publisher);
-    let mut peer_waiter = arm(&env, peer);
+    arm(&env, publisher);
+    arm(&env, peer);
 
     // The publisher speaks. It resolves its own session from the environment, exactly
     // as an agent's `mailbox publish` does (no --session flag anywhere).
@@ -74,25 +91,10 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
     );
 
     // The PEER wakes, naming the topic.
-    let status = wait_within(&mut peer_waiter, WAKE).expect("the peer's waiter must wake");
-    assert_eq!(status.code(), Some(2), "a peer subscriber must be kicked");
-    assert!(
-        drain_stderr(&mut peer_waiter).contains(&format!("mail on topic {topic}")),
-        "the peer's wake must name the topic it has mail on"
-    );
+    assert_woken_for(&env, peer, topic);
 
     // ...and so does the PUBLISHER, on the same wire.
-    let status =
-        wait_within(&mut publisher_waiter, WAKE).expect("the publisher's waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "the publisher must be kicked for its own event too"
-    );
-    assert!(
-        drain_stderr(&mut publisher_waiter).contains(&format!("mail on topic {topic}")),
-        "the publisher's wake must name the topic, exactly like a peer's"
-    );
+    assert_woken_for(&env, publisher, topic);
 
     // Its own event is visible to it, as it always has been. Nothing may mark an event
     // read except a `read` — the publisher's cursor is NOT advanced by publishing.
@@ -107,8 +109,6 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
         "the peer must have the event to read"
     );
 
-    drop(publisher_waiter);
-    drop(peer_waiter);
     env.cleanup(publisher);
     env.cleanup(peer);
     daemon.stop();
@@ -313,17 +313,10 @@ fn an_adapter_publish_has_no_session_kicks_everyone_and_ignores_the_unread_rule(
     );
 
     // A subscriber with unread still gets kicked by the next adapter publish.
-    let mut waiter = arm(&env, agent);
+    arm(&env, agent);
     env.publish(topic);
-    let status = wait_within(&mut waiter, WAKE).expect("the subscriber's waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "a session-less (adapter) publish must kick every subscriber, as it always has"
-    );
-    assert!(drain_stderr(&mut waiter).contains(&format!("mail on topic {topic}")));
+    assert_woken_for(&env, agent, topic);
 
-    drop(waiter);
     env.cleanup(agent);
     daemon.stop();
     guard.assert_clean();
@@ -346,7 +339,7 @@ fn a_no_session_publish_wakes_every_subscriber_including_the_ambient_agent() {
     let topic = "team.ci";
     let agent = "s-ci";
     env.run_ok(&["subscribe", topic, "--session", agent], "subscribe");
-    let mut waiter = arm(&env, agent);
+    arm(&env, agent);
 
     // The spawned script publishes with the agent's session id in its environment —
     // but says, explicitly, "this is not from the agent".
@@ -362,16 +355,10 @@ fn a_no_session_publish_wakes_every_subscriber_including_the_ambient_agent() {
         "an anonymous publish from a process that inherited the agent's session id",
     );
 
-    let status = wait_within(&mut waiter, WAKE)
-        .expect("an anonymous publish must wake the subscriber, ambient session id or not");
-    assert_eq!(status.code(), Some(2));
-    assert!(
-        drain_stderr(&mut waiter).contains(&format!("mail on topic {topic}")),
-        "the wake must name the topic"
-    );
+    // An anonymous publish must wake the subscriber, ambient session id or not.
+    assert_woken_for(&env, agent, topic);
     assert_eq!(env.unread_on(agent, topic), 1);
 
-    drop(waiter);
     env.cleanup(agent);
     daemon.stop();
     guard.assert_clean();
@@ -458,13 +445,12 @@ fn send_to_a_peer_inbox_is_unaffected_by_the_publisher_rules() {
     let bob = "s-bob";
     // Arming registers each session's always-on inbox (ADR-0007), which is what makes
     // them addressable at all.
-    let mut alice_waiter = arm(&env, alice);
-    let mut bob_waiter = arm(&env, bob);
+    arm(&env, alice);
+    arm(&env, bob);
 
     // Bob pokes Alice, so Alice now has unread on her OWN inbox.
     env.run_as_ok(bob, &["send", alice, "--text", "you up?"], "bob -> alice");
-    let status = wait_within(&mut alice_waiter, WAKE).expect("alice must wake");
-    assert_eq!(status.code(), Some(2), "a send must wake the recipient");
+    assert_woken_for(&env, alice, &format!("agent.{alice}"));
     assert_eq!(
         env.unread_on(alice, &format!("agent.{alice}")),
         1,
@@ -478,12 +464,8 @@ fn send_to_a_peer_inbox_is_unaffected_by_the_publisher_rules() {
         &["send", bob, "--text", "yes, replying"],
         "alice -> bob while behind on her own inbox",
     );
-    let status = wait_within(&mut bob_waiter, WAKE).expect("bob must wake");
-    assert_eq!(status.code(), Some(2), "the reply must wake bob");
-    assert!(drain_stderr(&mut bob_waiter).contains(&format!("mail on topic agent.{bob}")));
+    assert_woken_for(&env, bob, &format!("agent.{bob}"));
 
-    drop(alice_waiter);
-    drop(bob_waiter);
     env.cleanup(alice);
     env.cleanup(bob);
     daemon.stop();

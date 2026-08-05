@@ -34,8 +34,35 @@ use std::time::{Duration, Instant};
 
 use common::{
     Env, LeakGuard, PR_CONFLICTING_CI_FAILURE, PR_CONFLICTING_CI_SUCCESS, PR_MERGED, count_edges,
-    descendant_pids, drain_stderr, pid_alive, poll_until, wait_within,
+    descendant_pids, pid_alive, poll_until,
 };
+
+/// Start `session` through the production `SessionStart` hook and block until its
+/// detached watcher is listening (the pidfile lands after it takes the lock).
+fn arm(env: &Env, session: &str) {
+    let out = env.session_start(session);
+    assert!(out.status.success(), "session-start must exit 0");
+    poll_until("watcher pidfile appears", SETTLE, || {
+        env.waiter_pidfile(session).exists().then_some(())
+    });
+}
+
+/// Block until `session`'s sentinel names `topic`, then confirm the `FileChanged`
+/// hook turns that into a real wake (exit 2). This pair IS the wake wire.
+fn assert_woken_for(env: &Env, session: &str, topic: &str) {
+    poll_until("the sentinel names the topic", SETTLE, || {
+        env.sentinel_topics(session)
+            .iter()
+            .any(|t| t == topic)
+            .then_some(())
+    });
+    assert_eq!(
+        env.wake_hook(session).status.code(),
+        Some(2),
+        "{session} must be woken for {topic}"
+    );
+}
+
 
 /// A generous bound for "the supervisor spawned/settled the adapter", well above
 /// its ~1s restart backoff, so the suite stays green under parallel load.
@@ -605,24 +632,11 @@ fn wake_supervised_adapter_publish_wakes_armed_waiter() {
         "watch stub",
     );
 
-    // The SessionStart/Stop hook launches the waiter (the agent runs nothing).
-    let mut arm = env.spawn_arm(s, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
-        env.waiter_pidfile(s).exists().then_some(())
-    });
+    // The SessionStart hook launches the watcher (the agent runs nothing).
+    arm(&env, s);
 
-    // The supervised stub's publish kicks the waiter → exit 2 (you have mail).
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "a publish must wake the armed waiter"
-    );
-    assert!(
-        drain_stderr(&mut arm).contains("mail on topic stub.wake"),
-        "the wake reminder names the topic (payload-free)"
-    );
-    drop(arm);
+    // The supervised stub's publish bumps the sentinel → the wake hook exits 2.
+    assert_woken_for(&env, s, "stub.wake");
 
     // Teardown: stop the poller + drop the session (SessionEnd), leaving nothing.
     env.run_ok(&["unwatch", "stub", "wake", "--session", s], "unwatch stub");
@@ -644,22 +658,17 @@ fn wake_many_publishes_coalesce_to_one_wake() {
     let topic = "t.coalesce";
     env.run_ok(&["subscribe", topic, "--session", s], "subscribe");
 
-    let mut arm = env.spawn_arm(s, &[]);
-    poll_until("waiter pidfile appears", SETTLE, || {
-        env.waiter_pidfile(s).exists().then_some(())
-    });
+    arm(&env, s);
     assert!(
-        arm.try_wait().expect("try_wait").is_none(),
-        "the waiter blocks before any publish"
+        env.sentinel_topics(s).is_empty(),
+        "nothing is pending before any publish"
     );
 
     // Ten rapid publishes → the single armed waiter wakes exactly once.
     for _ in 0..10 {
         env.publish(topic);
     }
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(status.code(), Some(2), "a publish storm wakes the waiter");
-    drop(arm);
+    assert_woken_for(&env, s, topic);
 
     // The wake advanced no cursor, so a read now drains all ten durable events.
     let events = env.read_events(s);
@@ -711,15 +720,10 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
         (env.unread_total(s) >= 1).then_some(())
     });
 
-    // The next arm's fresh waiter sees the still-unread edge immediately and wakes.
-    let mut arm = env.spawn_arm(s, &[]);
-    let status = wait_within(&mut arm, SETTLE).expect("the waiter must wake");
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "a supervised edge from before the waiter armed still wakes it (cursor kept it unread)"
-    );
-    drop(arm);
+    // A fresh watcher sees the still-unread edge immediately and bumps for it.
+    arm(&env, s);
+    let topic = format!("github.pr.{spec}");
+    assert_woken_for(&env, s, &topic);
 
     // Delivered exactly once, then the cursor advances (no redelivery).
     let events = env.read_events(s);

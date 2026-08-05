@@ -52,7 +52,6 @@ pub use model::{
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
 // `wake` module.
 pub(crate) use reader::ReadOnlyStore;
-pub use reader::{Fleet, FleetSession, FleetWatch};
 
 use writer::Command;
 

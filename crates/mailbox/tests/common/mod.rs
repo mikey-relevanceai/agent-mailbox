@@ -379,28 +379,6 @@ impl Env {
         self.waiters_dir().join(format!("{session}.waiter.pid"))
     }
 
-    /// Spawn `mailbox harness arm`, feeding it the Stop hook payload JSON on stdin
-    /// (the fake harness driver — exactly what Claude Code's hook does). Returns an
-    /// [`ArmChild`] so a test panic can never leak the live waiter it execs into.
-    pub fn spawn_arm(&self, session: &str, extra: &[&str]) -> ArmChild {
-        let mut child = mailbox_command()
-            .args(["harness", "arm"])
-            .args(extra)
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn mailbox harness arm");
-        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"Stop"}}"#);
-        let mut stdin = child.stdin.take().expect("arm stdin");
-        stdin
-            .write_all(payload.as_bytes())
-            .expect("write hook payload");
-        drop(stdin); // EOF so arm's stdin read returns
-        ArmChild(child)
-    }
 
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload),
     /// the fake harness driver's teardown half. Returns its output.
@@ -470,9 +448,9 @@ impl Env {
     }
 
     /// Spawn the detached watcher directly (`mailbox harness watch --session <id>`), for
-    /// tests that exercise the watcher in isolation. Wrapped in [`ArmChild`] so a test
+    /// tests that exercise the watcher in isolation. Wrapped in [`ChildGuard`] so a test
     /// panic can never leak the live watcher (its Drop kills + reaps it).
-    pub fn spawn_watcher(&self, session: &str) -> ArmChild {
+    pub fn spawn_watcher(&self, session: &str) -> ChildGuard {
         let child = mailbox_command()
             .args(["harness", "watch", "--session", session])
             .env("AGENT_MAILBOX_DB", &self.db_path)
@@ -483,7 +461,7 @@ impl Env {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn mailbox harness watch");
-        ArmChild(child)
+        ChildGuard(child)
     }
 
     /// Run `mailbox harness wake` (the ADR-0008 FileChanged hook) for a session, feeding
@@ -633,25 +611,25 @@ impl Drop for Daemon {
     }
 }
 
-/// A spawned `mailbox harness arm` child, which execs (same PID) into the waiter.
-/// Wrapped in a Drop guard so a test panic can never leak the live waiter (mirrors
-/// card 11's `harness.rs`). Deref(Mut) to the inner `Child` for `try_wait` etc.
-pub struct ArmChild(pub Child);
 
-impl std::ops::Deref for ArmChild {
+/// A spawned child that is killed and reaped when the test drops it, so a failing
+/// assertion can never leak a process into the next test.
+pub struct ChildGuard(pub Child);
+
+impl std::ops::Deref for ChildGuard {
     type Target = Child;
     fn deref(&self) -> &Child {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for ArmChild {
+impl std::ops::DerefMut for ChildGuard {
     fn deref_mut(&mut self) -> &mut Child {
         &mut self.0
     }
 }
 
-impl Drop for ArmChild {
+impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
