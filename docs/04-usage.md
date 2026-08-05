@@ -108,8 +108,10 @@ absolute path.
 
 ### Start the daemon
 
-Every command except `wait` is a client of the `mailbox serve` daemon. Start it
-once (a login item, a `tmux` pane, or a user service):
+Every command except `mailbox doctor` is a client of the `mailbox serve` daemon
+(`doctor` reads sentinel files, not the store, so it works when the daemon is the
+broken thing). Start the daemon once — a login item, a `tmux` pane, or a user
+service:
 
 ```bash
 mailbox serve
@@ -221,10 +223,12 @@ session; the rest always exit 0:
 
 > **After upgrading the `mailbox` binary, re-run `mailbox harness install-hooks`.** An
 > upgrade that skips it leaves hooks pointing at subcommands the new binary no longer
-> has (`harness arm`, `harness ensure-watcher`, `harness watch`) — every turn then runs
-> a hook that exits with a clap usage error. Re-running sweeps them and installs the
-> current set; it recognises every name we have ever installed, so nothing is left
-> behind.
+> has (`harness arm`, `harness ensure-watcher`, `harness watch`). Those do not fail
+> quietly: an unrecognised subcommand exits **2**, and a `Stop` hook that exits 2
+> *blocks the turn from ending* and feeds its stderr to the model — so a half-upgraded
+> install nags the agent with clap usage text at every turn boundary, on top of having
+> no working wake path. Re-running sweeps them and installs the current set; it
+> recognises every name we have ever installed, so nothing is left behind.
 
 What each hook does:
 
@@ -530,8 +534,8 @@ mailbox read
 ```
 
 ```json
-{"result":"read","events":[{"topic":"agent.9d2e7c05-…","offset":0,"id":"evt-7",
- "body":{"from":"4f9c1a2b-…","kind":"review-done","pr":42}}]}
+{"result":"read","events":[{"id":"evt-7","offset":0,"topic":"agent.9d2e7c05-…",
+ "timestamp":1785904651808,"body":{"from":"4f9c1a2b-…","kind":"review-done","pr":42}}]}
 ```
 
 **The body convention.** The bridge stamps `"from": "<sender-session-id>"` into
@@ -715,7 +719,7 @@ mailbox doctor --timeout-ms 20000 # longer budget on a loaded machine
 ```
 
 ```text
-probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 6 deaf
+probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 4 deaf, 2 UNMEASURED
   459ba64c-…  DEAF — its sentinel changed and Claude Code never ran the wake hook; mail will not reach this agent
   8ce450e7-…  DEAF — …
 ```
@@ -723,9 +727,19 @@ probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 6 deaf
 - **Exit 1 when any session is deaf**, so a supervisor can notice without parsing
   prose. Sessions with no live process do not affect the exit code.
 - The verdicts are `wakeable` (the hook answered — positive proof), `deaf` (live,
-  armed, **idle**, and silent — **the fault**), `busy` (mid-turn, so it could not have
-  answered; not a fault, it collects mail at the turn boundary), `gone` (no live
-  Claude Code process; normal, not a fault), `never_armed`, and `undetermined`.
+  armed, **idle**, and silent — **the fault**), `busy`, `gone` (no live Claude Code
+  process; normal, not a fault), `never_armed`, and `undetermined`.
+- **`busy` is reported as `UNMEASURED`, and that is not "no fault found".** A
+  mid-turn session could not have answered the probe, so the probe learned nothing
+  about it — and a genuinely deaf session that happens to be busy looks exactly the
+  same. It is an open question to re-probe while the session is idle, which is why
+  the summary line counts it in its own bucket rather than folding it into the
+  healthy total.
+- **A session cannot measure itself.** Running `doctor` IS a turn, so the caller is
+  busy for the whole probe and can only ever report itself `UNMEASURED`. An agent
+  auditing its own fleet is therefore structurally blind to its own deafness;
+  `doctor` warns about this on stderr. Probe a session from a *different* session
+  (or a cron) to learn whether it can be woken.
 - Busy-vs-deaf comes from a pair of turn-boundary stamps written by the
   `UserPromptSubmit` and `Stop` hooks, so **re-run `mailbox harness install-hooks`**
   after upgrading. Without the new hook every busy session reports as `deaf`.

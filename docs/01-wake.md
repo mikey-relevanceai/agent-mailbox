@@ -213,8 +213,10 @@ sweeps them and installs these in their place.
 
 > **After upgrading the `mailbox` binary, re-run `mailbox harness install-hooks`.** An
 > upgrade that skips it leaves hooks pointing at subcommands the new binary no longer
-> has (`harness arm`, `harness ensure-watcher`, `harness watch`); re-running sweeps
-> every name we have ever installed and writes the current set.
+> has (`harness arm`, `harness ensure-watcher`, `harness watch`). An unrecognised
+> subcommand exits **2**, and on a `Stop` hook exit 2 blocks the turn from ending and
+> surfaces stderr to the model — so the failure is loud and per-turn, not silent.
+> Re-running sweeps every name we have ever installed and writes the current set.
 
 ### Diagnosing a wake ("why didn't my agent wake?")
 

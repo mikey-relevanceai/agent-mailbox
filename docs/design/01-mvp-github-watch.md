@@ -83,7 +83,8 @@ Parity with `agent-ipc-github`, plus CI:
 - **Adapter** only polls and publishes; it does not wake agents or touch SQLite.
 - **Bridge** owns durability, subscriptions, delivery cursors, and **adapter
   process lifecycle**.
-- **Harness** owns arm/re-arm via hooks ([01-wake](../01-wake.md)).
+- **Harness** owns the wake hooks — arming the sentinel at `SessionStart` and
+  turning a change to it into a wake. Nothing re-arms ([01-wake](../01-wake.md)).
 
 ## Adapter lifecycle (no zombies)
 
@@ -196,7 +197,7 @@ No `ipc-arm.sh` step.
 | Bridge down | Publish/watch commands fail; no silent orphan writers |
 | One of N sessions dies | That session’s interest dropped; adapter keeps running for the rest |
 | Last session dies / hard kill | Reconcile / TTL sweeper drops dead interests; stop adapter when count hits 0 |
-| Mid-turn publishes | Delivery cursor + Stop re-arm ([01](../01-wake.md)) |
+| Mid-turn publishes | Delivery cursor + the `turn-end` re-trigger at the turn boundary ([01](../01-wake.md), [ADR-0012](../adr/0012-level-triggered-wake-at-the-turn-boundary.md)) |
 
 ## Test plan
 

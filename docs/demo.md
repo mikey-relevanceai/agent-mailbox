@@ -42,8 +42,12 @@ whole path.
 
 ### Expected output
 
-Captured from a clean run on macOS (`SKIP_BUILD=1 scripts/demo.sh`; paths and
-pids vary, ANSI colour stripped):
+Captured from a clean run on macOS (`SKIP_BUILD=1 scripts/demo.sh`, ANSI colour
+stripped). Three things legitimately differ run to run, so do not read them as a
+contract: the **tempdir path and pids**; the **absolute binary path** the script
+echoes on each `$` line, abbreviated to `mailbox` below; and the **number of stub
+events** in step 3, since the stub publishes on a 500 ms timer and how many have
+landed by the time `read` runs is a race (2 and 3 are both normal).
 
 ```text
 demo workdir: /var/folders/.../mailbox-demo.wFPR9y

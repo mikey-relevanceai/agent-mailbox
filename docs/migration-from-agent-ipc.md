@@ -7,9 +7,11 @@ per PR — this is how to move off them.
 
 The headline change: **the agent stops owning the wake loop.** No more
 `ipc-arm.sh` after every message, no more background `gh-watch.sh` pollers piling
-up. The Claude Code *hooks* keep the waiter armed, and the *bridge daemon*
-supervises the PR pollers (one per PR, refcounted, torn down when the last
-interested session leaves). See [01-wake](01-wake.md) and
+up. A Claude Code *hook* arms a wake sentinel file once per session and another
+turns a change to it into a wake, while the *bridge daemon* writes that file when
+mail lands and supervises the PR pollers (one per PR, refcounted, torn down when
+the last interested session leaves). There is no waiter process and nothing to
+re-arm. See [01-wake](01-wake.md) and
 [design/01](design/01-mvp-github-watch.md) for the why.
 
 ---
@@ -35,7 +37,7 @@ interested session leaves). See [01-wake](01-wake.md) and
 | Read the NDJSON inbox / react to a kick | `mailbox read` |
 | `kill` the `gh-watch.sh` loop when done | `mailbox unwatch github-pr OWNER/REPO#N` (or just end the session) |
 | Check what you're watching | `mailbox status` |
-| Send a peer-agent message (`agent-ipc`) | Publish/subscribe on a shared topic: `mailbox publish <topic>` / `mailbox subscribe <topic>` (peer chat is topics too; the MVP demo is GitHub PRs) |
+| Send a peer-agent message (`agent-ipc`) | `mailbox send <peer-session-id> --text "…"` — every live session is automatically given an `agent.<session-id>` inbox, so there is nothing to arrange first. `mailbox agents` lists who is addressable. (A shared `mailbox subscribe` / `mailbox publish` topic still works for broadcast.) |
 
 The four-verb loop — **subscribe → read → react → unsubscribe** — is documented
 in full in [04-usage.md § The four-verb agent loop](04-usage.md#3-the-four-verb-agent-loop).

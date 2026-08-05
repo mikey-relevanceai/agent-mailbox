@@ -96,7 +96,7 @@ Subprocess remains valid forever for “I already trust this binary / script.”
 
 | Component | Process | Trust |
 |---|---|---|
-| Bridge core | `mailbox` | Trusted; owns DB, cursors, kicks |
+| Bridge core | `mailbox` | Trusted; owns DB, cursors, and the wake sentinel writes |
 | Harness hooks | Claude hook / child of session | Trusted per user session |
 | Subprocess adapter | separate OS process | Same user; treat events as untrusted *content* |
 | WASI adapter (later) | sandboxed guest | Least privilege; host mediates I/O |
