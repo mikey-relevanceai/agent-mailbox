@@ -27,8 +27,8 @@ use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Top
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, PublishAttempt, ReadPage, SessionId, SubscribeKind, SubscribeOutcome,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
+    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -86,19 +86,6 @@ pub(crate) enum Command {
         timestamp: Timestamp,
         body: Value,
         reply: oneshot::Sender<Result<Event, StorageError>>,
-    },
-    /// Publish on behalf of a SESSION (an agent), rather than an adapter: check the
-    /// publisher is caught up on the topic, append, and advance its own cursor past
-    /// its own event — all in ONE transaction, so the "caught up" check cannot go
-    /// stale between the check and the append. See [`PublishAttempt`] and
-    /// `do_publish_as_session`.
-    PublishAsSession {
-        topic: Topic,
-        adapter: AdapterId,
-        timestamp: Timestamp,
-        body: Value,
-        publisher: SessionId,
-        reply: oneshot::Sender<Result<PublishAttempt, StorageError>>,
     },
     ReadEvents {
         topic: Topic,
@@ -352,20 +339,6 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "publish", || format!("topic={}", topic.as_str()));
             let _ = reply.send(result);
         }
-        Command::PublishAsSession {
-            topic,
-            adapter,
-            timestamp,
-            body,
-            publisher,
-            reply,
-        } => {
-            let result = do_publish_as_session(conn, &topic, &adapter, timestamp, body, &publisher);
-            log_on_err(&result, "publish_as_session", || {
-                format!("topic={} session={}", topic.as_str(), publisher.as_str())
-            });
-            let _ = reply.send(result);
-        }
         Command::ReadEvents {
             topic,
             cursor,
@@ -589,6 +562,17 @@ fn handle(conn: &mut Connection, cmd: Command) {
     }
 }
 
+/// Publish one event to a topic. ONE path for every publisher — adapter, agent or
+/// script — because there is exactly one publish rule left: the event goes to the
+/// topic and every subscriber is woken, its author included (ADR-0018).
+///
+/// There used to be a second, caller-aware path (`do_publish_as_session`) that
+/// enforced "be caught up to speak": a publisher subscribed to the topic with unread
+/// on it was REFUSED. It is gone, and with it the `event.author_session` column it
+/// existed to read. The rule blocked a *write* because of the writer's *read* state,
+/// and it decided that on an author inferred from the ambient
+/// `$CLAUDE_CODE_SESSION_ID` — which Claude Code exports into every process an agent
+/// spawns, so the "author" was routinely the wrong session.
 fn do_publish(
     conn: &mut Connection,
     topic: &Topic,
@@ -597,102 +581,19 @@ fn do_publish(
     body: Value,
 ) -> Result<Event, StorageError> {
     let tx = conn.transaction()?;
-    // No authoring session: an adapter (or an explicit `publish --no-session`) is
-    // nobody's message, so it is unread — and wakeable — for EVERY subscriber.
-    let event = append_event_tx(&tx, topic, adapter, timestamp, body, None)?;
+    let event = append_event_tx(&tx, topic, adapter, timestamp, body)?;
     tx.commit()?;
     Ok(event)
 }
 
-/// Publish on behalf of a session (an agent), enforcing the caller-aware rule in ONE
-/// transaction with the append (see [`PublishAttempt`]).
-///
-/// **Be caught up to speak.** If the publisher is subscribed to the topic and has
-/// unread events on it **that it did not write itself**, REFUSE — nothing is
-/// written. An agent that speaks over mail it has not read is talking past its peers,
-/// and the durable log would interleave a reply to a message it never saw.
-///
-/// The "that it did not write itself" clause is what keeps the rule from deadlocking
-/// the publisher on its own last message, and it is why the author is stamped on the
-/// row (`event.author_session`, schema v5). The obvious alternative — advancing the
-/// publisher's own cursor past its own event — was WRONG and is gone: the publisher
-/// is *inferred* from the ambient `$CLAUDE_CODE_SESSION_ID`, which Claude Code
-/// exports into every process the agent spawns, so a build script / git hook /
-/// subagent publishing under that id had its event silently marked read for the
-/// agent. That is silent mail loss. Nothing may skip an event for a session, so no
-/// cursor is touched here: the event stays unread and readable for everyone,
-/// including its (possibly mis-attributed) author — it simply does not *block* or
-/// *wake* the session it is attributed to.
-///
-/// The rule only applies while subscribed: a session publishing to a topic it does
-/// not subscribe to has no cursor and no unread, and is unaffected. The atomicity is
-/// load-bearing — a check in one transaction and an append in another could be
-/// separated by a concurrent publish, which would decide the rule on a log that no
-/// longer exists by the time the event lands.
-fn do_publish_as_session(
-    conn: &mut Connection,
-    topic: &Topic,
-    adapter: &AdapterId,
-    timestamp: Timestamp,
-    body: Value,
-    publisher: &SessionId,
-) -> Result<PublishAttempt, StorageError> {
-    let tx = conn.transaction()?;
-
-    let subscribed: bool = tx
-        .query_row(
-            "SELECT 1 FROM subscription WHERE session_id = ?1 AND topic = ?2",
-            params![publisher.as_str(), topic.as_str()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-
-    if subscribed {
-        // The unread predicate of `do_unread_counts` / `read_topic_unread` (strictly
-        // beyond the delivery cursor; absent cursor => -1 => everything), narrowed to
-        // events this session did NOT author. Your own message is still unread — it
-        // shows in `read` and in `status` — it just is not mail you owe anyone a read
-        // of before you may speak again.
-        let unread: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM event
-             WHERE topic = ?1
-               AND (author_session IS NULL OR author_session <> ?2)
-               AND offset > COALESCE(
-                   (SELECT offset FROM delivery_cursor
-                    WHERE session_id = ?2 AND topic = ?1),
-                   -1)",
-            params![topic.as_str(), publisher.as_str()],
-            |row| row.get(0),
-        )?;
-        if unread > 0 {
-            // Refuse: the tx drops (rolls back) with nothing written.
-            return Ok(PublishAttempt::RefusedUnread {
-                unread: unread.max(0) as u64,
-            });
-        }
-    }
-
-    let event = append_event_tx(&tx, topic, adapter, timestamp, body, Some(publisher))?;
-
-    tx.commit()?;
-    Ok(PublishAttempt::Published(event))
-}
-
 /// Append one event to a topic's log inside an open transaction, assigning the next
-/// per-topic offset and the opaque event id. Shared by the adapter publish and the
-/// session publish so the two can never drift in how an event is minted.
-///
-/// `author` is the session that published it, or `None` for an adapter / anonymous
-/// publish. It is provenance for the two caller-aware rules ONLY (be-caught-up-to-
-/// speak, and no-self-wake); it grants no authority and the body stays opaque.
+/// per-topic offset and the opaque event id.
 fn append_event_tx(
     tx: &rusqlite::Transaction<'_>,
     topic: &Topic,
     adapter: &AdapterId,
     timestamp: Timestamp,
     body: Value,
-    author: Option<&SessionId>,
 ) -> Result<Event, StorageError> {
     let body_text = serde_json::to_string(&body)?;
 
@@ -713,8 +614,8 @@ fn append_event_tx(
     // (topic, offset) is unique, so it never collides with a committed row.
     let temp_id = format!("pending:{}:{offset}", topic.as_str());
     tx.execute(
-        "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             topic.as_str(),
             offset,
@@ -722,7 +623,6 @@ fn append_event_tx(
             adapter.0,
             timestamp.0,
             body_text,
-            author.map(SessionId::as_str),
         ],
     )?;
     let row_id = tx.last_insert_rowid();
@@ -997,12 +897,13 @@ fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, 
 /// (`read_topic_unread`), and the fresh subscription that baselines to the head
 /// (`do_subscribe_and_baseline` — you are not shown mail sent before you existed).
 ///
-/// A publish deliberately does NOT advance the publisher's cursor, even over its own
-/// event. It used to, and that was silent mail loss: the "publisher" is inferred from
-/// an ambient env var Claude Code exports into every process an agent spawns, so a
-/// mis-attributed publish silently marked itself read for the agent (see
-/// `do_publish_as_session`). Marking an event read is now something only a `read`
-/// (or a baseline at subscribe time) may do.
+/// A publish deliberately does NOT advance any cursor, not even for the session that
+/// ran it. It used to advance the "publisher's", and that was silent mail loss: the
+/// publisher was inferred from an ambient env var Claude Code exports into every
+/// process an agent spawns, so a mis-attributed publish marked itself read for the
+/// agent. Marking an event read is now something only a `read` (or a baseline at
+/// subscribe time) may do — and a publish no longer knows who ran it at all
+/// (ADR-0018).
 fn advance_cursor_tx(
     tx: &rusqlite::Transaction,
     session: &SessionId,
@@ -1993,32 +1894,20 @@ mod tests {
         .unwrap();
     }
 
-    // ---- the caller-aware publish (`do_publish_as_session`) ----------------------
-    //
-    // These sit beside the other writer tests on purpose: the rules are decided in ONE
-    // SQL transaction, and they were previously only covered by heavyweight process-level
-    // e2e (an inverted pyramid — slow, and it could not reach the interesting states).
-
-    /// A session publish, at the writer level.
-    fn publish_as(
-        conn: &mut Connection,
-        session: &str,
-        topic: &Topic,
-        body: &str,
-    ) -> PublishAttempt {
-        do_publish_as_session(
+    /// A publish, at the writer level.
+    fn publish(conn: &mut Connection, topic: &Topic, body: &str) {
+        do_publish(
             conn,
             topic,
             &AdapterId("cli".to_string()),
             Timestamp(1),
             serde_json::from_str(body).unwrap(),
-            &SessionId::new(session),
         )
-        .unwrap()
+        .unwrap();
     }
 
-    /// The unread count as `status` (and the refusal message) reports it: EVERY event
-    /// beyond the cursor, whoever wrote it.
+    /// The unread count as `status` reports it: EVERY event beyond the cursor, whoever
+    /// wrote it.
     fn unread_of(conn: &Connection, session: &str, topic: &Topic) -> u64 {
         do_unread_counts(conn, &SessionId::new(session))
             .unwrap()
@@ -2028,61 +1917,31 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Be caught up to speak: unread mail from SOMEONE ELSE refuses the publish, and the
-    /// refusal writes nothing at all (it is one transaction, and it rolls back).
-    #[test]
-    fn publish_as_session_is_refused_when_others_events_are_unread_and_writes_nothing() {
-        let mut conn = migrated();
-        let topic = Topic::parse("t.rules").unwrap();
-        subscribe_explicit(&mut conn, &SessionId::new("s"), &topic, 1).unwrap();
-
-        // A peer speaks (an adapter would do just as well — neither is `s`).
-        publish_as(&mut conn, "peer", &topic, r#"{"n":1}"#);
-        assert_eq!(unread_of(&conn, "s", &topic), 1);
-
-        let attempt = publish_as(&mut conn, "s", &topic, r#"{"n":2}"#);
-        assert_eq!(attempt, PublishAttempt::RefusedUnread { unread: 1 });
-        let events: i64 = conn
-            .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(events, 1, "a refused publish must append nothing");
-
-        // Reading clears it, and the same publish then goes through.
-        do_read_unread(&mut conn, &SessionId::new("s"), None).unwrap();
-        assert!(matches!(
-            publish_as(&mut conn, "s", &topic, r#"{"n":2}"#),
-            PublishAttempt::Published(_)
-        ));
-    }
-
-    /// Your OWN events do not gag you — but nothing marks them read for you.
+    /// **Only a `read` may mark mail read.** Publishing never touches a delivery
+    /// cursor — not even for a session that has just published three times in a row —
+    /// so every event stays unread, and countable, until it is genuinely delivered.
     ///
-    /// This is the adv-2 fix in one test: the rule counts only events you did not
-    /// author (so your own message never blocks your next publish), and NO cursor is
-    /// advanced (so your own message stays visible and countable). The old design
-    /// advanced the publisher's cursor, which silently consumed any event mis-attributed
-    /// to it via the ambient `$CLAUDE_CODE_SESSION_ID` — real message loss.
+    /// This is the surviving half of the adv-2 fix. The publish path once advanced the
+    /// "publisher's" own cursor past its own event, and the publisher was inferred from
+    /// the ambient `$CLAUDE_CODE_SESSION_ID` that Claude Code exports into every process
+    /// an agent spawns — so a build script's publish silently consumed the agent's mail.
+    /// There is no longer any caller identity on this path at all, but the invariant it
+    /// broke is still the one worth guarding.
     #[test]
-    fn publish_as_session_ignores_your_own_events_but_never_marks_them_read() {
+    fn publishing_never_advances_anyones_delivery_cursor() {
         let mut conn = migrated();
         let topic = Topic::parse("t.own").unwrap();
         let session = SessionId::new("s");
         subscribe_explicit(&mut conn, &session, &topic, 1).unwrap();
 
-        for n in 0..3 {
-            assert!(
-                matches!(
-                    publish_as(&mut conn, "s", &topic, r#"{"n":1}"#),
-                    PublishAttempt::Published(_)
-                ),
-                "publish {n}: your own last message must never block your next one"
-            );
+        for _ in 0..3 {
+            publish(&mut conn, &topic, r#"{"n":1}"#);
         }
 
         assert_eq!(
             unread_of(&conn, "s", &topic),
             3,
-            "your own events are NOT hidden from you: they remain unread until you read them"
+            "events stay unread until they are read"
         );
         let cursor: Option<i64> = conn
             .query_row(
@@ -2094,60 +1953,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             cursor, None,
-            "publishing must not advance the publisher's cursor — only a `read` may mark mail read"
+            "publishing must not advance a subscriber's cursor — only a `read` may mark mail read"
         );
 
-        // And they are genuinely deliverable to it.
+        // And they are genuinely deliverable.
         let page = do_read_unread(&mut conn, &session, None).unwrap();
         assert_eq!(page.len(), 3);
-    }
-
-    /// An event is stamped with its author, and ONLY on the session path: an adapter
-    /// publish is anonymous (NULL), which is what makes it wake everyone.
-    #[test]
-    fn the_author_is_stamped_only_on_a_session_publish() {
-        let mut conn = migrated();
-        let topic = Topic::parse("t.stamp").unwrap();
-
-        publish_as(&mut conn, "s", &topic, "{}");
-        do_publish(
-            &mut conn,
-            &topic,
-            &AdapterId("github-pr".to_string()),
-            Timestamp(2),
-            serde_json::json!({}),
-        )
-        .unwrap();
-
-        let authors: Vec<Option<String>> = conn
-            .prepare("SELECT author_session FROM event ORDER BY offset")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(authors, vec![Some("s".to_string()), None]);
-    }
-
-    /// A session that does not SUBSCRIBE to the topic it publishes to has no cursor and
-    /// no unread there, so the rule cannot bite it — however far behind it is elsewhere.
-    /// (This is the `send`-to-a-peer's-inbox shape.)
-    #[test]
-    fn publish_as_session_never_refuses_a_topic_you_do_not_subscribe_to() {
-        let mut conn = migrated();
-        let mine = Topic::parse("t.mine").unwrap();
-        let theirs = Topic::parse("t.theirs").unwrap();
-        subscribe_explicit(&mut conn, &SessionId::new("s"), &mine, 1).unwrap();
-
-        // Hopelessly behind on my own topic...
-        publish_as(&mut conn, "peer", &mine, "{}");
-        assert_eq!(unread_of(&conn, "s", &mine), 1);
-
-        // ...but a topic I do not subscribe to is not mine to be caught up on.
-        assert!(matches!(
-            publish_as(&mut conn, "s", &theirs, "{}"),
-            PublishAttempt::Published(_)
-        ));
     }
 
     #[test]

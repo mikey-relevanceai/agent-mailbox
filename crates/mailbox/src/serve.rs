@@ -68,7 +68,7 @@ use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
-use mailbox::storage::{PublishAttempt, SessionId, Storage, StorageConfig, SubscribeKind};
+use mailbox::storage::{SessionId, Storage, StorageConfig, SubscribeKind};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
@@ -504,11 +504,9 @@ fn request_op(request: &Request) -> &'static str {
 /// The session a request is for, if any.
 fn request_session(request: &Request) -> Option<&SessionId> {
     match request {
-        // A publish MAY carry a session (an agent) or not (an adapter, whose
-        // provenance is its adapter id instead); `topics` is a global read with no
-        // session at all.
-        Request::Publish { session, .. } => session.as_ref(),
-        Request::Topics { .. } => None,
+        // A publish names no session at all — every publisher is the same publisher
+        // (ADR-0018), and its provenance is its adapter id. `topics` is a global read.
+        Request::Publish { .. } | Request::Topics { .. } => None,
         Request::Subscribe { session, .. }
         | Request::Unsubscribe { session, .. }
         | Request::Read { session, .. }
@@ -558,8 +556,7 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             topic,
             adapter,
             body,
-            session,
-        } => publish(bus, topic, adapter, body, session).await,
+        } => publish(bus, topic, adapter, body).await,
         Request::Subscribe {
             session,
             topic,
@@ -648,23 +645,12 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
 
 /// Publish an event.
 ///
-/// Two callers, two contracts, kept apart by whether a `session` came with the
-/// request:
-///
-/// - **An adapter** (no session — including an agent's own `publish --no-session`)
-///   publishes exactly as it always has: no unread rule, every subscriber kicked, no
-///   author stamped. Adapters are the original publisher and have no session id to
-///   resolve — changing this path would break them.
-/// - **An agent** (a session) is held to the caller-aware rules: it must be caught up
-///   on the topic to publish to it, and it is never woken by its own event (see
-///   [`Bus::publish_as_session`]).
-async fn publish(
-    bus: &Bus,
-    topic: Topic,
-    adapter: AdapterId,
-    body: serde_json::Value,
-    session: Option<SessionId>,
-) -> Response {
+/// One caller, one contract (ADR-0018): the event goes to the topic and every
+/// subscriber is woken, its author included. An adapter, an agent and a script an
+/// agent spawned are indistinguishable here, deliberately — the daemon used to route
+/// on whether a session came with the request, so it could refuse a publish from a
+/// caller with unread mail on the topic.
+async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
     // An agent inbox is writable ONLY through `mailbox send`, which stamps
     // provenance (`from`) and refuses an unregistered target (ADR-0007). The
     // generic publish path does neither, so allowing it here would let any caller
@@ -682,30 +668,11 @@ async fn publish(
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
     let timestamp = Timestamp(mailbox::clock::now_millis());
 
-    let Some(session) = session else {
-        return match bus.publish(topic, adapter, timestamp, body).await {
-            Ok(event) => Response::Published {
-                id: event.id,
-                offset: event.offset,
-            },
-            Err(err) => Response::error(err.to_string()),
-        };
-    };
-
-    match bus
-        .publish_as_session(session, topic.clone(), adapter, timestamp, body)
-        .await
-    {
-        Ok(PublishAttempt::Published(event)) => Response::Published {
+    match bus.publish(topic, adapter, timestamp, body).await {
+        Ok(event) => Response::Published {
             id: event.id,
             offset: event.offset,
         },
-        // Be caught up to speak. A TYPED refusal, not an `Error`: nothing failed and
-        // nothing was written, so a scripted publisher must be able to tell this
-        // ("read, then retry") from a real error ("the bridge is down") — which it
-        // could not while both came back as a string and exit 1. The CLI renders it
-        // with the one command that fixes it, and exits with its own code.
-        Ok(PublishAttempt::RefusedUnread { unread }) => Response::PublishRefused { topic, unread },
         Err(err) => Response::error(err.to_string()),
     }
 }

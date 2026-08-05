@@ -53,7 +53,7 @@ use crate::storage::{Storage, StorageError};
 use crate::wake::Waker;
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
-pub use crate::storage::{PublishAttempt, SessionId, SubscribeKind, SubscribeOutcome};
+pub use crate::storage::{SessionId, SubscribeKind, SubscribeOutcome};
 
 /// Errors from a bus operation.
 ///
@@ -161,6 +161,12 @@ impl Bus {
     /// Publish `body` to `topic` under `adapter`, appending it to the durable log
     /// and assigning the next per-topic offset.
     ///
+    /// **The one publish rule (ADR-0018): the event goes to the topic, and every
+    /// subscriber is woken — its author included.** There is no caller-aware variant
+    /// and no refusal: an adapter, an agent and a script an agent spawned all take
+    /// this path and are treated identically. Who published is not a claim about who
+    /// already knows, so it does not participate in delivery.
+    ///
     /// Appending and offset assignment are already one atomic writer op, and
     /// publish carries no bus-level policy over the body — it is stored verbatim
     /// and never interpreted (ADR-0001).
@@ -192,62 +198,6 @@ impl Bus {
         self.wake_subscribers(&topic).await;
 
         Ok(event)
-    }
-
-    /// Publish `body` to `topic` **as `publisher`** — an agent, not an adapter —
-    /// applying the caller-aware rule and then waking every subscriber, the
-    /// publisher included.
-    ///
-    /// The rule itself is one atomic writer command
-    /// ([`Storage::publish_as_session`], see [`PublishAttempt`]):
-    ///
-    /// 1. **Be caught up to speak.** A publisher subscribed to the topic with unread
-    ///    events on it *that it did not write itself* is REFUSED, and nothing is
-    ///    written. It must `read` first.
-    ///
-    /// And here, at the wake boundary:
-    ///
-    /// 2. **Every subscriber is woken, the publisher included** (ADR-0014). Authorship
-    ///    is provenance, not a claim about what the agent already knows: the common
-    ///    case — a `github-pr` transition the agent itself caused — carries no author
-    ///    session at all and has always woken it. Suppressing only the attributable
-    ///    case was the inconsistency, and it made the wake path disagree with `status`.
-    ///
-    /// Note that rule 1 still ignores the publisher's OWN events when deciding whether
-    /// it is caught up: being woken by your own message is fine, but having to `read`
-    /// it before you may speak again would make a second publish impossible
-    /// (`storage::writer`).
-    ///
-    /// A REFUSED publish wakes nobody: there is nothing to wake about.
-    pub async fn publish_as_session(
-        &self,
-        publisher: SessionId,
-        topic: Topic,
-        adapter: AdapterId,
-        timestamp: Timestamp,
-        body: Value,
-    ) -> Result<PublishAttempt, BusError> {
-        let attempt = self
-            .storage
-            .publish_as_session(topic.clone(), adapter, timestamp, body, publisher.clone())
-            .await?;
-
-        match &attempt {
-            PublishAttempt::Published(_) => {
-                self.wake_subscribers(&topic).await;
-            }
-            // Log the decision: a refused publish is a real, observable outcome the
-            // agent must act on (read first), not a silent no-op.
-            PublishAttempt::RefusedUnread { unread } => info!(
-                session = publisher.as_str(),
-                topic = topic.as_str(),
-                unread,
-                "refused a publish: the publisher has unread events on this topic \
-                 (be caught up to speak); nothing was written"
-            ),
-        }
-
-        Ok(attempt)
     }
 
     /// Wake every session subscribed to `topic` — the publisher included (ADR-0014)

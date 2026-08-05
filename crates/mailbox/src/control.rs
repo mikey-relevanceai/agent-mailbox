@@ -57,23 +57,16 @@ pub enum Request {
     /// Publish an event to a topic. The daemon stamps the timestamp, exactly as the
     /// durable bridge does; provenance is the [`AdapterId`] (a name, not authority).
     ///
-    /// `session` is the CALLER, when there is one — an agent's `mailbox publish`
-    /// resolves it from the environment like every other session-scoped command. It
-    /// is `Option` because the original publisher, an **adapter**, genuinely has no
-    /// session, and its contract must not change: no session → no unread rule. With a
-    /// session, one rule applies (see [`crate::serve`]): the publish is REFUSED if
-    /// that session has unread events on the topic that it did not itself write
-    /// ("be caught up to speak"). Either way every subscriber is kicked, the publisher
-    /// included (ADR-0014).
-    ///
-    /// `#[serde(default)]` so a frame from an older client (which had no such field)
-    /// still decodes as the session-less adapter publish it was.
+    /// It carries no caller: **every publisher is the same publisher** (ADR-0018).
+    /// An adapter, an agent and a script an agent spawned all append to the topic and
+    /// wake every subscriber, author included. The frame used to carry an optional
+    /// `session` so the daemon could refuse a publish from a caller with unread mail
+    /// on the topic; that rule is deleted, and an extra field a rule no longer reads
+    /// is a place for the rule to grow back.
     Publish {
         topic: Topic,
         adapter: AdapterId,
         body: Value,
-        #[serde(default)]
-        session: Option<SessionId>,
     },
     /// Subscribe `session` to `topic` (baseline-on-subscribe). `kind` distinguishes
     /// an explicit user/agent subscribe from the automatic `harness arm` inbox
@@ -209,15 +202,6 @@ pub enum Response {
         interests_dropped: u64,
         adapters_stopped: u64,
     },
-    /// A publish was REFUSED because the caller is not caught up on the topic: it has
-    /// `unread` event(s) there that someone else wrote. **Nothing was written.**
-    ///
-    /// This is its own response (and its own CLI exit code) rather than a generic
-    /// [`Response::Error`] because it is not a failure: it is a "retry after reading"
-    /// instruction with a defined remedy, and a scripted publisher must be able to
-    /// tell it apart from "the bridge is down" — which it could not when both exited
-    /// 1 with a string.
-    PublishRefused { topic: Topic, unread: u64 },
     /// The command was well-formed but could not be serviced (bad topic, storage
     /// error, …). Human-readable detail only; not machine-dispatched on.
     Error { message: String },
@@ -533,14 +517,6 @@ mod tests {
             topic: Topic::parse("github.pr.o/r#1").unwrap(),
             adapter: AdapterId("cli".to_string()),
             body: serde_json::json!({ "hello": "world" }),
-            session: None,
-        });
-        // The session-aware (agent) publish carries the caller.
-        round_trip_request(Request::Publish {
-            topic: Topic::parse("github.pr.o/r#1").unwrap(),
-            adapter: AdapterId("cli".to_string()),
-            body: serde_json::json!({ "hello": "world" }),
-            session: Some(SessionId::new("s-pub")),
         });
         round_trip_request(Request::Subscribe {
             session: SessionId::new("s1"),
@@ -563,26 +539,6 @@ mod tests {
         round_trip_request(Request::Status {
             session: SessionId::new("s1"),
         });
-    }
-
-    /// A publish frame with NO `session` key — what an older client, or any encoder
-    /// that predates the caller-aware publish, emits — must still decode as the
-    /// session-less adapter publish it is, rather than failing the frame.
-    #[test]
-    fn a_publish_frame_without_a_session_decodes_as_session_less() {
-        let line = format!(
-            r#"{{"version":{PROTOCOL_VERSION},"op":"publish","topic":"t.a","adapter":"gh","body":{{}}}}"#
-        );
-        let decoded: Request = decode_frame(&line).expect("legacy publish frame must decode");
-        assert_eq!(
-            decoded,
-            Request::Publish {
-                topic: Topic::parse("t.a").unwrap(),
-                adapter: AdapterId("gh".to_string()),
-                body: serde_json::json!({}),
-                session: None,
-            }
-        );
     }
 
     #[test]

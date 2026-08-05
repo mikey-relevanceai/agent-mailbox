@@ -214,15 +214,6 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_event_by(conn: &Connection, topic: &str, offset: i64, author: &str) {
-        conn.execute(
-            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
-             VALUES (?1, ?2, ?3, 'a', 0, '{}', ?4)",
-            params![topic, offset, format!("evt-{topic}-{offset}"), author],
-        )
-        .unwrap();
-    }
-
     fn set_cursor(conn: &Connection, session: &str, topic: &str, offset: i64) {
         conn.execute(
             "INSERT INTO delivery_cursor (session_id, topic, offset) VALUES (?1, ?2, ?3)
@@ -232,39 +223,31 @@ mod tests {
         .unwrap();
     }
 
-    /// Authorship does not enter the unread predicate (ADR-0014): your own event is
-    /// mail to you exactly as a peer's is, so the wake path and `status` agree on one
-    /// definition of "unread". Only the delivery cursor makes mail go quiet.
+    /// Authorship does not enter the unread predicate — there is no authorship on an
+    /// event any more (ADR-0018), and there was already none in this query (ADR-0014).
+    /// One definition of "unread" for the wake path and for `status`: subscribed, and
+    /// beyond the delivery cursor. **Only the cursor makes mail go quiet.**
     #[test]
-    fn an_event_you_authored_wakes_you_just_like_a_peers_does() {
+    fn every_subscriber_has_the_same_event_unread_until_it_reads() {
         let conn = migrated();
         subscribe(&conn, "s", "t.a");
         subscribe(&conn, "peer", "t.a");
 
-        insert_event_by(&conn, "t.a", 0, "s");
-        assert_eq!(
-            query_topics_with_unread(&conn, "s").unwrap().len(),
-            1,
-            "your own event is mail to you too"
-        );
+        insert_event(&conn, "t.a", 0);
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
+        assert_eq!(query_topics_with_unread(&conn, "peer").unwrap().len(), 1);
+
+        insert_event(&conn, "t.a", 1);
+        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
+
+        // Caught up (the cursor covers both) => quiet, for this session only.
+        set_cursor(&conn, "s", "t.a", 1);
+        assert!(query_topics_with_unread(&conn, "s").unwrap().is_empty());
         assert_eq!(
             query_topics_with_unread(&conn, "peer").unwrap().len(),
             1,
-            "and it IS mail for the peer"
+            "one session reading must not quiet another's mail"
         );
-
-        // A peer's event wakes you.
-        insert_event_by(&conn, "t.a", 1, "peer");
-        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
-
-        // Caught up again (the cursor covers both) => quiet.
-        set_cursor(&conn, "s", "t.a", 1);
-        assert!(query_topics_with_unread(&conn, "s").unwrap().is_empty());
-
-        // An anonymous publish (adapter / `--no-session`) wakes EVERY subscriber,
-        // including a session that happens to have spawned the publisher.
-        insert_event(&conn, "t.a", 2);
-        assert_eq!(query_topics_with_unread(&conn, "s").unwrap().len(), 1);
     }
 
     #[test]
@@ -408,23 +391,6 @@ mod tests {
         assert!(
             second.high_water() > first,
             "a newer event on another topic must advance the watermark, despite its offset 0"
-        );
-    }
-
-    /// A self-authored event advances the watermark like any other (ADR-0014), so the
-    /// ADR-0012 turn-boundary re-trigger treats it as genuinely new mail and nudges
-    /// the session once for it.
-    #[test]
-    fn a_self_authored_event_advances_the_watermark_like_any_other() {
-        let conn = migrated();
-        subscribe(&conn, "s", "t.a");
-        insert_event_by(&conn, "t.a", 0, "peer");
-        let before = pending(&conn, "s").high_water();
-
-        insert_event_by(&conn, "t.a", 1, "s");
-        assert!(
-            pending(&conn, "s").high_water() > before,
-            "your own event is mail, so it advances your watermark"
         );
     }
 

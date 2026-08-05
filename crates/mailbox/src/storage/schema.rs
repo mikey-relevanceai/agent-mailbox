@@ -18,7 +18,9 @@ use super::error::StorageError;
 /// `watch.publish_count` for the stub adapter — see [`SCHEMA_V3`]. v4 (card 16)
 /// adds `session_tombstone` for the inbox-resurrection guard — see [`SCHEMA_V4`].
 /// v5 (card 19) stamps the AUTHORING session on an event — see [`SCHEMA_V5`].
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+/// v6 drops that column again, along with the one rule that read it — see
+/// [`SCHEMA_V6`].
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 
 /// Version 1 of the schema.
 ///
@@ -162,29 +164,36 @@ CREATE TABLE session_tombstone (
 
 /// Version 5 of the schema (card 19): the authoring session of an event.
 ///
-/// `event.author_session` is the session id of the agent that published the event,
-/// or `NULL` when nobody did — an adapter, a cron script, or an explicit
-/// `mailbox publish --no-session`. It is *provenance for the caller-aware rules*,
-/// nothing more: the body stays opaque and the adapter label stays the publisher's
-/// name, exactly as before (ADR-0001).
-///
-/// It exists because the alternative was silent mail loss. The caller-aware publish
-/// used to advance the publisher's own delivery cursor past its own event, so that
-/// its own message could not block its next publish. But the publisher is inferred
-/// from the ambient `$CLAUDE_CODE_SESSION_ID`, which Claude Code exports into EVERY
-/// process an agent spawns (a build script, a git hook, a subagent) — so any of
-/// those publishing on a topic the agent subscribes to had the event silently marked
-/// read *for the agent*, and the agent was excluded from the kick: it never saw the
-/// message and was never woken. With the author stamped on the row, no cursor is
-/// ever advanced behind anyone's back: the event stays unread and readable, and only
-/// the two rules that legitimately need to know who wrote it consult this column
-/// (the "be caught up to speak" check, and the no-self-wake filter).
-///
-/// Additive, like every prior step: a nullable column on `event`. Rows written
-/// before v5 (every adapter publish there has ever been) migrate to `NULL`, which is
-/// exactly right — they had no authoring session.
+/// `event.author_session` was the session id of the agent that published the event,
+/// or `NULL` when nobody did. It was provenance for the caller-aware publish rules,
+/// nothing more. Both of those rules are gone, so [`SCHEMA_V6`] drops the column;
+/// this step is kept only because the migration chain is a historical record — a v4
+/// database on disk must still be walked forward through it.
 const SCHEMA_V5: &str = r#"
 ALTER TABLE event ADD COLUMN author_session TEXT;
+"#;
+
+/// Version 6 of the schema: drop `event.author_session` (ADR-0018).
+///
+/// The column existed for exactly one reader: the "be caught up to speak" rule, which
+/// refused a publish from a session that had unread mail on the topic **that it had
+/// not itself written**. That rule is deleted, and the only other behaviour that ever
+/// consulted authorship — the no-self-wake filter — was deleted by ADR-0014. Nothing
+/// reads the column now, and nothing displays it: `Event` never carried it on the
+/// wire, and `mailbox send` (the peer-to-peer path) never stamped it at all, putting
+/// its provenance in the body's `from` field instead.
+///
+/// Dropped rather than left nullable-and-unwritten, because the author was *inferred*
+/// from the ambient `$CLAUDE_CODE_SESSION_ID` that Claude Code exports into every
+/// process an agent spawns. A column recording a routinely-wrong answer to a question
+/// nobody asks is worse than no column: it is an invitation to grow a new rule on top
+/// of bad data.
+///
+/// `ALTER TABLE ... DROP COLUMN` is supported from SQLite 3.35 (we bundle far newer)
+/// and is legal here because the column is plain: not indexed, not part of a key, no
+/// CHECK or generated column refers to it.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE event DROP COLUMN author_session;
 "#;
 
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
@@ -224,6 +233,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 5 {
         sql.push_str(SCHEMA_V5);
+    }
+    if current < 6 {
+        sql.push_str(SCHEMA_V6);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -379,26 +391,28 @@ mod tests {
         assert_eq!(ended, 99);
     }
 
-    /// The v5 step is ADDITIVE on a real file: every event written before it keeps
-    /// its body/offset/adapter and simply gains a NULL author — which is the honest
-    /// value, since a pre-v5 publish had no authoring session to record.
+    /// A v5 database on disk — one that HAS the author column, possibly with values
+    /// in it — migrates forward to v6 without losing an event. Dropping a column
+    /// rewrites the table, so "the bodies and offsets survive" is the property that
+    /// matters; that the column itself is gone is the second half.
     #[test]
-    fn on_disk_v4_to_v5_migration_preserves_events_and_defaults_the_author_to_null() {
+    fn on_disk_v5_to_v6_migration_drops_the_author_and_keeps_every_event() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("mailbox.db");
 
         {
             let conn = Connection::open(&path).unwrap();
-            for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4] {
+            for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5] {
                 conn.execute_batch(step).unwrap();
             }
             conn.execute(
-                "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
-                 VALUES ('t.a', 0, 'evt-1', 'github-pr', 123, '{\"edge\":\"ci\"}')",
+                "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
+                 VALUES ('t.a', 0, 'evt-1', 'github-pr', 123, '{\"edge\":\"ci\"}', NULL),
+                        ('t.a', 1, 'evt-2', 'cli', 124, '{}', 's-agent')",
                 [],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA user_version = 4").unwrap();
+            conn.execute_batch("PRAGMA user_version = 5").unwrap();
         }
 
         let conn = Connection::open(&path).unwrap();
@@ -408,32 +422,35 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
 
-        let (body, adapter, author): (String, String, Option<String>) = conn
+        let (body, adapter): (String, String) = conn
             .query_row(
-                "SELECT body, adapter, author_session FROM event WHERE event_id = 'evt-1'",
+                "SELECT body, adapter FROM event WHERE event_id = 'evt-1'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(body, "{\"edge\":\"ci\"}", "the body survives verbatim");
         assert_eq!(adapter, "github-pr", "provenance survives");
-        assert_eq!(author, None, "a pre-v5 event has no authoring session");
 
-        // The new column is writable, and NULL vs a session id are distinguishable.
-        conn.execute(
-            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, author_session)
-             VALUES ('t.a', 1, 'evt-2', 'cli', 124, '{}', 's-agent')",
-            [],
-        )
-        .unwrap();
-        let author: Option<String> = conn
-            .query_row(
-                "SELECT author_session FROM event WHERE event_id = 'evt-2'",
-                [],
-                |r| r.get(0),
-            )
+        let (count, max_offset): (i64, i64) = conn
+            .query_row("SELECT COUNT(*), MAX(offset) FROM event", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
-        assert_eq!(author.as_deref(), Some("s-agent"));
+        assert_eq!(count, 2, "no event is lost when the column is dropped");
+        assert_eq!(
+            max_offset, 1,
+            "offsets survive, so the next publish appends"
+        );
+
+        // The column is genuinely gone: nothing can read (or start writing) it again.
+        let err = conn.query_row("SELECT author_session FROM event", [], |r| {
+            r.get::<_, i64>(0)
+        });
+        assert!(
+            err.is_err(),
+            "event.author_session must not exist after the v6 migration"
+        );
     }
 
     #[test]

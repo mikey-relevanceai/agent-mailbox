@@ -27,18 +27,6 @@ use crate::control::{
 };
 use crate::serve;
 
-/// Exit code for a REFUSED publish ("you have unread mail on this topic; read first").
-///
-/// Its own code, because it is not a failure: nothing was written, nothing is broken,
-/// and the remedy is defined (`mailbox read`, then retry). It used to exit 1 — the
-/// same code as "the bridge is down" — so a scripted publisher could not tell "retry
-/// after reading" from a real error without string-matching stderr.
-///
-/// **Not 2**: 2 is the wake code (`wait`/`arm`), and Claude Code treats an exit 2 from
-/// an asyncRewake hook as "wake this session". Reusing it here would be a category
-/// error. Clap's own usage errors also exit 2, which is another reason to keep away.
-const PUBLISH_REFUSED_EXIT: u8 = 3;
-
 /// How a command renders its result on stdout.
 ///
 /// A named enum rather than a bare `bool` threaded through every handler, so a
@@ -156,14 +144,6 @@ impl SessionOpt {
             env_session(ENV_MAILBOX_SESSION),
             env_session(ENV_CLAUDE_SESSION),
         )
-    }
-
-    /// Resolve the session where having none is LEGAL — the `publish` path, whose
-    /// caller may be an adapter or a plain script with no session anywhere. `None`
-    /// is the adapter contract (kick every subscriber; no caller-aware rules), so it
-    /// must not be an error the way it is for a session-scoped command.
-    pub fn resolve_optional(&self) -> Option<SessionId> {
-        self.resolve().ok()
     }
 }
 
@@ -287,19 +267,17 @@ pub struct InstallSkillsArgs {
 
 /// Arguments to `publish`.
 ///
-/// The session is resolved like every other session-scoped command, but is
-/// **optional**: an adapter (or any script outside a Claude Code session) has no
-/// session id anywhere, and publishing must keep working exactly as it always has
-/// for it. A resolved session turns on the two caller-aware rules — be caught up to
-/// speak, and never wake yourself — in [`crate::serve`].
+/// It takes no session, by design (ADR-0018). `publish` has ONE rule — the event goes
+/// to the topic and wakes every subscriber, its author included — so who is calling
+/// changes nothing, and an adapter, an agent and a script an agent spawned all use
+/// the same command with the same effect.
 ///
-/// `--no-session` publishes ANONYMOUSLY on purpose. It matters because Claude Code
-/// exports `$CLAUDE_CODE_SESSION_ID` into every process an agent spawns — a build
-/// script, a git hook, a subagent — so such a process's `publish` is otherwise
-/// attributed to the AGENT, and an agent is never woken by its own message. Any
-/// process the agent spawned that publishes on the agent's behalf should pass
-/// `--no-session`, so the event has no author and wakes every subscriber, the agent
-/// included.
+/// This is why there is no `--no-session` flag any more. It existed because the
+/// caller's identity WAS load-bearing: Claude Code exports `$CLAUDE_CODE_SESSION_ID`
+/// into every process an agent spawns, so a build script's publish was attributed to
+/// the agent — which (under the old rules) gagged it behind the agent's unread mail
+/// and did not wake the agent. Neither rule survives, so neither does the escape
+/// hatch from them.
 #[derive(Args, Debug)]
 pub struct PublishArgs {
     /// Topic to publish to (e.g. `github.pr.owner/repo#42`).
@@ -310,15 +288,6 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
-    /// Publish with NO authoring session, ignoring `--session` and the ambient
-    /// `$CLAUDE_CODE_SESSION_ID` / `$MAILBOX_SESSION_ID`. The event then belongs to
-    /// nobody, so the "be caught up to speak" rule does not apply to it. Use it from
-    /// any script/hook/subagent an agent spawns, so that process's work is not
-    /// attributed to whichever session id it happened to inherit.
-    #[arg(long, conflicts_with = "session")]
-    pub no_session: bool,
-    #[command(flatten)]
-    pub session: SessionOpt,
 }
 
 #[derive(Args, Debug)]
@@ -479,32 +448,20 @@ async fn run_serve() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `publish`: append an event to a topic.
+/// `publish`: append an event to a topic, waking every subscriber to it.
 ///
-/// The caller's session is resolved when there IS one (an agent's shell always has
-/// `$CLAUDE_CODE_SESSION_ID`), and carried on the wire. That is what lets the bridge
-/// apply the two caller-aware rules — refuse a publish from a caller with unread on
-/// that topic, and never kick the publisher for its own event (ADR-0006 / §Publish
-/// in docs/04-usage.md). With no session (an adapter, a cron script) the publish
-/// behaves exactly as it always did: no unread rule, kick every subscriber.
+/// One rule, no caller-aware behaviour (ADR-0018): the publish does not resolve a
+/// session, so it cannot be refused, gagged, or filtered by who ran it.
 async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<ExitCode> {
     let topic = parse_topic(&args.topic)?;
     let body: serde_json::Value =
         serde_json::from_str(&args.body).context("--body must be valid JSON")?;
-    // `--no-session` deliberately drops the ambient identity: the caller is a script
-    // an agent spawned, not the agent, and it must NOT publish as it (see PublishArgs).
-    let session = if args.no_session {
-        None
-    } else {
-        args.session.resolve_optional()
-    };
     request(
         format,
         Request::Publish {
             topic,
             adapter: AdapterId(args.adapter),
             body,
-            session,
         },
     )
     .await
@@ -726,13 +683,7 @@ async fn request(format: OutputFormat, request: Request) -> anyhow::Result<ExitC
     } else {
         render_human(&response);
     }
-    // A refused publish is the ONE serviced, non-error outcome with its own exit code:
-    // "you are not caught up; read and retry" is not a failure, and a scripted
-    // publisher must be able to tell it from one (FIX 6). Everything else is success.
-    Ok(match &response {
-        Response::PublishRefused { .. } => ExitCode::from(PUBLISH_REFUSED_EXIT),
-        _ => ExitCode::SUCCESS,
-    })
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Build the edge error. In JSON mode it first prints the TYPED
@@ -891,15 +842,6 @@ fn render_human(response: &Response) {
             adapters_stopped,
         } => println!(
             "ended session (subscriptions dropped={subscriptions_dropped}, interests dropped={interests_dropped}, adapters stopped={adapters_stopped})"
-        ),
-        // Be caught up to speak. Named counts, the topic, and the ONE command that
-        // fixes it: an agent must be able to act on this without guessing. Nothing was
-        // written, so it can simply read and retry. Printed on stdout (it is this
-        // command's result, not an error), and the exit code says so too.
-        Response::PublishRefused { topic, unread } => println!(
-            "refused: you have {unread} unread event(s) on {} — run `mailbox read` first, then \
-             publish again (nothing was published)",
-            topic.as_str()
         ),
         // Error is handled before rendering; nothing to print here.
         Response::Error { message } => eprintln!("error: {message}"),

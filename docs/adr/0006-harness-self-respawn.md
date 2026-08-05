@@ -1,10 +1,14 @@
 # ADR-0006: Harness wake loop — re-arm exit, waiter-owned pidfile, arm-iff-subscribed
 
-- Status: **Superseded by [ADR-0008](0008-on-demand-wake-filechanged.md); the `arm` and
-  `wait` commands it describes have been REMOVED.** What survives is the waiter
-  pidfile (still written by the watcher, still the liveness signal for ADR-0009) and
-  the publish rules. Everything about the periodic re-arm — `max_block`, the exit-2
-  boundary, the arm decision, exec-into-waiter — is gone from the code.
+- Status: **Fully superseded. Nothing decided here is still in force.** The `arm` and
+  `wait` commands are REMOVED ([ADR-0008](0008-on-demand-wake-filechanged.md)); the
+  waiter pidfile is gone ([ADR-0017](0017-daemon-bumps-the-sentinel.md)); and §8's
+  **publish rules are deleted** ([ADR-0018](0018-publish-has-one-rule.md)) — "be
+  caught up to speak", the author stamp and `--no-session` no longer exist, and the
+  no-self-wake half was already reversed by
+  [ADR-0014](0014-self-authored-events-wake-their-author.md). Read this only as
+  history: it records WHY those mechanisms were built, which is the part worth not
+  rediscovering.
 
   Original status note: **Partially superseded by [ADR-0008](0008-on-demand-wake-filechanged.md).**
   The **periodic re-arm** (the `Stop` → `arm` → exit-2-at-`max_block` loop) is
@@ -166,7 +170,11 @@ the `serve` daemon's stderr. The benign `AlreadyWaiting` lock-race loser — the
 *expected* outcome of the single-waiter invariant — is logged at `info`, not `error`;
 logging it as a failure sent a bug reporter down a dead end.
 
-**8. The publish rules (and what they may NOT do).** A session-aware `publish` is
+**8. The publish rules (and what they may NOT do).** *(Deleted by
+[ADR-0018](0018-publish-has-one-rule.md) — a publish now resolves no caller and is
+never refused. The paragraph is kept because the adv-2 failure it describes is the
+reason nothing may advance a cursor behind a session's back, which IS still in force.)*
+A session-aware `publish` is
 REFUSED if the caller has unread events on that topic **that it did not author**, and
 the publisher is never kicked for its own event. It may **not** advance anyone's cursor:
 an earlier version marked the publisher's own event read, and since the publisher is

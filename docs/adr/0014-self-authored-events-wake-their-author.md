@@ -1,9 +1,15 @@
 # ADR-0014: A self-authored event wakes its author
 
-- Status: Accepted
+- Status: Accepted — and now the ONLY publish rule.
 - Date: 2026-07-21
 - Amends: [ADR-0006](0006-harness-self-respawn.md) (the publish rules). Rule 1, "be
   caught up to speak", is unchanged. Rule 2, "no self-wake", is **reversed**.
+- Amended by: [ADR-0018](0018-publish-has-one-rule.md). The decision below stands
+  unchanged — an event wakes every subscriber, its author included — but everything
+  this ADR says about rule 1 surviving, about `event.author_session` remaining as
+  provenance, and about `--no-session` narrowing in meaning is **out of date**: rule 1,
+  the column and the flag are all deleted. Authorship is no longer recorded at all, so
+  "it no longer participates in the wake decision" is now true by construction.
 
 ## Context
 

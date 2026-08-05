@@ -443,70 +443,47 @@ override but do not need it.
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
-| `mailbox publish <topic> [--body <json>] [--adapter <id>] [--no-session]` | Publish an event to a topic (see the rules below). `--no-session` publishes anonymously — use it from any script/hook/subagent the agent spawns. |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). |
 | `mailbox whoami [--json]` | Print this session's id and inbox topic. Works with the bridge down. |
 | `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). |
 | `mailbox agents [--json]` | List the agents you can `send` to. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
 
-### Publishing: two rules for agents (adapters are unaffected)
+### Publishing: one rule
 
-`publish` resolves *you* the same way every other command does, so a publish from an
-agent is attributed to that agent's session — the event carries your session id as its
-**author**. Two rules follow, and they only apply to a **topic you subscribe to**:
+**An event goes to the topic and wakes every subscriber — its author included.**
+That is the whole of it ([ADR-0018](adr/0018-publish-has-one-rule.md)).
 
-1. **Be caught up to speak.** A publish is **refused** (exit **3**, nothing written) if
-   you have unread events on that topic **that someone else wrote**. You would be
-   talking past mail you have not read.
-
-   ```text
-   refused: you have 3 unread event(s) on gibson — run `mailbox read` first, then
-   publish again (nothing was published)
-   ```
-
-   Run `mailbox read`, react to what is there, then publish. Nothing was lost — the
-   event you tried to send was simply not written, so just publish it again.
-
-   Exit **3** is the refusal's own code, so a script can tell it apart from a real
-   failure (a bridge that is down is still exit 1). It is never exit 2 — that is the
-   wake code.
-
-2. **Your own message wakes you too.** The publish wakes every subscriber to the
-   topic, you included ([ADR-0014](adr/0014-self-authored-events-wake-their-author.md)).
-   Authorship records *who published*, not *what you already know*: the same PR
-   transition arriving from a `github-pr` watch has no author at all and has always
-   woken you, even when you caused it by pushing the commit. Waking on one and not the
-   other was the inconsistency.
-
-   Your own event is ordinary mail: it stays unread, `mailbox read` returns it, and
-   `mailbox status` counts it — all three now agree. The one thing it does not do is
-   *gag* you: rule 1 ignores what you wrote, so your own message can never block your
-   next publish.
-
-**Adapters are exempt from rule 1.** An adapter has no session, so no unread rule
-applies to its publishes. That is the point of a mailbox — a poller must be able to
-publish into a topic whose subscribers are far behind.
-
-### `--no-session`: publishing from a script the agent spawned
-
-Claude Code exports `$CLAUDE_CODE_SESSION_ID` into **every process an agent spawns** — a
-build script, a git hook, a subagent. So a `mailbox publish` from any of them is
-attributed to the *agent*, and by rule 2 it will not wake the agent.
-
-Pass **`--no-session`** from any such process:
+`publish` does not resolve who is calling, and nothing about a publish depends on it.
+An adapter, an agent, and a build script the agent spawned all run the same command
+with the same effect. There is no refusal, no exit code to handle, and no flag to
+remember when something you spawned needs to publish:
 
 ```bash
-# in a build script / git hook / subagent the agent spawned
-mailbox publish ci.builds --no-session --body '{"build":"failed"}'
+# from the agent, from a git hook, from a subagent — identical
+mailbox publish ci.builds --body '{"build":"failed"}'
 ```
 
-The event is then authored by **nobody**: no unread rule applies to it, and it wakes
-**every** subscriber — the agent included. This is the right flag for anything that
-publishes *on the agent's behalf* rather than *as* the agent.
+**Your own message wakes you too**
+([ADR-0014](adr/0014-self-authored-events-wake-their-author.md)). Publishing is not
+evidence of what you know: the same PR transition arriving from a `github-pr` watch has
+no author at all and has always woken you, even when you caused it by pushing the
+commit. Your own event is ordinary mail — it stays unread, `mailbox read` returns it,
+and `mailbox status` counts it. The wake stops as soon as you read, like any other.
 
-Without it, the message is still durable and still visible (it is unread for the agent,
-and `mailbox read` returns it) — it just will not *wake* the session it was
-mis-attributed to.
+**Publishing never marks anything read.** Only a `read` moves a cursor, for you or for
+anyone else.
+
+Two rules used to live here and are gone:
+
+- *"Be caught up to speak"* refused a publish (exit 3) from a caller with unread mail on
+  the topic. It blocked a **write** because of the writer's **read** state, and it
+  decided who the writer was from `$CLAUDE_CODE_SESSION_ID` — which Claude Code exports
+  into every process an agent spawns, so a build script was gagged by its parent
+  agent's inbox.
+- *`--no-session`* was the escape hatch from that mis-attribution (and, before
+  ADR-0014, from not waking yourself). With neither rule left, it had nothing to opt
+  out of.
 
 ---
 
