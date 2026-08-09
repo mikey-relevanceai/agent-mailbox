@@ -267,6 +267,27 @@ impl Env {
         self.db_path.parent().unwrap().join("claude-sessions")
     }
 
+    /// Register `session` as a Claude Code session that Claude Code gave NO inbox
+    /// socket — a session nothing can wake.
+    pub fn register_socketless(&self, session: &str) {
+        let dir = self.sessions_dir();
+        std::fs::create_dir_all(&dir).expect("create fake sessions dir");
+        std::fs::write(
+            dir.join(format!("{session}.json")),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "sessionId": session,
+                "cwd": "/tmp",
+                "status": "idle",
+                "name": session,
+                "peerProtocol": 1,
+                "updatedAt": 1_786_000_000_000i64,
+            })
+            .to_string(),
+        )
+        .expect("write fake session registry entry");
+    }
+
     /// Register `session` as a Claude Code session with a bound inbox socket, and
     /// start listening on it — the wake path's happy path (ADR-0020/0021).
     pub fn register_peer(&self, session: &str) -> FakePeer {
@@ -368,6 +389,9 @@ impl Env {
             .args(args)
             .env("AGENT_MAILBOX_DB", &self.db_path)
             .env("CLAUDE_CODE_SESSION_ID", session)
+            // Client commands read the registry too (subscribe/watch refuse when the
+            // caller cannot be woken), so they must see the TEST one.
+            .env("MAILBOX_CLAUDE_SESSIONS_DIR", self.sessions_dir())
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")

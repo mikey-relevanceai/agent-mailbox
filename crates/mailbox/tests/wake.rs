@@ -143,3 +143,83 @@ fn a_subscriber_with_nothing_unread_is_not_woken() {
 
     peer.expect_silence(Duration::from_millis(500));
 }
+
+// ==== the refusal: an agent is told it cannot be woken while it can still hear ====
+
+/// `subscribe` and `watch` mean "tell me when this changes". If Claude Code gave this
+/// session no inbox socket, that promise cannot be kept — and the ONE moment the agent
+/// can be told is while it is still awake, asking. So the request fails loudly with the
+/// remedy, rather than succeeding and leaving it to wait forever on a wake that will
+/// never come.
+#[test]
+fn subscribe_refuses_for_a_session_that_nothing_could_wake() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "no-inbox";
+
+    env.register_socketless(session);
+
+    let out = env.run_as(session, &["subscribe", "stub.demo"]);
+
+    assert!(
+        !out.status.success(),
+        "subscribing a session nothing can wake must FAIL, not silently succeed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no Claude Code inbox socket"),
+        "the failure must say what is wrong: {stderr}"
+    );
+    assert!(
+        stderr.contains("Restart the session"),
+        "and it must say what to do about it: {stderr}"
+    );
+}
+
+/// The same gate on `watch`, which is the command whose entire purpose is being woken.
+#[test]
+fn watch_refuses_for_a_session_that_nothing_could_wake() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "no-inbox-watch";
+
+    env.register_socketless(session);
+
+    let out = env.run_as(session, &["watch", "stub", "demo"]);
+
+    assert!(!out.status.success(), "watch must refuse too");
+    guard.assert_clean();
+}
+
+/// A session with a socket is exactly as usable as before — the gate must not become
+/// a tax on the working case.
+#[test]
+fn subscribe_succeeds_for_a_session_with_an_inbox() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "has-inbox";
+
+    let _inbox = env.register_peer(session);
+
+    env.run_as_ok(session, &["subscribe", "stub.demo"], "subscribe");
+}
+
+/// A session Claude Code has NOT registered is not necessarily unwakeable — it may be
+/// a harness that is not Claude Code at all. Only an explicit "registered, and given no
+/// socket" is unambiguous enough to refuse on, so an unknown session is let through.
+#[test]
+fn subscribe_allows_a_session_claude_code_has_never_heard_of() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+
+    // No register_peer, no register_socketless: absent from the registry entirely.
+    env.run_as_ok("stranger", &["subscribe", "stub.demo"], "subscribe");
+}

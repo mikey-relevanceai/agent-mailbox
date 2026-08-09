@@ -425,7 +425,7 @@ async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<
     request(
         format,
         Request::Subscribe {
-            session: resolve_session_or_fail(format)?,
+            session: resolve_wakeable_session_or_fail(format)?,
             topic,
             // An explicit `mailbox subscribe` from a live turn: unguarded, and it
             // clears any tombstone (proof-of-life, ADR-0007). Only the automatic
@@ -568,12 +568,12 @@ async fn run_topics(format: OutputFormat, args: TopicsArgs) -> anyhow::Result<Ex
 async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<ExitCode> {
     let req = match args.target {
         WatchTargetCmd::GithubPr(gh) => Request::Watch {
-            session: resolve_session_or_fail(format)?,
+            session: resolve_wakeable_session_or_fail(format)?,
             target: parse_pr_spec(&gh.spec)?,
             interval_secs: gh.interval,
         },
         WatchTargetCmd::Stub(stub) => Request::WatchStub {
-            session: resolve_session_or_fail(format)?,
+            session: resolve_wakeable_session_or_fail(format)?,
             // Validate the label at the edge (same as the daemon) so a bad label
             // is a clean local error, not a round-trip.
             label: parse_stub_label(&stub.label)?,
@@ -727,6 +727,54 @@ fn fail(format: OutputFormat, message: &str) -> anyhow::Error {
 /// exit 2 — a resolution failure is an error, not a wake.
 fn resolve_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
     resolve_session().map_err(|err| fail(format, &format!("{err:#}")))
+}
+
+/// Resolve the calling session AND refuse if nothing could ever wake it (ADR-0021).
+///
+/// # Why this refuses rather than warning
+///
+/// `subscribe` and `watch` mean one thing: *tell me when this changes*. An agent that
+/// runs one and then goes idle is making a promise to itself that the bridge cannot
+/// keep if Claude Code bound it no inbox socket — it will sit there forever, and the
+/// mail it is waiting for will pile up unread with nothing to announce it.
+///
+/// That is precisely the silent deafness this project has spent eighteen ADRs chasing,
+/// and the one moment it can be caught is HERE: the agent is awake, it is asking to be
+/// woken, and it can still be told that it cannot be. A warning on stderr would be
+/// read by nobody in an unattended session. So the request fails, loudly, with the
+/// remedy attached.
+///
+/// The mail itself is unaffected either way — `publish` and `read` do not go through
+/// here, so a session that cannot be woken can still be sent to and can still read.
+fn resolve_wakeable_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
+    let session = resolve_session_or_fail(format)?;
+
+    // A registry we cannot read at all is not evidence of anything — do not refuse on
+    // it. The daemon logs the same condition per publish, and `doctor` reports it.
+    let Ok(registry) = mailbox::claude_registry::ClaudeRegistry::open() else {
+        return Ok(session);
+    };
+    if registry.inbox_socket(&session).is_some() {
+        return Ok(session);
+    }
+    // Equally: a session Claude Code has not registered at all is not necessarily
+    // unwakeable — it may be a harness that is not Claude Code. Only refuse when
+    // Claude Code KNOWS this session and gave it no socket, which is unambiguous.
+    if registry.get(&session).is_none() {
+        return Ok(session);
+    }
+
+    Err(fail(
+        format,
+        &format!(
+            "{} has no Claude Code inbox socket, so nothing can wake it — subscribing \
+             would leave you waiting on mail you would never be told about.\n{}",
+            session.as_str(),
+            mailbox::doctor::Reachability::NoInbox
+                .remedy()
+                .unwrap_or_default()
+        ),
+    ))
 }
 
 /// A short "what was being attempted" label for a failed request, for the stderr
