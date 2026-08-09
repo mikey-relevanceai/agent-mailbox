@@ -52,7 +52,7 @@
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,7 +175,20 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     let storage = Storage::open(config.clone()).await?;
     let sentinel_root = mailbox::sentinel::root_from_env()
         .map_err(|e| anyhow::anyhow!("could not resolve the wake sentinel root: {e}"))?;
-    let bus = Bus::with_waker(storage.clone(), Waker::new(&sentinel_root));
+    // Claude Code's sessions directory is the PEER channel's lookup (ADR-0020).
+    // Unresolvable is NOT fatal, unlike the sentinel root: it only means no session is
+    // reachable by socket, and every subscriber falls back to the sentinel — which is
+    // exactly the pre-ADR-0020 behaviour, and the state of most sessions anyway while
+    // Claude Code's `agents_cross_session_inbox` gate is a partial rollout.
+    let sessions_dir = mailbox::claude_registry::sessions_dir_from_env().unwrap_or_else(|e| {
+        warn!(
+            error = %e,
+            "could not resolve Claude Code's sessions directory; every subscriber will \
+             wake through its sentinel instead of its inbox socket"
+        );
+        PathBuf::new()
+    });
+    let bus = Bus::with_waker(storage.clone(), Waker::new(&sentinel_root, &sessions_dir));
 
     // 4. Build the watch supervisor with the default resolver: a `stub` watch
     //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the

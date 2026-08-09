@@ -36,15 +36,42 @@
 // changing behaviour), so folding them in is deferred to avoid churning green suites.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
+
+/// A stand-in for a Claude Code session listening on its inbox socket, created by
+/// [`Env::register_peer`].
+///
+/// Only the receiving half is exposed: what a test needs to know is whether the
+/// daemon delivered a wake here, and what was in it.
+pub struct FakePeer {
+    rx: mpsc::Receiver<String>,
+}
+
+impl FakePeer {
+    /// The next frame delivered to this session's inbox, or `None` if none arrives
+    /// within `timeout`.
+    pub fn next_frame(&self, timeout: Duration) -> Option<Value> {
+        let line = self.rx.recv_timeout(timeout).ok()?;
+        serde_json::from_str(line.trim_end()).ok()
+    }
+
+    /// Assert that NOTHING is delivered here within `timeout`. Used to prove the
+    /// peer channel stayed silent — e.g. for a session with nothing unread.
+    pub fn expect_silence(&self, timeout: Duration) {
+        if let Ok(line) = self.rx.recv_timeout(timeout) {
+            panic!("expected no peer delivery, but the inbox received: {line}");
+        }
+    }
+}
 
 // ---- binary locations ---------------------------------------------------------
 
@@ -198,6 +225,60 @@ impl Env {
         self.db_path.parent().unwrap().join("sentinel")
     }
 
+    /// The fake Claude Code sessions directory for this env, under the tempdir.
+    /// ALWAYS passed as `MAILBOX_CLAUDE_SESSIONS_DIR` to the daemon, so a test can
+    /// NEVER read the developer's real `~/.claude/sessions` — and, far worse, never
+    /// deliver a wake onto a real session's inbox socket (ADR-0020).
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.db_path.parent().unwrap().join("claude-sessions")
+    }
+
+    /// Register `session` as a Claude Code session with a bound inbox socket, and
+    /// start listening on it — the peer channel's happy path (ADR-0020).
+    ///
+    /// The socket lives directly under the tempdir root rather than in a nested
+    /// directory, because a Unix socket path is capped near 104 bytes on macOS and a
+    /// deep temp path plus a session id blows through it.
+    pub fn register_peer(&self, session: &str) -> FakePeer {
+        let dir = self.sessions_dir();
+        std::fs::create_dir_all(&dir).expect("create fake sessions dir");
+        let socket = self
+            .db_path
+            .parent()
+            .unwrap()
+            .join(format!("{session}.sock"));
+
+        let listener = UnixListener::bind(&socket).expect("bind fake inbox socket");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Serve every connection: the daemon opens a fresh one per delivery.
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                if BufReader::new(stream).read_line(&mut line).is_ok() && tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::fs::write(
+            dir.join(format!("{session}.json")),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "sessionId": session,
+                "cwd": "/tmp",
+                "status": "idle",
+                "name": session,
+                "peerProtocol": 1,
+                "updatedAt": 1_786_000_000_000i64,
+                "messagingSocketPath": socket,
+            })
+            .to_string(),
+        )
+        .expect("write fake session registry entry");
+
+        FakePeer { rx }
+    }
+
     /// The absolute sentinel file path for `session` (its encoded id is itself for the
     /// safe ids the tests use).
     pub fn sentinel_path(&self, session: &str) -> PathBuf {
@@ -264,6 +345,10 @@ impl Env {
             // tempdir root — without this a test would bump files under the
             // developer's real ~/.mailbox.
             .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
+            // Likewise for the PEER channel (ADR-0020): without this the daemon would
+            // read the developer's real ~/.claude/sessions and could deliver a test's
+            // wake onto a real Claude Code session's inbox socket.
+            .env("MAILBOX_CLAUDE_SESSIONS_DIR", self.sessions_dir())
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_adapter_bin())
             .env("MAILBOX_GH_ADAPTER_BIN", github_pr_adapter_bin())
             .env("MAILBOX_GH_BIN", &self.fake_gh)

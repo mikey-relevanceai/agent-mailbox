@@ -1,18 +1,33 @@
 //! The wake path: telling an idle Claude Code session that mail has arrived.
 //!
-//! # The whole mechanism, in one line
+//! # Two channels, tried in order (ADR-0020)
 //!
-//! `publish` → the `serve` daemon writes the subscriber's sentinel file → Claude
-//! Code's `FileChanged` hook fires → `mailbox harness wake` exits 2 → the idle
-//! session takes a turn.
+//! ```text
+//! publish → has this subscriber a bound Claude Code inbox socket?
+//!           ├─ yes → write the socket; the idle session takes a turn
+//!           └─ no  → write its sentinel → `FileChanged` → `mailbox harness wake`
+//!                    exits 2 → the idle session takes a turn
+//! ```
 //!
-//! That is two live components (the daemon and Claude Code) and one file. It used
-//! to be five: a per-session FIFO, a detached watcher process blocked on it, a
-//! single-waiter advisory lock, a waiter pidfile, and the sentinel. The watcher
-//! existed only to turn a kick into a file write — work the daemon can do itself,
-//! in the same process that just committed the event — and every one of those
-//! pieces could fail silently, leaving the agent deaf with nothing reporting it
-//! (ADR-0017).
+//! The **peer channel** is one hop and is preferred. The **sentinel channel** is
+//! everything ADR-0008 and ADR-0017 describe, and it stays because Claude Code's
+//! `agents_cross_session_inbox` gate decides which sessions bind a socket and
+//! **cannot be turned on from outside Claude Code** — on the machine this was
+//! designed against, 2 of 19 live sessions had one, across identical versions.
+//!
+//! The sentinel path used to be five moving parts: a per-session FIFO, a detached
+//! watcher process blocked on it, a single-waiter advisory lock, a waiter pidfile,
+//! and the sentinel. Every one could fail silently, leaving the agent deaf with
+//! nothing reporting it (ADR-0017).
+//!
+//! # The two channels are not equally forgiving
+//!
+//! On the sentinel channel the write is only a TRIGGER: the woken hook re-reads the
+//! store and exits 0 if there is nothing unread, so a spurious bump costs a hook
+//! process and no model turn. On the peer channel **delivery IS the wake** — there
+//! is no second opinion between the socket write and the agent taking a turn. So a
+//! peer message is sent only when there is genuinely something to report; see
+//! [`Waker::deliver`].
 //!
 //! # What crosses the boundary (and what does not)
 //!
@@ -24,8 +39,8 @@
 //! # Two sides, two types
 //!
 //! - [`Waker`] is the DAEMON side: given a session and its currently-unread topics,
-//!   write them into that session's sentinel. Held by the [`crate::bus`], used on
-//!   every publish.
+//!   deliver on whichever channel that session supports. Held by the [`crate::bus`],
+//!   used on every publish.
 //! - [`SessionMail`] is the HOOK side: a read-only view of one session's unread
 //!   mail, used by the `FileChanged` wake hook to decide whether to wake (exit 2),
 //!   by `SessionStart` to arm the sentinel, and by the `Stop` hook for the ADR-0012
@@ -34,12 +49,14 @@
 //! They never talk to each other; the durable store and the sentinel file are the
 //! only things between them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
 use mailbox_protocol::Topic;
 
+use crate::claude_registry::ClaudeRegistry;
+use crate::peer::{self, PeerDeliveryError};
 use crate::sentinel::{RetriggerRecord, Sentinel, SentinelError};
 use crate::storage::{ReadOnlyStore, SessionId, StorageError, Unread, WakeWatermark};
 
@@ -120,23 +137,61 @@ pub fn needs_retrigger(record: RetriggerRecord, high_water: WakeWatermark) -> bo
     }
 }
 
-/// The DAEMON side of wake: writes a session's unread topic set into its sentinel,
-/// which is what makes that session's `FileChanged` hook fire.
+/// Which channel carried one session's wake, and what went wrong on the way
+/// (ADR-0020).
 ///
-/// Cheap to clone; it holds only the sentinel root. It never opens the database —
+/// Returned rather than logged in place so [`Waker::wake_all`] can aggregate, and so
+/// a test can assert the FALLBACK branch directly instead of inferring it from a file
+/// mtime. Every variant carries what a reader needs to explain the outcome.
+#[derive(Debug)]
+pub enum WakeOutcome {
+    /// Delivered on the session's inbox socket. One hop; no hook involved.
+    Peer,
+
+    /// The session has no usable socket, so the sentinel was written and the
+    /// `FileChanged` path takes over. The ordinary case wherever the
+    /// `agents_cross_session_inbox` gate has not reached.
+    Sentinel,
+
+    /// The socket was registered but would not take the frame, and the sentinel
+    /// carried the wake instead. Expected transiently: a session can exit between
+    /// the registry read and the write.
+    SentinelAfterPeerFailure { peer_error: PeerDeliveryError },
+
+    /// Nothing landed on either channel. The event is still durable and surfaces on
+    /// the session's next `read`, `SessionStart` arm, or turn-boundary re-trigger.
+    Undelivered {
+        peer_error: Option<PeerDeliveryError>,
+        sentinel_error: SentinelError,
+    },
+}
+
+/// The DAEMON side of wake: delivers a session's unread topic set on whichever
+/// channel that session supports — its inbox socket, or its sentinel.
+///
+/// Cheap to clone; it holds only two directory paths. It never opens the database —
 /// it is handed the sessions to wake and what they have unread.
 #[derive(Debug, Clone)]
 pub struct Waker {
     sentinel_root: PathBuf,
+    sessions_dir: PathBuf,
 }
 
 impl Waker {
     /// Build a waker over the resolved sentinel root (`~/.mailbox` by default; see
-    /// [`crate::sentinel`]). The root is resolved ONCE, by the daemon at startup,
-    /// rather than re-read from the environment per publish.
-    pub fn new(sentinel_root: impl Into<PathBuf>) -> Self {
+    /// [`crate::sentinel`]) and Claude Code's sessions directory (`~/.claude/sessions`
+    /// by default; see [`crate::claude_registry`]).
+    ///
+    /// Both are resolved ONCE, by the daemon at startup, rather than re-read from the
+    /// environment per publish — which also means a test can point them at a tempdir
+    /// and never touch the developer's real `~/.claude` or `~/.mailbox`.
+    ///
+    /// The sessions directory is a PATH, not a registry: its *contents* are re-read on
+    /// every publish, because sessions start, stop and resume constantly.
+    pub fn new(sentinel_root: impl Into<PathBuf>, sessions_dir: impl Into<PathBuf>) -> Self {
         Self {
             sentinel_root: sentinel_root.into(),
+            sessions_dir: sessions_dir.into(),
         }
     }
 
@@ -157,36 +212,117 @@ impl Waker {
         Sentinel::under_root(&self.sentinel_root, session).write_topics(unread)
     }
 
+    /// Deliver one session's wake on the best channel available to it.
+    ///
+    /// `socket` is that session's inbox socket if Claude Code bound one — see
+    /// [`ClaudeRegistry::inbox_socket`]. Passing it in (rather than looking it up
+    /// here) keeps the channel decision a pure function of its inputs, so every
+    /// branch below is testable without a registry on disk.
+    ///
+    /// # Why an empty topic set never goes on the peer channel
+    ///
+    /// The sentinel is a TRIGGER — the woken hook re-reads the store and exits 0 when
+    /// there is nothing unread, so writing an empty set is harmless and is what keeps
+    /// the file's contents agreeing with reality. The peer channel has no such second
+    /// opinion: the message IS the turn. Sending "you have mail" when the session has
+    /// none would spend a model turn to say nothing, which is the exact cost this
+    /// whole subsystem exists to avoid. So an empty set takes the sentinel path only.
+    pub fn deliver(
+        &self,
+        session: &SessionId,
+        unread: &[Topic],
+        socket: Option<&Path>,
+    ) -> WakeOutcome {
+        if let Some(socket) = socket.filter(|_| !unread.is_empty()) {
+            match peer::deliver(socket, &reminder(unread)) {
+                Ok(()) => return WakeOutcome::Peer,
+                Err(peer_error) => {
+                    // Fall through to the sentinel: a registered socket that will not
+                    // take the frame is a session that went away between the registry
+                    // read and now, and the fallback still reaches it if its hooks are
+                    // installed.
+                    return match self.wake(session, unread) {
+                        Ok(()) => WakeOutcome::SentinelAfterPeerFailure { peer_error },
+                        Err(sentinel_error) => WakeOutcome::Undelivered {
+                            peer_error: Some(peer_error),
+                            sentinel_error,
+                        },
+                    };
+                }
+            }
+        }
+
+        match self.wake(session, unread) {
+            Ok(()) => WakeOutcome::Sentinel,
+            Err(sentinel_error) => WakeOutcome::Undelivered {
+                peer_error: None,
+                sentinel_error,
+            },
+        }
+    }
+
     /// Wake every session in `unread_by_session`, then log the aggregate outcome.
     ///
-    /// Payload-free: `topic` is used only for the log line. With zero sessions this
-    /// logs `bumped=0` — an honest "nothing to wake", not a misleading claim.
-    ///
-    /// A failure to write one session's sentinel is logged and skipped: the event is
-    /// already durable, so it must never fail a publish, and the other subscribers
-    /// still get their wake.
+    /// Reads Claude Code's session registry ONCE per publish and never caches it:
+    /// sessions start, stop and resume constantly, and a wake delivered to a socket
+    /// that closed a minute ago is a lost wake. A directory that does not exist (no
+    /// Claude Code on this machine) yields an empty registry, which puts every
+    /// subscriber on the sentinel channel — the pre-ADR-0020 behaviour.
     pub fn wake_all(&self, unread_by_session: &[(SessionId, Vec<Topic>)], topic: &Topic) {
-        let mut bumped = 0usize;
-        let mut failed = 0usize;
+        let registry = ClaudeRegistry::read_dir(&self.sessions_dir);
+        self.wake_all_with_registry(unread_by_session, topic, &registry);
+    }
+
+    /// The injectable core of [`Waker::wake_all`], taking the registry rather than
+    /// reading it, so the two-channel behaviour is testable against a fixture.
+    ///
+    /// Payload-free: `topic` is used only for the log line. With zero sessions this
+    /// logs all-zero counts — an honest "nothing to wake", not a misleading claim.
+    ///
+    /// A failure for one session is logged and skipped: the event is already durable,
+    /// so delivery must never fail a publish, and the other subscribers still get
+    /// their wake.
+    pub fn wake_all_with_registry(
+        &self,
+        unread_by_session: &[(SessionId, Vec<Topic>)],
+        topic: &Topic,
+        registry: &ClaudeRegistry,
+    ) {
+        let (mut peer, mut sentinel, mut fell_back, mut failed) = (0usize, 0usize, 0usize, 0usize);
+
         for (session, unread) in unread_by_session {
-            match self.wake(session, unread) {
-                Ok(()) => bumped += 1,
-                Err(err) => {
+            match self.deliver(session, unread, registry.inbox_socket(session)) {
+                WakeOutcome::Peer => peer += 1,
+                WakeOutcome::Sentinel => sentinel += 1,
+                WakeOutcome::SentinelAfterPeerFailure { peer_error } => {
+                    fell_back += 1;
+                    warn!(
+                        session = session.as_str(),
+                        error = %peer_error,
+                        "a subscriber's inbox socket refused the wake; fell back to its sentinel"
+                    );
+                }
+                WakeOutcome::Undelivered {
+                    peer_error,
+                    sentinel_error,
+                } => {
                     failed += 1;
                     warn!(
                         session = session.as_str(),
-                        error = %err,
-                        "could not write a subscriber's wake sentinel; it will not wake for \
+                        peer_error = peer_error.map(|e| e.to_string()).unwrap_or_default(),
+                        error = %sentinel_error,
+                        "could not wake a subscriber on either channel; it will not wake for \
                          this event (the event is durable and surfaces on its next read)"
                     );
                 }
             }
         }
-        // Log after the decision point: which topic drove the writes, and how many
-        // subscribers we actually bumped. Never the body.
+
+        // Log after the decision point: which topic drove the delivery, and how each
+        // subscriber was actually reached. Never the body.
         info!(
             topic = topic.as_str(),
-            bumped, failed, "bumped subscribers' wake sentinels after publish"
+            peer, sentinel, fell_back, failed, "woke subscribers after publish"
         );
     }
 }
@@ -382,7 +518,7 @@ mod tests {
     #[test]
     fn waking_writes_topic_names_into_that_session_and_no_other() {
         let dir = tempfile::TempDir::new().unwrap();
-        let waker = Waker::new(dir.path());
+        let waker = Waker::new(dir.path(), dir.path());
         let (a, b) = (SessionId::new("s-a"), SessionId::new("s-b"));
         let topic = Topic::parse("agent.s-a").unwrap();
 
@@ -407,7 +543,7 @@ mod tests {
     #[test]
     fn waking_twice_with_the_same_topics_still_advances_the_mtime() {
         let dir = tempfile::TempDir::new().unwrap();
-        let waker = Waker::new(dir.path());
+        let waker = Waker::new(dir.path(), dir.path());
         let session = SessionId::new("s-a");
         let topics = [Topic::parse("t.a").unwrap()];
         let sentinel = Sentinel::under_root(dir.path(), &session);
@@ -434,6 +570,114 @@ mod tests {
     /// store at all. A file that does not exist is not watchable, and the whole point
     /// of arming is to give `watchPaths` something to register before the daemon's
     /// first bump.
+    /// Accept one connection on `socket` and hand back whatever line was written.
+    fn listen_once(socket: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, BufReader};
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                let _ = BufReader::new(stream).read_line(&mut line);
+                let _ = tx.send(line);
+            }
+        });
+        rx
+    }
+
+    /// The happy path of ADR-0020: a session with a bound socket is woken in ONE hop,
+    /// and its sentinel is not written at all. The sentinel assertion is the point —
+    /// writing both would leave the `FileChanged` hook firing redundantly for a
+    /// session that has already taken its turn.
+    #[test]
+    fn delivers_on_the_peer_channel_and_leaves_the_sentinel_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("inbox.sock");
+        let rx = listen_once(&socket);
+        let waker = Waker::new(dir.path(), dir.path());
+        let session = SessionId::new("s-peer");
+        let topics = [Topic::parse("t.a").unwrap()];
+
+        let outcome = waker.deliver(&session, &topics, Some(socket.as_path()));
+
+        assert!(matches!(outcome, WakeOutcome::Peer), "{outcome:?}");
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the session should have received a frame");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["message"]["content"], "mail on topic t.a");
+        assert!(
+            !Sentinel::under_root(dir.path(), &session).path().exists(),
+            "a peer delivery must not also write the sentinel"
+        );
+    }
+
+    /// The gate leaves most sessions without a socket, and they must keep waking
+    /// exactly as they did before ADR-0020.
+    #[test]
+    fn falls_back_to_the_sentinel_when_the_session_has_no_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let waker = Waker::new(dir.path(), dir.path());
+        let session = SessionId::new("s-nosock");
+        let topics = [Topic::parse("t.a").unwrap()];
+
+        let outcome = waker.deliver(&session, &topics, None);
+
+        assert!(matches!(outcome, WakeOutcome::Sentinel), "{outcome:?}");
+        assert_eq!(
+            Sentinel::under_root(dir.path(), &session).read_topics(),
+            vec!["t.a".to_string()]
+        );
+    }
+
+    /// A session can exit between the registry read and the write. That must degrade
+    /// to the fallback, not lose the wake.
+    #[test]
+    fn falls_back_to_the_sentinel_when_the_socket_refuses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let waker = Waker::new(dir.path(), dir.path());
+        let session = SessionId::new("s-dead");
+        let topics = [Topic::parse("t.a").unwrap()];
+
+        let outcome = waker.deliver(&session, &topics, Some(&dir.path().join("gone.sock")));
+
+        assert!(
+            matches!(outcome, WakeOutcome::SentinelAfterPeerFailure { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            Sentinel::under_root(dir.path(), &session).read_topics(),
+            vec!["t.a".to_string()],
+            "the sentinel must carry the wake the socket refused"
+        );
+    }
+
+    /// The asymmetry between the channels, pinned. An empty sentinel write is benign
+    /// (the hook re-checks the store and exits 0), but an empty PEER message would
+    /// spend a full model turn to announce nothing — the exact cost this subsystem
+    /// exists to avoid. There is no anti-loop on the peer channel, so the guard has
+    /// to be here.
+    #[test]
+    fn never_sends_an_empty_wake_on_the_peer_channel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("inbox.sock");
+        let rx = listen_once(&socket);
+        let waker = Waker::new(dir.path(), dir.path());
+        let session = SessionId::new("s-empty");
+
+        let outcome = waker.deliver(&session, &[], Some(socket.as_path()));
+
+        assert!(
+            matches!(outcome, WakeOutcome::Sentinel),
+            "an empty unread set belongs on the sentinel channel only: {outcome:?}"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "nothing may be written to the socket when there is nothing unread"
+        );
+    }
+
     #[test]
     fn arming_creates_the_sentinel_even_with_no_store() {
         let dir = tempfile::TempDir::new().unwrap();
