@@ -1666,22 +1666,22 @@ pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
     }
 }
 
-/// Human output: the faults, and a one-line count. `--all` lists everything.
+/// Human output: one line per session, a count, and — ONCE — what to do about it.
+///
+/// The remedy is a footer rather than a per-row note on purpose. A fleet where the
+/// feature gate is off has every session in the same state, and repeating six lines of
+/// explanation twenty times buries the one line that says how many there are.
 fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
     for entry in &report.sessions {
         if !show_all && !entry.reachability.is_fault() {
             continue;
         }
-        let name = entry.name.as_deref().unwrap_or("-");
         println!(
             "{:<10} {}  {}",
             entry.reachability.label(),
             entry.session.as_str(),
-            name
+            entry.name.as_deref().unwrap_or("-")
         );
-        if let Some(remedy) = entry.reachability.remedy() {
-            println!("           {remedy}");
-        }
     }
     println!(
         "{} session(s): {} reachable, {} cannot be woken, {} gone",
@@ -1690,6 +1690,11 @@ fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
         report.no_inbox(),
         report.gone()
     );
+    if report.no_inbox() > 0
+        && let Some(remedy) = mailbox::doctor::Reachability::NoInbox.remedy()
+    {
+        println!("\n{remedy}");
+    }
 }
 
 /// `--json`: the whole report, stable field names for a supervisor to gate on.
