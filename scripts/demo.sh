@@ -4,9 +4,9 @@
 # loop. It proves, on your machine with no GitHub and no Claude Code, that:
 #
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
-#   2. an *idle* session wakes when mail lands (the asyncRewake contract: the
-#      daemon bumps that session's sentinel as part of the publish, and
-#      `mailbox harness wake` exits 2 with a payload-free "mail on topic X"
+#   2. an *idle* session wakes when mail lands (the daemon writes that session's
+#      Claude Code inbox socket as part of the publish, delivering a payload-free
+#      "mail on topic X"
 #      reminder);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
@@ -49,9 +49,10 @@ export AGENT_MAILBOX_DB="${WORK_DIR}/mailbox.db"
 # Point the supervisor's stub resolver at the binary we just built (the normal
 # install co-locates it beside `mailbox`, so this override is a dev convenience).
 export MAILBOX_STUB_ADAPTER_BIN="${STUB_ADAPTER}"
-# Keep the wake sentinels inside the throwaway dir, so the demo never touches
-# the real ~/.mailbox tree.
-export MAILBOX_SENTINEL_ROOT="${WORK_DIR}/sentinel"
+# Keep the fake Claude Code session registry inside the throwaway dir: without this
+# the demo would read your REAL ~/.claude/sessions and could deliver its wake onto a
+# live session of yours.
+export MAILBOX_CLAUDE_SESSIONS_DIR="${WORK_DIR}/claude-sessions"
 export RUST_LOG="${RUST_LOG:-error}"
 
 SESSION="demo-session"
@@ -78,6 +79,17 @@ cleanup() {
 trap cleanup EXIT
 
 step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$*"; }
+
+# Poll a condition with a bounded deadline (never a fixed sleep waiting on a state).
+wait_for() {
+  local what="$1"; shift
+  for _ in $(seq 1 100); do
+    if "$@"; then return 0; fi
+    sleep 0.05
+  done
+  echo "error: timed out waiting for ${what}" >&2
+  exit 1
+}
 run()  { printf '\033[2m$ %s\033[0m\n' "$*"; eval "$*"; }
 
 echo "demo workdir: ${WORK_DIR}"
@@ -106,45 +118,59 @@ run "${MAILBOX} publish demo.hello --body '{\"msg\":\"first\"}'"
 run "${MAILBOX} read"
 
 # --- 2. wake an IDLE session ---------------------------------------------------
-# This is the load-bearing mechanic, and it is exactly what Claude Code does. The
-# SessionStart hook ARMS the session's sentinel file and registers a watch on it;
-# a publish makes the DAEMON rewrite that file as part of serving the publish;
-# Claude Code's FileChanged hook fires on the change even though the session is
-# idle, and `mailbox harness wake` exits 2 iff there is genuine unread mail. Here
-# we drive the same three steps by hand — with no sleeps, because there is no
-# third process whose scheduling we would have to wait on.
-step "2. wake an idle session (the FileChanged contract)"
-echo "running the SessionStart hook (arms the sentinel) ..."
-echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
-  | "${MAILBOX}" harness session-start >"${WORK_DIR}/watchpaths.json"
-echo "  watchPaths registered with the harness:"
-sed 's/^/    /' "${WORK_DIR}/watchpaths.json"
+# This is the load-bearing mechanic, and it is exactly what Claude Code does. A
+# session binds an inbox socket and registers itself in ~/.claude/sessions; a publish
+# makes the DAEMON write that socket as part of serving the publish; Claude Code then
+# starts a turn on the idle session with whatever arrived. Here we stand in for Claude
+# Code with a socket of our own — no sleeps for a third process to be scheduled,
+# because the write happens inside the publish request.
+step "2. wake an idle session (the inbox-socket contract)"
 
-SENTINEL="${MAILBOX_SENTINEL_ROOT}/by-agent/${SESSION}/.mailbox-wake"
-if [[ ! -f "${SENTINEL}" ]]; then
-  echo "error: SessionStart did not arm the sentinel at ${SENTINEL}" >&2
-  exit 1
-fi
+mkdir -p "${MAILBOX_CLAUDE_SESSIONS_DIR}"
+INBOX="${WORK_DIR}/inbox.sock"
+FRAME="${WORK_DIR}/frame.json"
+
+# A stand-in for Claude Code: accept one connection and record the frame.
+cat >"${WORK_DIR}/listen.py" <<'LISTENER'
+import os
+import socket
+import sys
+
+sock, out = sys.argv[1], sys.argv[2]
+if os.path.exists(sock):
+    os.unlink(sock)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock)
+srv.listen(1)
+conn, _ = srv.accept()
+open(out, "wb").write(conn.recv(65536))
+LISTENER
+
+python3 "${WORK_DIR}/listen.py" "${INBOX}" "${FRAME}" &
+LISTENER_PID=$!
+trap 'kill "${LISTENER_PID}" 2>/dev/null || true' EXIT
+wait_for "the demo inbox socket" test -S "${INBOX}"
+
+# Register the session the way Claude Code does, naming that socket.
+cat >"${MAILBOX_CLAUDE_SESSIONS_DIR}/${SESSION}.json" <<REGISTRY
+{"pid":$$,"sessionId":"${SESSION}","cwd":"${WORK_DIR}","status":"idle","name":"demo","updatedAt":1786000000000,"messagingSocketPath":"${INBOX}"}
+REGISTRY
+
+echo "running the SessionStart hook (registers this session's agent inbox) ..."
+echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
+  | "${MAILBOX}" harness session-start
 
 echo "publishing while the session is idle ..."
 run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
 
-echo "the daemon bumped the sentinel (topic NAMES only, never a body):"
-sed 's/^/    /' "${SENTINEL}"
-
-echo "running the FileChanged hook, as Claude Code would on that change ..."
-set +e
-echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"FileChanged\"}" \
-  | "${MAILBOX}" harness wake >"${WORK_DIR}/wake.out" 2>"${WORK_DIR}/wake.err"
-WAKE_RC=$?
-set -e
-echo "wake hook exit code: ${WAKE_RC}   (2 = wake this session)"
-echo "wake reminder (stderr, payload-free):"
-sed 's/^/    /' "${WORK_DIR}/wake.err"
-if [[ "${WAKE_RC}" -ne 2 ]]; then
-  echo "error: expected the wake hook to exit 2, got ${WAKE_RC}" >&2
+wait_for "the wake to reach the session's inbox" test -s "${FRAME}"
+echo "the wake delivered to the session's inbox (topic NAMES only, never a body):"
+sed 's/^/    /' "${FRAME}"
+if grep -q "wake up" "${FRAME}"; then
+  echo "error: the wake carried the event body; it must be payload-free" >&2
   exit 1
 fi
+
 run "${MAILBOX} read"
 
 # --- 3. a bridge-SUPERVISED adapter (no agent-owned poller) -------------------

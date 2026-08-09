@@ -15,7 +15,7 @@
 //!   publishes exactly once across many polls.
 //! - **Independent per-subscriber cursors** — scenario 2 asserts two sessions
 //!   each read the same edge from their own cursor.
-//! - **Payload-free harness wake** — the wake-path tests wake an armed session and
+//! - **Payload-free wake** — the wake-path tests wake an idle session and
 //!   coalesce a publish storm into a single wake (ac-12-2).
 //!
 //! Unit-level proofs of the same machinery live in their own cards' suites

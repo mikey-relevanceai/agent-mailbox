@@ -96,21 +96,25 @@ The daemon keeps everything under one directory (default
 | `mailbox.lock` | the daemon's exclusive `flock` (single-writer guard) |
 | `harness.log` | the hooks' decisions (kept off stderr so wakes stay clean) |
 
-The per-session wake sentinels live elsewhere, under `~/.mailbox/by-agent/<session>/`
-(override with `MAILBOX_SENTINEL_ROOT`), because Claude Code has to watch them by
-absolute path.
+Nothing else is written per session. The wake path reads Claude Code's own registry
+(`~/.claude/sessions/*.json`) to find each subscriber's inbox socket, and writes to
+that socket — it keeps no per-session state of its own.
 
-> Upgrading from an older build? It left a `waiters/` directory of per-session FIFOs,
-> lockfiles and pidfiles, plus one detached `mailbox harness watch` process per session
-> that has ever started. Neither exists any more ([ADR-0017](adr/0017-daemon-bumps-the-sentinel.md)).
-> Clean them up once with `pkill -f 'mailbox harness watch'` and
-> `rm -rf ~/.agent-mailbox/waiters`; nothing recreates them.
+> Upgrading from an older build? Earlier versions left a `~/.mailbox/by-agent/`
+> directory of per-session wake sentinels, and before that a `waiters/` directory of
+> FIFOs, lockfiles and pidfiles plus a detached `mailbox harness watch` process per
+> session. None of it exists any more
+> ([ADR-0021](adr/0021-delete-the-sentinel-fallback.md),
+> [ADR-0017](adr/0017-daemon-bumps-the-sentinel.md)). Clean up once with
+> `pkill -f 'mailbox harness watch'`, `rm -rf ~/.agent-mailbox/waiters` and
+> `rm -rf ~/.mailbox`; nothing recreates them. **Re-run
+> `mailbox harness install-hooks`** so the retired hooks are swept.
 
 ### Start the daemon
 
 Every command except `mailbox doctor` is a client of the `mailbox serve` daemon
-(`doctor` reads sentinel files, not the store, so it works when the daemon is the
-broken thing). Start the daemon once — a login item, a `tmux` pane, or a user
+(`doctor` reads Claude Code's registry and the process table, not the store, so it
+works when the daemon is the broken thing). Start the daemon once — a login item, a `tmux` pane, or a user
 service:
 
 ```bash
@@ -134,10 +138,9 @@ mailbox harness install-skills   # skill  -> ~/.claude/skills
 mailbox harness install-hooks    # hooks  -> ~/.claude/settings.json (when it exists)
 ```
 
-- **`install-hooks`** makes wake **infrastructure** — the `SessionStart` hook arms
-  the session's wake sentinel and tells Claude Code to watch it, so the agent stays
-  wakeable for the whole session with no periodic re-arm (ADR-0008) and nothing to
-  run itself.
+- **`install-hooks`** makes the session **addressable** — the `SessionStart` hook
+  registers its always-on agent inbox, so peers can reach it. Waking needs no
+  infrastructure at all: the daemon writes the inbox socket Claude Code already bound.
 - **`install-skills`** installs the skill that teaches the agent the loop it wakes
   into (subscribe / read / react / unsubscribe — no background pollers, no
   self-arming).
@@ -155,7 +158,7 @@ mailbox harness install-inbound --settings <file>   # crossSessionInbound: "acce
 
 You need it only if your sessions run `--dangerously-skip-permissions`. Claude Code
 holds an inbox-socket wake arriving at such a session for human approval and drops it
-after ~5 minutes, so those sessions wake only through the slower sentinel fallback.
+after ~5 minutes, so those sessions are never woken at all.
 `accept` fixes that — and in doing so lets **any** process running as you put a
 prompt in front of an agent that acts without asking. Read
 [docs/01-wake.md](01-wake.md#receiving-on-a---dangerously-skip-permissions-session)
@@ -216,113 +219,37 @@ mailbox harness install-hooks \
 
 Pass an **absolute** `--mailbox-bin` so the hook works regardless of the
 session's `PATH` (it defaults to the resolved path of the `mailbox` you ran).
-The snippet wires five hooks. Exactly ONE of them (`FileChanged`) can wake the
-session; the rest always exit 0:
+The snippet wires **two** hooks, and neither can wake the session:
 
 ```json
 {
   "hooks": {
     "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness session-start" }] }],
-    "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness turn-end" }] }],
-    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness turn-start" }] }],
-    "FileChanged": [{ "matcher": ".mailbox-wake", "hooks": [{ "type": "command",
-      "command": "/abs/path/mailbox harness wake",
-      "asyncRewake": true, "timeout": 30 }] }],
     "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command",
       "command": "/abs/path/mailbox harness cleanup" }] }]
   }
 }
 ```
 
-> **After upgrading the `mailbox` binary, re-run `mailbox harness install-hooks`.** An
-> upgrade that skips it leaves hooks pointing at subcommands the new binary no longer
-> has (`harness arm`, `harness ensure-watcher`, `harness watch`). Those do not fail
-> quietly: an unrecognised subcommand exits **2**, and a `Stop` hook that exits 2
-> *blocks the turn from ending* and feeds its stderr to the model — so a half-upgraded
-> install nags the agent with clap usage text at every turn boundary, on top of having
-> no working wake path. Re-running sweeps them and installs the current set; it
-> recognises every name we have ever installed, so nothing is left behind.
+- **`SessionStart` (matcher `""`) → `mailbox harness session-start`.** Registers this
+  session's always-on agent inbox (`agent.<session-id>`), so peer agents can address it
+  (§4). The matcher is `""` — every source, not just `startup` — so a **resumed**
+  session, which is a fresh process, re-registers itself. Idempotent, fail-open, and it
+  exits 0 always.
+- **`SessionEnd` → `mailbox harness cleanup`.** Drops this session's subscriptions and
+  interests, so no poller outlives the session that wanted it.
 
-What each hook does:
+That is the whole harness surface. Waking is not a hook: the daemon writes the
+session's inbox socket directly, and Claude Code starts a turn on it.
 
-- **`SessionStart` (matcher `""`) → `mailbox harness session-start`** (plain,
-  synchronous). Reads the `session_id` from the hook's stdin JSON, **registers the
-  session's agent inbox** (`agent.<session-id>` — this is what makes it reachable by peer
-  agents, see §4), **arms the wake sentinel** (writes the session's current unread topics
-  into it, creating the file), and prints the `watchPaths` registration for that absolute
-  path. The order matters: Claude Code watches a path, and the daemon's later writes are
-  *modifications* — if the file did not exist first, the daemon's first write would be a
-  *creation*, which the watch may not deliver. Arming also picks up mail that arrived
-  while nothing owned this session, so a resumed agent wakes for it instead of waiting
-  for the next publish. The matcher is `""` (all sources), so it re-fires on
-  **resume**/clear/compact, and this is the only hook that can re-print watchPaths
-  (ADR-0013). Every step is idempotent, and it never wakes the session itself.
+> **Upgrading?** Older versions installed three more hooks — a `FileChanged`
+> `asyncRewake` wake, a `Stop` turn-end re-trigger, and a `UserPromptSubmit` turn
+> stamp — all of which existed to prop up a wake wire that could silently lose an edge
+> ([ADR-0021](adr/0021-delete-the-sentinel-fallback.md)). Re-running `install-hooks`
+> sweeps them.
 
-  If the bridge is **down or erroring**, it still arms (with an empty topic set) and
-  still prints the watchPaths — fail-open, because an unwatchable file is worse than an
-  empty one. A down bridge never produces a *wake*; the first publish after the daemon
-  returns writes the sentinel.
-- **`Stop` → `mailbox harness turn-end`**. The turn boundary — the session's per-turn
-  self-healing point, with three jobs. **(1) Close the turn** (ADR-0016), so
-  `mailbox doctor` can tell a session that is merely mid-turn from one that cannot be
-  woken. **(2) Re-register the inbox** (best-effort, fail-open — ADR-0013, restoring the
-  register-on-every-`Stop` invariant; this is what self-heals a resume that raced the 10s
-  tombstone). **(3) Re-arm and re-trigger:** if the sentinel has gone missing it is
-  written again (the only deafness a per-turn hook can heal), and if the session is
-  sitting on unread mail the sentinel is re-bumped so the `FileChanged` wake fires
-  against the now-idle session (ADR-0012). That third part is what delivers mail which
-  arrived while the agent was **busy** — a wake edge spent mid-turn reaches nothing, and
-  without it the agent would go idle deaf on top of unread mail (a real bug, seen on a
-  watched PR). It is bounded: each message earns at most one turn-boundary nudge, so an
-  agent that wakes and does not read is not looped. It does **not** re-print
-  `watchPaths` (a `Stop` cannot emit a SessionStart registration — that is
-  `session-start`'s job). It **always exits 0** — a `Stop` can never itself wake the
-  session. It cannot help a session that goes idle *forever* (which fires no `Stop`) —
-  see the note below.
-- **`UserPromptSubmit` → `mailbox harness turn-start`.** Stamps that a turn has opened.
-  Paired with the `Stop` hook's turn-ended stamp it is what lets `mailbox doctor` report
-  a silent session as **busy** rather than libelling it as deaf (ADR-0016). It prints
-  nothing and always exits 0.
-- **`FileChanged` (matcher `.mailbox-wake`) → `mailbox harness wake`**
-  (`asyncRewake: true`). When the daemon writes the sentinel, this fires — even on an
-  idle session — and exits **2** with `mail on topic X` **iff there is genuinely unread
-  mail**, else exits **0**. That anti-loop guard is load-bearing: a `FileChanged` fires
-  on every change to the sentinel, so waking unconditionally would loop the agent.
-- **`SessionEnd` → `mailbox harness cleanup`.** **Removes the session's sentinel dir**
-  and drops this session's subscriptions (including its inbox — it stops being
-  addressable) **and** watch interests, stopping any adapter whose last interested
-  session it was (no zombie poller outlives the session).
-
-**No periodic re-arm (ADR-0008).** The old design kept a long idle armed by having a
-waiter exit 2 at `--max-block-ms` to force a re-arm — one model turn per `max_block` of
-idle. That is gone: nothing runs on a timer, so an idle subscribed session costs **zero**
-model turns until real mail arrives, and **every wake is real mail**. See
-[01-wake](01-wake.md),
-[ADR-0008](adr/0008-on-demand-wake-filechanged.md) and
-[ADR-0017](adr/0017-daemon-bumps-the-sentinel.md).
-
-**Notes and limits.**
-
-- **Launch `claude` from a project directory, not `$HOME`.** `FileChanged` watches the
-  cwd recursively, so if the cwd is an ancestor of `~/.mailbox`, every *other* session's
-  sentinel bump also fires this session's wake hook. There is **no false wake** (the hook
-  re-checks this session's own unread and exits 0), but it does spawn an extra wake-hook
-  process per unrelated bump. Launching from a project dir avoids the churn.
-- **Idle-forever + a lost sentinel.** A session that goes idle *forever* (never takes
-  another turn, so the `Stop` hook never fires) whose sentinel is then deleted stays deaf
-  until it next takes a turn or is restarted. This is the accepted limit of a
-  zero-spurious-wake design: nothing can poke a session that will neither act nor be
-  poked. `mailbox doctor` is how you find one — it PROVES wakeability rather than
-  assuming it.
-- **Mail that arrives while the daemon is down** bumps nothing. It is not lost (the
-  event is durable): the session's next turn boundary re-triggers for it, and its next
-  `SessionStart` re-arms from unread. Restarting the daemon does not by itself wake
-  anyone who missed a publish.
-
-#### Recovering a session whose inbox lapsed
+## Recovering a session whose inbox lapsed
 
 Symptom: `mailbox status` reports `inbox: agent.<id> (NOT registered)` and
 `subscriptions: none`, peers' `mailbox send` to you fails, and you never wake. Since
@@ -339,17 +266,12 @@ echo "{\"session_id\":\"$CLAUDE_CODE_SESSION_ID\"}" | mailbox harness session-st
 
 Two things to know about that manual path:
 
-- **The inbox comes back, but the wake does not (yet).** The handler prints a
-  `watchPaths` registration on stdout, and that only means anything when **Claude Code**
-  is the one reading it — i.e. when it runs as a real `SessionStart` hook. Run from a
-  shell, the registration goes to your terminal and is discarded, so no watch is placed
-  on the sentinel for the current process. You become *addressable* (peers can `send`,
-  and you will see mail on your next `mailbox read`) but not *auto-wakeable* until a
-  genuine `SessionStart` fires. **No `Stop` hook can fix this** — a `Stop` cannot emit a
-  `SessionStart`-shaped registration.
-- **Confirm with `mailbox doctor`, not by reading logs.** It bumps the sentinel and
-  requires the `FileChanged` hook to answer, so it distinguishes "wakeable" from "deaf"
-  from "busy" from "no process at all" — none of which the logs can tell apart.
+- **This makes you addressable; it does not make you wakeable.** Registering the inbox
+  is all the hook does. Whether anything can *wake* you is Claude Code's decision — it
+  binds the inbox socket, or it does not — and running a hook by hand cannot change
+  that.
+- **Confirm with `mailbox doctor`, not by reading logs.** It reads whether your process
+  is alive and whether Claude Code bound you a socket, which is the whole answer.
 
 ### 2b. Install the skill
 
@@ -418,9 +340,9 @@ subscribe  ──►  (idle; the hooks keep you armed)  ──►  read  ──�
    `mailbox watch github-pr <owner>/<repo>#<n>` (which subscribes *and* starts the
    shared poller). Baseline-on-subscribe: you only ever see events published
    *after* you subscribe.
-2. **idle** — do other work, or nothing. The `SessionStart` hook armed your wake
-   sentinel and told Claude Code to watch it; the daemon writes that file when mail
-   lands for you. **The agent does not arm anything and does not poll.**
+2. **idle** — do other work, or nothing. When mail lands, the daemon writes it to the
+   inbox socket Claude Code bound for your session, and you take a turn. **The agent
+   does not arm anything and does not poll.**
 3. **read** — on wake (a system reminder like `mail on topic X`), run
    `mailbox read`. It returns unread events and advances your cursor
    (exactly-once, advance-on-read).
@@ -765,72 +687,46 @@ For "do I have unread?", sum `.unread[].unread` from the same report.
 ### Is the wake path actually working?
 
 `status` answers "what does this session have?". It cannot answer "will this session
-ever be told?", because the last hop of the wake — Claude Code noticing the sentinel
-file and running the `FileChanged` hook — happens outside the bridge. A session can
-have a registered inbox and a sentinel being written on every publish, and still never
-wake.
+ever be told?", because whether a session can be woken at all is Claude Code's
+decision: it binds a per-session inbox socket, or it does not, and the gate that
+decides cannot be turned on from outside.
 
-There used to be a `mailbox dashboard` that inferred this from `harness.log`. It was
-removed: measured against an active probe on 19 live idle sessions it was wrong 9
-times — 6 sessions it called suspect answered immediately, and 3 it called verified
-could not be woken at all. History cannot answer a question about now, so ask
-directly.
+### `mailbox doctor` — can these agents be woken?
 
-### `mailbox doctor` — can these agents be woken *right now*?
-
-`doctor` runs the experiment
-([ADR-0016](adr/0016-prove-wakeability-with-an-active-probe.md)): it bumps each
-session's sentinel and requires the `FileChanged` hook to answer, which it does by
-stamping `.mailbox-hook-ran` on every run.
+`doctor` reads the answer ([ADR-0021](adr/0021-delete-the-sentinel-fallback.md)). It is
+two facts: is the session's process alive, and did Claude Code bind it an inbox socket.
 
 ```bash
-mailbox doctor                    # probe every session; print only the faults
-mailbox doctor --all              # list every session probed
+mailbox doctor                    # every session; print only the faults
+mailbox doctor --all              # list every session
 mailbox doctor --json             # for a supervisor agent or a cron
 mailbox doctor --session <id>     # just one
-mailbox doctor --timeout-ms 20000 # longer budget on a loaded machine
 ```
 
 ```text
-probed 19 session(s) in one window, 10000ms budget: 13 wakeable, 4 deaf, 2 UNMEASURED
-  459ba64c-…  DEAF — its sentinel changed and Claude Code never ran the wake hook; mail will not reach this agent
-  8ce450e7-…  DEAF — …
+no-inbox   983eae5f-0b09-410e-a457-c9633b6f1a8a  agent-mailbox-30
+           Claude Code bound this session no inbox socket, so nothing can wake it.
+           Restart the session. …
+3 session(s): 2 reachable, 1 cannot be woken, 0 gone
 ```
 
-- **Exit 1 when any session is deaf**, so a supervisor can notice without parsing
-  prose. Sessions with no live process do not affect the exit code.
-- The verdicts are `wakeable` (the hook answered — positive proof), `deaf` (live,
-  armed, **idle**, and silent — **the fault**), `busy`, `gone` (no live Claude Code
-  process; normal, not a fault), `never_armed`, and `undetermined`.
-- **`busy` is reported as `UNMEASURED`, and that is not "no fault found".** A
-  mid-turn session could not have answered the probe, so the probe learned nothing
-  about it — and a genuinely deaf session that happens to be busy looks exactly the
-  same. It is an open question to re-probe while the session is idle, which is why
-  the summary line counts it in its own bucket rather than folding it into the
-  healthy total.
-- **A session cannot measure itself.** Running `doctor` IS a turn, so the caller is
-  busy for the whole probe and can only ever report itself `UNMEASURED`. An agent
-  auditing its own fleet is therefore structurally blind to its own deafness;
-  `doctor` warns about this on stderr. Probe a session from a *different* session
-  (or a cron) to learn whether it can be woken.
-- Busy-vs-deaf comes from a pair of turn-boundary stamps written by the
-  `UserPromptSubmit` and `Stop` hooks, so **re-run `mailbox harness install-hooks`**
-  after upgrading. Without the new hook every busy session reports as `deaf`.
-- **Wakeability is perishable.** A session that answers today can be deaf tomorrow
-  with no visible event in between, so re-run this rather than trusting an old
-  result. That is the finding that motivates the command existing at all.
-- Every session is bumped **before any is polled**, so the fleet is measured in one
-  window — which is what makes "this session is deaf" distinguishable from "something
-  global hiccuped".
-- Probing does not change what an agent will be told is unread: the bump rewrites the
-  sentinel with the bytes it already holds. A session with nothing unread answers with
-  exit 0 and no model turn. A session that *does* have unread mail will be woken —
-  which is correct, since it should already have been.
-- Reads no store and needs no daemon.
-- If **nothing at all** answers, suspect the install before the fleet: the ack is
-  written by whichever `mailbox` binary the hook invokes, and an old one looks
-  identical to a total blackout. `doctor` says so when it sees that pattern. No
-  session needs restarting after an upgrade.
+- **Exit 1 when any session is a fault**, so a supervisor can notice without parsing
+  prose.
+- Three verdicts. `reachable` (live process, bound socket). `no-inbox` (live process,
+  **no** socket — **the fault**; nothing can wake it, and only restarting the session
+  can fix it). `gone` (no live process — normal, and not a fault).
+- **A session can measure itself.** The probe this replaced could not: running it *was*
+  a turn, so the caller was busy for the whole measurement and could only ever report
+  itself as unmeasured. A read has no such blind spot.
+- **There is no `busy` verdict any more**, because being busy no longer affects
+  reachability: a message queues at the receiver and is read between tool calls, so a
+  mid-turn session is just as reachable as an idle one.
+- Reads no store and needs no daemon, so it still answers when the daemon is the
+  broken thing.
+
+You should rarely need it: `subscribe` and `watch` already refuse for a session
+nothing can wake, so the common case is caught at the moment of asking rather than
+discovered later.
 
 ---
 

@@ -11,26 +11,27 @@ woken when one of them changes. Things worth waking on:
 - a peer agent handing off work
 
 The key idea: **the agent never polls and never re-arms.** A local *bridge daemon*
-supervises the pollers and, when mail lands, delivers straight onto the session's
-Claude Code **inbox socket** — which starts a turn on an idle session. Sessions that
-have no socket (Claude Code gates it, and the gate cannot be turned on from outside)
-fall back to a **sentinel file** plus a `FileChanged` hook. The whole agent-facing
-contract is four verbs — **subscribe → read → react → unsubscribe** — and that's it.
+supervises the pollers and, when mail lands, writes it straight to the session's
+Claude Code **inbox socket** — which starts a turn on an idle session. The whole
+agent-facing contract is four verbs — **subscribe → read → react → unsubscribe** —
+and that's it.
 
 ```text
 Adapters (detect world changes)
         ↓ publish
-Bridge (durable events + subscriptions; delivers the wake)
-        ↓ has this subscriber an inbox socket?
-        ├─ yes → write it; the idle session takes a turn
-        └─ no  → write its sentinel → FileChanged hook → exit 2
-Agent sessions (react, never poll)
+Bridge (durable events + subscriptions)
+        ↓ write the subscriber's inbox socket
+Agent sessions (take a turn; never poll)
 ```
 
-Two live components and, on the fallback path, a file. There is no per-session
-watcher process and nothing on a timer
-([ADR-0020](docs/adr/0020-peer-inbox-socket-is-the-wake-wire.md),
-[ADR-0017](docs/adr/0017-daemon-bumps-the-sentinel.md)).
+One hop. No file, no watch, no hook, no exit code, nothing per-session on our side,
+and nothing on a timer
+([ADR-0021](docs/adr/0021-delete-the-sentinel-fallback.md),
+[ADR-0020](docs/adr/0020-peer-inbox-socket-is-the-wake-wire.md)).
+
+Requires **Claude Code 2.1.226+**. A session Claude Code gave no inbox socket cannot
+be woken by anything, so `mailbox watch` and `mailbox subscribe` refuse up front
+rather than leaving an agent waiting on a wake that will never come.
 
 ## Quickstart
 
@@ -44,7 +45,7 @@ scripts/demo.sh
 
 The demo starts a private daemon in a tempdir and walks the whole loop —
 subscribe/read, an idle wake, a supervised poller, and teardown — asserting that
-the daemon writes the sentinel and that the wake hook exits 2 on it. Captured
+the daemon delivers the wake to the session's inbox. Captured
 output is in [docs/demo.md](docs/demo.md).
 
 To actually use it:
@@ -111,8 +112,7 @@ crates/
   mailbox/            # bridge CLI + daemon binary
   mailbox-protocol/   # shared publish/subscribe types
   mailbox-harness/    # Claude Code integration: the hook set (session-start /
-                      # turn-start / turn-end / wake / cleanup) + hooks, skills and
-                      # inbound-policy install
+                      # cleanup) + hooks, skills and inbound-policy install
 adapters/
   stub-adapter/       # reference adapter (synthetic edges; demo/tests)
   github-pr-adapter/  # the real GitHub PR poller (via `gh`)
@@ -145,7 +145,7 @@ guidance lives in [AGENTS.md](AGENTS.md).
 
 **Design:**
 
-- [Wake](docs/01-wake.md) — the sentinel, the hooks, and why nothing re-arms
+- [Wake](docs/01-wake.md) — the inbox socket, the two hooks, and why nothing re-arms
 - [Tech stack](docs/02-tech-stack.md)
 - [Working agreements](docs/03-working-agreements.md) — ADRs, designs, PRs, mikey-in-a-box install
 - [ADRs](docs/adr/README.md) · [Designs](docs/design/README.md) · [MVP GitHub watch](docs/design/01-mvp-github-watch.md)

@@ -156,10 +156,13 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
-            // The daemon writes each subscriber's wake sentinel, so it MUST be
-            // pointed at a tempdir — without this a test writes into the
-            // developer's real ~/.mailbox.
-            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+            // The daemon reads Claude Code's session registry to find each
+            // subscriber's inbox socket, so it MUST be pointed at a tempdir —
+            // without this a test could deliver its wake onto a REAL session.
+            .env(
+                "MAILBOX_CLAUDE_SESSIONS_DIR",
+                dir.path().join("claude-sessions"),
+            )
             // The github-pr resolver runs the freshly built adapter...
             .env("MAILBOX_GH_ADAPTER_BIN", github_pr_adapter_bin())
             // ...and the adapter (inheriting serve's env) reaches the FAKE gh.

@@ -24,20 +24,19 @@ touches your real `~/.agent-mailbox` or `~/.claude`), then walks four steps:
 0. **start the daemon** — `mailbox serve`, wait for its socket.
 1. **four-verb core** — `subscribe` → `publish` (standing in for an adapter) →
    `read`.
-2. **wake an idle session** — run the `SessionStart` hook so it ARMS the session's
-   sentinel (exactly what Claude Code does), then `publish` and see the DAEMON
-   rewrite that sentinel with the topic NAME only. Running the `FileChanged` hook on
-   that change exits **2** with a payload-free `mail on topic X` reminder — the
+2. **wake an idle session** — stand in for Claude Code by binding an inbox socket and
+   registering the session the way Claude Code does, then `publish` and watch the
+   DAEMON write that socket with the topic NAME only — the
    asyncRewake contract the harness turns into a session wake. There are no sleeps in
-   this step: the daemon writes the sentinel before it answers the publish.
+   this step: the daemon writes the inbox socket before it answers the publish.
 3. **supervised adapter** — `watch stub` records interest and the daemon spawns
    the reference stub poller; `status` shows it `running` with a child pid;
    `read` drains its synthetic edges. The agent never launched this loop.
 4. **teardown** — `unwatch` drops the last interest and the supervisor stops the
    adapter; `status` shows `stopped`, no child. **No zombie poller.**
 
-The script asserts the wake hook exited 2 (and that `SessionStart` armed the
-sentinel at all) and fails loudly otherwise, so it doubles as a smoke test of the
+The script asserts a wake actually reached the inbox, and that it carried no event
+body, and fails loudly otherwise — so it doubles as a smoke test of the
 whole path.
 
 ### Expected output
@@ -64,19 +63,13 @@ $ mailbox read
 1 unread event(s):
   [demo.hello] offset=0 id=evt-1 body={"msg":"first"}
 
-== 2. wake an idle session (the FileChanged contract) ==
-running the SessionStart hook (arms the sentinel) ...
-  watchPaths registered with the harness:
-    {"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["<workdir>/sentinel/by-agent/demo-session/.mailbox-wake"]}}
+== 2. wake an idle session (the inbox-socket contract) ==
+running the SessionStart hook (registers this session's agent inbox) ...
 publishing while the session is idle ...
 $ mailbox publish demo.hello --body '{"msg":"wake up"}'
 published event evt-2 at offset 1
-the daemon bumped the sentinel (topic NAMES only, never a body):
-    demo.hello
-running the FileChanged hook, as Claude Code would on that change ...
-wake hook exit code: 2   (2 = wake this session)
-wake reminder (stderr, payload-free):
-    mail on topic demo.hello
+the wake delivered to the session's inbox (topic NAMES only, never a body):
+    {"message":{"content":"mail on topic demo.hello","role":"user"},"type":"user"}
 $ mailbox read
 1 unread event(s):
   [demo.hello] offset=1 id=evt-2 body={"msg":"wake up"}
@@ -180,9 +173,9 @@ local stack can stand in for.
      fires on the rollup transitioning *into* failure and names the failed
      checks).
 
-5. **Watch the idle session wake.** Within ~one poll interval the adapter
-   publishes the edge, the daemon bumps the session's sentinel, and Claude Code surfaces a
-   system reminder (`mail on topic github.pr.OWNER/REPO#N`). The agent then:
+5. **Watch the idle session wake.** Within ~one poll interval the adapter publishes
+   the edge, the daemon writes the session's inbox socket, and Claude Code starts a
+   turn with `mail on topic github.pr.OWNER/REPO#N`. The agent then:
 
    ```bash
    mailbox read

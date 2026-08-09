@@ -65,15 +65,16 @@ fn spawn_serve(db_path: &Path, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = mailbox_command();
     cmd.arg("serve")
         .env("AGENT_MAILBOX_DB", db_path)
-        // The daemon writes each subscriber's wake sentinel, so it MUST be pointed
-        // at a tempdir — without this a test writes into the developer's real
-        // ~/.mailbox. Derived from the DB path so it follows every caller.
+        // The daemon reads Claude Code's session registry to find each subscriber's
+        // inbox socket, so it MUST be pointed at a tempdir — without this a test could
+        // deliver its wake onto a REAL session. Derived from the DB path so it follows
+        // every caller.
         .env(
-            "MAILBOX_SENTINEL_ROOT",
+            "MAILBOX_CLAUDE_SESSIONS_DIR",
             db_path
                 .parent()
                 .expect("db path has a parent")
-                .join("sentinel"),
+                .join("claude-sessions"),
         )
         .env("RUST_LOG", "error")
         .stdin(Stdio::null());
@@ -676,7 +677,10 @@ fn second_serve_on_same_db_fails_loudly() {
     let second = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
-        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+        .env(
+            "MAILBOX_CLAUDE_SESSIONS_DIR",
+            dir.path().join("claude-sessions"),
+        )
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()
@@ -752,7 +756,10 @@ fn hardening_failure_is_fatal() {
     let output = mailbox_command()
         .arg("serve")
         .env("AGENT_MAILBOX_DB", &db_path)
-        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+        .env(
+            "MAILBOX_CLAUDE_SESSIONS_DIR",
+            dir.path().join("claude-sessions"),
+        )
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .output()

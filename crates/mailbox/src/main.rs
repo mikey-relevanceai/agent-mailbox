@@ -9,12 +9,10 @@
 //! - [`control`] — the request/response types client and server share;
 //! - [`cli`] — the clap command layer, argument parsing, and output formatting.
 //!
-//! Three commands do not use the socket. `serve` *is* the daemon. `harness wake` is
-//! the `FileChanged` hook: a read-only peek at the store, so it runs synchronously
-//! with no tokio runtime. `doctor` is the other read-only reader (ADR-0016): a health
-//! check has to work when the daemon is the thing that is broken, which is exactly
-//! when a socket client cannot. Both read-only opens are permitted by ADR-0003 and
-//! neither can mutate.
+//! Two commands do not use the socket. `serve` *is* the daemon. `doctor` reads Claude
+//! Code's session registry and the process table rather than the store, because a
+//! health check has to work when the daemon is the thing that is broken — which is
+//! exactly when a socket client cannot (ADR-0021).
 //!
 //! [`Storage`]: mailbox::storage::Storage
 //! [`Waker`]: mailbox::wake::Waker
@@ -78,11 +76,8 @@ fn main() -> ExitCode {
 /// Whether this command's tracing must be kept OFF stderr and sent to
 /// `harness.log` instead. Two reasons a harness command qualifies:
 ///
-/// - its stderr is a WAKE WIRE — the `harness wake` hook writes the payload-free
-///   reminder there on exit 2, so a tracing line would pollute it;
-/// - its stdout is a HOOK CONTRACT — `harness session-start` prints the `watchPaths`
-///   JSON there, and it wants its lifecycle in `harness.log` rather than on a channel
-///   Claude Code parses.
+/// Their stdout and stderr are read by Claude Code, and they want their lifecycle in
+/// `harness.log` rather than on a channel the harness parses.
 fn is_wire_stderr(command: &Command) -> bool {
     matches!(
         command,

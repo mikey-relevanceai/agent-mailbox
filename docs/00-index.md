@@ -18,7 +18,7 @@ Notes for the project. **New here and want to *use* it?** Start with
 | # | Doc | What it covers |
 |---|---|---|
 | 00 | [Index](00-index.md) | This page |
-| 01 | [Wake](01-wake.md) | Idle-session wake: the daemon writes the session's Claude Code inbox socket, falling back to a sentinel + `FileChanged` + `asyncRewake`; the inbound permission gate, delivery cursors, Codex gap |
+| 01 | [Wake](01-wake.md) | Idle-session wake: the daemon writes the session's Claude Code inbox socket and it takes a turn; the inbound permission gate, the registry, delivery cursors, other harnesses |
 | 02 | [Tech stack](02-tech-stack.md) | Rust bridge, subprocess adapters (WASI later), security process split, early test bar |
 | 03 | [Working agreements](03-working-agreements.md) | ADRs, designs, branch/PR default, mikey-in-a-box install |
 
@@ -35,8 +35,8 @@ Also:
 ```text
 Adapters (detect world changes)          Peer agents (mailbox send)
         ↓ publish                                ↓ publish to agent.<session-id>
-Bridge (durable events + subscriptions; delivers each subscriber's wake)
-        ↓ inbox socket (preferred), else sentinel → FileChanged hook → harness wake
+Bridge (durable events + subscriptions)
+        ↓ write the subscriber's Claude Code inbox socket
 Agent sessions (react, never poll)
 ```
 
