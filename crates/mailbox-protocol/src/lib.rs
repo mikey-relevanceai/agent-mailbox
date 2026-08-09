@@ -56,8 +56,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// `FileChanged` would watch a file no one bumps. It is deliberately dotted and
 /// mailbox-specific — not the bare word `wake` — so a stray file in a recursively
 /// watched cwd cannot trip the hook.
-pub const WAKE_SENTINEL_BASENAME: &str = ".mailbox-wake";
-
 pub use error::{FramingError, IncompatibleVersion, LineError, TopicError, check_version};
 pub use framing::{decode_line, encode_line, read_lines, write_line};
 pub use ids::{AdapterId, Cursor, EventId, Offset, Timestamp};

@@ -46,19 +46,10 @@ fn main() -> ExitCode {
     init_tracing(&cli.command);
 
     match cli.command {
-        // `doctor` is read-only and socket-free (ADR-0016): it
-        // proves wakeability from sentinel files and the process table, and a health
-        // check must still work when the daemon is the thing that is broken.
+        // `doctor` is socket-free by design: it reads Claude Code's own session
+        // registry and the process table, so a health check still works when the
+        // daemon is the thing that is broken. It needs no runtime.
         Command::Doctor(args) => cli::run_doctor(cli::output_format(cli.json), &args),
-        // The FileChanged wake hook is a read-only peek that owns its own exit code
-        // (2 = wake), so it runs synchronously — no runtime. Matched here so it never
-        // reaches the async path.
-        Command::Harness(cli::HarnessArgs {
-            command: HarnessCommand::Wake,
-        }) => cli::run_wake_hook(),
-        // The Stop hook (turn-end) is NOT matched here: it re-registers the inbox over
-        // the socket (ADR-0013), so it needs the async runtime and is dispatched via
-        // the async path below like the other socket hooks.
         // Everything else is async (socket client, or the serve daemon).
         command => {
             let runtime = match tokio::runtime::Runtime::new() {
@@ -96,7 +87,7 @@ fn is_wire_stderr(command: &Command) -> bool {
     matches!(
         command,
         Command::Harness(cli::HarnessArgs {
-            command: HarnessCommand::Wake | HarnessCommand::SessionStart | HarnessCommand::TurnEnd
+            command: HarnessCommand::SessionStart | HarnessCommand::Cleanup
         })
     )
 }

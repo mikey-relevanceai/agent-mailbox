@@ -35,7 +35,7 @@ mod common;
 
 // The ONE session-stripping spawner + bin path (tests/common): a test must never
 // inherit the developer's CLAUDE_CODE_SESSION_ID.
-use common::mailbox_command;
+use common::{FakePeer, mailbox_command, register_fake_peer};
 
 /// The reference stub adapter binary (`mailbox-stub-adapter`), built if missing.
 ///
@@ -96,10 +96,13 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
-            // The daemon writes each subscriber's wake sentinel, so it MUST be
-            // pointed at a tempdir — without this a test writes into the
-            // developer's real ~/.mailbox.
-            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+            // The daemon reads Claude Code's session registry to find each
+            // subscriber's inbox socket, so it MUST be pointed at a tempdir —
+            // without this a test could deliver its wake onto a REAL session.
+            .env(
+                "MAILBOX_CLAUDE_SESSIONS_DIR",
+                dir.path().join("claude-sessions"),
+            )
             // The env override that makes `serve`'s stub resolver run the freshly
             // built binary instead of relying on it being installed on PATH.
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
@@ -130,33 +133,19 @@ impl Daemon {
             .expect("run mailbox client")
     }
 
-    /// The tempdir sentinel root this daemon writes wake sentinels under.
-    fn sentinel_root(&self) -> PathBuf {
-        self._dir.path().join("sentinel")
+    /// The fake Claude Code sessions directory this daemon reads.
+    fn sessions_dir(&self) -> PathBuf {
+        self.db_path.parent().unwrap().join("claude-sessions")
     }
 
-    /// Run the `FileChanged` wake hook for `session`, feeding it the hook JSON on
-    /// stdin exactly as Claude Code would. Exit 2 = wake (stderr carries the
-    /// payload-free reminder), 0 = no wake.
-    fn wake_hook(&self, session: &str) -> Output {
-        let mut child = mailbox_command()
-            .args(["harness", "wake"])
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn mailbox harness wake");
-        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"FileChanged"}}"#);
-        child
-            .stdin
-            .take()
-            .expect("wake stdin")
-            .write_all(payload.as_bytes())
-            .expect("write payload");
-        child.wait_with_output().expect("wake output")
+    /// Register `session` as a Claude Code session with a bound inbox socket, and
+    /// start listening on it — what makes the session wakeable.
+    fn register_peer(&self, session: &str) -> FakePeer {
+        register_fake_peer(
+            &self.sessions_dir(),
+            self.db_path.parent().unwrap(),
+            session,
+        )
     }
 }
 
@@ -408,41 +397,30 @@ fn ac09_2_a_stub_publish_wakes_the_subscribed_session() {
     let daemon = Daemon::start();
     let session = "s-wait";
 
-    // Watching subscribes the session; the stub then publishes on its interval,
-    // and each publish makes the daemon write this session's sentinel.
+    // The session is idle with an inbox socket bound. Watching subscribes it; the
+    // stub then publishes on its interval, and each publish is delivered straight to
+    // that inbox — which IS the wake.
+    let inbox = daemon.register_peer(session);
     assert_ok(
         &daemon.run_as(session, &["watch", "stub", "wake", "--interval-ms", "120"]),
         "watch stub wake",
     );
 
-    let sentinel = daemon
-        .sentinel_root()
-        .join("by-agent")
-        .join(session)
-        .join(".mailbox-wake");
-    poll_until(
-        "the daemon bumps the session's sentinel",
-        Duration::from_secs(10),
-        || {
-            std::fs::read_to_string(&sentinel)
-                .ok()
-                .filter(|body| body.contains("stub.wake"))
-                .map(|_| ())
-        },
+    let frame = inbox
+        .next_frame(Duration::from_secs(10))
+        .expect("the daemon should have woken the session on its inbox");
+    assert!(
+        frame["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stub.wake"),
+        "the wake names the topic"
     );
 
-    // ...and that state is a real wake: the FileChanged hook exits 2.
-    let wake = daemon.wake_hook(session);
-    assert_eq!(
-        wake.status.code(),
-        Some(2),
-        "a supervised adapter's publish must wake the subscribed session; stderr: {}",
-        stderr(&wake)
-    );
+    // Payload-free: the frame names the topic and carries no event body.
     assert!(
-        stderr(&wake).contains("mail on topic stub.wake"),
-        "the reminder names the topic (payload-free): {}",
-        stderr(&wake)
+        !frame.to_string().contains("\"body\""),
+        "the wake must not carry the event body: {frame}"
     );
 }
 

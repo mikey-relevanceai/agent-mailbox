@@ -1,11 +1,14 @@
-//! Integration tests for the PEER wake channel: the `serve` daemon delivering a
-//! wake straight onto a Claude Code session's inbox socket (ADR-0020).
+//! Integration tests for the wake path: the `serve` daemon delivering a wake straight
+//! onto a Claude Code session's inbox socket (ADR-0020/0021).
 //!
 //! Everything drives the real `mailbox serve` daemon in a tempdir. The Claude Code
 //! sessions directory is ALWAYS a tempdir (`MAILBOX_CLAUDE_SESSIONS_DIR`, set by
 //! [`common::Env`]) and every inbox socket is a fake bound by the test — so a test
 //! can never read the developer's real `~/.claude/sessions`, and can never deliver a
 //! wake onto a real session.
+//!
+//! This is now the ONLY wake path: the sentinel + `FileChanged` fallback was deleted
+//! in ADR-0021, so there is nothing else for a session to be woken by.
 //!
 //! # What is NOT covered headlessly
 //!
@@ -26,13 +29,10 @@ use common::Env;
 /// deliver does not stall the suite.
 const DELIVERY: Duration = Duration::from_secs(10);
 
-/// The happy path: a subscriber with a bound inbox socket is woken in ONE hop.
-///
-/// The sentinel assertion is half the point. Writing both channels would leave the
-/// `FileChanged` hook firing for a session that has already taken its turn — a
-/// second, redundant wake for one message.
+/// The happy path, and the whole wake path: a subscriber with a bound inbox socket is
+/// woken in ONE hop.
 #[test]
-fn a_subscriber_with_an_inbox_socket_is_woken_on_the_peer_channel() {
+fn a_subscriber_with_an_inbox_socket_is_woken() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
@@ -54,18 +54,14 @@ fn a_subscriber_with_an_inbox_socket_is_woken_on_the_peer_channel() {
         frame["message"]["content"], "mail on topic stub.demo",
         "the wake names the topic and nothing else"
     );
-    assert!(
-        !env.sentinel_path(session).exists(),
-        "a peer delivery must not ALSO write the sentinel, or the session wakes twice \
-         for one message"
-    );
 }
 
-/// Claude Code's `agents_cross_session_inbox` gate leaves most sessions with no
-/// socket, and it cannot be turned on from outside Claude Code. Those sessions must
-/// keep waking exactly as they did before ADR-0020.
+/// A subscriber with no inbox socket cannot be woken by anyone — there is no second
+/// channel to fall back to (ADR-0021). The event must still be durable, so it
+/// surfaces the moment that session reads; what must NOT happen is a silent claim
+/// that it was delivered.
 #[test]
-fn a_subscriber_without_an_inbox_socket_still_wakes_through_its_sentinel() {
+fn a_subscriber_without_an_inbox_socket_is_not_woken_but_keeps_its_mail() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
@@ -78,11 +74,14 @@ fn a_subscriber_without_an_inbox_socket_still_wakes_through_its_sentinel() {
 
     env.publish(topic);
 
+    // The mail is durable and readable, even though nothing could wake the session.
+    let events = env.read_events(session);
     assert_eq!(
-        env.sentinel_topics(session),
-        vec![topic.to_string()],
-        "with no socket the sentinel must carry the wake, as it always did"
+        events.len(),
+        1,
+        "an unwakeable session still receives its mail durably"
     );
+    assert_eq!(events[0]["topic"], topic);
 }
 
 /// Wake is payload-free (ADR-0001), and a change of transport must not quietly end
@@ -127,11 +126,10 @@ fn the_peer_frame_carries_topic_names_and_never_the_event_body() {
 }
 
 /// A session subscribed to a DIFFERENT topic has nothing unread, so nothing may be
-/// delivered to it. On the sentinel channel a stray write is harmless (the hook
-/// re-checks the store and exits 0); on this channel a frame IS a model turn, so an
-/// unnecessary one is a real cost with no second opinion to catch it.
+/// delivered to it. There is no anti-loop between the socket and the model: a frame IS
+/// a model turn, so an unnecessary one is a real cost with nothing to catch it.
 #[test]
-fn a_subscriber_with_nothing_unread_gets_no_peer_frame() {
+fn a_subscriber_with_nothing_unread_is_not_woken() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();

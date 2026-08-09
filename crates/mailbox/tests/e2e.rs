@@ -40,22 +40,19 @@ use common::{
 /// Start `session` through the production `SessionStart` hook, which registers its
 /// inbox and arms its wake sentinel.
 fn arm(env: &Env, session: &str) {
-    env.arm(session);
+    env.start_session(session);
 }
 
-/// Block until `session`'s sentinel names `topic`, then confirm the `FileChanged`
-/// hook turns that into a real wake (exit 2). This pair IS the wake wire.
-fn assert_woken_for(env: &Env, session: &str, topic: &str) {
-    poll_until("the sentinel names the topic", SETTLE, || {
-        env.sentinel_topics(session)
-            .iter()
-            .any(|t| t == topic)
-            .then_some(())
-    });
-    assert_eq!(
-        env.wake_hook(session).status.code(),
-        Some(2),
-        "{session} must be woken for {topic}"
+/// Block until a wake naming `topic` lands on `inbox`. That frame IS the wake wire:
+/// its arrival is the turn the session takes, so there is nothing else to confirm.
+fn assert_woken_for(inbox: &common::FakePeer, session: &str, topic: &str) {
+    let frame = inbox
+        .next_frame(SETTLE)
+        .unwrap_or_else(|| panic!("{session} must be woken for {topic}"));
+    let content = frame["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains(topic),
+        "{session}'s wake must name {topic}; got {content}"
     );
 }
 
@@ -513,11 +510,11 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
 
 // ===== Wake path — a supervised adapter's publish wakes an idle session (ac-12-2) ==
 
-/// A REAL supervised adapter's publish wakes an armed idle session: `watch stub`
-/// subscribes the session and starts the stub poller; `session-start` arms the
-/// sentinel; the stub's next publish makes the daemon write it → the wake hook exits
-/// 2 with the payload-free topic reminder on stderr. This is the full watch →
-/// adapter → bridge → harness-wake chain the other suites don't drive end to end.
+/// A REAL supervised adapter's publish wakes an idle session: `watch stub` subscribes
+/// the session and starts the stub poller; the stub's next publish makes the daemon
+/// deliver the payload-free topic reminder to that session's inbox socket. This is the
+/// full watch → adapter → bridge → session chain the other suites don't drive end to
+/// end.
 #[test]
 fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     let env = Env::new();
@@ -532,11 +529,12 @@ fn wake_supervised_adapter_publish_wakes_an_armed_session() {
         "watch stub",
     );
 
-    // The SessionStart hook launches the watcher (the agent runs nothing).
+    // The session goes idle with an inbox socket bound (the agent runs nothing).
     arm(&env, s);
+    let inbox = env.register_peer(s);
 
-    // The supervised stub's publish bumps the sentinel → the wake hook exits 2.
-    assert_woken_for(&env, s, "stub.wake");
+    // The supervised stub's publish is delivered straight to that inbox.
+    assert_woken_for(&inbox, s, "stub.wake");
 
     // Teardown: stop the poller + drop the session (SessionEnd), leaving nothing.
     env.run_as_ok(s, &["unwatch", "stub", "wake"], "unwatch stub");
@@ -544,54 +542,70 @@ fn wake_supervised_adapter_publish_wakes_an_armed_session() {
     guard.assert_clean();
 }
 
-/// Coalescing: a storm of publishes against a single armed session produces ONE
-/// wake, and a later `read` still returns EVERY event (the wake advanced no
-/// cursor). Driven through the real CLI + the fake harness driver.
+/// **No coalescing.** A storm of publishes against one idle session delivers a wake
+/// per publish, and a later `read` still returns EVERY event (a wake advances no
+/// cursor).
+///
+/// The retired sentinel path collapsed a burst to ~1 wake, because its hook re-checked
+/// the store and exited 0 once the agent was caught up. Nothing here does that: the
+/// frame IS the turn, so a burst of N costs up to N wakes. That is deliberate, and it
+/// is the same trade ADR-0008 made when it removed the last coalescing layer — every
+/// attempt to be clever about which publishes "need" a wake produced a silent lost
+/// wake instead. Claude Code drops identical repeats arriving close together, which
+/// blunts the cost in practice, but the bridge does not rely on that.
 #[test]
-fn wake_many_publishes_coalesce_to_one_wake() {
+fn every_publish_delivers_its_own_wake_and_none_is_coalesced_away() {
     let env = Env::new();
     let daemon = env.start_daemon();
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    let s = "coalesce";
-    let topic = "t.coalesce";
+    let s = "burst";
+    let topic = "t.burst";
     env.run_as_ok(s, &["subscribe", topic], "subscribe");
-
     arm(&env, s);
-    assert!(
-        env.sentinel_topics(s).is_empty(),
-        "nothing is pending before any publish"
-    );
+    let inbox = env.register_peer(s);
 
-    // Ten rapid publishes → the armed session wakes exactly once.
     for _ in 0..10 {
         env.publish(topic);
     }
-    assert_woken_for(&env, s, topic);
 
-    // The wake advanced no cursor, so a read now drains all ten durable events.
+    // Every publish produced a wake: none was silently dropped on our side.
+    for i in 0..10 {
+        let frame = inbox
+            .next_frame(SETTLE)
+            .unwrap_or_else(|| panic!("publish {i} produced no wake"));
+        assert!(
+            frame["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(topic)
+        );
+    }
+
+    // And a wake advanced no cursor, so a read still drains all ten durable events.
     let events = env.read_events(s);
-    assert_eq!(
-        events.len(),
-        10,
-        "one wake, but a later read returns every coalesced event"
-    );
+    assert_eq!(events.len(), 10, "a wake must never consume mail");
 
     let _ = env.cleanup(s);
     guard.assert_clean();
 }
 
-/// Mid-turn surfacing through the COMPOSED path: a SUPERVISED adapter's edge that
-/// lands while the agent is mid-turn is not lost. The
-/// github-pr poller fires exactly one conflict edge; we confirm it is unread
-/// WITHOUT reading it (via `status`, which does not advance the cursor); then the
-/// next wake-hook run sees the still-unread edge and wakes (exit 2),
-/// delivered exactly once. Unlike a bare-`publish` version (which would duplicate
-/// `harness.rs`'s AC2), this proves the full watch → supervised adapter → bridge →
-/// next-arm composition.
+/// A SUPERVISED adapter's edge reaches the session through the COMPOSED path, and is
+/// delivered exactly once.
+///
+/// This used to be the mid-turn test: under the sentinel path a wake was an EDGE, and
+/// one spent while the agent was busy was lost forever, so the agent went idle deaf on
+/// top of unread mail (ADR-0012). The whole apparatus that compensated for it — the
+/// turn-boundary re-trigger, its watermark, the turn-started/turn-ended stamps — is
+/// gone, because the failure it existed for cannot happen here: a message queues at
+/// the receiver and is read between tool calls, so being busy delays a wake rather
+/// than destroying it.
+///
+/// What is still worth proving is the composition: watch → supervised github-pr poller
+/// → bridge → this session's inbox, with the real adapter and a real edge.
 #[test]
-fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
+fn supervised_github_edge_reaches_the_session_exactly_once() {
     let env = Env::new();
     env.set_pr_fixture(1, PR_CONFLICTING_CI_SUCCESS); // one conflict edge, then stable
     let daemon = env.start_daemon();
@@ -607,16 +621,15 @@ fn wake_mid_turn_supervised_edge_surfaces_on_next_arm() {
     );
     let pid = poll_until("adapter running", SETTLE, || env.watch_pid(s));
 
-    // The supervised poller fires its one conflict edge mid-turn. Confirm it is
-    // unread WITHOUT reading it, so it stays pending for the wake hook.
+    // The session is idle with an inbox bound; the supervised poller fires its one
+    // conflict edge, which is delivered straight to it.
+    arm(&env, s);
+    let inbox = env.register_peer(s);
     poll_until("the supervised edge lands unread", SETTLE, || {
         (env.unread_total(s) >= 1).then_some(())
     });
-
-    // A fresh watcher sees the still-unread edge immediately and bumps for it.
-    arm(&env, s);
     let topic = format!("github.pr.{spec}");
-    assert_woken_for(&env, s, &topic);
+    assert_woken_for(&inbox, s, &topic);
 
     // Delivered exactly once, then the cursor advances (no redelivery).
     let events = env.read_events(s);

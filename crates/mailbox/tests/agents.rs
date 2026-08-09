@@ -29,7 +29,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 /// (ADR-0007) and arm its wake sentinel. Both are synchronous, so when this returns
 /// the session is genuinely addressable and wakeable.
 fn arm_idle(env: &Env, session: &str) {
-    env.arm(session);
+    env.start_session(session);
 }
 
 /// `mailbox agents --json` as seen by `caller`.
@@ -49,9 +49,10 @@ fn agent_row(env: &Env, caller: &str, session: &str) -> Option<Value> {
 
 // ==== the headline: two idle agents poke each other, no human in the loop =======
 
-/// A and B are both registered and armed. A sends to B: the daemon writes B's
-/// sentinel with B's inbox topic (and nothing else — payload-free), B's wake hook
-/// exits 2, B reads the message and sees `from: A`; B replies; A wakes the same way.
+/// A and B are both registered, and both have an inbox socket. A sends to B: the
+/// daemon delivers to B's socket naming only the topic (and nothing else —
+/// payload-free), B reads the message and sees `from: A`; B replies; A wakes the
+/// same way.
 #[test]
 fn round_trip_two_idle_agents_wake_each_other() {
     let env = Env::new();
@@ -61,10 +62,12 @@ fn round_trip_two_idle_agents_wake_each_other() {
 
     let (a, b) = ("s-alice", "s-bob");
 
-    // Both sessions go idle. The hooks register each inbox and arm each sentinel —
-    // the agents run nothing themselves.
+    // Both sessions go idle. The hook registers each inbox; the agents run nothing
+    // themselves. Each binds an inbox socket, which is what makes it wakeable.
     arm_idle(&env, a);
     arm_idle(&env, b);
+    let inbox_a = env.register_peer(a);
+    let inbox_b = env.register_peer(b);
 
     // --- A → B ---------------------------------------------------------------
     env.run_as_ok(
@@ -73,24 +76,17 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "send a->b",
     );
 
-    // The daemon writes B's sentinel, naming only the topic — that file IS the wake
-    // wire, so it is where payload-freeness has to hold.
-    let topics = poll_until("B's sentinel names its inbox", SETTLE, || {
-        let topics = env.sentinel_topics(b);
-        topics
-            .iter()
-            .any(|t| t == &format!("agent.{b}"))
-            .then_some(topics)
-    });
+    // The daemon delivers to B's inbox socket, naming only the topic — that frame IS
+    // the wake wire, so it is where payload-freeness has to hold.
+    let frame = inbox_b.next_frame(SETTLE).expect("B is woken on its inbox");
+    let content = frame["message"]["content"].as_str().unwrap_or_default();
     assert!(
-        !topics.iter().any(|t| t.contains("please review PR 42")),
-        "the wake must not carry the body: {topics:?}"
+        content.contains(&format!("agent.{b}")),
+        "the wake names B's inbox topic: {content}"
     );
-    // ...and the FileChanged hook turns that into a real wake (exit 2).
-    assert_eq!(
-        env.wake_hook(b).status.code(),
-        Some(2),
-        "a peer message wakes B"
+    assert!(
+        !content.contains("please review PR 42"),
+        "the wake must not carry the body: {content}"
     );
 
     // B reads its mail and can see who to reply to.
@@ -103,13 +99,16 @@ fn round_trip_two_idle_agents_wake_each_other() {
     // --- B → A (the reply) ----------------------------------------------------
     env.run_as_ok(b, &["send", a, "--text", "done, approved"], "send b->a");
 
-    poll_until("A's sentinel names its inbox", SETTLE, || {
-        env.sentinel_topics(a)
-            .iter()
-            .any(|t| t == &format!("agent.{a}"))
-            .then_some(())
-    });
-    assert_eq!(env.wake_hook(a).status.code(), Some(2), "B's reply wakes A");
+    let frame = inbox_a
+        .next_frame(SETTLE)
+        .expect("B's reply wakes A on its inbox");
+    assert!(
+        frame["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("agent.{a}")),
+        "the reply's wake names A's inbox topic"
+    );
 
     let events = env.read_events(a);
     assert_eq!(events.len(), 1);
@@ -143,6 +142,7 @@ fn a_human_with_no_session_can_list_agents_and_poke_one() {
 
     let b = "s-bob";
     arm_idle(&env, b);
+    let inbox_b = env.register_peer(b);
 
     // 1. Discovery, with no caller: the agent is listed, and NO row is marked self.
     let out = env.run_ok(&["--json", "agents"], "agents with no session");
@@ -175,16 +175,15 @@ fn a_human_with_no_session_can_list_agents_and_poke_one() {
     );
 
     // 3. It wakes B exactly like a peer's message does — the wake path is unchanged.
-    poll_until("B's sentinel names its inbox", SETTLE, || {
-        env.sentinel_topics(b)
-            .iter()
-            .any(|t| t == &format!("agent.{b}"))
-            .then_some(())
-    });
-    assert_eq!(
-        env.wake_hook(b).status.code(),
-        Some(2),
-        "a human's message wakes B like any other"
+    let frame = inbox_b
+        .next_frame(SETTLE)
+        .expect("a human's message wakes B like any other");
+    assert!(
+        frame["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("agent.{b}")),
+        "the wake names B's inbox topic"
     );
 
     // 4. B reads it. The content is there; `from` is ABSENT, not null and not a
@@ -508,13 +507,11 @@ fn agents_reports_registration_liveness_and_self() {
     let mut guard = env.leak_guard();
     guard.track_daemon(daemon.pid());
 
-    // Session ids long enough to be recognised as ids (the parser's guard against
-    // counting an id quoted inside an unrelated command line).
     let (a, b) = ("agent-alpha", "agent-bravo");
     arm_idle(&env, a);
     arm_idle(&env, b);
-    let claude_a = FakeClaude::running(a);
-    let claude_b = FakeClaude::running(b);
+    let claude_a = FakeClaude::running(&env.sessions_dir(), a, None);
+    let claude_b = FakeClaude::running(&env.sessions_dir(), b, None);
 
     // --json: both registered, both live, and A is marked as itself.
     let rows = agents(&env, a);

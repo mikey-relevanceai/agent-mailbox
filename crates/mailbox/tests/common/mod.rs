@@ -73,6 +73,47 @@ impl FakePeer {
     }
 }
 
+/// Register a fake Claude Code session in `sessions_dir` with an inbox socket under
+/// `socket_dir`, and serve it.
+///
+/// The socket lives directly under `socket_dir` rather than in a nested directory,
+/// because a Unix socket path is capped near 104 bytes on macOS and a deep temp path
+/// plus a session id blows through it.
+pub fn register_fake_peer(sessions_dir: &Path, socket_dir: &Path, session: &str) -> FakePeer {
+    std::fs::create_dir_all(sessions_dir).expect("create fake sessions dir");
+    let socket = socket_dir.join(format!("{session}.sock"));
+
+    let listener = UnixListener::bind(&socket).expect("bind fake inbox socket");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // Serve every connection: the daemon opens a fresh one per delivery.
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            if BufReader::new(stream).read_line(&mut line).is_ok() && tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(
+        sessions_dir.join(format!("{session}.json")),
+        serde_json::json!({
+            "pid": std::process::id(),
+            "sessionId": session,
+            "cwd": "/tmp",
+            "status": "idle",
+            "name": session,
+            "peerProtocol": 1,
+            "updatedAt": 1_786_000_000_000i64,
+            "messagingSocketPath": socket,
+        })
+        .to_string(),
+    )
+    .expect("write fake session registry entry");
+
+    FakePeer { rx }
+}
+
 // ---- binary locations ---------------------------------------------------------
 
 /// The freshly built `mailbox` bridge binary under test.
@@ -218,13 +259,6 @@ impl Env {
         self.db_path.parent().unwrap().join("mailbox.sock")
     }
 
-    /// The sentinel root for this env, under the tempdir. ALWAYS passed as
-    /// `MAILBOX_SENTINEL_ROOT` to the daemon AND to any command that resolves a
-    /// sentinel, so a test can NEVER touch the real `~/.mailbox`.
-    pub fn sentinel_root(&self) -> PathBuf {
-        self.db_path.parent().unwrap().join("sentinel")
-    }
-
     /// The fake Claude Code sessions directory for this env, under the tempdir.
     /// ALWAYS passed as `MAILBOX_CLAUDE_SESSIONS_DIR` to the daemon, so a test can
     /// NEVER read the developer's real `~/.claude/sessions` — and, far worse, never
@@ -234,72 +268,13 @@ impl Env {
     }
 
     /// Register `session` as a Claude Code session with a bound inbox socket, and
-    /// start listening on it — the peer channel's happy path (ADR-0020).
-    ///
-    /// The socket lives directly under the tempdir root rather than in a nested
-    /// directory, because a Unix socket path is capped near 104 bytes on macOS and a
-    /// deep temp path plus a session id blows through it.
+    /// start listening on it — the wake path's happy path (ADR-0020/0021).
     pub fn register_peer(&self, session: &str) -> FakePeer {
-        let dir = self.sessions_dir();
-        std::fs::create_dir_all(&dir).expect("create fake sessions dir");
-        let socket = self
-            .db_path
-            .parent()
-            .unwrap()
-            .join(format!("{session}.sock"));
-
-        let listener = UnixListener::bind(&socket).expect("bind fake inbox socket");
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            // Serve every connection: the daemon opens a fresh one per delivery.
-            for stream in listener.incoming().flatten() {
-                let mut line = String::new();
-                if BufReader::new(stream).read_line(&mut line).is_ok() && tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        std::fs::write(
-            dir.join(format!("{session}.json")),
-            serde_json::json!({
-                "pid": std::process::id(),
-                "sessionId": session,
-                "cwd": "/tmp",
-                "status": "idle",
-                "name": session,
-                "peerProtocol": 1,
-                "updatedAt": 1_786_000_000_000i64,
-                "messagingSocketPath": socket,
-            })
-            .to_string(),
+        register_fake_peer(
+            &self.sessions_dir(),
+            self.db_path.parent().unwrap(),
+            session,
         )
-        .expect("write fake session registry entry");
-
-        FakePeer { rx }
-    }
-
-    /// The absolute sentinel file path for `session` (its encoded id is itself for the
-    /// safe ids the tests use).
-    pub fn sentinel_path(&self, session: &str) -> PathBuf {
-        self.sentinel_root()
-            .join("by-agent")
-            .join(session)
-            .join(".mailbox-wake")
-    }
-
-    /// The topic names last written into `session`'s sentinel (payload-free), or an
-    /// empty vec if it was never written.
-    pub fn sentinel_topics(&self, session: &str) -> Vec<String> {
-        match std::fs::read_to_string(self.sentinel_path(session)) {
-            Ok(text) => text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
     }
 
     /// Write a `pr` view fixture for poll index `i` (scenario 1 scripts a
@@ -341,10 +316,8 @@ impl Env {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &self.db_path)
-            // The daemon writes the wake sentinels now, so it MUST be pointed at the
             // tempdir root — without this a test would bump files under the
             // developer's real ~/.mailbox.
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             // Likewise for the PEER channel (ADR-0020): without this the daemon would
             // read the developer's real ~/.claude/sessions and could deliver a test's
             // wake onto a real Claude Code session's inbox socket.
@@ -466,7 +439,6 @@ impl Env {
             .env("AGENT_MAILBOX_DB", &self.db_path)
             // Always a tempdir sentinel root: cleanup removes the sentinel dir, so this
             // is what keeps it off the real ~/.mailbox.
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -488,7 +460,6 @@ impl Env {
         let mut child = mailbox_command()
             .args(["harness", "session-start"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -502,66 +473,19 @@ impl Env {
         child.wait_with_output().expect("session-start output")
     }
 
-    /// Run `session-start` for a session and assert it armed: the sentinel exists.
+    /// Run `session-start` for a session and assert it succeeded.
     ///
-    /// Arming is now SYNCHRONOUS (the hook writes the file itself), so this needs no
-    /// poll — which is the point. It used to spawn a detached watcher and every
-    /// caller had to wait for a pidfile to appear before the session was really
-    /// wakeable.
-    pub fn arm(&self, session: &str) {
+    /// It used to also assert that a wake sentinel had been created, because Claude
+    /// Code could not watch a file that did not exist. Nothing is armed any more: a
+    /// session is woken through the inbox socket Claude Code binds for it, so all this
+    /// hook does is register the always-on agent inbox (ADR-0021).
+    pub fn start_session(&self, session: &str) {
         let out = self.session_start(session);
         assert!(
             out.status.success(),
             "session-start must exit 0; stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(
-            self.sentinel_path(session).exists(),
-            "session-start must arm the sentinel (Claude Code cannot watch a file that \
-             does not exist)"
-        );
-    }
-
-    /// Run `mailbox harness turn-end` (the Stop hook) for a session, feeding the Stop
-    /// hook JSON on stdin exactly as Claude Code would. It must ALWAYS exit 0 (never a
-    /// wake) and print nothing on stdout.
-    pub fn turn_end(&self, session: &str) -> Output {
-        let mut child = mailbox_command()
-            .args(["harness", "turn-end"])
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn mailbox harness turn-end");
-        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"Stop"}}"#);
-        let mut stdin = child.stdin.take().expect("turn-end stdin");
-        stdin.write_all(payload.as_bytes()).expect("write payload");
-        drop(stdin);
-        child.wait_with_output().expect("turn-end output")
-    }
-
-    /// Run `mailbox harness wake` (the FileChanged hook) for a session, feeding
-    /// the hook JSON. Returns its Output: exit code 2 = wake (stderr has the reminder),
-    /// 0 = no wake (the anti-loop path).
-    pub fn wake_hook(&self, session: &str) -> Output {
-        let mut child = mailbox_command()
-            .args(["harness", "wake"])
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("MAILBOX_SENTINEL_ROOT", self.sentinel_root())
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn mailbox harness wake");
-        let payload = format!(r#"{{"session_id":"{session}","hook_event_name":"FileChanged"}}"#);
-        let mut stdin = child.stdin.take().expect("wake stdin");
-        stdin.write_all(payload.as_bytes()).expect("write payload");
-        drop(stdin);
-        child.wait_with_output().expect("wake output")
     }
 
     // ---- status / read projections ------------------------------------------
@@ -693,61 +617,88 @@ impl Drop for Daemon {
 // ---- a stand-in for a running Claude Code process ------------------------------
 
 /// A process that looks like Claude Code to the ONE liveness signal the bridge
-/// trusts: [`mailbox::doctor::live_claude_sessions`] scans the process table for a
-/// program named `claude` carrying `--session-id <id>` in its own argv.
+/// trusts: an entry in Claude Code's session registry whose pid is still running
+/// ([`mailbox::doctor::live_from`]).
 ///
-/// It is a symlink to `/bin/sh` named `claude`, running a sleep loop with the
-/// session id in its arguments — so `ps` reports exactly the shape it reports for
-/// the real binary, with no Claude Code installed and no network. Killed and reaped
-/// on drop, so a failing assertion cannot leak it.
+/// It used to be a symlink to `/bin/sh` named `claude`, carrying `--session-id` in
+/// its argv, because liveness was reconstructed by parsing `ps` output. Claude Code
+/// publishes the id → pid mapping itself now, so the fake writes a registry entry
+/// instead of impersonating a command line (ADR-0021).
 ///
-/// The session id must LOOK like one (at least 8 characters of `[A-Za-z0-9_-]`), or
-/// the parser rejects it — that guard is what stops a session id quoted inside some
-/// unrelated command line from being counted as a live agent.
+/// The sleep loop is still a real process: the registry is deliberately NOT evidence
+/// of liveness (an entry outlives its process), so a test that wants a session to
+/// read as live needs something actually running to point the entry at.
+///
+/// Killed and reaped on drop, so a failing assertion cannot leak it.
 pub struct FakeClaude {
     child: Child,
-    _dir: TempDir,
+    registry_file: PathBuf,
+    sessions_dir: PathBuf,
+    session: String,
 }
 
 impl FakeClaude {
-    /// Start a fake Claude Code for `session` and block until the process table
-    /// actually reports it. Waiting here (rather than in each test) keeps the
-    /// liveness assertions about the code under test instead of about `ps` latency.
-    pub fn running(session: &str) -> Self {
-        let dir = TempDir::new().expect("fake claude tempdir");
-        let bin = dir.path().join("claude");
-        std::os::unix::fs::symlink("/bin/sh", &bin).expect("symlink /bin/sh as claude");
-        let child = Command::new(&bin)
-            .args(["-c", "while :; do sleep 1; done", "--session-id", session])
+    /// Start a fake Claude Code for `session`, registered in `sessions_dir`, and block
+    /// until the registry + process table agree it is live.
+    ///
+    /// `socket` optionally names an inbox socket to advertise — the difference between
+    /// a session that can be woken and one that cannot.
+    pub fn running(sessions_dir: &Path, session: &str, socket: Option<&Path>) -> Self {
+        std::fs::create_dir_all(sessions_dir).expect("create fake sessions dir");
+        let child = Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the fake claude");
+
+        let socket_field = match socket {
+            Some(path) => format!(r#","messagingSocketPath":"{}""#, path.display()),
+            None => String::new(),
+        };
+        let registry_file = sessions_dir.join(format!("{}.json", child.id()));
+        std::fs::write(
+            &registry_file,
+            format!(
+                r#"{{"pid":{},"sessionId":"{session}","cwd":"/tmp","status":"idle","name":"fake","updatedAt":1{socket_field}}}"#,
+                child.id()
+            ),
+        )
+        .expect("write fake registry entry");
+
+        let fake = FakeClaude {
+            child,
+            registry_file,
+            sessions_dir: sessions_dir.to_path_buf(),
+            session: session.to_string(),
+        };
         poll_until(
-            "the fake claude appears in the process table",
+            "the fake claude reads as live",
             Duration::from_secs(10),
-            || {
-                mailbox::doctor::live_claude_sessions()
-                    .filter(|live| live.contains(session))
-                    .map(|_| ())
-            },
+            || fake.is_live().then_some(()),
         );
-        FakeClaude { child, _dir: dir }
+        fake
     }
 
-    /// Kill and reap it, then block until it has left the process table — so a test
-    /// asserting "this agent is gone" is not racing the kernel.
-    pub fn stop(mut self, session: &str) {
+    /// Whether the bridge would currently consider this session live.
+    fn is_live(&self) -> bool {
+        let registry = mailbox::claude_registry::ClaudeRegistry::read_dir(&self.sessions_dir);
+        mailbox::doctor::live_from(&registry).contains(&self.session)
+    }
+
+    /// Kill and reap it, then block until it reads as gone — so a test asserting
+    /// "this agent is gone" is not racing the kernel.
+    pub fn stop(mut self, _session: &str) {
         self.terminate();
+        let sessions_dir = self.sessions_dir.clone();
+        let session = self.session.clone();
         poll_until(
-            "the fake claude leaves the process table",
+            "the fake claude reads as gone",
             Duration::from_secs(10),
             || {
-                mailbox::doctor::live_claude_sessions()
-                    .map(|live| !live.contains(session))
-                    .unwrap_or(true)
-                    .then_some(())
+                let registry = mailbox::claude_registry::ClaudeRegistry::read_dir(&sessions_dir);
+                (!mailbox::doctor::live_from(&registry).contains(&session)).then_some(())
             },
         );
     }
@@ -755,6 +706,8 @@ impl FakeClaude {
     fn terminate(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A real session's entry outlives it; these tests want a clean tempdir.
+        let _ = std::fs::remove_file(&self.registry_file);
     }
 }
 
