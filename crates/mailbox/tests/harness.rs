@@ -864,6 +864,120 @@ fn install_skills_installs_the_embedded_skill_and_is_idempotent() {
     assert_eq!(std::fs::read_to_string(&installed).unwrap(), written);
 }
 
+// ==== install-inbound: the opt-in that lets a bypass session RECEIVE (ADR-0020) ===
+
+/// The command does exactly one thing, and leaves everything else alone. It edits
+/// the same real `settings.json` `install-hooks` does, so "preserves unrelated
+/// settings" is the load-bearing property.
+#[test]
+fn install_inbound_sets_accept_and_preserves_unrelated_settings() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"model":"sonnet","permissions":{"deny":["Read"]}}"#,
+    )
+    .unwrap();
+
+    let out = install_inbound(home.path(), &[]);
+
+    assert_ok(&out, "install-inbound");
+    let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(merged["crossSessionInbound"], "accept");
+    assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
+    assert_eq!(merged["permissions"]["deny"][0], "Read");
+}
+
+/// Setting the inbound policy must never install hooks, and `install-hooks` must
+/// never set the inbound policy. They are separate decisions: one wires a wake path,
+/// the other widens what a bypassPermissions agent will accept unattended. Bundling
+/// them would mean nobody ever consciously agreed to the second.
+#[test]
+fn install_inbound_and_install_hooks_stay_separate_decisions() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+
+    assert_ok(&install_inbound(home.path(), &[]), "install-inbound");
+    let after_inbound = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(after_inbound["crossSessionInbound"], "accept");
+    assert!(
+        after_inbound.get("hooks").is_none(),
+        "install-inbound must not install hooks: {after_inbound}"
+    );
+
+    // And the reverse: installing hooks over it leaves the policy exactly as the
+    // operator set it — neither adding one nor removing the one they chose.
+    let fresh = TempDir::new().unwrap();
+    let fresh_settings = default_settings(fresh.path());
+    std::fs::create_dir_all(fresh_settings.parent().unwrap()).unwrap();
+    std::fs::write(&fresh_settings, "{}").unwrap();
+    assert_ok(&install_hooks(fresh.path(), &[]), "install-hooks");
+    let after_hooks = parse_json(&std::fs::read_to_string(&fresh_settings).unwrap());
+    assert!(
+        after_hooks.get("crossSessionInbound").is_none(),
+        "install-hooks must never widen the inbound policy: {after_hooks}"
+    );
+}
+
+/// A re-run reports that nothing changed rather than pretending it did something —
+/// and, more importantly, does not re-print the security warning at someone who has
+/// already accepted it.
+#[test]
+fn install_inbound_is_idempotent_and_says_so() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+
+    assert_ok(&install_inbound(home.path(), &[]), "first install-inbound");
+    let second = install_inbound(home.path(), &[]);
+
+    assert_ok(&second, "second install-inbound");
+    assert!(
+        stdout(&second).contains("already \"accept\""),
+        "a re-run must say it changed nothing: {}",
+        stdout(&second)
+    );
+    assert!(
+        !stderr(&second).contains("accepts messages from any process"),
+        "the warning is for the person who is CHANGING the policy, not every re-run"
+    );
+}
+
+/// With no Claude Code settings file, this writes nothing at all — the same stance
+/// `install-hooks` takes. Conjuring a settings.json to loosen a security default on a
+/// machine that may not even run Claude Code would be the worst possible default.
+#[test]
+fn install_inbound_without_a_settings_file_changes_nothing() {
+    let home = TempDir::new().unwrap();
+
+    let out = install_inbound(home.path(), &[]);
+
+    assert_ok(&out, "install-inbound (no settings)");
+    assert!(
+        stdout(&out).contains("no Claude Code settings found at"),
+        "it must say why it did nothing: {}",
+        stdout(&out)
+    );
+    assert!(
+        !default_settings(home.path()).exists(),
+        "no settings file may be conjured to hold this setting"
+    );
+}
+
+fn install_inbound(home: &Path, args: &[&str]) -> Output {
+    mailbox_command()
+        .args(["harness", "install-inbound"])
+        .args(args)
+        .env("AGENT_MAILBOX_HOME", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-inbound")
+}
+
 /// `install-hooks`, ALWAYS with the home redirected at a tempdir.
 ///
 /// Every one of these tests must be hermetic: `install-hooks` now merges into the

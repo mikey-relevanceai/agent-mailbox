@@ -349,6 +349,63 @@ pub fn merge_into_settings(mut existing: Value, snippet: &Value) -> Value {
     existing
 }
 
+/// Claude Code's setting for what a session does with messages arriving on its inbox
+/// socket (ADR-0020).
+pub const INBOUND_SETTING_KEY: &str = "crossSessionInbound";
+
+/// The value that lets a `bypassPermissions` session receive a mailbox wake without
+/// a human approving each one.
+pub const INBOUND_ACCEPT: &str = "accept";
+
+/// What [`inbound_state`] found in a settings document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundState {
+    /// No value set. Claude Code then decides per message from the two sessions'
+    /// permission classes — which HOLDS our wakes for a `bypassPermissions` session.
+    Unset,
+    /// Already `accept`: nothing to do.
+    Accept,
+    /// Set to something else (`hold` / `refuse`, or a value we do not recognise).
+    /// Reported rather than silently overwritten.
+    Other(String),
+}
+
+/// Read the current inbound policy out of a settings document.
+///
+/// Separate from the write so the CLI can tell the operator what is there *before*
+/// changing it — and so re-running the command on an already-configured machine can
+/// say "already accept" instead of rewriting the file.
+pub fn inbound_state(existing: &Value) -> InboundState {
+    match existing.get(INBOUND_SETTING_KEY).and_then(Value::as_str) {
+        None => InboundState::Unset,
+        Some(INBOUND_ACCEPT) => InboundState::Accept,
+        Some(other) => InboundState::Other(other.to_string()),
+    }
+}
+
+/// Set `crossSessionInbound: "accept"`, leaving every other setting untouched.
+///
+/// # Why this is its own command and never part of `install-hooks`
+///
+/// `accept` re-opens unattended delivery in exactly the configuration Claude Code's
+/// default guards: a session running `--dangerously-skip-permissions` acts without
+/// asking, so accepting messages from any same-user process means any such process
+/// can direct that agent. That is a real widening of trust, and it is the operator's
+/// call to make — not a side effect of installing a wake path. `install-hooks` must
+/// never do this implicitly.
+///
+/// Idempotent, as [`merge_settings_file`] requires.
+pub fn set_inbound_accept(mut existing: Value) -> Value {
+    if !existing.is_object() {
+        existing = json!({});
+    }
+    existing
+        .as_object_mut()
+        .expect("existing is an object")
+        .insert(INBOUND_SETTING_KEY.to_string(), json!(INBOUND_ACCEPT));
+    existing
+}
+
 /// Whether a hook group is one WE installed — i.e. it runs any agent-mailbox
 /// harness command. Matched on the command's shape rather than its exact text, so
 /// the group we planted with a different binary path or `--max-block-ms` is still
@@ -522,6 +579,27 @@ pub fn merge_hooks_file(
     snippet: &Value,
     backup: BackupPolicy,
 ) -> Result<MergeReport, MergeError> {
+    merge_settings_file(path, backup, |existing| {
+        merge_into_settings(existing, snippet)
+    })
+}
+
+/// The general form of [`merge_hooks_file`]: apply `merge` to the settings document
+/// at `path` under every guarantee listed there.
+///
+/// Split out because the hooks are no longer the only thing we edit — ADR-0020 adds
+/// `crossSessionInbound` — and every one of those guarantees (do not destroy an
+/// unreadable file, write through a symlink, compare-and-swap against Claude Code's
+/// own writes, keep a pre-image) is the product of a real bug. A second command
+/// hand-rolling its own settings write would re-open all of them.
+///
+/// `merge` must be **idempotent**: it is re-applied from scratch on every retry
+/// after a lost compare-and-swap.
+pub fn merge_settings_file(
+    path: &Path,
+    backup: BackupPolicy,
+    merge: impl Fn(Value) -> Value,
+) -> Result<MergeReport, MergeError> {
     let (target, via_symlink) = resolve_symlink(path)?;
     let mut backup_path = None;
 
@@ -530,7 +608,7 @@ pub fn merge_hooks_file(
         // below checks is still there when we publish.
         let raw = read_settings(&target)?;
         let existing = parse_settings(&target, raw.as_deref())?;
-        let merged = merge_into_settings(existing, snippet);
+        let merged = merge(existing);
         let mut body = serde_json::to_string_pretty(&merged).map_err(MergeError::Serialize)?;
         body.push('\n');
 
@@ -671,6 +749,75 @@ mod tests {
             mailbox_bin: "/opt/mailbox".to_string(),
             timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
+    }
+
+    // ==== crossSessionInbound (ADR-0020) ======================================
+
+    /// The whole point of the setting, and the whole risk of it, is one key. It must
+    /// land without disturbing anything else the user has configured — this command
+    /// edits the same real settings.json that `install-hooks` does.
+    #[test]
+    fn setting_inbound_accept_preserves_every_other_setting() {
+        let existing = json!({
+            "model": "opus",
+            "permissions": { "deny": ["Bash(rm -rf /)"] },
+            "hooks": { "Stop": [{ "matcher": "" }] },
+        });
+
+        let merged = set_inbound_accept(existing);
+
+        assert_eq!(merged[INBOUND_SETTING_KEY], "accept");
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(merged["permissions"]["deny"][0], "Bash(rm -rf /)");
+        assert_eq!(merged["hooks"]["Stop"][0]["matcher"], "");
+    }
+
+    /// `merge_settings_file` re-applies the transform on every compare-and-swap
+    /// retry, so a non-idempotent one would produce a different document depending on
+    /// how many times it lost the race.
+    #[test]
+    fn setting_inbound_accept_is_idempotent() {
+        let once = set_inbound_accept(json!({"model": "opus"}));
+        let twice = set_inbound_accept(once.clone());
+        assert_eq!(once, twice);
+    }
+
+    /// The command reports what it found before changing it, so the three states have
+    /// to be told apart — including a value we do not recognise, which must read as
+    /// "something is set" rather than as "unset" and be reported, not silently kept.
+    #[test]
+    fn inbound_state_distinguishes_unset_accept_and_anything_else() {
+        assert_eq!(inbound_state(&json!({})), InboundState::Unset);
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "accept" })),
+            InboundState::Accept
+        );
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "hold" })),
+            InboundState::Other("hold".to_string())
+        );
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "banana" })),
+            InboundState::Other("banana".to_string())
+        );
+        // A non-string value is not a policy we can read; treat it as "something else"
+        // rather than as unset, so it is reported before being replaced.
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: 7 })),
+            InboundState::Unset
+        );
+    }
+
+    /// Setting the inbound policy must never install hooks as a side effect. They are
+    /// separate decisions with separate consequences, and `install-hooks` is
+    /// deliberately the one that does NOT widen a security default.
+    #[test]
+    fn setting_inbound_accept_installs_no_hooks() {
+        let merged = set_inbound_accept(json!({}));
+        assert!(
+            merged.get("hooks").is_none(),
+            "install-inbound changes one key and nothing else: {merged}"
+        );
     }
 
     #[test]

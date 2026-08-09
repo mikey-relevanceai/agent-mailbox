@@ -203,6 +203,9 @@ pub enum HarnessCommand {
     InstallHooks(InstallHooksArgs),
     /// Install the embedded agent-mailbox skill into the Claude Code skills dir.
     InstallSkills(InstallSkillsArgs),
+    /// Let a bypassPermissions session RECEIVE mailbox wakes on its inbox socket, by
+    /// setting `crossSessionInbound: "accept"` (ADR-0020). Opt-in, never implicit.
+    InstallInbound(InstallInboundArgs),
 }
 
 #[derive(Args, Debug)]
@@ -220,6 +223,22 @@ pub struct InstallHooksArgs {
     /// Claude Code hook timeout to write, in seconds.
     #[arg(long, default_value_t = DEFAULT_HOOK_TIMEOUT_SECS)]
     pub timeout_secs: u64,
+}
+
+/// Arguments to `install-inbound`.
+///
+/// Deliberately minimal: there is exactly one thing this command does, and no flag
+/// to make it do something weaker. If you do not want `accept`, do not run it.
+#[derive(Args, Debug)]
+pub struct InstallInboundArgs {
+    /// settings.json to set the policy in, created if missing. Defaults to
+    /// `~/.claude/settings.json` (home from `AGENT_MAILBOX_HOME`, else `HOME`) IF
+    /// that file exists. Unrelated settings are always preserved.
+    ///
+    /// Prefer a per-session `--settings` file over your user settings: a user-level
+    /// `accept` applies to EVERY session you run, not only the ones that subscribe.
+    #[arg(long)]
+    pub settings: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1068,6 +1087,7 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
         HarnessCommand::TurnStart => Ok(run_turn_start_hook()),
         HarnessCommand::InstallHooks(args) => run_harness_install(format, args),
         HarnessCommand::InstallSkills(args) => run_harness_install_skills(format, args),
+        HarnessCommand::InstallInbound(args) => run_harness_install_inbound(format, args),
         // `wake` is dispatched synchronously by `main` (a read-only peek needs no tokio
         // runtime) and never reaches here. `turn-end` re-registers the inbox over the
         // socket, so it IS dispatched here.
@@ -1439,6 +1459,106 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
     }
 
     eprintln!("next: run `mailbox harness install-skills` to install the agent-mailbox skill");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `install-inbound`: set `crossSessionInbound: "accept"` so a `bypassPermissions`
+/// session can RECEIVE mailbox wakes on its inbox socket (ADR-0020).
+///
+/// # Why this is a separate, opt-in command
+///
+/// With no value set, Claude Code decides per message from both sessions' permission
+/// classes. A session running `--dangerously-skip-permissions` HOLDS an arriving
+/// message for human approval and drops it after ~5 minutes — so the bridge's wakes
+/// never land, silently. `accept` fixes that, and in doing so re-opens unattended
+/// delivery in exactly the configuration the guard exists for: an agent that acts
+/// without asking, now taking direction from any process running as the same user.
+///
+/// That trade is the operator's to make. `install-hooks` therefore never does this,
+/// and this command exists so that saying yes is explicit, reversible, and reported.
+fn run_harness_install_inbound(
+    format: OutputFormat,
+    args: InstallInboundArgs,
+) -> anyhow::Result<ExitCode> {
+    use mailbox_harness::install::{BackupPolicy, InboundState, SettingsTarget};
+    use std::cell::RefCell;
+
+    let target = mailbox_harness::install::settings_target(args.settings);
+
+    let (path, backup) = match &target {
+        SettingsTarget::Explicit(path) => (path, BackupPolicy::Skip),
+        SettingsTarget::DefaultFound(path) => (path, BackupPolicy::Keep),
+        SettingsTarget::NoDefault { looked_at } => {
+            // Nothing to edit, and conjuring a settings.json on a machine with no
+            // Claude Code is not ours to do (same stance as `install-hooks`).
+            let where_we_looked = match looked_at {
+                Some(path) => format!("no Claude Code settings found at {}", path.display()),
+                None => "no home to resolve Claude Code settings under (neither \
+                         AGENT_MAILBOX_HOME nor HOME is set, or it is not absolute)"
+                    .to_string(),
+            };
+            note(
+                format,
+                &format!(
+                    "{where_we_looked}; nothing was changed — pass --settings <path> to choose one"
+                ),
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+
+    // What the successful merge actually read, recorded by the merge itself rather
+    // than by a second read: the closure re-runs on every compare-and-swap retry, so
+    // this ends up holding what the winning attempt saw, with no race to misreport.
+    let seen = RefCell::new(InboundState::Unset);
+    let report = mailbox_harness::install::merge_settings_file(path, backup, |existing| {
+        *seen.borrow_mut() = mailbox_harness::install::inbound_state(&existing);
+        mailbox_harness::install::set_inbound_accept(existing)
+    })
+    .with_context(|| {
+        format!(
+            "setting {} in {} (your settings were NOT modified)",
+            mailbox_harness::install::INBOUND_SETTING_KEY,
+            path.display()
+        )
+    })?;
+
+    let before = seen.into_inner();
+    let what_changed = match &before {
+        InboundState::Accept => format!(
+            "{} was already \"accept\" in {}; nothing changed",
+            mailbox_harness::install::INBOUND_SETTING_KEY,
+            report.written.display()
+        ),
+        InboundState::Unset => format!(
+            "set {} = \"accept\" in {}",
+            mailbox_harness::install::INBOUND_SETTING_KEY,
+            report.written.display()
+        ),
+        InboundState::Other(previous) => format!(
+            "changed {} from \"{previous}\" to \"accept\" in {}",
+            mailbox_harness::install::INBOUND_SETTING_KEY,
+            report.written.display()
+        ),
+    };
+    note(format, &what_changed);
+    if let Some(backup) = &report.backup {
+        note(
+            format,
+            &format!("previous settings saved to {}", backup.display()),
+        );
+    }
+
+    // Say plainly what was just widened. A setup command that quietly loosens a
+    // security default and prints only "done" is how an operator ends up not knowing.
+    if before != InboundState::Accept {
+        eprintln!(
+            "note: this session class now accepts messages from any process running as you, \
+             without a prompt. That is what lets the bridge wake a --dangerously-skip-permissions \
+             session; it also means anything else running as you can direct that agent. Undo by \
+             removing the key, or setting it to \"hold\" or \"refuse\"."
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
