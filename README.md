@@ -11,21 +11,26 @@ woken when one of them changes. Things worth waking on:
 - a peer agent handing off work
 
 The key idea: **the agent never polls and never re-arms.** A local *bridge daemon*
-supervises the pollers and, when mail lands, writes a per-session **sentinel file**
-that Claude Code is watching; a `FileChanged` *hook* turns that write into a wake.
-The whole agent-facing contract is four verbs — **subscribe → read → react →
-unsubscribe** — and that's it.
+supervises the pollers and, when mail lands, delivers straight onto the session's
+Claude Code **inbox socket** — which starts a turn on an idle session. Sessions that
+have no socket (Claude Code gates it, and the gate cannot be turned on from outside)
+fall back to a **sentinel file** plus a `FileChanged` hook. The whole agent-facing
+contract is four verbs — **subscribe → read → react → unsubscribe** — and that's it.
 
 ```text
 Adapters (detect world changes)
         ↓ publish
-Bridge (durable events + subscriptions; writes each subscriber's wake sentinel)
-        ↓ FileChanged hook → exit 2
+Bridge (durable events + subscriptions; delivers the wake)
+        ↓ has this subscriber an inbox socket?
+        ├─ yes → write it; the idle session takes a turn
+        └─ no  → write its sentinel → FileChanged hook → exit 2
 Agent sessions (react, never poll)
 ```
 
-Three links, two live components and a file. There is no per-session watcher
-process and nothing on a timer ([ADR-0017](docs/adr/0017-daemon-bumps-the-sentinel.md)).
+Two live components and, on the fallback path, a file. There is no per-session
+watcher process and nothing on a timer
+([ADR-0020](docs/adr/0020-peer-inbox-socket-is-the-wake-wire.md),
+[ADR-0017](docs/adr/0017-daemon-bumps-the-sentinel.md)).
 
 ## Quickstart
 
@@ -62,6 +67,21 @@ Both are idempotent — re-run them after an upgrade to refresh the hooks and th
 skill. Both default under the same home (`AGENT_MAILBOX_HOME`, else `HOME`), and
 both take an override: `--skills-dir <path>` and `--settings <path>`.
 
+**If your sessions run `--dangerously-skip-permissions`**, they will *hold* an
+inbox-socket wake for an approval nobody is there to give, and drop it after five
+minutes — so they wake only through the slower fallback path. There is a third,
+**opt-in** command that fixes it:
+
+```bash
+mailbox harness install-inbound --settings <file>   # crossSessionInbound: "accept"
+```
+
+Read what it widens first: `accept` means that session takes messages from any
+process running as you without a prompt. That is what lets the bridge wake an agent
+that acts without asking — and it means anything else running as you can direct it
+too. `install-hooks` deliberately never sets this; the choice is yours to make.
+See [docs/01-wake.md](docs/01-wake.md).
+
 `install-hooks` merges into your existing `~/.claude/settings.json` (preserving
 unrelated settings and foreign hooks). If that file does **not** exist, it prints
 the snippet instead of conjuring a `settings.json` on a machine with no Claude
@@ -91,7 +111,8 @@ crates/
   mailbox/            # bridge CLI + daemon binary
   mailbox-protocol/   # shared publish/subscribe types
   mailbox-harness/    # Claude Code integration: the hook set (session-start /
-                      # turn-start / turn-end / wake / cleanup) + hooks & skills install
+                      # turn-start / turn-end / wake / cleanup) + hooks, skills and
+                      # inbound-policy install
 adapters/
   stub-adapter/       # reference adapter (synthetic edges; demo/tests)
   github-pr-adapter/  # the real GitHub PR poller (via `gh`)

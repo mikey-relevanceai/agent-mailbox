@@ -126,7 +126,8 @@ fails loudly (the lock is held for the daemon's whole life).
 
 ## 2. Set up Claude Code (two commands)
 
-Setting up a machine is two idempotent commands, and they are complementary:
+Setting up a machine is two idempotent commands (plus one opt-in third, below), and
+they are complementary:
 
 ```bash
 mailbox harness install-skills   # skill  -> ~/.claude/skills
@@ -145,6 +146,21 @@ Both resolve their default under the same home — `AGENT_MAILBOX_HOME` if set, 
 `HOME` — and both take an explicit override (`--settings <path>`,
 `--skills-dir <path>`). Both are safe to re-run: after upgrading `mailbox`, run
 them again to refresh the hooks and the skill.
+
+There is a **third, opt-in** command that neither of those two will ever do for you:
+
+```bash
+mailbox harness install-inbound --settings <file>   # crossSessionInbound: "accept"
+```
+
+You need it only if your sessions run `--dangerously-skip-permissions`. Claude Code
+holds an inbox-socket wake arriving at such a session for human approval and drops it
+after ~5 minutes, so those sessions wake only through the slower sentinel fallback.
+`accept` fixes that — and in doing so lets **any** process running as you put a
+prompt in front of an agent that acts without asking. Read
+[docs/01-wake.md](01-wake.md#receiving-on-a---dangerously-skip-permissions-session)
+before running it, and prefer a per-session `--settings` file over your user settings
+so it applies to the fleet that subscribes rather than every session you start.
 
 ### 2a. Wire the Claude Code hooks
 

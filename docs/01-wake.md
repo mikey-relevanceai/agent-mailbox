@@ -4,27 +4,123 @@ How an idle agent session gets woken when the world changes, and how it stays
 wakeable for the whole session with the agent doing nothing at all — no arm
 command, no re-arm, nothing on a timer.
 
-The design in force is [ADR-0017](adr/0017-daemon-bumps-the-sentinel.md) (the daemon
-writes the sentinel) over [ADR-0008](adr/0008-on-demand-wake-filechanged.md) (the
-wake is a file change, not a timer). The **re-arm** this file used to be named for —
-ADR-0006's `Stop` → `arm` → exit-2-at-`max_block` loop, one model turn per
-`max_block` of idle — no longer exists in any form; it is described below only as
-the problem the current design solves.
+The design in force is [ADR-0020](adr/0020-peer-inbox-socket-is-the-wake-wire.md):
+the daemon delivers straight onto the session's **Claude Code inbox socket**, and
+falls back to the **sentinel + `FileChanged`** path of
+[ADR-0017](adr/0017-daemon-bumps-the-sentinel.md) /
+[ADR-0008](adr/0008-on-demand-wake-filechanged.md) for sessions that have no socket.
+The **re-arm** this file used to be named for — ADR-0006's `Stop` → `arm` →
+exit-2-at-`max_block` loop, one model turn per `max_block` of idle — no longer
+exists in any form; it is described below only as the problem the current design
+solves.
 
 ## Layers
 
 ```text
 Adapters (detect world changes)
         ↓ publish
-Bridge (durable events + subscriptions; writes each subscriber's sentinel)
-        ↓ sentinel change → FileChanged hook wakes
+Bridge (durable events + subscriptions; delivers the wake)
+        ↓ has this subscriber an inbox socket?
+        ├─ yes → write it; the idle session takes a turn
+        └─ no  → write its sentinel → FileChanged hook → exit 2 → wake
 Agent sessions (react, never poll)
 ```
 
 Adapters only `publish`. The bridge owns durable logs, topics, per-subscriber
-cursors, **and the sentinel write**. Harness integrators own the arm/wake hooks.
+cursors, **and the wake delivery**. Harness integrators own the hooks that serve the
+fallback channel.
 
-## Claude Code: a sentinel file + a `FileChanged` wake
+## Two channels, and why both exist
+
+| | Peer inbox socket | Sentinel + `FileChanged` |
+|---|---|---|
+| Hops | 1 (daemon → session) | 4 (daemon → file → hook → exit 2 → session) |
+| Needs hooks installed | No | Yes |
+| Needs Claude Code ≥ 2.1.224 | Yes | No |
+| Available | Only when Claude Code bound a socket | Always |
+| Stray write costs | **a model turn** — the message IS the wake | a hook process; the hook re-checks the store and exits 0 |
+
+The socket is preferred because it is one hop with nothing in between to fail
+silently — which is what the sentinel path kept doing (ADR-0008's three coalescing
+bugs, ADR-0009's sweeper, ADR-0012's spent edge, ADR-0013's un-re-registered
+resume).
+
+The sentinel stays because **whether a session binds a socket is not ours to
+decide.** Claude Code gates it on `agents_cross_session_inbox`; when the gate is
+off it logs `[uds-messaging] Skipped: cross-session messaging gate off` and binds
+nothing. On the machine ADR-0020 was designed against, 2 of 19 live sessions had a
+socket, across identical versions. There is no setting, flag or environment
+variable that turns it on — `CLAUDE_CODE_MESSAGING_SOCKET` is an *output* Claude
+Code exports to hooks, not an input.
+
+**The asymmetry in the last row is load-bearing.** On the sentinel channel a write
+is only a trigger, so a spurious one is harmless. On the peer channel delivery *is*
+the turn, with no second opinion — so the daemon never sends a peer frame for an
+empty unread set.
+
+## The peer channel: the session's inbox socket
+
+Since 2.1.224 a Claude Code session registers itself at
+`~/.claude/sessions/<pid>.json` and — when the gate is on — binds a Unix socket
+listed there as `messagingSocketPath`. Anything running as the same user can write
+to it, and **if the session is idle, Claude Code starts a turn with the message.**
+That is the wake primitive, delivered by the harness rather than assembled from
+file watches.
+
+On publish the daemon looks up each subscriber's `sessionId` in that registry and,
+if it has a live socket, writes one newline-terminated frame:
+
+```json
+{"type":"user","message":{"role":"user","content":"mail on topic github.pr.o/r#42"}}
+```
+
+Three properties are deliberate, and each is pinned by a test:
+
+- **We claim no permission class.** The richer envelope `SendMessage` writes carries
+  `from-mode`, self-asserting whether the sender bypasses permission prompts. It is
+  believed without verification, and setting it to `bypass` would reach a
+  `bypassPermissions` receiver — but it is *also* what makes every ordinary
+  permission-prompting receiver HOLD the message. The honest frame is the more
+  deliverable one.
+- **Payload-free, still.** `content` is the same topic-names-only reminder the
+  exit-2 hook writes to stderr. The body stays in the durable log until `read`.
+- **The registry is a lookup, not liveness.** A registry file outlives its process,
+  exactly as ADR-0017 found for every other per-session artefact, so a socket that
+  no longer exists reads as "no socket" and the subscriber falls back.
+
+### Receiving on a `--dangerously-skip-permissions` session
+
+Claude Code decides delivery from **both** sessions' permission classes, where
+`bypassPermissions` is one class and everything else (default, `auto`,
+`acceptEdits`, `dontAsk`) is the other. With nothing configured:
+
+| Receiver | Sender claims | Outcome |
+|---|---|---|
+| prompting | nothing | **delivered** — nothing to configure |
+| bypass | nothing | **held** for approval, dropped after `dialogExpiry` (default 5m) |
+
+So an ordinary session wakes out of the box, and a `bypassPermissions` session
+does not — its wakes are held behind a dialog nobody is there to answer, then
+dropped. The fix is Claude Code's `crossSessionInbound: "accept"`, which
+`mailbox harness install-inbound` sets **only when you ask it to**:
+
+```bash
+mailbox harness install-inbound                      # user settings (every session)
+mailbox harness install-inbound --settings <file>    # preferred: just this fleet
+```
+
+Understand what it widens before running it. `accept` means that session takes
+messages from any process running as you, without a prompt — which is what lets the
+bridge wake it, and also means anything else running as you can direct an agent that
+acts without asking. Prefer a per-session `--settings` file over user settings, so
+it applies to the sessions that actually subscribe rather than every session you
+run. `install-hooks` never does this, and never will: it is a separate decision with
+a separate consequence.
+
+Until you opt in, a `bypassPermissions` session is still served by the fallback
+channel below — so it wakes, just through the hooks rather than the socket.
+
+## The fallback channel: a sentinel file + a `FileChanged` wake
 
 Claude Code can run a background hook with `asyncRewake: true`. When that process
 exits with code **2**, the harness wakes an idle session and surfaces stderr as a
@@ -72,7 +168,8 @@ Caveats:
 | `UserPromptSubmit` (matcher `""`) | `mailbox harness turn-start` | Stamps that a turn has OPENED (ADR-0016). Paired with the `Stop` hook's turn-ended stamp, it is what lets `mailbox doctor` report a silent session as **busy** rather than deaf. Prints nothing, always exits 0. |
 | `FileChanged` (matcher `.mailbox-wake`) | `mailbox harness wake` (`asyncRewake: true`, `timeout` 30s) | On any change to the sentinel, opens the store **read-only** and checks whether THIS session has genuine unread mail. Exits **2** with `mail on topic X` on stderr iff so; otherwise exits **0** (the anti-loop guard — a `FileChanged` fires on every change, so an unconditional exit 2 would loop the agent). It also stamps a hook-ran ack on every exit path (ADR-0016). Isolation: the store re-check, not the sentinel path, is authoritative — a bump to another session's sentinel (shared-ancestor cwd) exits 0 here. |
 | `SessionEnd` | `mailbox harness cleanup` | **Removes the session's sentinel dir** and calls the bridge to drop this session's subscriptions **and** interests (feeds the card-08 refcount — no zombie poller outlives the session). It reaps nothing: there is no per-session process left to reap. |
-| install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` *atomically*, preserving unrelated settings; an upgrade sweeps the retired ADR-0006 `arm` hooks. |
+| install | `mailbox harness install-hooks [--settings <path>]` | Merges the hooks snippet into the Claude Code `settings.json` *atomically*, preserving unrelated settings; an upgrade sweeps the retired ADR-0006 `arm` hooks. **Never touches `crossSessionInbound`.** |
+| install (opt-in) | `mailbox harness install-inbound [--settings <path>]` | Sets `crossSessionInbound: "accept"` so a `bypassPermissions` session can RECEIVE a peer-channel wake instead of holding it for approval (ADR-0020). Run only when you have read what it widens; it prints that plainly. Idempotent, and reports what it found before changing it. |
 
 **The sentinel.** `<sentinel-root>/by-agent/<encoded-session>/.mailbox-wake`, where
 `<sentinel-root>` defaults to `~/.mailbox` (override with `MAILBOX_SENTINEL_ROOT`;
@@ -231,8 +328,9 @@ its per-publish wake counts at INFO on its own stderr:
 | Line | Means |
 |---|---|
 | `armed the wake sentinel` | `session-start` created/refreshed the watched file, with the topics it wrote |
-| `bumped subscribers' wake sentinels after publish` (`bumped` / `failed`) | how many subscribers the daemon actually wrote a sentinel for |
-| `could not write a subscriber's wake sentinel` | that subscriber will not wake for THIS event (the event is still durable) |
+| `woke subscribers after publish` (`peer` / `sentinel` / `fell_back` / `failed`) | how each subscriber was reached. **`peer` is the socket channel, `sentinel` the fallback** — if you expected the socket and see `sentinel`, that session bound no socket (the gate), not that anything broke |
+| `a subscriber's inbox socket refused the wake; fell back to its sentinel` | the session exited between the registry read and the write; the fallback carried it |
+| `could not wake a subscriber on either channel` | that subscriber will not wake for THIS event (the event is still durable) |
 | `FileChanged wake: genuine unread mail; exiting 2 to wake the session` | the wake hook fired a real wake |
 | `FileChanged wake: nothing unread (stray sentinel change); exiting 0 (no wake)` | the anti-loop guard held |
 | `turn boundary: the wake sentinel is missing … re-arming it` | the session had become unwakeable; the Stop hook healed it |
@@ -251,7 +349,8 @@ Codex has lifecycle hooks (`SessionStart`, `Stop`, …) but **not** an
 | `async: true` background hooks | Yes | Parsed, then **skipped** |
 | `asyncRewake` (bg exit → wake idle) | Yes | **No** |
 | `FileChanged` (external file change → hook) | Yes | **No** |
-| Native external-event → idle wake | Via hooks / Monitor | [Requested](https://github.com/openai/codex/issues/20312), not shipped |
+| Per-session inbox socket (external process → idle wake) | Yes, 2.1.224+ — but **feature-gated**, and the gate cannot be turned on | **No** |
+| Native external-event → idle wake | Yes, via the inbox socket (else hooks) | [Requested](https://github.com/openai/codex/issues/20312), not shipped |
 
 Codex `Stop` can continue a turn (block stop) at turn boundaries; it does not wake a
 truly idle session. For agent-mailbox, Claude Code is the first harness; Codex needs a
@@ -282,20 +381,28 @@ sequenceDiagram
 
     Adapter->>Bridge: publish(topic, event)
     Bridge->>Bridge: append durable log; advance offset
-    Bridge->>Sentinel: write the subscriber's unread topic names (bump mtime)
-    Sentinel-->>Harness: FileChanged fires (idle session)
-    Harness->>Hooks: FileChanged → wake
-    Hooks->>Bridge: read-only unread check
-    alt genuine unread
-        Hooks-->>Harness: exit 2, stderr "mail on topic X"
-        Harness->>Agent: wake idle session (system reminder)
-        Agent->>Bridge: read(my cursors)
-        Bridge-->>Agent: unread events
-        Agent->>Agent: react (tools, edits, replies)
-    else nothing unread (stray change)
-        Hooks-->>Harness: exit 0 (no wake) — anti-loop
+    Bridge->>Bridge: look up the subscriber in ~/.claude/sessions
+
+    alt the subscriber has an inbox socket (ADR-0020)
+        Bridge->>Harness: write {"type":"user", …"mail on topic X"} to its socket
+        Harness->>Agent: start a turn (the message IS the wake)
+    else no socket — the fallback channel
+        Bridge->>Sentinel: write the subscriber's unread topic names (bump mtime)
+        Sentinel-->>Harness: FileChanged fires (idle session)
+        Harness->>Hooks: FileChanged → wake
+        Hooks->>Bridge: read-only unread check
+        alt genuine unread
+            Hooks-->>Harness: exit 2, stderr "mail on topic X"
+            Harness->>Agent: wake idle session (system reminder)
+        else nothing unread (stray change)
+            Hooks-->>Harness: exit 0 (no wake) — anti-loop
+        end
     end
-    Note over Sentinel: Still watched and armed — no re-arm needed
+
+    Agent->>Bridge: read(my cursors)
+    Bridge-->>Agent: unread events
+    Agent->>Agent: react (tools, edits, replies)
+    Note over Sentinel: Nothing to re-arm on either channel
 ```
 
 ## Contrast with `agent-ipc`
