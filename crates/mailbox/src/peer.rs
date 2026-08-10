@@ -32,9 +32,9 @@
 //! # Payload-free, still
 //!
 //! The socket *could* carry an event body; it must not. `content` is
-//! [`crate::wake::reminder`] — topic names only, the same string the fallback path's
-//! exit-2 hook writes to stderr. The body stays in the durable log until the agent's
-//! `read`. This is the ADR-0001 invariant, preserved across a change of transport.
+//! [`crate::wake::reminder`] — topic names only. The body stays in the durable log
+//! until the agent's `read`. This is the ADR-0001 invariant, preserved across a change
+//! of transport.
 //!
 //! # Why this lives in the daemon
 //!
@@ -67,16 +67,18 @@ use serde_json::json;
 ///
 /// One second is enormous for ~100 bytes onto a local socket that a healthy receiver
 /// drains immediately — it is a "this peer is wedged" detector, not a latency budget.
-/// Hitting it is not fatal: the delivery fails, and the caller falls back to the
-/// sentinel, which is exactly what we want for a session that is not reading.
+/// Hitting it is not fatal: the delivery fails and is reported. The event is already
+/// durable, so it surfaces on that session's next `read` — there is no second channel
+/// to fall back to, and deliberately so (ADR-0021).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A wake could not be delivered on the peer socket.
 ///
-/// Every variant means the same thing to the caller — **fall back to the sentinel**
-/// — but they are kept apart because they say different things to an operator
-/// reading the log: a refused connect is a session that went away, while a write
-/// failure is a session that is there and did not take it.
+/// Every variant means the same thing to the caller — **this wake did not land, and
+/// the event waits for the session's next `read`** — but they are kept apart because
+/// they say different things to an operator reading the log: a refused connect is a
+/// session that went away, while a write failure is a session that is there and did
+/// not take it.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerDeliveryError {
     /// The socket could not be connected: the session exited, or the socket was

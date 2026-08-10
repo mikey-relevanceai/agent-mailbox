@@ -52,6 +52,14 @@ pub enum Reachability {
     /// a finished session as broken is what once made a real bug look ten times bigger
     /// than it was.
     Gone,
+
+    /// Claude Code has never registered this session, so we know nothing about it —
+    /// it may be a harness that is not Claude Code at all.
+    ///
+    /// Distinct from [`Reachability::Gone`] on purpose: "it ended" and "I cannot see
+    /// it" are different answers, and only the second is a reason to withhold
+    /// judgement. ADR-0021's refusal gate turns on exactly this distinction.
+    Unregistered,
 }
 
 impl Reachability {
@@ -66,13 +74,14 @@ impl Reachability {
             Reachability::Reachable => "reachable",
             Reachability::NoInbox => "no-inbox",
             Reachability::Gone => "gone",
+            Reachability::Unregistered => "unregistered",
         }
     }
 
     /// What a human should do about it, or `None` when there is nothing to do.
     pub fn remedy(&self) -> Option<&'static str> {
         match self {
-            Reachability::Reachable | Reachability::Gone => None,
+            Reachability::Reachable | Reachability::Gone | Reachability::Unregistered => None,
             Reachability::NoInbox => Some(
                 "Claude Code bound this session no inbox socket, so nothing can wake it. \
                  Restart the session. If it persists, the cross-session messaging feature \
@@ -135,29 +144,46 @@ impl FleetReport {
 pub fn report(
     sessions: &[SessionId],
     registry: &ClaudeRegistry,
-    live: &BTreeSet<String>,
+    live: &BTreeSet<SessionId>,
 ) -> FleetReport {
     let sessions = sessions
         .iter()
-        .map(|session| {
-            let entry = registry.get(session);
-            let reachability = if !live.contains(session.as_str()) {
-                // A registry entry outlives its process, so liveness is decided by the
-                // process table and never by the presence of a file.
-                Reachability::Gone
-            } else if entry.and_then(|e| e.inbox_socket()).is_some() {
-                Reachability::Reachable
-            } else {
-                Reachability::NoInbox
-            };
-            SessionReport {
-                session: session.clone(),
-                reachability,
-                name: entry.and_then(|e| e.name.clone()),
-            }
+        .map(|session| SessionReport {
+            reachability: reachability_of(session, registry, live),
+            name: registry.get(session).and_then(|e| e.name.clone()),
+            session: session.clone(),
         })
         .collect();
     FleetReport { sessions }
+}
+
+/// The ONE definition of "can this session be woken?".
+///
+/// Every caller that acts on the answer goes through here and matches the enum
+/// exhaustively — `doctor` to report it, and `subscribe`/`watch` to refuse on it. That
+/// is deliberate: they used to be two independent `if`-chains with slightly different
+/// state spaces, so a change to one silently did not reach the other. Adding a variant
+/// now breaks compilation at every place that decides something.
+pub fn reachability_of(
+    session: &SessionId,
+    registry: &ClaudeRegistry,
+    live: &BTreeSet<SessionId>,
+) -> Reachability {
+    let Some(entry) = registry.get(session) else {
+        // Not "gone": Claude Code has never heard of it, which is what a non-Claude
+        // harness also looks like.
+        return Reachability::Unregistered;
+    };
+    if !live.contains(session) {
+        // A registry entry outlives its process, so liveness is decided by the process
+        // table and never by the presence of a file.
+        return Reachability::Gone;
+    }
+    if entry.inbox_socket().is_some() {
+        Reachability::Reachable
+    } else {
+        Reachability::NoInbox
+    }
 }
 
 /// The session ids that currently have a live Claude Code process.
@@ -175,18 +201,29 @@ pub fn report(
 /// Best-effort by design: a session whose Claude Code is too old to register itself is
 /// invisible here and will be treated as gone. That is the accepted cost of the 2.1.226+
 /// floor ADR-0021 sets.
-pub fn live_claude_sessions() -> Option<BTreeSet<String>> {
+pub fn live_claude_sessions() -> Option<BTreeSet<SessionId>> {
     let registry = ClaudeRegistry::open().ok()?;
-    Some(live_from(&registry))
+    live_from(&registry)
 }
 
 /// The pure half of [`live_claude_sessions`]: which registered sessions are running.
-pub fn live_from(registry: &ClaudeRegistry) -> BTreeSet<String> {
-    registry
-        .sessions()
-        .filter(|s| pid_is_alive(s.pid))
-        .map(|s| s.session_id.as_str().to_string())
-        .collect()
+///
+/// `None` means **we could not tell**, not "none are". An unreadable sessions directory
+/// yields an empty registry, and returning that as an authoritative empty set is how a
+/// startup reconcile stops every watch and a TTL sweep reaps live agents' interests
+/// (ADR-0009, relearned the hard way). Callers that act destructively on "nothing is
+/// live" must get `None` and skip.
+pub fn live_from(registry: &ClaudeRegistry) -> Option<BTreeSet<SessionId>> {
+    if !registry.is_readable() {
+        return None;
+    }
+    Some(
+        registry
+            .sessions()
+            .filter(|s| pid_is_alive(s.pid))
+            .map(|s| s.session_id.clone())
+            .collect(),
+    )
 }
 
 /// Whether `pid` names a running process we can see.
@@ -230,8 +267,8 @@ mod tests {
         ClaudeRegistry::read_dir(dir)
     }
 
-    fn live(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+    fn live(ids: &[&str]) -> BTreeSet<SessionId> {
+        ids.iter().map(|s| SessionId::new(*s)).collect()
     }
 
     /// The three verdicts, and which one is the fault.
@@ -285,9 +322,43 @@ mod tests {
         // pid 1 is alive but is not ours; a pid that cannot exist is plainly dead.
         let registry = registry_with(dir.path(), &[("ghost", 4_000_000_000, None)]);
 
-        assert!(
-            live_from(&registry).is_empty(),
+        assert_eq!(
+            live_from(&registry),
+            Some(BTreeSet::new()),
             "an entry whose process is gone must not be reported live"
         );
+    }
+
+    /// **Absence of evidence is not evidence of absence.** An unreadable sessions
+    /// directory must report UNKNOWN, never an authoritative empty set — the startup
+    /// reconcile and the TTL sweep both act destructively on "nothing is live", so
+    /// handing them a confident empty set stops every watch and reaps live agents'
+    /// interests. That is ADR-0009's bug, and this branch reintroduced it once already
+    /// by folding an unreadable directory into an empty registry.
+    #[test]
+    fn an_unreadable_sessions_directory_reports_unknown_not_empty() {
+        let registry = ClaudeRegistry::read_dir(std::path::Path::new("/nonexistent/xyzzy"));
+
+        assert!(!registry.is_readable());
+        assert_eq!(
+            live_from(&registry),
+            None,
+            "a directory we could not read must not be reported as zero live sessions"
+        );
+    }
+
+    /// A session Claude Code has never registered is UNREGISTERED, not gone. "It ended"
+    /// and "I cannot see it" are different answers, and only the second is a reason to
+    /// withhold judgement — the refusal gate in `subscribe`/`watch` turns on exactly
+    /// this distinction.
+    #[test]
+    fn a_session_claude_code_never_registered_is_unregistered_not_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = registry_with(dir.path(), &[]);
+
+        let out = report(&[SessionId::new("stranger")], &registry, &live(&[]));
+
+        assert_eq!(out.sessions[0].reachability, Reachability::Unregistered);
+        assert!(!out.has_fault(), "an unknown session is not a fault");
     }
 }

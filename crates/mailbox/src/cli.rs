@@ -746,35 +746,43 @@ fn resolve_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
 ///
 /// The mail itself is unaffected either way — `publish` and `read` do not go through
 /// here, so a session that cannot be woken can still be sent to and can still read.
+///
+/// # One definition of "wakeable", matched exhaustively
+///
+/// The verdict comes from [`mailbox::doctor::reachability_of`], the same function
+/// `doctor` reports from. This used to be a hand-rolled `if`-chain here with a subtly
+/// different state space, which meant a change to one did not reach the other and the
+/// compiler could not say so. Now a new [`Reachability`] variant breaks compilation in
+/// both places.
 fn resolve_wakeable_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
+    use mailbox::doctor::Reachability;
+
     let session = resolve_session_or_fail(format)?;
 
-    // A registry we cannot read at all is not evidence of anything — do not refuse on
-    // it. The daemon logs the same condition per publish, and `doctor` reports it.
+    // A registry we cannot read is not evidence of anything, so it must not produce a
+    // refusal. `live_from` returns None for exactly that case.
     let Ok(registry) = mailbox::claude_registry::ClaudeRegistry::open() else {
         return Ok(session);
     };
-    if registry.inbox_socket(&session).is_some() {
+    let Some(live) = mailbox::doctor::live_from(&registry) else {
         return Ok(session);
-    }
-    // Equally: a session Claude Code has not registered at all is not necessarily
-    // unwakeable — it may be a harness that is not Claude Code. Only refuse when
-    // Claude Code KNOWS this session and gave it no socket, which is unambiguous.
-    if registry.get(&session).is_none() {
-        return Ok(session);
-    }
+    };
 
-    Err(fail(
-        format,
-        &format!(
-            "{} has no Claude Code inbox socket, so nothing can wake it — subscribing \
-             would leave you waiting on mail you would never be told about.\n{}",
-            session.as_str(),
-            mailbox::doctor::Reachability::NoInbox
-                .remedy()
-                .unwrap_or_default()
-        ),
-    ))
+    match mailbox::doctor::reachability_of(&session, &registry, &live) {
+        // Refuse ONLY on unambiguous evidence: Claude Code knows this session and gave
+        // it no socket. `Unregistered` may be a harness that is not Claude Code, and
+        // `Gone` cannot be the caller (it is running this command).
+        Reachability::NoInbox => Err(fail(
+            format,
+            &format!(
+                "{} has no Claude Code inbox socket, so nothing can wake it — subscribing \
+                 would leave you waiting on mail you would never be told about.\n{}",
+                session.as_str(),
+                Reachability::NoInbox.remedy().unwrap_or_default()
+            ),
+        )),
+        Reachability::Reachable | Reachability::Unregistered | Reachability::Gone => Ok(session),
+    }
 }
 
 /// A short "what was being attempted" label for a failed request, for the stderr
@@ -1460,6 +1468,13 @@ fn run_harness_install_inbound(
             mailbox_harness::install::INBOUND_SETTING_KEY,
             report.written.display()
         ),
+        // They had SOMETHING there, even if we could not read it as a policy. Saying
+        // "set" would understate what we just did to their config.
+        InboundState::Unreadable => format!(
+            "replaced an unreadable {} value with \"accept\" in {}",
+            mailbox_harness::install::INBOUND_SETTING_KEY,
+            report.written.display()
+        ),
     };
     note(format, &what_changed);
     if let Some(backup) = &report.backup {
@@ -1650,7 +1665,16 @@ pub fn run_doctor(format: OutputFormat, args: &DoctorArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let live = mailbox::doctor::live_from(&registry);
+    // An unreadable sessions directory is UNKNOWN, not empty: reporting every session
+    // as `gone` would be a confident lie, which is the failure mode this command exists
+    // to end.
+    let Some(live) = mailbox::doctor::live_from(&registry) else {
+        eprintln!(
+            "mailbox doctor: could not read Claude Code's sessions directory, so no \
+             session's reachability can be determined"
+        );
+        return ExitCode::FAILURE;
+    };
     let report = mailbox::doctor::report(&sessions, &registry, &live);
 
     if format.is_json() {

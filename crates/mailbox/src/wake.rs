@@ -74,6 +74,15 @@ pub enum WakeOutcome {
     /// it means the socket went away after the agent subscribed.
     NoInbox,
 
+    /// The session had nothing unread, so there was nothing to say.
+    ///
+    /// Kept apart from [`WakeOutcome::NoInbox`] because they are opposite facts: this
+    /// is the ordinary healthy no-op, that one is the single fault this design reports.
+    /// Folding them together made a reachable session emit "it cannot be woken" and
+    /// counted routine quiet publishes into the `no_inbox` total — corrupting the one
+    /// aggregate an operator uses to tell a reachability regression from a quiet day.
+    NothingUnread,
+
     /// The socket was there and would not take the frame. The event stays durable and
     /// surfaces on the session's next `read`.
     Failed { error: PeerDeliveryError },
@@ -114,10 +123,11 @@ impl Waker {
     /// without a registry on disk.
     ///
     /// An empty `unread` set is never delivered: see the module docs. There is no
-    /// anti-loop between here and the model.
+    /// anti-loop between here and the model. It reports [`WakeOutcome::NothingUnread`]
+    /// — NOT `NoInbox`, which is a fault and this is not.
     pub fn deliver(&self, unread: &[Topic], socket: Option<&Path>) -> WakeOutcome {
         if unread.is_empty() {
-            return WakeOutcome::NoInbox;
+            return WakeOutcome::NothingUnread;
         }
         let Some(socket) = socket else {
             return WakeOutcome::NoInbox;
@@ -148,11 +158,14 @@ impl Waker {
         topic: &Topic,
         registry: &ClaudeRegistry,
     ) {
-        let (mut delivered, mut no_inbox, mut failed) = (0usize, 0usize, 0usize);
+        let (mut delivered, mut no_inbox, mut failed, mut quiet) = (0usize, 0usize, 0usize, 0usize);
 
         for (session, unread) in unread_by_session {
             match self.deliver(unread, registry.inbox_socket(session)) {
                 WakeOutcome::Delivered => delivered += 1,
+                // The ordinary no-op: this subscriber had nothing unread by the time we
+                // read it. Counted, never warned about.
+                WakeOutcome::NothingUnread => quiet += 1,
                 WakeOutcome::NoInbox => {
                     no_inbox += 1;
                     warn!(
@@ -177,7 +190,7 @@ impl Waker {
         // subscribers actually fared. Never the body.
         info!(
             topic = topic.as_str(),
-            delivered, no_inbox, failed, "woke subscribers after publish"
+            delivered, no_inbox, failed, quiet, "woke subscribers after publish"
         );
     }
 }
@@ -259,7 +272,10 @@ mod tests {
 
         let outcome = waker.deliver(&[], Some(socket.as_path()));
 
-        assert!(matches!(outcome, WakeOutcome::NoInbox), "{outcome:?}");
+        assert!(
+            matches!(outcome, WakeOutcome::NothingUnread),
+            "nothing unread is the healthy no-op, NOT the no-inbox fault: {outcome:?}"
+        );
         assert!(
             rx.recv_timeout(std::time::Duration::from_millis(200))
                 .is_err(),

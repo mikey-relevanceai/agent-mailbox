@@ -244,7 +244,7 @@ async fn is_registered(storage: &Storage, session: &SessionId) -> Result<bool, S
 /// is addressable is the same question whoever asks it.
 pub async fn list(
     storage: &Storage,
-    live: &BTreeSet<String>,
+    live: &BTreeSet<SessionId>,
     caller: Option<&SessionId>,
 ) -> Result<Vec<AgentInbox>, SendError> {
     let sessions = storage.list_agent_inboxes().await?;
@@ -255,7 +255,7 @@ pub async fn list(
         // `expect` keeps the impossible case a value, not a panic.
         let inbox = inbox_topic(&session)?;
         agents.push(AgentInbox {
-            live: live.contains(session.as_str()),
+            live: live.contains(&session),
             is_self: caller.is_some_and(|caller| caller == &session),
             session,
             inbox,
@@ -547,7 +547,7 @@ mod tests {
         register(&bus, &a).await;
         register(&bus, &b).await;
 
-        let live = BTreeSet::from(["s-a".to_string()]);
+        let live = BTreeSet::from([SessionId::new("s-a")]);
         let agents = list(&storage, &live, Some(&a)).await.unwrap();
         assert!(agents[0].live, "s-a has a live Claude Code process");
         assert!(

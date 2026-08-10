@@ -708,7 +708,8 @@ impl FakeClaude {
     /// Whether the bridge would currently consider this session live.
     fn is_live(&self) -> bool {
         let registry = mailbox::claude_registry::ClaudeRegistry::read_dir(&self.sessions_dir);
-        mailbox::doctor::live_from(&registry).contains(&self.session)
+        mailbox::doctor::live_from(&registry)
+            .is_some_and(|live| live.contains(&mailbox::storage::SessionId::new(&self.session)))
     }
 
     /// Kill and reap it, then block until it reads as gone — so a test asserting
@@ -722,7 +723,9 @@ impl FakeClaude {
             Duration::from_secs(10),
             || {
                 let registry = mailbox::claude_registry::ClaudeRegistry::read_dir(&sessions_dir);
-                (!mailbox::doctor::live_from(&registry).contains(&session)).then_some(())
+                mailbox::doctor::live_from(&registry)
+                    .is_none_or(|live| !live.contains(&mailbox::storage::SessionId::new(&session)))
+                    .then_some(())
             },
         );
     }

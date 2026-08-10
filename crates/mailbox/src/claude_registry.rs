@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use mailbox_protocol::SessionId;
 
@@ -138,6 +138,14 @@ pub enum RegistryError {
 #[derive(Debug, Default, Clone)]
 pub struct ClaudeRegistry {
     by_session: BTreeMap<String, ClaudeSession>,
+    /// Whether the directory was actually read.
+    ///
+    /// **Absence of evidence is not evidence of absence**, and conflating the two is
+    /// how a sweeper reaps live agents' watches (ADR-0009). An unreadable directory
+    /// must not be indistinguishable from "no sessions are running", because the two
+    /// demand opposite responses: report nothing reachable, versus stop every watch
+    /// nobody can be proven to want.
+    readable: bool,
 }
 
 impl ClaudeRegistry {
@@ -155,12 +163,21 @@ impl ClaudeRegistry {
     pub fn read_dir(dir: &Path) -> Self {
         let mut by_session: BTreeMap<String, ClaudeSession> = BTreeMap::new();
 
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            debug!(
-                dir = %dir.display(),
-                "no readable Claude Code sessions directory; no session is reachable by socket"
-            );
-            return Self { by_session };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // Not readable is NOT the same as empty; see [`ClaudeRegistry::readable`].
+                warn!(
+                    dir = %dir.display(),
+                    %error,
+                    "could not read Claude Code's sessions directory; no session can be \
+                     proven live or reachable from it"
+                );
+                return Self {
+                    by_session,
+                    readable: false,
+                };
+            }
         };
 
         for entry in entries.flatten() {
@@ -168,8 +185,19 @@ impl ClaudeRegistry {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                continue;
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    // Logged rather than skipped in silence: a session that vanishes
+                    // from the registry with no trace is the invisible failure this
+                    // project keeps paying for.
+                    debug!(
+                        file = %path.display(),
+                        %error,
+                        "skipped an unreadable Claude Code session file"
+                    );
+                    continue;
+                }
             };
             let session: ClaudeSession = match serde_json::from_str(&raw) {
                 Ok(session) => session,
@@ -195,7 +223,20 @@ impl ClaudeRegistry {
             }
         }
 
-        Self { by_session }
+        Self {
+            by_session,
+            readable: true,
+        }
+    }
+
+    /// Whether the sessions directory could be read at all.
+    ///
+    /// `false` means **unknown**, not empty: every answer this registry gives is the
+    /// absence of information rather than information. Callers that would act
+    /// destructively on "nothing is live" — the startup reconcile and the TTL sweep —
+    /// MUST check this and skip instead.
+    pub fn is_readable(&self) -> bool {
+        self.readable
     }
 
     /// Where to deliver to `session`, or `None` if it has no usable socket.

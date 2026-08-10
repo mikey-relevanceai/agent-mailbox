@@ -125,7 +125,7 @@ pub struct HookInstallSpec {
 impl HookInstallSpec {
     /// The `session-start` hook command (`<bin> harness session-start`). A
     /// short-lived, synchronous hook: it registers the inbox, arms the wake sentinel,
-    /// and prints the `watchPaths`, then exits 0. NOT asyncRewake — it never wakes the
+    /// then exits 0. It can never wake the
     /// session itself.
     fn session_start_command(&self) -> String {
         format!("{} harness session-start", self.mailbox_bin)
@@ -137,29 +137,17 @@ impl HookInstallSpec {
     }
 }
 
-/// Build the `{ "hooks": { … } }` snippet for the on-demand wake loop.
+/// Build the `{ "hooks": { … } }` snippet.
 ///
-/// Five hooks, exactly one of which can wake the session:
+/// TWO hooks, and **neither can wake the session** — waking is the daemon writing the
+/// session's inbox socket, not a hook (ADR-0021):
 ///
-/// - `SessionStart` (matcher `""`, all sources) runs `session-start` (plain,
-///   synchronous): register the inbox, arm the wake sentinel, print the `watchPaths`
-///   registering it. Firing on every source (not just `startup`) is what re-establishes
-///   all three on a resume (ADR-0013).
-/// - `Stop` runs `turn-end` (plain, synchronous, NEVER asyncRewake): close the turn
-///   (ADR-0016), re-register the inbox (restoring ADR-0007's register-on-every-Stop
-///   invariant), re-arm a missing sentinel, and re-trigger for mail that arrived while
-///   the session was busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a
-///   config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
-///   NEVER a model turn.
-/// - `UserPromptSubmit` runs `turn-start`: the turn-opened stamp `mailbox doctor` needs
-///   to tell BUSY from deaf (ADR-0016).
-/// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
-///   basename ([`WAKE_SENTINEL_BASENAME`]): when the daemon writes the sentinel, this
-///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
-///   It carries its own short kill deadline — it is a fast read-only peek, so the
-///   timeout is only a backstop.
-/// - `SessionEnd` runs `cleanup` (plain): remove the sentinel, drop
-///   subscriptions/interests.
+/// - `SessionStart` (matcher `""`, all sources) runs `session-start`: register the
+///   always-on agent inbox so peers can address this session (ADR-0007). Firing on
+///   every source rather than just `startup` is what re-establishes it on a resume,
+///   which is a fresh process (ADR-0013).
+/// - `SessionEnd` runs `cleanup`: drop subscriptions and interests, so no poller
+///   outlives the session that wanted it.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
         "hooks": {
@@ -271,6 +259,10 @@ pub enum InboundState {
     /// Set to something else (`hold` / `refuse`, or a value we do not recognise).
     /// Reported rather than silently overwritten.
     Other(String),
+    /// Present but not a string, so we cannot say what policy it expresses — only
+    /// that the user had one. Distinct from [`InboundState::Unset`] so the command
+    /// reports "replaced" rather than "set".
+    Unreadable,
 }
 
 /// Read the current inbound policy out of a settings document.
@@ -279,10 +271,13 @@ pub enum InboundState {
 /// changing it — and so re-running the command on an already-configured machine can
 /// say "already accept" instead of rewriting the file.
 pub fn inbound_state(existing: &Value) -> InboundState {
-    match existing.get(INBOUND_SETTING_KEY).and_then(Value::as_str) {
+    match existing.get(INBOUND_SETTING_KEY) {
         None => InboundState::Unset,
-        Some(INBOUND_ACCEPT) => InboundState::Accept,
-        Some(other) => InboundState::Other(other.to_string()),
+        Some(value) => match value.as_str() {
+            Some(INBOUND_ACCEPT) => InboundState::Accept,
+            Some(other) => InboundState::Other(other.to_string()),
+            None => InboundState::Unreadable,
+        },
     }
 }
 
@@ -702,11 +697,14 @@ mod tests {
             inbound_state(&json!({ INBOUND_SETTING_KEY: "banana" })),
             InboundState::Other("banana".to_string())
         );
-        // A non-string value is not a policy we can read; treat it as "something else"
-        // rather than as unset, so it is reported before being replaced.
+        // A non-string value is not a policy we can read, and it is NOT "unset" — the
+        // user has something there. Reporting it as unset would tell them we "set"
+        // the key when we in fact replaced whatever they had, which is the wrong
+        // report for a command whose whole justification is that widening this trust
+        // boundary must be explicit.
         assert_eq!(
             inbound_state(&json!({ INBOUND_SETTING_KEY: 7 })),
-            InboundState::Unset
+            InboundState::Unreadable
         );
     }
 
