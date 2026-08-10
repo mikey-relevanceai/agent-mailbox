@@ -13,11 +13,12 @@
 
 pub mod agents;
 pub mod bus;
+pub mod claude_registry;
 pub mod clock;
 pub mod doctor;
 pub mod host;
+pub mod peer;
 pub mod resolver;
-pub mod sentinel;
 pub mod storage;
 pub mod supervisor;
 pub mod wake;

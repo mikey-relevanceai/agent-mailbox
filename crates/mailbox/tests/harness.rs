@@ -1,12 +1,11 @@
 //! Claude Code harness integration tests (card 11), driving the REAL `mailbox`
 //! binary end to end WITHOUT a live Claude Code.
 //!
-//! **Scope.** The wake path's own end-to-end tests live in
-//! `tests/filechanged_wake.rs`. What is left here is the SETUP half: the
+//! **Scope.** The wake path's own end-to-end tests live in `tests/wake.rs`. What is
+//! left here is the SETUP half: the
 //! `install-hooks` / `install-skills` commands, and the `cleanup` and
 //! `session-start` behaviours that must hold with the bridge down. The snippet
-//! assertions pin the current hook set (`session-start` / `turn-end` /
-//! `turn-start` / `wake` / `cleanup`).
+//! assertions pin the current hook set (`session-start` / `cleanup`).
 //!
 //! The `install-hooks` tests are the ones with teeth: a settings file the merge
 //! cannot read, cannot parse, or reaches through a symlink must come back INTACT,
@@ -15,9 +14,8 @@
 //!
 //! Each test simulates the hook environment: it feeds the hook payload JSON on the
 //! handler's stdin (exactly as Claude Code would) and runs everything against a real
-//! `mailbox serve` daemon in a tempdir. Every test that resolves a home or a sentinel
-//! root redirects both at a tempdir, so a run can never touch the developer's real
-//! `~/.claude` or `~/.mailbox`.
+//! `mailbox serve` daemon in a tempdir. Every test that resolves a home redirects it
+//! at a tempdir, so a run can never touch the developer's real `~/.claude`.
 //!
 //! Flakiness discipline (mirrors `tests/stub_e2e.rs`): poll for readiness with
 //! bounded deadlines rather than fixed sleeps; reap every child on drop.
@@ -92,10 +90,13 @@ impl Daemon {
         let child = mailbox_command()
             .arg("serve")
             .env("AGENT_MAILBOX_DB", &db_path)
-            // The daemon writes each subscriber's wake sentinel, so it MUST be
-            // pointed at a tempdir — without this a test writes into the
-            // developer's real ~/.mailbox.
-            .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+            // The daemon reads Claude Code's session registry to find each
+            // subscriber's inbox socket, so it MUST be pointed at a tempdir — without
+            // this a test could deliver its wake onto a REAL session.
+            .env(
+                "MAILBOX_CLAUDE_SESSIONS_DIR",
+                dir.path().join("claude-sessions"),
+            )
             .env("MAILBOX_STUB_ADAPTER_BIN", stub_bin())
             .env("RUST_LOG", "error")
             .stdin(Stdio::null())
@@ -130,13 +131,6 @@ impl Daemon {
         let mut child = mailbox_command()
             .args(["harness", "cleanup"])
             .env("AGENT_MAILBOX_DB", &self.db_path)
-            // A tempdir sentinel root so cleanup's ADR-0008 sentinel removal can never
-            // touch the real ~/.mailbox (these tests never create one, but the safety
-            // rule holds regardless).
-            .env(
-                "MAILBOX_SENTINEL_ROOT",
-                self.db_path.parent().unwrap().join("sentinel"),
-            )
             .env("RUST_LOG", "error")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -247,7 +241,6 @@ fn session_start_with_bridge_down_and_no_store_exits_zero_without_waking() {
     let mut child = mailbox_command()
         .args(["harness", "session-start"])
         .env("AGENT_MAILBOX_DB", &db_path)
-        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
         .env("RUST_LOG", "error")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -279,12 +272,8 @@ fn cleanup_with_bridge_down_still_exits_zero() {
     let mut child = mailbox_command()
         .args(["harness", "cleanup"])
         .env("AGENT_MAILBOX_DB", &db_path)
-        // HERMETICITY: cleanup resolves + `remove_dir_all`s the session's ADR-0008
-        // sentinel dir. Without a tempdir root (and home) it would fall back to the REAL
-        // `$HOME/.mailbox/by-agent/s-cd` and delete it. Both env vars are pinned to the
-        // tempdir so a test can NEVER touch a real `~/.mailbox` (this spawns cleanup
-        // directly, bypassing the `Daemon::cleanup` helper that already sets these).
-        .env("MAILBOX_SENTINEL_ROOT", dir.path().join("sentinel"))
+        // HERMETICITY: the home is pinned to the tempdir so a test can never resolve
+        // anything under the developer's real `~`.
         .env("AGENT_MAILBOX_HOME", dir.path())
         .env("RUST_LOG", "error")
         .stdin(Stdio::piped())
@@ -358,62 +347,37 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&out, "install-hooks");
     let value = parse_json(&stdout(&out));
 
-    // The hook set is wired: SessionStart(matcher "" — all sources, so it re-fires on
-    // resume per ADR-0013) → plain session-start, FileChanged(matcher = the sentinel
-    // basename) → asyncRewake wake, SessionEnd → cleanup. There is NO Stop re-arm hook.
-    let hooks = &value["hooks"];
+    // The hook set is wired, and it is TWO hooks: SessionStart (matcher "" — all
+    // sources, so it re-fires on resume per ADR-0013) → plain session-start, and
+    // SessionEnd → cleanup. Nothing here can wake the session: the daemon does that by
+    // writing the session's inbox socket (ADR-0021).
+    let hooks = value["hooks"].as_object().expect("hooks object");
+    assert_eq!(
+        hooks.keys().collect::<Vec<_>>(),
+        vec!["SessionEnd", "SessionStart"],
+        "only SessionStart and SessionEnd remain: {hooks:?}"
+    );
     assert_eq!(
         hooks["SessionStart"][0]["matcher"], "",
         "SessionStart must fire on every source (incl. resume), not just startup"
     );
-    let session_start = &hooks["SessionStart"][0]["hooks"][0];
     assert!(
-        session_start.get("asyncRewake").is_none(),
-        "session-start must NOT be asyncRewake"
-    );
-    assert!(
-        session_start["command"]
+        hooks["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains("harness session-start")
     );
-    // The Stop hook is the turn boundary (`turn-end`): plain, NOT asyncRewake, so it
-    // closes the turn, re-registers the inbox and re-triggers busy-window mail without
-    // ever waking the session. It is NOT the retired periodic re-arm.
-    let stop = &hooks["Stop"][0]["hooks"][0];
-    assert!(
-        stop["command"]
-            .as_str()
-            .unwrap()
-            .contains("harness turn-end"),
-        "Stop must run the turn-end hook"
-    );
-    assert!(
-        stop.get("asyncRewake").is_none(),
-        "the Stop hook must NOT be asyncRewake (it never wakes)"
-    );
-
-    let file_changed = &hooks["FileChanged"][0];
-    assert_eq!(file_changed["matcher"], ".mailbox-wake");
-    let wake = &file_changed["hooks"][0];
-    assert_eq!(wake["asyncRewake"], true);
-    assert_eq!(
-        wake["timeout"],
-        mailbox_harness::install::WAKE_HOOK_TIMEOUT_SECS
-    );
-    assert!(wake["command"].as_str().unwrap().contains("harness wake"));
-
     assert!(
         hooks["SessionEnd"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains("harness cleanup")
     );
-    assert!(
-        hooks["SessionEnd"][0]["hooks"][0]
-            .get("asyncRewake")
-            .is_none()
-    );
+    // No hook may be a wake wire. A second way to wake a session is exactly the
+    // unaccountable machinery ADR-0021 deleted.
+    let wire = value.to_string();
+    assert!(!wire.contains("asyncRewake"), "no hook may wake: {wire}");
+    assert!(!wire.contains("FileChanged"), "FileChanged is gone: {wire}");
 
     // An explicit --settings merges into that file, preserving unrelated keys.
     let settings = dir.path().join("settings.json");
@@ -422,7 +386,10 @@ fn install_hooks_emits_valid_settings_snippet() {
     assert_ok(&merged_out, "install-hooks --settings");
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
-    assert!(merged["hooks"]["FileChanged"].is_array(), "hooks merged in");
+    assert!(
+        merged["hooks"]["SessionStart"].is_array(),
+        "hooks merged in"
+    );
 }
 
 /// `--settings <path>` is an instruction, so a MISSING file is created — that is
@@ -466,22 +433,17 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
 
     let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
     assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
-    // The foreign Stop hook survives, AND our turn-end hook is appended alongside it —
-    // the snippet writes a Stop hook, but it must never clobber a foreign one.
+    // The foreign Stop hook survives UNTOUCHED. We no longer install a Stop hook at
+    // all, so this is the sharper version of the old assertion: an event we write
+    // nothing to must be left exactly as the user had it, not emptied because our
+    // pre-sweep once owned a group there.
     let stop = merged["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(
         stop.len(),
-        2,
-        "the foreign Stop hook survives; ours is appended"
+        1,
+        "only the foreign Stop hook remains: {stop:?}"
     );
     assert_eq!(stop[0]["hooks"][0]["command"], "echo other");
-    assert!(
-        stop[1]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("harness turn-end"),
-        "our turn-end hook is appended after the foreign one"
-    );
     // Our hooks landed on their own events.
     assert!(
         merged["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -490,10 +452,10 @@ fn install_hooks_merges_into_the_default_settings_when_it_exists() {
             .contains("harness session-start")
     );
     assert!(
-        merged["hooks"]["FileChanged"][0]["hooks"][0]["command"]
+        merged["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("harness wake")
+            .contains("harness session-start")
     );
     assert!(merged["hooks"]["SessionEnd"].is_array());
 
@@ -523,7 +485,10 @@ fn install_hooks_without_a_default_settings_file_prints_only_and_writes_nothing(
         "the print-only run must say WHY, naming the path it looked at: {text}"
     );
     // The snippet is still printed, so it can be installed by hand.
-    assert!(text.contains("asyncRewake"), "the snippet is still printed");
+    assert!(
+        text.contains("harness session-start"),
+        "the snippet is still printed"
+    );
 
     // Nothing was created ANYWHERE under the home — not even the `.claude` dir.
     assert_eq!(
@@ -552,7 +517,10 @@ fn install_hooks_with_no_home_prints_only_without_panicking() {
         text.contains("no home to resolve Claude Code settings under"),
         "a homeless run must explain itself: {text}"
     );
-    assert!(text.contains("asyncRewake"), "the snippet is still printed");
+    assert!(
+        text.contains("harness session-start"),
+        "the snippet is still printed"
+    );
 }
 
 /// `--json` keeps its machine contract: stdout is EXACTLY the snippet, and the
@@ -580,7 +548,8 @@ fn install_hooks_json_keeps_stdout_clean_when_it_merges() {
         "the merge note belongs on stderr in --json mode"
     );
     assert!(
-        parse_json(&std::fs::read_to_string(&settings).unwrap())["hooks"]["FileChanged"].is_array(),
+        parse_json(&std::fs::read_to_string(&settings).unwrap())["hooks"]["SessionStart"]
+            .is_array(),
         "--json still merges"
     );
 }
@@ -632,7 +601,7 @@ fn install_hooks_never_replaces_a_settings_file_it_cannot_read() {
             "the user's settings must survive byte for byte"
         );
         // The snippet is STILL printed: hand-installation is now the only route.
-        assert!(stdout(&out).contains("asyncRewake"));
+        assert!(stdout(&out).contains("harness session-start"));
     }
     std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -661,7 +630,7 @@ fn install_hooks_never_replaces_a_settings_file_it_cannot_read() {
     assert!(!out.status.success(), "a directory must FAIL");
     assert!(settings.is_dir(), "left exactly as it was");
     assert!(
-        stdout(&out).contains("asyncRewake"),
+        stdout(&out).contains("harness session-start"),
         "a failed merge must STILL print the snippet — hand-installing it is now the \
          user's only option, so the failure must not suppress the fallback"
     );
@@ -692,7 +661,7 @@ fn install_hooks_writes_through_a_symlinked_settings_file() {
     let written = parse_json(&std::fs::read_to_string(&tracked).unwrap());
     assert_eq!(written["model"], "opus", "unrelated settings preserved");
     assert!(
-        written["hooks"]["FileChanged"].is_array(),
+        written["hooks"]["SessionStart"].is_array(),
         "the TRACKED file is what received the hooks"
     );
     assert!(
@@ -764,7 +733,6 @@ fn install_hooks_re_run_with_a_different_binary_updates_rather_than_appends() {
             && command.contains("harness session-start"),
         "the surviving hook points at the relocated binary: {command}"
     );
-    assert_eq!(merged["hooks"]["FileChanged"].as_array().unwrap().len(), 1);
     assert_eq!(merged["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
 }
 
@@ -862,6 +830,120 @@ fn install_skills_installs_the_embedded_skill_and_is_idempotent() {
         "updated"
     );
     assert_eq!(std::fs::read_to_string(&installed).unwrap(), written);
+}
+
+// ==== install-inbound: the opt-in that lets a bypass session RECEIVE (ADR-0020) ===
+
+/// The command does exactly one thing, and leaves everything else alone. It edits
+/// the same real `settings.json` `install-hooks` does, so "preserves unrelated
+/// settings" is the load-bearing property.
+#[test]
+fn install_inbound_sets_accept_and_preserves_unrelated_settings() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"model":"sonnet","permissions":{"deny":["Read"]}}"#,
+    )
+    .unwrap();
+
+    let out = install_inbound(home.path(), &[]);
+
+    assert_ok(&out, "install-inbound");
+    let merged = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(merged["crossSessionInbound"], "accept");
+    assert_eq!(merged["model"], "sonnet", "unrelated settings preserved");
+    assert_eq!(merged["permissions"]["deny"][0], "Read");
+}
+
+/// Setting the inbound policy must never install hooks, and `install-hooks` must
+/// never set the inbound policy. They are separate decisions: one wires a wake path,
+/// the other widens what a bypassPermissions agent will accept unattended. Bundling
+/// them would mean nobody ever consciously agreed to the second.
+#[test]
+fn install_inbound_and_install_hooks_stay_separate_decisions() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+
+    assert_ok(&install_inbound(home.path(), &[]), "install-inbound");
+    let after_inbound = parse_json(&std::fs::read_to_string(&settings).unwrap());
+    assert_eq!(after_inbound["crossSessionInbound"], "accept");
+    assert!(
+        after_inbound.get("hooks").is_none(),
+        "install-inbound must not install hooks: {after_inbound}"
+    );
+
+    // And the reverse: installing hooks over it leaves the policy exactly as the
+    // operator set it — neither adding one nor removing the one they chose.
+    let fresh = TempDir::new().unwrap();
+    let fresh_settings = default_settings(fresh.path());
+    std::fs::create_dir_all(fresh_settings.parent().unwrap()).unwrap();
+    std::fs::write(&fresh_settings, "{}").unwrap();
+    assert_ok(&install_hooks(fresh.path(), &[]), "install-hooks");
+    let after_hooks = parse_json(&std::fs::read_to_string(&fresh_settings).unwrap());
+    assert!(
+        after_hooks.get("crossSessionInbound").is_none(),
+        "install-hooks must never widen the inbound policy: {after_hooks}"
+    );
+}
+
+/// A re-run reports that nothing changed rather than pretending it did something —
+/// and, more importantly, does not re-print the security warning at someone who has
+/// already accepted it.
+#[test]
+fn install_inbound_is_idempotent_and_says_so() {
+    let home = TempDir::new().unwrap();
+    let settings = default_settings(home.path());
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "{}").unwrap();
+
+    assert_ok(&install_inbound(home.path(), &[]), "first install-inbound");
+    let second = install_inbound(home.path(), &[]);
+
+    assert_ok(&second, "second install-inbound");
+    assert!(
+        stdout(&second).contains("already \"accept\""),
+        "a re-run must say it changed nothing: {}",
+        stdout(&second)
+    );
+    assert!(
+        !stderr(&second).contains("accepts messages from any process"),
+        "the warning is for the person who is CHANGING the policy, not every re-run"
+    );
+}
+
+/// With no Claude Code settings file, this writes nothing at all — the same stance
+/// `install-hooks` takes. Conjuring a settings.json to loosen a security default on a
+/// machine that may not even run Claude Code would be the worst possible default.
+#[test]
+fn install_inbound_without_a_settings_file_changes_nothing() {
+    let home = TempDir::new().unwrap();
+
+    let out = install_inbound(home.path(), &[]);
+
+    assert_ok(&out, "install-inbound (no settings)");
+    assert!(
+        stdout(&out).contains("no Claude Code settings found at"),
+        "it must say why it did nothing: {}",
+        stdout(&out)
+    );
+    assert!(
+        !default_settings(home.path()).exists(),
+        "no settings file may be conjured to hold this setting"
+    );
+}
+
+fn install_inbound(home: &Path, args: &[&str]) -> Output {
+    mailbox_command()
+        .args(["harness", "install-inbound"])
+        .args(args)
+        .env("AGENT_MAILBOX_HOME", home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run install-inbound")
 }
 
 /// `install-hooks`, ALWAYS with the home redirected at a tempdir.

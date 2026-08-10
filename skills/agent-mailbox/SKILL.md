@@ -20,14 +20,11 @@ read the two hard rules below.
 
 ## Two hard rules (this is the whole point)
 
-1. **NEVER re-arm.** Do not run any arm/listen command after a wake. The
-   `SessionStart` Claude Code hook (`mailbox harness session-start`) arms a wake
-   sentinel file that Claude Code watches for the whole session, and a `Stop` hook
-   (`mailbox harness turn-end`) silently re-checks it at every turn boundary — so
-   **just ending your turn is the correct, complete action**; it keeps you armed.
-   Ending your turn NEVER wakes you (the Stop hook exits 0, never a wake). If you
-   catch yourself about to "re-arm listening," stop — it is already armed, and it
-   stays armed with no action from you.
+1. **NEVER re-arm.** Do not run any arm/listen command after a wake. There is
+   nothing to arm: Claude Code gives your session an inbox, and the bridge writes to
+   it when mail lands. **Just ending your turn is the correct, complete action.** If
+   you catch yourself about to "re-arm listening," stop — there was never anything
+   armed, and nothing decays.
 2. **NEVER spawn a background poller.** Do not run `gh-watch.sh`, and do not
    background a `while true; gh …; sleep` loop or anything like it. To watch a
    PR, declare a `watch` — the bridge daemon owns and supervises the poller (one
@@ -95,8 +92,9 @@ mailbox publish TOPIC --body '{"...":"..."}'
 
 ### On wake
 
-When the world changes, the bridge writes your wake sentinel and Claude Code
-surfaces a system reminder like `mail on topic github.pr.OWNER/REPO#NUMBER`. When
+When the world changes, the bridge writes to your session's inbox and you start a
+turn with a message like `mail on topic github.pr.OWNER/REPO#NUMBER`. It names the
+topic only — the event body is in the durable log, which is what `read` returns. When
 you see it:
 
 ```bash
@@ -109,16 +107,21 @@ peer. Then just end your turn. **You do nothing to stay wakeable** — the
 infrastructure keeps you armed for the next message.
 
 **Every wake is real mail.** You will only ever be woken with a `mail on topic …`
-reminder — there is no "keeping you alive" nudge to ignore. When you wake, there is
-something to `mailbox read`. (Behind the scenes the bridge daemon writes one file
-the moment mail arrives, and nothing at all otherwise — so an idle session costs
-nothing and never sees a spurious wake.)
+message — there is no "keeping you alive" nudge to ignore. When you wake, there is
+something to `mailbox read`. (Behind the scenes the bridge writes to your inbox the
+moment mail arrives, and nothing at all otherwise — so an idle session costs nothing
+and never sees a spurious wake.)
 
-**Mail that arrives while you are BUSY reaches you at the end of that turn**, not
-mid-turn — you cannot be woken while already awake. So you may finish a turn and
-immediately be woken with mail that landed during it. That is working as intended;
-just `mailbox read` as usual. You still never re-arm, and you never need to poll
-"just in case" — if there is mail, you will be told.
+**Mail that arrives while you are BUSY is not lost.** It queues and reaches you
+between tool calls, or at the end of the turn. Either way you just `mailbox read` as
+usual. You never re-arm, and you never need to poll "just in case" — if there is mail,
+you will be told.
+
+**If `subscribe` or `watch` REFUSES**, saying this session has no Claude Code inbox
+socket, believe it: nothing can wake you, and no amount of retrying or re-arming will
+change that. Tell your human, and suggest restarting the session. Do NOT fall back to
+polling — that is the exact habit this skill exists to remove, and durable mail is
+still readable with `mailbox read` in the meantime.
 
 ### Check state (read-only)
 

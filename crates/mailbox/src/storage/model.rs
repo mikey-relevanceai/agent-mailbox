@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use mailbox_protocol::{Cursor, Event, Offset, Topic};
+use mailbox_protocol::{Cursor, Event, Offset};
 // The session identity is shared with the harness, so it lives in the protocol
 // crate (see `mailbox_protocol::session`). Re-exported here so the many existing
 // `mailbox::storage::SessionId` call sites keep working unchanged.
@@ -59,125 +59,6 @@ impl Pid {
     /// The underlying pid value.
     pub fn get(self) -> u32 {
         self.0
-    }
-}
-
-/// How far a session's UNREAD mail extends: the `event.event_row_id` of the newest
-/// event it has not yet read.
-///
-/// `event_row_id` is the store's single global monotonic sequence (see
-/// `schema::SCHEMA_V1`), so this is comparable ACROSS topics — which per-topic
-/// [`Offset`]s are not. That is exactly the property the ADR-0012 turn-boundary
-/// re-trigger needs: "is there unread mail NEWER than the mail I have already
-/// re-triggered a wake for?" is one `>` on this value, whatever topic it arrived on.
-///
-/// Branded (not a bare `i64`) so it cannot be confused with an offset, a
-/// [`WatchId`], or a pid. It is `Ord` because comparing two watermarks is the whole
-/// point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WakeWatermark(i64);
-
-impl WakeWatermark {
-    /// Wrap a row id. Crate-private: a watermark is minted only by the store that
-    /// read it, or by [`WakeWatermark::parse`] reading one back that a store minted.
-    pub(crate) fn new(row_id: i64) -> Self {
-        Self(row_id)
-    }
-
-    /// The underlying row id, for persisting the watermark.
-    pub fn get(self) -> i64 {
-        self.0
-    }
-
-    /// Parse a persisted watermark, or `None` if the text is not one.
-    ///
-    /// Only a POSITIVE row id parses: SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`
-    /// starts at 1, so `0` and negatives are not watermarks any store ever minted —
-    /// they are corruption. Accepting them would be actively harmful in the wrong
-    /// direction: the comparison is `last >= high_water`, so a garbled `-1` is
-    /// harmless but a garbled huge value would suppress every future re-trigger.
-    /// Rejecting the whole out-of-range domain keeps the brand's promise ("a row id
-    /// some store really assigned") true of every value that inhabits the type.
-    ///
-    /// A `None` means "we have no usable record", which callers must treat as
-    /// "nothing re-triggered yet" — the fail-safe direction (a redundant wake, never
-    /// a lost one).
-    pub fn parse(raw: &str) -> Option<Self> {
-        raw.trim()
-            .parse::<i64>()
-            .ok()
-            .filter(|id| *id > 0)
-            .map(Self)
-    }
-}
-
-/// Mail waiting for a session: the topics it is on, and how far it extends.
-///
-/// The fields are PRIVATE and there is no public constructor, which is what makes
-/// "pending mail always has at least one topic" a fact rather than a comment. The
-/// only way to obtain one is [`Unread::from_parts`], which collapses an empty topic
-/// set to [`Unread::CaughtUp`] — so a `PendingMail` naming no topics cannot be built,
-/// and the re-trigger can never bump a sentinel with an empty topic list while
-/// recording a watermark for mail it never named.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingMail {
-    topics: Vec<Topic>,
-    high_water: WakeWatermark,
-}
-
-impl PendingMail {
-    /// The topics with mail waiting, ascending — the payload-free list written into
-    /// the wake reminder and the sentinel. Never empty.
-    pub fn topics(&self) -> &[Topic] {
-        &self.topics
-    }
-
-    /// The newest waiting event's watermark.
-    pub fn high_water(&self) -> WakeWatermark {
-        self.high_water
-    }
-}
-
-/// A session's unread mail as ONE snapshot: which subscribed topics have mail
-/// waiting, and how far that mail extends.
-///
-/// A sum type rather than a `(Vec<Topic>, Option<WakeWatermark>)` because the two
-/// fields are not independent: unread topics ALWAYS have a newest unread event, and
-/// no unread topics never do. The pair form lets a caller ask for the watermark of
-/// nothing; this one does not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unread {
-    /// Nothing to be woken about: the session's cursors cover every event on every
-    /// topic it subscribes to (or it subscribes to none).
-    CaughtUp,
-    /// Mail is waiting — see [`PendingMail`], which guarantees at least one topic.
-    Pending(PendingMail),
-}
-
-impl Unread {
-    /// Build the snapshot from a query's two outputs, collapsing "no topics" to
-    /// [`Unread::CaughtUp`].
-    ///
-    /// This is the ONLY way a [`PendingMail`] is minted, which is what makes the
-    /// "pending implies non-empty" invariant structural: the caller cannot skip the
-    /// collapse, because it cannot construct the variant itself.
-    pub(crate) fn from_parts(topics: Vec<Topic>, high_water: Option<WakeWatermark>) -> Self {
-        match (topics.is_empty(), high_water) {
-            (false, Some(high_water)) => Unread::Pending(PendingMail { topics, high_water }),
-            // No topics, or no watermark: nothing to wake about either way. The two
-            // always agree (a topic row exists only because an event set the
-            // watermark), so this is the same state reached two ways, not a fallback.
-            _ => Unread::CaughtUp,
-        }
-    }
-
-    /// The unread topics, empty when caught up — the payload-free view the wake
-    /// reminder and the sentinel are written from.
-    pub fn topics(&self) -> &[Topic] {
-        match self {
-            Unread::CaughtUp => &[],
-            Unread::Pending(mail) => mail.topics(),
-        }
     }
 }
 

@@ -28,7 +28,6 @@
 
 mod error;
 mod model;
-mod reader;
 mod schema;
 mod writer;
 
@@ -45,12 +44,11 @@ pub use error::StorageError;
 pub use mailbox_protocol::Cursor;
 pub use model::{
     EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
-    Unread, WakeWatermark, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
 // `wake` module.
-pub(crate) use reader::ReadOnlyStore;
 
 use writer::Command;
 

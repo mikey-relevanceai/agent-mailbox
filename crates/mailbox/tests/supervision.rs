@@ -829,7 +829,7 @@ async fn reconcile_startup_resumes_a_watch_whose_session_is_still_running() {
 
     // s1 is still running: the process table carries its id (ADR-0017's probe,
     // handed in by `serve` as one `ps` read per reconcile).
-    let live = BTreeSet::from([s1.as_str().to_string()]);
+    let live = BTreeSet::from([s1.clone()]);
 
     reconcile_startup(&storage, &supervisor, &live)
         .await
@@ -885,7 +885,7 @@ async fn reconcile_startup_resumes_a_stopped_watch_of_a_running_session() {
         .add_interest(watch_id, s1.clone(), 1_000)
         .await
         .unwrap();
-    let live = BTreeSet::from([s1.as_str().to_string()]);
+    let live = BTreeSet::from([s1.clone()]);
 
     reconcile_startup(&storage, &supervisor, &live)
         .await
@@ -944,7 +944,7 @@ async fn reconcile_startup_resumes_when_only_one_of_several_sessions_is_alive() 
         .await
         .unwrap();
     // Only `alive` still has a Claude Code process; `dead` does not.
-    let live = BTreeSet::from([alive.as_str().to_string()]);
+    let live = BTreeSet::from([alive.clone()]);
 
     reconcile_startup(&storage, &supervisor, &live)
         .await
@@ -993,7 +993,7 @@ async fn reconcile_startup_leaves_a_failed_watch_alone() {
         .await
         .unwrap();
     // A live session — to prove liveness does NOT override the Failed skip.
-    let live = BTreeSet::from([s1.as_str().to_string()]);
+    let live = BTreeSet::from([s1.clone()]);
 
     reconcile_startup(&storage, &supervisor, &live)
         .await
@@ -1030,7 +1030,7 @@ async fn ttl_sweeper_drops_stale_interest_and_stops_adapter() {
     let s1 = SessionId::new("s1");
     // Nobody is running: the live set is empty, so the sweep's liveness probe
     // spares nothing and the TTL alone decides — which is what this test drives.
-    let live = BTreeSet::<String>::new();
+    let live = BTreeSet::<SessionId>::new();
 
     record(
         &bus,
@@ -1113,7 +1113,7 @@ async fn ttl_sweeper_spares_a_live_session_however_stale_its_last_seen() {
     .await;
 
     // s1's Claude Code process is still running.
-    let live = BTreeSet::from([s1.as_str().to_string()]);
+    let live = BTreeSet::from([s1.clone()]);
 
     // Backdate last-seen far past the TTL — the exact state an idle-but-live
     // session reaches on its own, since nothing but `watch` ever stamps it.
@@ -1317,7 +1317,7 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
     // Upstream recovers, and s1's Claude Code process is still running — the
     // sweep's liveness signal (ADR-0017's probe).
     healthy.store(true, Ordering::SeqCst);
-    let live = BTreeSet::from([s1.as_str().to_string()]);
+    let live = BTreeSet::from([s1.clone()]);
 
     // One sweep retries the failed watch; it comes back Running under a fresh pid.
     supervisor

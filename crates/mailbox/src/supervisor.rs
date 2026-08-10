@@ -66,6 +66,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use mailbox_protocol::SessionId;
 use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic, stub_topic};
 
 use crate::bus::Bus;
@@ -253,7 +254,7 @@ impl Supervisor {
     pub async fn sweep(
         &self,
         ttl: Duration,
-        live: BTreeSet<String>,
+        live: BTreeSet<SessionId>,
     ) -> Result<Vec<WatchId>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
@@ -356,7 +357,7 @@ impl Supervisor {
 pub async fn reconcile_startup(
     storage: &Storage,
     supervisor: &Supervisor,
-    live: &BTreeSet<String>,
+    live: &BTreeSet<SessionId>,
 ) -> Result<(), SupervisorError> {
     for watch in storage.list_watches().await? {
         if matches!(watch.state, WatchState::Failed) {
@@ -370,7 +371,7 @@ pub async fn reconcile_startup(
         }
 
         let sessions = storage.list_watch_interest_sessions(watch.id).await?;
-        let wanted = sessions.iter().any(|s| live.contains(s.as_str()));
+        let wanted = sessions.iter().any(|s| live.contains(s));
 
         if wanted {
             // `ensure_running` owns the state transition (and is idempotent), so
@@ -492,7 +493,7 @@ enum Command {
         /// The sessions with a live Claude Code process — the sweep's liveness
         /// evidence. Passed per-call for the same reason `ttl` is: it is the
         /// caller's measurement, not supervisor state.
-        live: BTreeSet<String>,
+        live: BTreeSet<SessionId>,
         reply: oneshot::Sender<Result<Vec<WatchId>, SupervisorError>>,
     },
     RunningPid {
@@ -1035,11 +1036,11 @@ impl Actor {
     async fn sweep(
         &mut self,
         ttl: Duration,
-        live: &BTreeSet<String>,
+        live: &BTreeSet<SessionId>,
     ) -> Result<Vec<WatchId>, SupervisorError> {
         let now = now_millis();
         for session in self.storage.list_interest_sessions().await? {
-            if live.contains(session.as_str()) {
+            if live.contains(&session) {
                 let refreshed = self
                     .storage
                     .touch_session_interests(session.clone(), now)
@@ -1093,14 +1094,14 @@ impl Actor {
     /// no zombie retries, the same liveness invariant as the TTL sweep itself.
     async fn retry_failed_watches(
         &mut self,
-        live: &BTreeSet<String>,
+        live: &BTreeSet<SessionId>,
     ) -> Result<(), SupervisorError> {
         for watch in self.storage.list_watches().await? {
             if !matches!(watch.state, WatchState::Failed) {
                 continue;
             }
             let sessions = self.storage.list_watch_interest_sessions(watch.id).await?;
-            if sessions.iter().any(|s| live.contains(s.as_str())) {
+            if sessions.iter().any(|s| live.contains(s)) {
                 // Log after the retry is issued, not before — never claim a retry
                 // that a propagated error would abort (mirrors `reconcile_startup`).
                 self.ensure_running(watch.id).await?;

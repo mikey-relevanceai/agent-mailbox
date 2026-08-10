@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// call site cannot reach in and treat it as a bare `String`.
 /// `#[serde(transparent)]` so on the wire a session id is just its bare string —
 /// no envelope for a non-Rust peer to produce — while in Rust it stays branded.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 

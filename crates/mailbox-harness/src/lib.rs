@@ -2,17 +2,18 @@
 //!
 //! # The whole agent-facing loop is subscribe / read / react / unsubscribe
 //!
-//! The agent never re-arms itself. Infrastructure owns the wake loop via Claude
-//! Code hooks (see `docs/01-wake.md`): the `serve` daemon writes a
-//! session's wake sentinel when mail lands for it, the `FileChanged` hook fires on
-//! that change even against an idle session, and an `asyncRewake` hook that exits 2
-//! wakes it. [`install`](install) wires that hook set into `~/.claude/settings.json`
-//! (when that file exists — else it prints the snippet and says why), merging rather
-//! than clobbering.
+//! The agent never arms anything. When mail lands, the `serve` daemon writes it to
+//! the inbox socket Claude Code bound for that session, and an idle session takes a
+//! turn (see `docs/01-wake.md`, ADR-0021). **No hook is involved in waking** — the
+//! sentinel + `FileChanged` + `asyncRewake` mechanism this crate used to wire is
+//! deleted. [`install`](install) now wires just two plain hooks, `SessionStart`
+//! (register the agent inbox) and `SessionEnd` (drop interests), into
+//! `~/.claude/settings.json` when that file exists — else it prints the snippet and
+//! says why — merging rather than clobbering.
 //!
 //! The other half of setup is [`skills`](skills), which installs the embedded
-//! `agent-mailbox` skill into the user's Claude Code skills dir. The hooks make
-//! wake infrastructure; the skill teaches the agent the loop it wakes into. Both
+//! `agent-mailbox` skill into the user's Claude Code skills dir. The hooks make the
+//! session addressable; the skill teaches the agent the loop it wakes into. Both
 //! default under the same home ([`home`](home)) — one convention, one override.
 //!
 //! # What this crate is (and is not)

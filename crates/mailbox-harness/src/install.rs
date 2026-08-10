@@ -1,31 +1,26 @@
 //! Emitting (and merging) the Claude Code `settings.json` hooks snippet.
 //!
-//! `install-hooks` wires the on-demand wake loop with five hooks. Exactly ONE of
-//! them can ever wake the session (`FileChanged`); the rest are plain exit-0 hooks:
+//! `install-hooks` wires TWO plain hooks, and **neither can wake the session**:
 //!
 //! - `SessionStart` (matcher `""` — all sources) runs `mailbox harness session-start`,
-//!   a plain synchronous hook: it registers the inbox, ARMS this session's wake
-//!   sentinel, and prints the `watchPaths` registering it. It fires on `startup` AND on
-//!   `resume`/`clear`/`compact`, so a resumed session (a fresh process) re-establishes
-//!   all three — the gap ADR-0013 closes.
-//! - `Stop` (matcher `""`) runs `mailbox harness turn-end`, a plain synchronous hook
-//!   (NEVER asyncRewake): it closes the turn (ADR-0016), re-registers the inbox
-//!   (ADR-0013), and re-bumps the sentinel for mail that arrived while the session was
-//!   busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a config/stdin error and 0
-//!   otherwise — so it can never cost a model turn of its own.
-//! - `UserPromptSubmit` runs `mailbox harness turn-start`: the other half of the
-//!   turn-boundary pair, so `mailbox doctor` can tell a BUSY session from a deaf one
-//!   (ADR-0016).
-//! - `FileChanged` (matcher [`WAKE_SENTINEL_BASENAME`]) runs `mailbox harness wake`
-//!   as an `asyncRewake` hook with a `timeout` (seconds): when the daemon writes the
-//!   sentinel, it fires even on an idle session and exits 2 iff there is real unread
-//!   mail. It is a fast read-only peek, so the timeout is a backstop, not a timer.
-//! - `SessionEnd` runs `mailbox harness cleanup` (a plain, synchronous hook): remove
-//!   the sentinel, drop interests/subscriptions.
+//!   registering the always-on agent inbox so peers can address this session
+//!   (ADR-0007). It fires on `startup` AND on `resume`/`clear`/`compact`, so a resumed
+//!   session (a fresh process) re-establishes it — the gap ADR-0013 closes.
+//! - `SessionEnd` runs `mailbox harness cleanup`: drop interests/subscriptions, so no
+//!   poller outlives the session that wanted it.
 //!
-//! This REPLACES the ADR-0006 `SessionStart`/`Stop` → `arm` → exit-2-re-arm loop,
-//! whose every re-arm cost a full model turn on a long idle. See
-//! `docs/01-wake.md`, ADR-0008 and ADR-0017.
+//! # What used to be here
+//!
+//! Three more: a `FileChanged` `asyncRewake` hook that exited 2 to wake an idle
+//! session, a `Stop` hook that re-triggered for mail whose wake edge was spent while
+//! the agent was busy, and a `UserPromptSubmit` hook stamping turn boundaries so a
+//! health probe could tell "busy" from "deaf". All three existed to compensate for a
+//! wake wire that could silently lose an edge. The wire is now the session's inbox
+//! socket, which the daemon writes directly, so none of them has anything to do
+//! ([ADR-0021](../../docs/adr/0021-delete-the-sentinel-fallback.md)).
+//!
+//! A re-run **sweeps** every hook name we have ever installed, so upgrading over an
+//! older install removes the retired three rather than leaving them firing.
 //!
 //! # Where the hooks go, and why that is a TYPE
 //!
@@ -39,7 +34,6 @@
 
 use std::path::{Path, PathBuf};
 
-use mailbox_protocol::WAKE_SENTINEL_BASENAME;
 use serde_json::{Value, json};
 
 use crate::atomic::{write_atomic, write_atomic_guarded};
@@ -126,67 +120,15 @@ pub struct HookInstallSpec {
     /// Absolute path to the `mailbox` binary the hooks invoke. Absolute so the
     /// hook works regardless of the session's `PATH`.
     pub mailbox_bin: String,
-    /// Claude Code's per-hook kill deadline, in **seconds** (the `timeout` field).
-    pub timeout_secs: u64,
 }
-
-/// The async-hook `timeout` the snippet writes by default: **1 hour**, well above
-/// Claude Code's own 10-minute default for command hooks.
-///
-/// A large timeout IS honoured (measured: a hook with `timeout: 3600` sailed past
-/// the 600s default and was still alive at 703s — there is no hidden 600s cap), and
-/// it is the ONLY thing that buys a long idle now that we know a waiter cannot
-/// extend its own life (ADR-0006). The trade: the waiter yields for a re-arm every
-/// `max_block`, so a *larger* timeout means *fewer* benign re-arm wakes. 1h is the
-/// verified-safe maximum we are willing to ship; both knobs stay tunable
-/// (`--timeout-secs`, `--max-block-ms`).
-pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 3600;
-
-/// Claude Code's kill deadline for the `FileChanged` wake hook, in **seconds**.
-///
-/// Deliberately NOT [`HookInstallSpec::timeout_secs`]. That value exists to bound a
-/// hook that *blocks* — it must stay above `max_block_ms` so a waiting waiter is
-/// never killed mid-wait — and it is measured in the tens of minutes. The wake hook
-/// blocks on nothing: it peeks the read-only store and exits. Measured on a real
-/// fleet it completes in ~40ms.
-///
-/// Sharing the blocking hook's hour-long deadline gave a 40ms peek an hour of rope.
-/// That is the wrong direction to be wrong in: if the hook ever does wedge (a stuck
-/// read, an NFS stall), a long deadline is exactly how long wake delivery could stay
-/// blocked behind it — indistinguishable, from the outside, from the session simply
-/// having gone deaf. Thirty seconds is ~700x the observed runtime and still bounds
-/// the damage to something a human would notice rather than mistake for a fault.
-pub const WAKE_HOOK_TIMEOUT_SECS: u64 = 30;
 
 impl HookInstallSpec {
     /// The `session-start` hook command (`<bin> harness session-start`). A
     /// short-lived, synchronous hook: it registers the inbox, arms the wake sentinel,
-    /// and prints the `watchPaths`, then exits 0. NOT asyncRewake — it never wakes the
+    /// then exits 0. It can never wake the
     /// session itself.
     fn session_start_command(&self) -> String {
         format!("{} harness session-start", self.mailbox_bin)
-    }
-
-    /// The `wake` hook command (`<bin> harness wake`). The `FileChanged` hook
-    /// (ADR-0008): it wakes the session (exit 2) only when there is genuine unread
-    /// mail, else exits 0. The ONLY hook that can wake anything.
-    fn wake_command(&self) -> String {
-        format!("{} harness wake", self.mailbox_bin)
-    }
-
-    /// The `turn-end` hook command (`<bin> harness turn-end`). The `Stop` hook: a
-    /// plain hook that closes the turn (ADR-0016), re-registers the inbox (ADR-0013)
-    /// and re-arms/re-triggers the wake sentinel (ADR-0012). NOT asyncRewake — it never
-    /// wakes the session.
-    fn turn_end_command(&self) -> String {
-        format!("{} harness turn-end", self.mailbox_bin)
-    }
-
-    /// The `turn-start` hook command (`<bin> harness turn-start`). The
-    /// `UserPromptSubmit` hook (ADR-0016): stamps that a turn has opened so a health
-    /// probe can tell "busy" from "unreachable". Prints nothing and always exits 0.
-    fn turn_start_command(&self) -> String {
-        format!("{} harness turn-start", self.mailbox_bin)
     }
 
     /// The `cleanup` hook command string (`<bin> harness cleanup`).
@@ -195,39 +137,25 @@ impl HookInstallSpec {
     }
 }
 
-/// Build the `{ "hooks": { … } }` snippet for the on-demand wake loop.
+/// Build the `{ "hooks": { … } }` snippet.
 ///
-/// Five hooks, exactly one of which can wake the session:
+/// TWO hooks, and **neither can wake the session** — waking is the daemon writing the
+/// session's inbox socket, not a hook (ADR-0021):
 ///
-/// - `SessionStart` (matcher `""`, all sources) runs `session-start` (plain,
-///   synchronous): register the inbox, arm the wake sentinel, print the `watchPaths`
-///   registering it. Firing on every source (not just `startup`) is what re-establishes
-///   all three on a resume (ADR-0013).
-/// - `Stop` runs `turn-end` (plain, synchronous, NEVER asyncRewake): close the turn
-///   (ADR-0016), re-register the inbox (restoring ADR-0007's register-on-every-Stop
-///   invariant), re-arm a missing sentinel, and re-trigger for mail that arrived while
-///   the session was busy (ADR-0012). It NEVER exits 2 — it exits 1 only on a
-///   config/stdin error and 0 otherwise — so it costs a per-turn process spawn but
-///   NEVER a model turn.
-/// - `UserPromptSubmit` runs `turn-start`: the turn-opened stamp `mailbox doctor` needs
-///   to tell BUSY from deaf (ADR-0016).
-/// - `FileChanged` runs `wake` as an `asyncRewake` hook, matched on the sentinel
-///   basename ([`WAKE_SENTINEL_BASENAME`]): when the daemon writes the sentinel, this
-///   fires even on a truly-idle session and exits 2 (iff there is real unread mail).
-///   It carries its own short kill deadline — it is a fast read-only peek, so the
-///   timeout is only a backstop.
-/// - `SessionEnd` runs `cleanup` (plain): remove the sentinel, drop
-///   subscriptions/interests.
+/// - `SessionStart` (matcher `""`, all sources) runs `session-start`: register the
+///   always-on agent inbox so peers can address this session (ADR-0007). Firing on
+///   every source rather than just `startup` is what re-establishes it on a resume,
+///   which is a fresh process (ADR-0013).
+/// - `SessionEnd` runs `cleanup`: drop subscriptions and interests, so no poller
+///   outlives the session that wanted it.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
         "hooks": {
             // SessionStart fires on startup AND on resume/clear/compact. The matcher is
             // "" (all sources), NOT "startup": a RESUMED session is a fresh process that
-            // must re-register its inbox, re-print its watchPaths, and re-spawn its
-            // watcher — none of which the Stop hook can do for it (a Stop cannot emit a
-            // SessionStart watchPaths registration). Gating this to "startup" left every
-            // resumed session unaddressable and unwakeable (ADR-0013). session-start is
-            // idempotent, so firing on every source is safe.
+            // must re-register its inbox, and gating this to "startup" left every
+            // resumed session unaddressable (ADR-0013). It is idempotent, so firing on
+            // every source is safe.
             "SessionStart": [json!({
                 "matcher": "",
                 "hooks": [{
@@ -235,45 +163,8 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.session_start_command(),
                 }],
             })],
-            // Stop fires at every turn boundary: a plain (NOT asyncRewake) hook that
-            // closes the turn, re-registers the inbox and re-triggers for busy-window
-            // mail, exiting 0 always so it can never itself wake the session.
-            "Stop": [json!({
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": spec.turn_end_command(),
-                }],
-            })],
-            // UserPromptSubmit opens a turn. Paired with Stop's turn-ended stamp it
-            // tells a health probe whether a silent session is mid-turn (and will pick
-            // its mail up at the boundary anyway) or genuinely unable to be woken —
-            // a distinction that, unmade, libels every busy agent as deaf (ADR-0016).
-            "UserPromptSubmit": [json!({
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": spec.turn_start_command(),
-                }],
-            })],
-            // FileChanged fires when the daemon writes the sentinel. The matcher is
-            // the sentinel BASENAME (Claude Code matches FileChanged by basename);
-            // per-session isolation comes from the absolute path SessionStart
-            // registered via watchPaths.
-            "FileChanged": [json!({
-                "matcher": WAKE_SENTINEL_BASENAME,
-                "hooks": [{
-                    "type": "command",
-                    "command": spec.wake_command(),
-                    // asyncRewake: wake the idle session when this exits 2 (the
-                    // payload is the wake hook's payload-free stderr reminder).
-                    "asyncRewake": true,
-                    // Claude Code's per-hook kill deadline (seconds) — a backstop for
-                    // a fast hook, NOT `timeout_secs`. See [`WAKE_HOOK_TIMEOUT_SECS`].
-                    "timeout": WAKE_HOOK_TIMEOUT_SECS,
-                }],
-            })],
-            // SessionEnd removes the sentinel and drops interests/subscriptions.
+            // SessionEnd drops interests/subscriptions, so no poller outlives the
+            // session that wanted it.
             "SessionEnd": [json!({
                 "matcher": "",
                 "hooks": [{
@@ -346,6 +237,70 @@ pub fn merge_into_settings(mut existing: Value, snippet: &Value) -> Value {
             array.extend(groups.iter().cloned());
         }
     }
+    existing
+}
+
+/// Claude Code's setting for what a session does with messages arriving on its inbox
+/// socket (ADR-0020).
+pub const INBOUND_SETTING_KEY: &str = "crossSessionInbound";
+
+/// The value that lets a `bypassPermissions` session receive a mailbox wake without
+/// a human approving each one.
+pub const INBOUND_ACCEPT: &str = "accept";
+
+/// What [`inbound_state`] found in a settings document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundState {
+    /// No value set. Claude Code then decides per message from the two sessions'
+    /// permission classes — which HOLDS our wakes for a `bypassPermissions` session.
+    Unset,
+    /// Already `accept`: nothing to do.
+    Accept,
+    /// Set to something else (`hold` / `refuse`, or a value we do not recognise).
+    /// Reported rather than silently overwritten.
+    Other(String),
+    /// Present but not a string, so we cannot say what policy it expresses — only
+    /// that the user had one. Distinct from [`InboundState::Unset`] so the command
+    /// reports "replaced" rather than "set".
+    Unreadable,
+}
+
+/// Read the current inbound policy out of a settings document.
+///
+/// Separate from the write so the CLI can tell the operator what is there *before*
+/// changing it — and so re-running the command on an already-configured machine can
+/// say "already accept" instead of rewriting the file.
+pub fn inbound_state(existing: &Value) -> InboundState {
+    match existing.get(INBOUND_SETTING_KEY) {
+        None => InboundState::Unset,
+        Some(value) => match value.as_str() {
+            Some(INBOUND_ACCEPT) => InboundState::Accept,
+            Some(other) => InboundState::Other(other.to_string()),
+            None => InboundState::Unreadable,
+        },
+    }
+}
+
+/// Set `crossSessionInbound: "accept"`, leaving every other setting untouched.
+///
+/// # Why this is its own command and never part of `install-hooks`
+///
+/// `accept` re-opens unattended delivery in exactly the configuration Claude Code's
+/// default guards: a session running `--dangerously-skip-permissions` acts without
+/// asking, so accepting messages from any same-user process means any such process
+/// can direct that agent. That is a real widening of trust, and it is the operator's
+/// call to make — not a side effect of installing a wake path. `install-hooks` must
+/// never do this implicitly.
+///
+/// Idempotent, as [`merge_settings_file`] requires.
+pub fn set_inbound_accept(mut existing: Value) -> Value {
+    if !existing.is_object() {
+        existing = json!({});
+    }
+    existing
+        .as_object_mut()
+        .expect("existing is an object")
+        .insert(INBOUND_SETTING_KEY.to_string(), json!(INBOUND_ACCEPT));
     existing
 }
 
@@ -522,6 +477,27 @@ pub fn merge_hooks_file(
     snippet: &Value,
     backup: BackupPolicy,
 ) -> Result<MergeReport, MergeError> {
+    merge_settings_file(path, backup, |existing| {
+        merge_into_settings(existing, snippet)
+    })
+}
+
+/// The general form of [`merge_hooks_file`]: apply `merge` to the settings document
+/// at `path` under every guarantee listed there.
+///
+/// Split out because the hooks are no longer the only thing we edit — ADR-0020 adds
+/// `crossSessionInbound` — and every one of those guarantees (do not destroy an
+/// unreadable file, write through a symlink, compare-and-swap against Claude Code's
+/// own writes, keep a pre-image) is the product of a real bug. A second command
+/// hand-rolling its own settings write would re-open all of them.
+///
+/// `merge` must be **idempotent**: it is re-applied from scratch on every retry
+/// after a lost compare-and-swap.
+pub fn merge_settings_file(
+    path: &Path,
+    backup: BackupPolicy,
+    merge: impl Fn(Value) -> Value,
+) -> Result<MergeReport, MergeError> {
     let (target, via_symlink) = resolve_symlink(path)?;
     let mut backup_path = None;
 
@@ -530,7 +506,7 @@ pub fn merge_hooks_file(
         // below checks is still there when we publish.
         let raw = read_settings(&target)?;
         let existing = parse_settings(&target, raw.as_deref())?;
-        let merged = merge_into_settings(existing, snippet);
+        let merged = merge(existing);
         let mut body = serde_json::to_string_pretty(&merged).map_err(MergeError::Serialize)?;
         body.push('\n');
 
@@ -669,55 +645,121 @@ mod tests {
     fn spec() -> HookInstallSpec {
         HookInstallSpec {
             mailbox_bin: "/opt/mailbox".to_string(),
-            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
     }
 
+    // ==== crossSessionInbound (ADR-0020) ======================================
+
+    /// The whole point of the setting, and the whole risk of it, is one key. It must
+    /// land without disturbing anything else the user has configured — this command
+    /// edits the same real settings.json that `install-hooks` does.
     #[test]
-    fn snippet_is_valid_and_wires_the_wake_hooks() {
+    fn setting_inbound_accept_preserves_every_other_setting() {
+        let existing = json!({
+            "model": "opus",
+            "permissions": { "deny": ["Bash(rm -rf /)"] },
+            "hooks": { "Stop": [{ "matcher": "" }] },
+        });
+
+        let merged = set_inbound_accept(existing);
+
+        assert_eq!(merged[INBOUND_SETTING_KEY], "accept");
+        assert_eq!(merged["model"], "opus");
+        assert_eq!(merged["permissions"]["deny"][0], "Bash(rm -rf /)");
+        assert_eq!(merged["hooks"]["Stop"][0]["matcher"], "");
+    }
+
+    /// `merge_settings_file` re-applies the transform on every compare-and-swap
+    /// retry, so a non-idempotent one would produce a different document depending on
+    /// how many times it lost the race.
+    #[test]
+    fn setting_inbound_accept_is_idempotent() {
+        let once = set_inbound_accept(json!({"model": "opus"}));
+        let twice = set_inbound_accept(once.clone());
+        assert_eq!(once, twice);
+    }
+
+    /// The command reports what it found before changing it, so the three states have
+    /// to be told apart — including a value we do not recognise, which must read as
+    /// "something is set" rather than as "unset" and be reported, not silently kept.
+    #[test]
+    fn inbound_state_distinguishes_unset_accept_and_anything_else() {
+        assert_eq!(inbound_state(&json!({})), InboundState::Unset);
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "accept" })),
+            InboundState::Accept
+        );
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "hold" })),
+            InboundState::Other("hold".to_string())
+        );
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: "banana" })),
+            InboundState::Other("banana".to_string())
+        );
+        // A non-string value is not a policy we can read, and it is NOT "unset" — the
+        // user has something there. Reporting it as unset would tell them we "set"
+        // the key when we in fact replaced whatever they had, which is the wrong
+        // report for a command whose whole justification is that widening this trust
+        // boundary must be explicit.
+        assert_eq!(
+            inbound_state(&json!({ INBOUND_SETTING_KEY: 7 })),
+            InboundState::Unreadable
+        );
+    }
+
+    /// Setting the inbound policy must never install hooks as a side effect. They are
+    /// separate decisions with separate consequences, and `install-hooks` is
+    /// deliberately the one that does NOT widen a security default.
+    #[test]
+    fn setting_inbound_accept_installs_no_hooks() {
+        let merged = set_inbound_accept(json!({}));
+        assert!(
+            merged.get("hooks").is_none(),
+            "install-inbound changes one key and nothing else: {merged}"
+        );
+    }
+
+    #[test]
+    fn snippet_wires_exactly_two_plain_hooks_and_nothing_that_can_wake() {
         let snippet = hooks_snippet(&spec());
-        let hooks = &snippet["hooks"];
+        let hooks = snippet["hooks"].as_object().expect("hooks object");
 
-        // SessionStart: matcher "" (all sources, so it re-fires on resume — ADR-0013),
-        // a PLAIN session-start command (NOT asyncRewake — it never wakes the session).
+        // TWO hooks, and the count is asserted: the retired wake path needed five, of
+        // which three (FileChanged/Stop/UserPromptSubmit) existed only to compensate
+        // for a wake wire that could lose an edge (ADR-0021). Re-growing this set is
+        // the shape of that mistake coming back.
+        assert_eq!(
+            hooks.keys().collect::<Vec<_>>(),
+            vec!["SessionEnd", "SessionStart"],
+            "only SessionStart and SessionEnd remain: {hooks:?}"
+        );
+
         let start = &hooks["SessionStart"][0];
-        assert_eq!(start["matcher"], "");
-        let ss = &start["hooks"][0];
-        assert_eq!(ss["type"], "command");
-        assert_eq!(ss["command"], "/opt/mailbox harness session-start");
-        assert!(
-            ss.get("asyncRewake").is_none(),
-            "session-start must NOT be asyncRewake"
+        assert_eq!(
+            start["matcher"], "",
+            "all sources, so it re-fires on resume"
+        );
+        assert_eq!(
+            start["hooks"][0]["command"],
+            "/opt/mailbox harness session-start"
         );
 
-        // The Stop hook is the turn boundary: `turn-end`, plain (NOT asyncRewake, no
-        // timeout), so it can never itself wake the session.
-        let stop = &hooks["Stop"][0];
-        assert_eq!(stop["matcher"], "");
-        let te = &stop["hooks"][0];
-        assert_eq!(te["command"], "/opt/mailbox harness turn-end");
-        assert!(
-            te.get("asyncRewake").is_none(),
-            "the Stop hook must NOT be asyncRewake (it never wakes)"
-        );
+        let end = &hooks["SessionEnd"][0];
+        assert_eq!(end["hooks"][0]["command"], "/opt/mailbox harness cleanup");
 
-        // FileChanged: matcher = the sentinel basename, asyncRewake wake with timeout.
-        let fc = &hooks["FileChanged"][0];
-        assert_eq!(fc["matcher"], WAKE_SENTINEL_BASENAME);
-        let wake = &fc["hooks"][0];
-        assert_eq!(wake["command"], "/opt/mailbox harness wake");
-        assert_eq!(wake["asyncRewake"], true);
-        // The wake hook carries its OWN short deadline, not the blocking hook's.
-        assert_eq!(wake["timeout"], WAKE_HOOK_TIMEOUT_SECS);
+        // NOTHING here may wake the session. A session is woken by the daemon writing
+        // its inbox socket; a hook that could exit 2 would be a second, unaccountable
+        // wake wire.
+        let wire = snippet.to_string();
         assert!(
-            WAKE_HOOK_TIMEOUT_SECS < spec().timeout_secs,
-            "a non-blocking peek must never inherit the blocking waiter's deadline"
+            !wire.contains("asyncRewake"),
+            "no hook may be a wake wire: {wire}"
         );
-
-        // SessionEnd: cleanup, NOT asyncRewake.
-        let end = &hooks["SessionEnd"][0]["hooks"][0];
-        assert_eq!(end["command"], "/opt/mailbox harness cleanup");
-        assert!(end.get("asyncRewake").is_none());
+        assert!(
+            !wire.contains("FileChanged"),
+            "the FileChanged wake path is gone: {wire}"
+        );
     }
 
     /// The shipped defaults must satisfy the invariant they exist to protect — a
@@ -763,7 +805,7 @@ mod tests {
         let twice = merge_into_settings(once.clone(), &hooks_snippet(&spec()));
         // Re-merging must not duplicate our hook groups.
         assert_eq!(once, twice);
-        assert_eq!(twice["hooks"]["FileChanged"].as_array().unwrap().len(), 1);
+        assert_eq!(twice["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(twice["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
     }
 
@@ -872,13 +914,14 @@ mod tests {
         std::fs::read(path).is_err()
     }
 
+    /// Every hook command wired to `event`. An ABSENT event yields an empty list
+    /// rather than panicking: since ADR-0021 we write no hook to most events, and
+    /// "nothing of ours is on Stop" is a thing tests need to assert.
     fn hook_commands(settings: &Value, event: &str) -> Vec<String> {
         settings["hooks"][event]
             .as_array()
-            .expect("event array")
-            .iter()
-            .flat_map(group_commands)
-            .collect()
+            .map(|groups| groups.iter().flat_map(group_commands).collect())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -907,7 +950,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["model"], "opus");
         assert_eq!(written["permissions"]["deny"][0], "Bash(rm -rf *)");
-        assert!(written["hooks"]["FileChanged"].is_array());
+        assert!(written["hooks"]["SessionStart"].is_array());
 
         let backup = report.backup.expect("the pre-image is kept");
         assert_eq!(
@@ -978,7 +1021,7 @@ mod tests {
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(written["hooks"]["FileChanged"].is_array());
+        assert!(written["hooks"]["SessionStart"].is_array());
     }
 
     /// **(B)** A symlinked settings.json (the dotfiles setup) is written THROUGH: the
@@ -1010,7 +1053,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&tracked).unwrap()).unwrap();
         assert_eq!(written["model"], "opus", "unrelated settings survive");
         assert!(
-            written["hooks"]["FileChanged"].is_array(),
+            written["hooks"]["SessionStart"].is_array(),
             "the TRACKED file is the one that got the hooks"
         );
     }
@@ -1084,7 +1127,7 @@ mod tests {
         // without dropping it.
         merge(&path, BackupPolicy::Skip).expect("a quiet merge succeeds");
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(value["hooks"]["FileChanged"].is_array());
+        assert!(value["hooks"]["SessionStart"].is_array());
         assert!(
             value.get("model").is_some(),
             "the concurrent writer's key survived the merge"
@@ -1107,26 +1150,24 @@ mod tests {
         });
         let merged = merge_into_settings(old, &hooks_snippet(&spec()));
 
-        // The stale Stop → arm hook is swept and REPLACED by the turn-end hook — the
-        // retired exit-2 re-arm must not survive.
+        // Every retired hook of ours is SWEPT, including from events we no longer
+        // write at all. An upgrade that left a `Stop → arm` (or a `FileChanged → wake`)
+        // behind would keep an exit-2 wake wire firing against a binary that no longer
+        // has the subcommand.
         let stop = hook_commands(&merged, "Stop");
         assert!(
-            !stop.iter().any(|c| c.contains("harness arm")),
-            "the retired arm hook must not survive an upgrade: {stop:?}"
+            stop.is_empty(),
+            "we install no Stop hook, and the retired one must not survive: {stop:?}"
         );
-        assert_eq!(
-            stop,
-            vec!["/opt/mailbox harness turn-end"],
-            "the Stop event now carries the turn-end hook: {stop:?}"
-        );
-        // SessionStart now runs session-start, FileChanged runs wake — the new loop.
+        // SessionStart now runs session-start — the whole remaining loop.
         assert_eq!(
             hook_commands(&merged, "SessionStart"),
             vec!["/opt/mailbox harness session-start"]
         );
-        assert_eq!(
-            hook_commands(&merged, "FileChanged"),
-            vec!["/opt/mailbox harness wake"]
+        // And no exit-2 wake wire survives anywhere.
+        assert!(
+            hook_commands(&merged, "FileChanged").is_empty(),
+            "the FileChanged wake hook is gone and must not be re-installed"
         );
     }
 
@@ -1190,24 +1231,19 @@ mod tests {
     fn re_merging_with_a_different_binary_replaces_our_hooks_instead_of_appending() {
         let first = hooks_snippet(&HookInstallSpec {
             mailbox_bin: "/tmp/target/debug/mailbox".to_string(),
-            timeout_secs: 600,
         });
         let second = hooks_snippet(&HookInstallSpec {
             mailbox_bin: "/home/u/.local/bin/mailbox".to_string(),
-            timeout_secs: 300,
         });
 
         let once = merge_into_settings(json!({}), &first);
         let twice = merge_into_settings(once, &second);
 
-        // Exactly ONE session-start and ONE wake hook — the first bin's hooks are
-        // REPLACED, not appended (a stale hook would point at a deleted binary).
+        // Exactly ONE of each of our hooks — the first bin's are REPLACED, not
+        // appended (a stale hook would point at a deleted binary).
         let start = hook_commands(&twice, "SessionStart");
         assert_eq!(start.len(), 1, "exactly ONE session-start hook: {start:?}");
         assert_eq!(start[0], "/home/u/.local/bin/mailbox harness session-start");
-        let wake = hook_commands(&twice, "FileChanged");
-        assert_eq!(wake.len(), 1, "exactly ONE wake hook: {wake:?}");
-        assert_eq!(wake[0], "/home/u/.local/bin/mailbox harness wake");
         let end = hook_commands(&twice, "SessionEnd");
         assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
     }

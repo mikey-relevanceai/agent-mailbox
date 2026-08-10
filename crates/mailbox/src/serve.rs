@@ -52,7 +52,7 @@
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -168,14 +168,22 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    Held for the daemon's whole life (released on drop at end of `run`).
     let _lock = acquire_daemon_lock(&config.lock_path())?;
 
-    // 3. Now it is safe to open the single writer + wake channel. The sentinel root
-    //    is resolved ONCE here: a daemon that cannot resolve it could never wake
-    //    anybody, and a bridge that cannot do its job fails loudly rather than
-    //    serving a bus whose whole point is silently missing (ADR-0004).
+    // 3. Now it is safe to open the single writer + wake channel. Claude Code's
+    //    sessions directory — the wake path's whole lookup (ADR-0021) — is resolved
+    //    ONCE here rather than per publish. Unresolvable is not fatal: it means no
+    //    session is reachable, which `mailbox doctor` reports and every `watch` refuses
+    //    up front, and a daemon that still stores events durably is more useful than
+    //    one that will not start.
     let storage = Storage::open(config.clone()).await?;
-    let sentinel_root = mailbox::sentinel::root_from_env()
-        .map_err(|e| anyhow::anyhow!("could not resolve the wake sentinel root: {e}"))?;
-    let bus = Bus::with_waker(storage.clone(), Waker::new(&sentinel_root));
+    let sessions_dir = mailbox::claude_registry::sessions_dir_from_env().unwrap_or_else(|e| {
+        warn!(
+            error = %e,
+            "could not resolve Claude Code's sessions directory; NO session can be woken \
+             (events are still stored durably and surface on the next read)"
+        );
+        PathBuf::new()
+    });
+    let bus = Bus::with_waker(storage.clone(), Waker::new(&sessions_dir));
 
     // 4. Build the watch supervisor with the default resolver: a `stub` watch
     //    spawns the reference adapter (card 09) and a `github-pr` watch spawns the
@@ -218,7 +226,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
         db = %config.path().display(),
         // Where wakes land. Worth a line: it is the one path a "why didn't my agent
         // wake?" investigation has to check agrees with what `watchPaths` registered.
-        sentinel_root = %sentinel_root.display(),
+        sessions_dir = %sessions_dir.display(),
         max_connections = limits.max_connections,
         "bridge serving (single writer + waker + supervisor); Ctrl-C or SIGTERM to stop"
     );

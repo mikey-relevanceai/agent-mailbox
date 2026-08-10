@@ -24,30 +24,29 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Env, poll_until};
+use common::Env;
 
 /// How long to wait for a wake that SHOULD happen.
 const WAKE: Duration = Duration::from_secs(10);
 
 /// Start `session` through the production `SessionStart` hook, which registers its
-/// inbox and arms its wake sentinel.
+/// inbox so peers can address it.
 fn arm(env: &Env, session: &str) {
-    env.arm(session);
+    env.start_session(session);
 }
 
-/// Block until `session`'s sentinel names `topic` — the wake wire: the daemon writes
-/// the topic there and the `FileChanged` hook turns it into a wake.
-fn assert_woken_for(env: &Env, session: &str, topic: &str) {
-    poll_until(&format!("{session}'s sentinel names {topic}"), WAKE, || {
-        env.sentinel_topics(session)
-            .iter()
-            .any(|t| t == topic)
-            .then_some(())
-    });
-    assert_eq!(
-        env.wake_hook(session).status.code(),
-        Some(2),
-        "{session} must be woken for {topic}"
+/// Block until a wake naming `topic` lands on `inbox` — the wake wire: the daemon
+/// writes that frame to the session's socket, and its arrival IS the turn.
+fn assert_woken_for(inbox: &common::FakePeer, session: &str, topic: &str) {
+    let frame = inbox
+        .next_frame(WAKE)
+        .unwrap_or_else(|| panic!("{session} must be woken for {topic}"));
+    assert!(
+        frame["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(topic),
+        "{session}'s wake must name {topic}"
     );
 }
 
@@ -70,6 +69,8 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
 
     arm(&env, publisher);
     arm(&env, peer);
+    let inbox_publisher = env.register_peer(publisher);
+    let inbox_peer = env.register_peer(peer);
 
     // The publisher speaks. It passes no session and needs none — `publish` resolves
     // nobody, because who is speaking changes nothing about where the event goes.
@@ -80,10 +81,10 @@ fn a_publisher_is_woken_by_its_own_event_just_like_any_peer_subscriber() {
     );
 
     // The PEER wakes, naming the topic.
-    assert_woken_for(&env, peer, topic);
+    assert_woken_for(&inbox_peer, peer, topic);
 
     // ...and so does the PUBLISHER, on the same wire.
-    assert_woken_for(&env, publisher, topic);
+    assert_woken_for(&inbox_publisher, publisher, topic);
 
     // Its own event is visible to it. Nothing may mark an event read except a `read`.
     assert_eq!(
@@ -166,8 +167,9 @@ fn a_publish_wakes_a_subscriber_that_is_already_far_behind() {
     assert_eq!(env.unread_on(agent, topic), 2);
 
     arm(&env, agent);
+    let inbox_agent = env.register_peer(agent);
     env.publish(topic);
-    assert_woken_for(&env, agent, topic);
+    assert_woken_for(&inbox_agent, agent, topic);
     assert_eq!(env.unread_on(agent, topic), 3);
 
     env.cleanup(agent);
