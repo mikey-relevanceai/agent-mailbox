@@ -343,9 +343,10 @@ subscribe  ──►  (idle; the hooks keep you armed)  ──►  read  ──�
 2. **idle** — do other work, or nothing. When mail lands, the daemon writes it to the
    inbox socket Claude Code bound for your session, and you take a turn. **The agent
    does not arm anything and does not poll.**
-3. **read** — on wake (a system reminder like `mail on topic X`), run
-   `mailbox read`. It returns unread events and advances your cursor
-   (exactly-once, advance-on-read).
+3. **read** — on wake (a message tagged `[agent-mailbox]`, naming each topic with
+   what changed on it), run `mailbox read`. It returns unread events and advances your
+   cursor (exactly-once, advance-on-read). The wake tells you *what* changed and links
+   to it; `read` is still where the event bodies are.
 4. **react** — do the work: resolve the conflict, address the review, fix CI.
 5. **unsubscribe** — `mailbox unsubscribe <topic>` (or `mailbox unwatch …`) when
    you no longer care. `SessionEnd` does this for you if you just end the session.
@@ -398,8 +399,8 @@ Add global `--json` for machine-readable stdout.
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
-| `mailbox publish <topic> [--body <json>] [--adapter <id>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). |
-| `mailbox send <target> [--text <s>] [--body <json>]` | Message a peer agent (see below). Works with no session; the message then carries no `from`. |
+| `mailbox publish <topic> [--body <json>] [--adapter <id>] [--subject <s>] [--link <url>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). `--subject` is the one line subscribers see on WAKE. |
+| `mailbox send <target> [--text <s>] [--body <json>] [--subject <s>] [--link <url>]` | Message a peer agent (see below). Works with no session; the message then carries no `from`. |
 | `mailbox agents [--json]` | List the agents you can `send` to. Works with no session; no row is then marked as you. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
 
@@ -417,6 +418,21 @@ remember when something you spawned needs to publish:
 # from the agent, from a git hook, from a subagent — identical
 mailbox publish ci.builds --body '{"build":"failed"}'
 ```
+
+**Say what it is** ([ADR-0022](adr/0022-the-wake-carries-a-subject.md)). A subscriber
+is woken with your `--subject`, so it starts the turn knowing what happened instead of
+diffing the world against its memory of it:
+
+```bash
+mailbox publish ci.builds \
+  --body '{"build":"failed","job":"lint"}' \
+  --subject 'the lint job failed on main' \
+  --link 'https://ci.example.com/runs/9'
+```
+
+It is optional — without one, subscribers are woken with the topic and a count. Keep it
+to a description and a pointer: it is collapsed to one line and truncated at 120
+characters, and the body is what `read` is for.
 
 **Your own message wakes you too**
 ([ADR-0014](adr/0014-self-authored-events-wake-their-author.md)). Publishing is not
@@ -470,10 +486,15 @@ mailbox send 9d2e7c05-… --text "review done on PR 42, please rebase"
 
 # ...or with a structured body:
 mailbox send 9d2e7c05-… --body '{"kind":"review-done","pr":42}'
+
+# ...and say what it is ABOUT, which is what the peer sees on wake:
+mailbox send 9d2e7c05-… --text "…" --subject "PR 42 is approved, please rebase"
 ```
 
-The peer wakes (`mail on topic agent.9d2e7c05-…` — payload-free, as always), and it
-reads the message like any other event:
+The peer wakes with its inbox topic and who messaged it — `from 4f9c1a2b-…: PR 42 is
+approved, please rebase`, or just `message from 4f9c1a2b-…` without a `--subject`. The
+message TEXT never rides the wake wire: a wake says what is waiting, not what it says.
+The peer reads it like any other event:
 
 ```bash
 mailbox read

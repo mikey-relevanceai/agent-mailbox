@@ -12,11 +12,21 @@
 //! same-user processes whose output is treated as untrusted *content*; giving
 //! the body a concrete schema here would tempt higher layers to trust it. The
 //! protocol's job is to carry the bytes, not to understand them.
+//!
+//! ## …and the subject, which is not part of the body (ADR-0022)
+//!
+//! [`Publish::subject`] is a separate, optional field rather than a well-known key
+//! inside the body, because it is the one thing that gets *different* treatment:
+//! the bridge renders it onto the wake wire. Keeping it out of the body means the
+//! bridge never has to reach into opaque content to find it, and an adapter has to
+//! say explicitly "this line is fit to show a model" rather than having that
+//! decided for it by a key name.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ids::{AdapterId, Cursor, EventId, Offset, Timestamp};
+use crate::subject::Subject;
 use crate::topic::Topic;
 
 /// Publish a new event to a topic (adapter/CLI → bridge).
@@ -27,6 +37,11 @@ pub struct Publish {
     pub adapter: AdapterId,
     /// Opaque, untrusted content. Never interpreted by this crate.
     pub body: Value,
+    /// One line saying what changed, for the wake wire (ADR-0022). Optional: an
+    /// adapter with nothing useful to say omits it, and its subscribers are woken
+    /// with the topic and a count, exactly as before subjects existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Subject>,
 }
 
 /// Persist an edge-triggered adapter's baseline snapshot (adapter → bridge).
@@ -77,6 +92,10 @@ pub struct Event {
     pub timestamp: Timestamp,
     /// Opaque, untrusted content. Never interpreted by this crate.
     pub body: Value,
+    /// The publisher's one-line description of this event, if it gave one — what
+    /// the wake wire showed, and what `read` shows beside the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Subject>,
 }
 
 /// Cursor-based read of a topic's durable log (consumer → bridge).
@@ -165,6 +184,7 @@ pub enum Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subject::Subject;
     use crate::topic::GithubPr;
 
     fn sample_topic() -> Topic {
@@ -185,6 +205,7 @@ mod tests {
             topic: sample_topic(),
             timestamp: Timestamp(1_720_000_000_000),
             body: serde_json::json!({ "action": "opened", "nested": [1, 2, 3] }),
+            subject: Some(Subject::new("new comment", Some("https://example.com/c/1")).unwrap()),
         }
     }
 
@@ -194,7 +215,39 @@ mod tests {
             topic: sample_topic(),
             adapter: AdapterId("github-watch".to_string()),
             body: serde_json::json!({ "hello": "world" }),
+            subject: Some(Subject::new("PR merged", None).unwrap()),
         }));
+    }
+
+    /// A publisher with nothing useful to say omits the subject, and the frame it
+    /// writes is byte-identical to one from before subjects existed — so an older
+    /// adapter still speaks this protocol (and a newer one is not forced to
+    /// invent a description it does not have).
+    #[test]
+    fn a_subject_less_publish_is_the_pre_subject_frame() {
+        let json = serde_json::to_value(Message::Publish(Publish {
+            topic: sample_topic(),
+            adapter: AdapterId("github-watch".to_string()),
+            body: serde_json::json!({ "hello": "world" }),
+            subject: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "publish",
+                "topic": "github.pr.octocat/hello-world#42",
+                "adapter": "github-watch",
+                "body": { "hello": "world" },
+            })
+        );
+
+        // And the reverse: a frame with no `subject` key parses as "no subject",
+        // not as a malformed message.
+        let Message::Publish(back) = serde_json::from_value(json).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(back.subject, None);
     }
 
     #[test]
@@ -300,6 +353,7 @@ mod tests {
             topic: sample_topic(),
             adapter: AdapterId("x".to_string()),
             body: weird.clone(),
+            subject: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let Message::Publish(back) = serde_json::from_str(&json).unwrap() else {

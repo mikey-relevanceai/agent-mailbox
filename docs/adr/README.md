@@ -28,6 +28,9 @@ The ADRs in force for that path are:
   `bypassPermissions` session has to opt past.
 - [**0018**](0018-publish-has-one-rule.md) — a publish goes to the topic and wakes
   every subscriber, its author included. That is the whole contract.
+- [**0022**](0022-the-wake-carries-a-subject.md) — what the wake actually SAYS: topic
+  names, unread counts, and each event's one-line `subject` and link, behind an
+  `[agent-mailbox]` tag. Never a body.
 
 Eight ADRs describe the wake path that was **deleted** in 0021 — 0008 and 0017 (the
 sentinel), 0012 (the turn-boundary re-trigger), 0016 (the active probe), and the
@@ -61,8 +64,9 @@ the reasoning, not for the mechanism.
 | [0017](0017-daemon-bumps-the-sentinel.md) | The daemon bumps the sentinel directly: delete the per-session watcher, the FIFO, the single-waiter lock and the pidfile — wakeability was an emergent property of six components, each able to fail silently; liveness moves to the process table | Accepted; **demoted to the fallback channel by 0020**, and its session discovery superseded by Claude Code's own session registry; **path deleted by 0021** |
 | [0018](0018-publish-has-one-rule.md) | `publish` has ONE rule: the event goes to the topic and wakes every subscriber, its author included. "Be caught up to speak", `--no-session` and `event.author_session` are deleted — the bridge no longer tries to know who is speaking | Accepted |
 | [0019](0019-remove-the-observability-and-re-arm-surfaces.md) | Delete `harness arm`, `mailbox wait` and the whole max-block apparatus (retained primitives nothing invoked), and `mailbox dashboard` (inferred wake health, measured wrong in BOTH directions against 0016's probe). `doctor` is the only wake-health surface | Accepted |
-| [0020](0020-peer-inbox-socket-is-the-wake-wire.md) | The peer inbox socket is the wake wire: publish writes Claude Code's per-session Unix socket directly and the idle session takes a turn, with the sentinel + `FileChanged` path retained as the fallback for sessions whose socket the `agents_cross_session_inbox` gate never bound. Claim no permission class; stay payload-free; never set `crossSessionInbound` for the operator | Accepted; **its fallback is deleted by 0021** |
-| [0021](0021-delete-the-sentinel-fallback.md) | Delete the sentinel fallback: the inbox socket is the ONLY wake wire. Removes `sentinel.rs`, `watchPaths`, the `FileChanged`/`asyncRewake` exit-2 hook, ADR-0012's turn-boundary re-trigger and ADR-0016's active probe (the hook set drops from five to two, neither able to wake). `doctor` becomes a read; `subscribe`/`watch` refuse for a session nothing can wake. Written after watching the fallback go silently deaf for 6.3h with everything configured correctly | Accepted |
+| [0020](0020-peer-inbox-socket-is-the-wake-wire.md) | The peer inbox socket is the wake wire: publish writes Claude Code's per-session Unix socket directly and the idle session takes a turn, with the sentinel + `FileChanged` path retained as the fallback for sessions whose socket the `agents_cross_session_inbox` gate never bound. Claim no permission class; stay payload-free; never set `crossSessionInbound` for the operator | Accepted; **its fallback is deleted by 0021**, and its payload-free clause **amended by 0022** (the frame carries subjects, never bodies) |
+| [0021](0021-delete-the-sentinel-fallback.md) | Delete the sentinel fallback: the inbox socket is the ONLY wake wire. Removes `sentinel.rs`, `watchPaths`, the `FileChanged`/`asyncRewake` exit-2 hook, ADR-0012's turn-boundary re-trigger and ADR-0016's active probe (the hook set drops from five to two, neither able to wake). `doctor` becomes a read; `subscribe`/`watch` refuse for a session nothing can wake. Written after watching the fallback go silently deaf for 6.3h with everything configured correctly | Accepted; its payload-free clause **amended by 0022** |
+| [0022](0022-the-wake-carries-a-subject.md) | The wake carries a subject — **pointer, not payload**. An event may publish one bounded, single-line `subject` (plus an optional link); the wake renders the subjects of what is unread, prefixed `[agent-mailbox]`. Bodies still never cross the wake boundary. Replaces "mail on topic X", which cost every woken agent a re-derivation of the delta the adapter already knew | Accepted |
 
 ## When to write one
 

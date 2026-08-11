@@ -64,7 +64,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, GithubPr, Subject, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
@@ -565,7 +565,8 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             topic,
             adapter,
             body,
-        } => publish(bus, topic, adapter, body).await,
+            subject,
+        } => publish(bus, topic, adapter, body, subject).await,
         Request::Subscribe {
             session,
             topic,
@@ -591,7 +592,12 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             unwatch_stub(bus, storage, supervisor, session, label).await
         }
         Request::Status { session } => status(storage, session).await,
-        Request::Send { from, to, body } => send(bus, storage, from, to, body).await,
+        Request::Send {
+            from,
+            to,
+            body,
+            subject,
+        } => send(bus, storage, from, to, body, subject).await,
         Request::Agents { session } => agents(storage, session).await,
         Request::Topics { prefix } => topics(storage, prefix).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
@@ -610,8 +616,9 @@ async fn send(
     from: Option<SessionId>,
     to: SessionId,
     body: serde_json::Map<String, serde_json::Value>,
+    subject: Option<Subject>,
 ) -> Response {
-    match mailbox::agents::send(bus, storage, from, to, body).await {
+    match mailbox::agents::send(bus, storage, from, to, body, subject).await {
         Ok(sent) => Response::Sent {
             to: sent.to,
             topic: sent.topic,
@@ -666,7 +673,13 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
 /// agent spawned are indistinguishable here, deliberately — the daemon used to route
 /// on whether a session came with the request, so it could refuse a publish from a
 /// caller with unread mail on the topic.
-async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::Value) -> Response {
+async fn publish(
+    bus: &Bus,
+    topic: Topic,
+    adapter: AdapterId,
+    body: serde_json::Value,
+    subject: Option<Subject>,
+) -> Response {
     // An agent inbox is writable ONLY through `mailbox send`, which stamps
     // provenance (`from`) and refuses an unregistered target (ADR-0007). The
     // generic publish path does neither, so allowing it here would let any caller
@@ -684,7 +697,7 @@ async fn publish(bus: &Bus, topic: Topic, adapter: AdapterId, body: serde_json::
     // The daemon stamps the timestamp (one clock, like the durable bridge does).
     let timestamp = Timestamp(mailbox::clock::now_millis());
 
-    match bus.publish(topic, adapter, timestamp, body).await {
+    match bus.publish(topic, adapter, timestamp, body, subject).await {
         Ok(event) => Response::Published {
             id: event.id,
             offset: event.offset,

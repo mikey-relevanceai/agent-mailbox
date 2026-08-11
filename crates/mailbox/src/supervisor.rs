@@ -67,7 +67,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use mailbox_protocol::SessionId;
-use mailbox_protocol::{AdapterId, GithubPr, Timestamp, Topic, stub_topic};
+use mailbox_protocol::{AdapterId, GithubPr, Subject, Timestamp, Topic, stub_topic};
 
 use crate::bus::Bus;
 use crate::clock::now_millis;
@@ -960,6 +960,15 @@ impl Actor {
             "pr": watch.target.pr_column(),
             "consecutive_failures": failures,
         });
+        // The one event on this topic that is about the mailbox rather than the PR,
+        // so it says so plainly: an agent woken by it should stop expecting news.
+        // `.ok()` because a subject is never worth failing a publish over — least of
+        // all this publish, whose whole job is to surface a failure.
+        let subject = Subject::new(
+            &format!("mailbox stopped watching this: the adapter failed {failures} times in a row"),
+            None,
+        )
+        .ok();
         match self
             .bus
             .publish(
@@ -967,6 +976,7 @@ impl Actor {
                 AdapterId("mailbox-supervisor".to_string()),
                 Timestamp(now_millis()),
                 body,
+                subject,
             )
             .await
         {

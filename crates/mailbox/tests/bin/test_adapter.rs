@@ -197,6 +197,7 @@ fn emit_publish(topic: &Topic, i: u64) {
         topic: topic.clone(),
         adapter: AdapterId(SELF_REPORTED_ADAPTER.to_string()),
         body: serde_json::json!({ "i": i }),
+        subject: None,
     });
     emit_raw(&encode_line(&message).expect("encode publish"));
 }

@@ -114,6 +114,11 @@ already pinned payload-free by its own test. The body stays in the durable log f
 the agent's `read`. This invariant (ADR-0001, `docs/01-wake.md`) is preserved
 deliberately: the socket *could* carry a body, and must not.
 
+> **Amended by [ADR-0022](0022-the-wake-carries-a-subject.md).** The frame is no
+> longer topic names alone: it also carries unread counts and each event's bounded,
+> single-line `subject` and link. The half of this clause that matters is untouched —
+> the socket still may not carry a body, and `read` is still the only way to one.
+
 **The daemon holds the connection open across the write** so peer-pid verification
 can succeed (finding 2). A fire-and-forget write is unverifiable on macOS.
 

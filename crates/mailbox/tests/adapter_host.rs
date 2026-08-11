@@ -174,6 +174,7 @@ async fn ac2_malformed_line_is_skipped_without_crashing_the_bridge() {
         AdapterId("after".to_string()),
         Timestamp(0),
         json!({ "after": "the bad line" }),
+        None,
     )
     .await
     .expect("bridge still accepts publishes after a malformed adapter line");

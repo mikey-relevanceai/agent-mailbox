@@ -247,17 +247,18 @@ fn config(max_polls: u64, baseline: Value) -> Value {
 // pr-view fixtures (state + mergeable + statusCheckRollup — reviews/comments come
 // from the REST endpoints now). All OPEN unless a test drives a merge.
 fn pr_mergeable_ci_success() -> &'static str {
-    r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
+    r#"{"state":"OPEN","mergeable":"MERGEABLE","url":"https://github.com/acme/web/pull/42","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
 fn pr_conflicting_ci_success() -> &'static str {
-    r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
+    r#"{"state":"OPEN","mergeable":"CONFLICTING","url":"https://github.com/acme/web/pull/42","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
+/// The failing check reports where it ran, which is what a CI subject links to.
 fn pr_conflicting_ci_failure() -> &'static str {
-    r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE"}]}"#
+    r#"{"state":"OPEN","mergeable":"CONFLICTING","url":"https://github.com/acme/web/pull/42","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/acme/web/actions/runs/9/job/2"}]}"#
 }
 /// A merged PR as `gh` reports it: `state` MERGED, `mergeable` gone UNKNOWN.
 fn pr_merged() -> &'static str {
-    r#"{"state":"MERGED","mergeable":"UNKNOWN","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
+    r#"{"state":"MERGED","mergeable":"UNKNOWN","url":"https://github.com/acme/web/pull/42","statusCheckRollup":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS"}]}"#
 }
 
 // ==== ac-10-1: baseline first, then conflict / review / CI each fire once =======
@@ -313,7 +314,17 @@ fn ac10_1_baseline_then_each_transition_fires_exactly_once() {
         .expect("a ci_failure event");
     assert_eq!(ci["body"]["rollup"], "failure");
     assert_eq!(ci["body"]["previous"], "success");
-    assert_eq!(ci["body"]["newly_failed"], json!(["build"]));
+    assert_eq!(
+        ci["body"]["newly_failed"],
+        json!([{"name": "build", "url": "https://github.com/acme/web/actions/runs/9/job/2"}])
+    );
+    // …and the subject the agent will actually be woken with: what broke, and the
+    // run that broke — not "mail on this PR" (ADR-0022).
+    assert_eq!(ci["subject"]["text"], "CI failed: build");
+    assert_eq!(
+        ci["subject"]["link"],
+        "https://github.com/acme/web/actions/runs/9/job/2"
+    );
 
     // The new-review edge carries the id delta.
     let review = result
@@ -323,6 +334,13 @@ fn ac10_1_baseline_then_each_transition_fires_exactly_once() {
         .expect("a new_reviews event");
     assert_eq!(review["body"]["previous_max_id"], 0);
     assert_eq!(review["body"]["current_max_id"], 100);
+    // Its subject links to that review, not to the PR — the id delta in the body is
+    // for a program, the permalink is for whoever has to go and look.
+    assert_eq!(review["subject"]["text"], "new review");
+    assert_eq!(
+        review["subject"]["link"],
+        "https://github.com/acme/web/pull/42#pullrequestreview-100"
+    );
 
     let baseline = result.last_baseline().expect("a persisted baseline");
     assert_eq!(baseline["mergeable"], "conflicting");

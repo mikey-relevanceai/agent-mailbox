@@ -93,20 +93,47 @@ mailbox publish TOPIC --body '{"...":"..."}'
 ### On wake
 
 When the world changes, the bridge writes to your session's inbox and you start a
-turn with a message like `mail on topic github.pr.OWNER/REPO#NUMBER`. It names the
-topic only — the event body is in the durable log, which is what `read` returns. When
-you see it:
+turn with a message like this:
+
+```text
+[agent-mailbox] mail on 2 topics — run `mailbox read`
+
+github.pr.OWNER/REPO#42 — 2 unread
+  · CI failed: build
+    https://github.com/OWNER/REPO/actions/runs/9/job/2
+  · new comment
+    https://github.com/OWNER/REPO/pull/42#issuecomment-2145678
+
+agent.983eae5f-0b09 — 1 unread
+  · from 700a3bf5-1c4d: PR 42 is approved, please rebase
+```
+
+**`[agent-mailbox]` is the tag that says this skill applies.** If a message starts
+with it, the mailbox woke you: read your mail and act on it.
+
+Each `·` line is one event's **subject** — a pointer to what changed, with a link
+straight to it. Use the links: they are why you do not have to re-derive the delta
+yourself. The subject is *not* the event, though; the body is in the durable log, so
+still:
 
 ```bash
 mailbox read
 ```
 
-`read` returns the unread events and advances your cursor (exactly-once). React
-to what you read — resolve the conflict, address the review, fix CI, reply to the
-peer. Then just end your turn. **You do nothing to stay wakeable** — the
-infrastructure keeps you armed for the next message.
+`read` returns the unread events and advances your cursor (exactly-once), with each
+event's subject shown beside its body. React to what you read — resolve the conflict,
+address the review, fix CI, reply to the peer. Then just end your turn. **You do
+nothing to stay wakeable** — the infrastructure keeps you armed for the next message.
 
-**Every wake is real mail.** You will only ever be woken with a `mail on topic …`
+Two things the wake deliberately does NOT tell you:
+
+- **The count is the truth, the subjects are a sample.** Only the newest few events
+  per topic are described (`· …and 4 earlier` says what was left out), so never treat
+  the bullets as the complete list — `read` is what hands you everything.
+- **Never the content.** A peer's message text, a comment's body, a check's output:
+  none of it rides the wake wire. `mailbox read`, then go and look at the link.
+
+**Every wake is real mail.** You will only ever be woken with an `[agent-mailbox]`
 message — there is no "keeping you alive" nudge to ignore. When you wake, there is
 something to `mailbox read`. (Behind the scenes the bridge writes to your inbox the
 moment mail arrives, and nothing at all otherwise — so an idle session costs nothing
@@ -170,11 +197,20 @@ mailbox send PEER_SESSION_ID --text "review done on PR 42, please rebase"
 
 # ...or send a structured body:
 mailbox send PEER_SESSION_ID --body '{"kind":"review-done","pr":42}'
+
+# ...and say what it is ABOUT — this is the line the peer sees on wake.
+mailbox send PEER_SESSION_ID --text "..." --subject "PR 42 is approved, please rebase"
 ```
 
-The idle peer wakes with `mail on topic agent.<its-id>`; it runs
-`mailbox read` and sees your message with a `"from"` field naming **your** session
-id. To reply, it just sends back to that id. That is the whole protocol.
+The idle peer wakes on its own inbox topic, told who messaged it and — if you passed
+`--subject` — what about: `· from YOUR_SESSION_ID: PR 42 is approved, please rebase`.
+It runs `mailbox read` and sees your message with a `"from"` field naming **your**
+session id. To reply, it just sends back to that id. That is the whole protocol.
+
+**Use `--subject` when the message needs acting on rather than just filing.** Without
+one the peer wakes knowing only that you messaged it, which is enough to go and read
+but tells it nothing about urgency. Your `--text` never rides the wake wire either
+way — the peer always has to `read` for the message itself.
 
 Notes that matter:
 

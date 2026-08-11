@@ -47,6 +47,7 @@ async fn publish_n(bus: &Bus, topic: &Topic, count: u64) {
             adapter(),
             Timestamp(i as i64),
             json!({ "i": i }),
+            None,
         )
         .await
         .unwrap();
@@ -138,6 +139,7 @@ async fn ac2_mid_turn_publish_surfaces_on_next_read() {
         adapter(),
         Timestamp(1),
         json!({ "mid": "turn" }),
+        None,
     )
     .await
     .unwrap(); // offset 1
@@ -194,9 +196,15 @@ async fn ac3_unsubscribe_stops_delivery_but_log_persists() {
     assert!(bus.read(alice.clone(), None).await.unwrap().is_empty());
 
     // A fresh publish after re-subscribe is delivered normally.
-    bus.publish(topic, adapter(), Timestamp(2), json!({ "after": "resub" }))
-        .await
-        .unwrap(); // offset 2
+    bus.publish(
+        topic,
+        adapter(),
+        Timestamp(2),
+        json!({ "after": "resub" }),
+        None,
+    )
+    .await
+    .unwrap(); // offset 2
     assert_eq!(read_offsets(&bus, &alice, None).await, vec![2]);
 }
 
@@ -232,7 +240,7 @@ async fn ac4_baseline_on_subscribe_does_not_replay_history() {
     assert!(bus.read(alice.clone(), None).await.unwrap().is_empty());
 
     // Only events published AFTER the subscribe are delivered.
-    bus.publish(topic, adapter(), Timestamp(2), json!({ "i": 2 }))
+    bus.publish(topic, adapter(), Timestamp(2), json!({ "i": 2 }), None)
         .await
         .unwrap(); // offset 2
     assert_eq!(read_offsets(&bus, &alice, None).await, vec![2]);
@@ -266,7 +274,7 @@ async fn ac4_resubscribe_baselines_to_head() {
     assert!(bus.read(alice.clone(), None).await.unwrap().is_empty());
 
     // Post-re-subscribe events flow again.
-    bus.publish(topic, adapter(), Timestamp(9), json!({ "i": 3 }))
+    bus.publish(topic, adapter(), Timestamp(9), json!({ "i": 3 }), None)
         .await
         .unwrap(); // offset 3
     assert_eq!(read_offsets(&bus, &alice, None).await, vec![3]);
@@ -547,7 +555,13 @@ async fn publish_racing_a_read_delivers_exactly_once() {
         .unwrap();
 
     let (pub_res, read_res) = tokio::join!(
-        bus.publish(topic.clone(), adapter(), Timestamp(0), json!({ "i": 0 })),
+        bus.publish(
+            topic.clone(),
+            adapter(),
+            Timestamp(0),
+            json!({ "i": 0 }),
+            None
+        ),
         bus.read(alice.clone(), None)
     );
     pub_res.unwrap();

@@ -8,6 +8,7 @@
 //! ([`WatchSpec`]) separate from the read model ([`Watch`]) so callers cannot
 //! invent an id or a lifecycle state for a watch that does not exist yet.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -234,6 +235,53 @@ pub struct TopicSummary {
     pub events: u64,
     /// Timestamp of the newest event, or `None` on a topic with no events.
     pub last_event: Option<mailbox_protocol::Timestamp>,
+}
+
+/// How many subjects a caller of `unread_digest` wants per topic.
+///
+/// A named choice rather than a count with a magic zero: `status` prints counts and
+/// the wake describes them, and `unread_digest(session, 0)` at a call site reads like
+/// a forgotten argument rather than the deliberate decision it is. `NonZeroU32` means
+/// "some, but none" cannot be spelled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectBudget {
+    /// Report what is unread, not what it is about.
+    CountsOnly,
+    /// Describe up to this many of the newest unread events per topic.
+    Newest(NonZeroU32),
+}
+
+impl SubjectBudget {
+    /// The budget as the SQL's per-topic rank cutoff. Private to storage: zero is a
+    /// fine *query parameter* — the subjects are LEFT JOINed onto the counts, so at
+    /// zero every topic still reports its count — it is only a bad thing to make a
+    /// caller write.
+    pub(super) fn rank_cutoff(self) -> u32 {
+        match self {
+            SubjectBudget::CountsOnly => 0,
+            SubjectBudget::Newest(n) => n.get(),
+        }
+    }
+}
+
+/// What one subscribed topic has waiting for a session: how much, and what the
+/// newest of it is about.
+///
+/// The read model behind the wake wire (ADR-0022) and `mailbox status`. A read
+/// model with no creation twin, like [`TopicSummary`]: only a query mints one.
+///
+/// `unread` counts EVERY unread event on the topic, while `subjects` holds at most
+/// the newest few — and only those whose publisher gave one. So `subjects.len()`
+/// is a floor on `unread`, never a restatement of it, and the two are deliberately
+/// not folded into one list: "6 unread" plus three descriptions is an honest
+/// summary, whereas three descriptions alone would read as three events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicDigest {
+    pub topic: mailbox_protocol::Topic,
+    /// Events on this topic beyond the session's delivery cursor.
+    pub unread: u64,
+    /// Subjects of the newest unread events that have one, newest first.
+    pub subjects: Vec<mailbox_protocol::Subject>,
 }
 
 /// A page of events plus the cursor to continue from.
