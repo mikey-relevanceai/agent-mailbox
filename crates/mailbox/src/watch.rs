@@ -38,8 +38,8 @@ use tracing::{info, warn};
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    SessionId, Storage, StorageError, SubscribeOutcome, WatchKind, WatchSpec, WatchState,
-    WatchTarget,
+    SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec,
+    WatchState, WatchTarget,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -321,10 +321,10 @@ pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView,
     }
     let subscriptions = storage.session_subscriptions(session.clone()).await?;
     // Counts, not subjects: `status` answers "is there anything waiting?", and what
-    // that mail is about is what `read` is for. Asking for zero subjects is the same
-    // query the wake uses, so the two can never disagree about what "unread" means.
+    // that mail is about is what `read` is for. It is the same query the wake uses,
+    // so the two can never disagree about what "unread" means.
     let unread = storage
-        .unread_digest(session, 0)
+        .unread_digest(session, SubjectBudget::CountsOnly)
         .await?
         .into_iter()
         .map(|digest| (digest.topic, digest.unread))

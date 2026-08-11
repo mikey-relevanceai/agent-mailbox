@@ -53,7 +53,7 @@ use crate::storage::{Storage, StorageError};
 use crate::wake::{self, Waker};
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
-pub use crate::storage::{SessionId, SubscribeKind, SubscribeOutcome};
+pub use crate::storage::{SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome};
 
 /// Errors from a bus operation.
 ///
@@ -238,7 +238,10 @@ impl Bus {
         for session in sessions {
             match self
                 .storage
-                .unread_digest(session.clone(), wake::SUBJECTS_PER_TOPIC)
+                .unread_digest(
+                    session.clone(),
+                    SubjectBudget::Newest(wake::SUBJECTS_PER_TOPIC),
+                )
                 .await
             {
                 Ok(digest) => unread_by_session.push((session, digest)),

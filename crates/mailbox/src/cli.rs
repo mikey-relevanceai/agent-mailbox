@@ -257,12 +257,41 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
+    #[command(flatten)]
+    pub subject: SubjectArgs,
+}
+
+/// The `--subject` / `--link` pair, shared by `publish` and `send`.
+///
+/// Defined once and flattened into both commands rather than declared twice: they
+/// are two `Option<String>`s that mean entirely different things, so a hand-rolled
+/// second copy is a transposition — the URL becomes the description and the
+/// description is dropped as an unusable link — that compiles and fails quietly.
+#[derive(Args, Debug)]
+pub struct SubjectArgs {
     /// One line saying what this is, shown to subscribers when they wake.
     #[arg(long)]
     pub subject: Option<String>,
     /// A URL to the thing the subject describes. Requires `--subject`.
     #[arg(long, requires = "subject")]
     pub link: Option<String>,
+}
+
+impl SubjectArgs {
+    /// Parse the flags into the [`Subject`] the wire carries, or `None` when the
+    /// caller gave no `--subject`.
+    ///
+    /// The text is normalized by [`Subject::new`] — collapsed to one line and
+    /// bounded — so what reaches the wire is what the wake will render, not what the
+    /// shell handed over. An unusable `--link` is dropped there rather than refused
+    /// here: the same degrade rule an adapter's link follows, and the CLI has no
+    /// better answer than the type does.
+    fn parse(&self) -> anyhow::Result<Option<Subject>> {
+        self.subject
+            .as_deref()
+            .map(|text| Subject::new(text, self.link.as_deref()).context("--subject"))
+            .transpose()
+    }
 }
 
 #[derive(Args, Debug)]
@@ -294,13 +323,8 @@ pub struct SendArgs {
     /// A JSON **object** body (stored verbatim; the bridge only adds `from`).
     #[arg(long)]
     pub body: Option<String>,
-    /// One line saying what this message is about, shown when the peer wakes.
-    /// The bridge appends who it is from.
-    #[arg(long)]
-    pub subject: Option<String>,
-    /// A URL to whatever the subject refers to. Requires `--subject`.
-    #[arg(long, requires = "subject")]
-    pub link: Option<String>,
+    #[command(flatten)]
+    pub subject: SubjectArgs,
 }
 
 #[derive(Args, Debug)]
@@ -433,22 +457,10 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
             topic,
             adapter: AdapterId(args.adapter),
             body,
-            subject: parse_subject(args.subject.as_deref(), args.link.as_deref())?,
+            subject: args.subject.parse()?,
         },
     )
     .await
-}
-
-/// Build the optional [`Subject`] two commands share (`publish` and `send`).
-///
-/// The text is normalized by [`Subject::new`] — collapsed to one line and bounded —
-/// so what reaches the wire is what the wake will render, not what the shell handed
-/// over. An unusable `--link` is dropped there rather than refused here: the same
-/// degrade rule an adapter's link follows, and the CLI has no better answer than the
-/// type does.
-fn parse_subject(text: Option<&str>, link: Option<&str>) -> anyhow::Result<Option<Subject>> {
-    text.map(|text| Subject::new(text, link).context("--subject"))
-        .transpose()
 }
 
 async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<ExitCode> {
@@ -519,7 +531,7 @@ async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCo
             from,
             to,
             body,
-            subject: parse_subject(args.subject.as_deref(), args.link.as_deref())?,
+            subject: args.subject.parse()?,
         },
     )
     .await
@@ -1829,6 +1841,30 @@ mod tests {
         assert_eq!(session_from_env_value(""), None);
         assert_eq!(session_from_env_value("   "), None);
         assert_eq!(session_from_env_value("\n"), None);
+    }
+
+    fn subject_args(subject: Option<&str>, link: Option<&str>) -> SubjectArgs {
+        SubjectArgs {
+            subject: subject.map(str::to_string),
+            link: link.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn subject_flags_parse_into_the_subject_the_wire_carries() {
+        assert_eq!(subject_args(None, None).parse().unwrap(), None);
+
+        let parsed = subject_args("  new   comment ".into(), Some("https://example.com/c/1"))
+            .parse()
+            .unwrap()
+            .expect("a subject");
+        assert_eq!(parsed.text(), "new comment", "normalized on the way in");
+        assert_eq!(parsed.link(), Some("https://example.com/c/1"));
+
+        // A subject that says nothing is a mistake worth reporting, not a silent
+        // no-op: the flag was passed on purpose.
+        let err = subject_args(Some("   "), None).parse().unwrap_err();
+        assert!(format!("{err}").contains("--subject"), "{err}");
     }
 
     #[test]

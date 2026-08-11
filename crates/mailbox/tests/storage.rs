@@ -5,12 +5,13 @@
 //! prefer a real DB over mocks (mikey-in-a-box testing-strategy). Each of the
 //! four acceptance criteria for card 03 has a named test below.
 
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
 
 use mailbox::storage::{
-    SessionId, Storage, StorageConfig, StorageError, SubscribeKind, WatchSpec, WatchState,
-    WatchTarget,
+    SessionId, Storage, StorageConfig, StorageError, SubjectBudget, SubscribeKind, WatchSpec,
+    WatchState, WatchTarget,
 };
 use mailbox_protocol::{AdapterId, Cursor, GithubPr, Offset, Subject, Timestamp, Topic};
 use serde_json::json;
@@ -747,7 +748,10 @@ async fn unread_digest_reports_per_topic_and_does_not_consume() {
         .await
         .unwrap();
 
-    let digest = storage.unread_digest(session.clone(), 0).await.unwrap();
+    let digest = storage
+        .unread_digest(session.clone(), SubjectBudget::CountsOnly)
+        .await
+        .unwrap();
     assert_eq!(
         digest
             .iter()
@@ -764,7 +768,13 @@ async fn unread_digest_reports_per_topic_and_does_not_consume() {
     // Counting did NOT advance the cursor: a real read still returns all three.
     assert_eq!(bus.read(session.clone(), None).await.unwrap().len(), 3);
     // After reading, nothing is unread.
-    assert!(storage.unread_digest(session, 0).await.unwrap().is_empty());
+    assert!(
+        storage
+            .unread_digest(session, SubjectBudget::CountsOnly)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The digest behind the wake wire (ADR-0022): the newest few subjects per topic,
@@ -793,7 +803,13 @@ async fn unread_digest_returns_the_newest_subjects_per_topic_with_the_full_count
         .unwrap();
     }
 
-    let digest = storage.unread_digest(session.clone(), 3).await.unwrap();
+    let digest = storage
+        .unread_digest(
+            session.clone(),
+            SubjectBudget::Newest(NonZeroU32::new(3).unwrap()),
+        )
+        .await
+        .unwrap();
     assert_eq!(digest.len(), 1);
     assert_eq!(digest[0].unread, 5, "the count is of everything unread");
     assert_eq!(
@@ -806,6 +822,89 @@ async fn unread_digest_returns_the_newest_subjects_per_topic_with_the_full_count
         "the newest three, newest first"
     );
     assert_eq!(digest[0].subjects[0].link(), Some("https://example.com/1"));
+}
+
+/// **Several topics at once** — the shape a real wake has, and the one the grouping
+/// code exists for. Each topic must get its own digest with its own subjects, and a
+/// topic whose events carry no subject must still report its count.
+#[tokio::test]
+async fn unread_digest_keeps_each_topics_subjects_to_that_topic() {
+    let (storage, _dir) = fresh_store().await;
+    let bus = mailbox::bus::Bus::new(storage.clone());
+    let session = SessionId::new("s-many");
+    let (described, quiet, single) = (pr_topic(1), pr_topic(2), pr_topic(3));
+    bus.subscribe(
+        session.clone(),
+        &[described.clone(), quiet.clone(), single.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Interleaved across topics, so a grouping that relied on rows arriving
+    // topic-by-topic would have to survive the log NOT being written that way.
+    for i in 0..3i64 {
+        bus.publish(
+            described.clone(),
+            adapter(),
+            Timestamp(i),
+            json!({}),
+            Subject::new(&format!("described {i}"), None).ok(),
+        )
+        .await
+        .unwrap();
+        bus.publish(quiet.clone(), adapter(), Timestamp(i), json!({}), None)
+            .await
+            .unwrap();
+    }
+    bus.publish(
+        single.clone(),
+        adapter(),
+        Timestamp(9),
+        json!({}),
+        Subject::new("the only one", None).ok(),
+    )
+    .await
+    .unwrap();
+
+    let digest = storage
+        .unread_digest(session, SubjectBudget::Newest(NonZeroU32::new(2).unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        digest
+            .iter()
+            .map(|d| (d.topic.clone(), d.unread))
+            .collect::<Vec<_>>(),
+        vec![
+            (described.clone(), 3),
+            (quiet.clone(), 3),
+            (single.clone(), 1)
+        ],
+        "one digest per topic, in topic order, each counting only its own events"
+    );
+    assert_eq!(
+        digest[0]
+            .subjects
+            .iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>(),
+        vec!["described 2", "described 1"],
+        "the newest two of ITS topic, newest first — never another topic's"
+    );
+    assert!(
+        digest[1].subjects.is_empty(),
+        "a topic whose events describe nothing is still counted: {:?}",
+        digest[1]
+    );
+    assert_eq!(
+        digest[2]
+            .subjects
+            .iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>(),
+        vec!["the only one"]
+    );
 }
 
 /// An event published without a subject is counted but describes nothing, and it
@@ -836,7 +935,10 @@ async fn unread_digest_counts_subject_less_events_without_describing_them() {
             .unwrap();
     }
 
-    let digest = storage.unread_digest(session, 3).await.unwrap();
+    let digest = storage
+        .unread_digest(session, SubjectBudget::Newest(NonZeroU32::new(3).unwrap()))
+        .await
+        .unwrap();
     assert_eq!(digest[0].unread, 4);
     assert_eq!(
         digest[0]

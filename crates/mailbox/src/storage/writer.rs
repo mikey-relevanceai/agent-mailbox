@@ -18,6 +18,8 @@
 //! the bridge (ADR-0003), and that daemon/socket lifecycle is owned by later
 //! cards (06–08), not here. No cross-process file locking lives in this card.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -29,8 +31,8 @@ use mailbox_protocol::{
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicDigest,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -233,7 +235,7 @@ pub(crate) enum Command {
     /// deliver without consuming it.
     UnreadDigest {
         session: SessionId,
-        subjects_per_topic: u32,
+        subjects: SubjectBudget,
         reply: oneshot::Sender<Result<Vec<TopicDigest>, StorageError>>,
     },
     /// The sessions with a registered agent inbox (card-16 `agents`). A read
@@ -532,10 +534,10 @@ fn handle(conn: &mut Connection, cmd: Command) {
         }
         Command::UnreadDigest {
             session,
-            subjects_per_topic,
+            subjects,
             reply,
         } => {
-            let result = do_unread_digest(conn, &session, subjects_per_topic);
+            let result = do_unread_digest(conn, &session, subjects);
             log_on_err(&result, "unread_digest", || {
                 format!("session={}", session.as_str())
             });
@@ -659,12 +661,14 @@ fn append_event_tx(
     })
 }
 
-/// The `event` columns every read below selects, in the order [`EventRow::read`]
-/// expects them.
+/// The `event` columns every read below selects.
 ///
 /// One definition because there are two read paths (a topic page and a session's
 /// unread) that must return the same event: when they drifted, only one of them
-/// would carry a new column.
+/// would carry a new column. The ORDER here is not load-bearing — [`EventRow::read`]
+/// reads by name, so reordering this list cannot silently swap two columns of the
+/// same type (`subject` and `subject_link` are both nullable TEXT, and swapping them
+/// would render a URL as a wake's description with nothing to catch it).
 const EVENT_COLUMNS: &str = "offset, event_id, timestamp, body, subject, subject_link";
 
 /// One `event` row as SQLite hands it over, before the fallible decoding of the
@@ -683,15 +687,17 @@ struct EventRow {
 }
 
 impl EventRow {
-    /// Read a row selected with [`EVENT_COLUMNS`].
+    /// Read a row selected with [`EVENT_COLUMNS`], BY NAME — so the select list and
+    /// this decoder cannot drift into each other, and a renamed column fails loudly
+    /// on the first read instead of mis-decoding.
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(EventRow {
-            offset: row.get(0)?,
-            event_id: row.get(1)?,
-            timestamp: row.get(2)?,
-            body_text: row.get(3)?,
-            subject: row.get(4)?,
-            subject_link: row.get(5)?,
+            offset: row.get("offset")?,
+            event_id: row.get("event_id")?,
+            timestamp: row.get("timestamp")?,
+            body_text: row.get("body")?,
+            subject: row.get("subject")?,
+            subject_link: row.get("subject_link")?,
         })
     }
 
@@ -1441,15 +1447,15 @@ fn build_watch(
 /// one no longer describes — so the wake could say "3 unread" and then describe
 /// four things. The `unread` CTE is the single definition both halves read.
 ///
-/// `subjects_per_topic` bounds the per-topic subject list (newest first); events
-/// published without a subject are counted but contribute nothing to it. **Zero is
-/// a supported value** — `status` wants counts only — which is why the subjects are
-/// a LEFT JOIN onto the counts rather than a filter over them: at zero, every topic
-/// still reports its count, with no subjects attached.
+/// `subjects` bounds the per-topic subject list (newest first); events published
+/// without a subject are counted but contribute nothing to it. A caller wanting no
+/// subjects at all ([`SubjectBudget::CountsOnly`]) is why the subjects are a LEFT
+/// JOIN onto the counts rather than a filter over them: with a zero cutoff, every
+/// topic still reports its count, with no subjects attached.
 fn do_unread_digest(
     conn: &Connection,
     session: &SessionId,
-    subjects_per_topic: u32,
+    subjects: SubjectBudget,
 ) -> Result<Vec<TopicDigest>, StorageError> {
     let mut stmt = conn.prepare(
         "WITH unread AS (
@@ -1476,17 +1482,21 @@ fn do_unread_digest(
          LEFT JOIN newest n ON n.topic = c.topic AND n.rank <= ?2
          ORDER BY c.topic ASC, n.rank ASC",
     )?;
-    let rows = stmt.query_map(params![session.as_str(), subjects_per_topic], |row| {
-        let topic: String = row.get(0)?;
-        let unread: i64 = row.get(1)?;
-        let subject: Option<String> = row.get(2)?;
-        let subject_link: Option<String> = row.get(3)?;
+    let rows = stmt.query_map(params![session.as_str(), subjects.rank_cutoff()], |row| {
+        let topic: String = row.get("topic")?;
+        let unread: i64 = row.get("unread")?;
+        let subject: Option<String> = row.get("subject")?;
+        let subject_link: Option<String> = row.get("subject_link")?;
         Ok((topic, unread, subject, subject_link))
     })?;
 
-    // One digest per topic, accumulating the (already ordered) subject rows into
-    // the entry the previous row opened.
-    let mut out: Vec<TopicDigest> = Vec::new();
+    // Keyed by topic rather than accumulated into whichever entry the PREVIOUS row
+    // opened: grouping then holds on its own, instead of resting on the SQL's
+    // `ORDER BY topic` keeping a topic's rows adjacent. A duplicated topic would
+    // otherwise print two blocks for one topic and inflate the wake's own header
+    // ("mail on 3 topics" for two). The map's ascending key order is the order the
+    // digest is returned in, which is the order `ORDER BY c.topic ASC` intended.
+    let mut by_topic: BTreeMap<Topic, TopicDigest> = BTreeMap::new();
     for row in rows {
         let (topic_str, unread, subject, subject_link) = row?;
         // A subscription row can only hold a topic the bridge accepted, so a value
@@ -1494,26 +1504,30 @@ fn do_unread_digest(
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
-        let digest = match out.last_mut() {
-            Some(last) if last.topic == topic => last,
-            _ => {
-                out.push(TopicDigest {
-                    topic,
-                    unread: unread.max(0) as u64,
-                    subjects: Vec::new(),
-                });
-                out.last_mut().expect("just pushed")
-            }
-        };
+        let digest = by_topic
+            .entry(topic.clone())
+            .or_insert_with(|| TopicDigest {
+                topic,
+                unread: unread.max(0) as u64,
+                subjects: Vec::new(),
+            });
         // A stored subject that no longer parses is dropped, never fatal: the same
-        // degrade rule `EventRow::into_event` follows.
-        if let Some(text) = subject
-            && let Ok(subject) = Subject::new(&text, subject_link.as_deref())
-        {
-            digest.subjects.push(subject);
+        // degrade rule `EventRow::into_event` follows — including its warning, so
+        // that a corrupt subject is equally visible on the path most wakes take.
+        if let Some(text) = subject {
+            match Subject::new(&text, subject_link.as_deref()) {
+                Ok(subject) => digest.subjects.push(subject),
+                Err(error) => warn!(
+                    topic = digest.topic.as_str(),
+                    session = session.as_str(),
+                    %error,
+                    "dropped an unreadable stored subject from the unread digest; \
+                     the event is still counted and still readable"
+                ),
+            }
         }
     }
-    Ok(out)
+    Ok(by_topic.into_values().collect())
 }
 
 /// The sessions that have REGISTERED an agent inbox (card-16 `agents`).
@@ -2026,7 +2040,7 @@ mod tests {
     /// The unread count as `status` reports it: EVERY event beyond the cursor, whoever
     /// wrote it.
     fn unread_of(conn: &Connection, session: &str, topic: &Topic) -> u64 {
-        do_unread_digest(conn, &SessionId::new(session), 0)
+        do_unread_digest(conn, &SessionId::new(session), SubjectBudget::CountsOnly)
             .unwrap()
             .into_iter()
             .find(|digest| &digest.topic == topic)

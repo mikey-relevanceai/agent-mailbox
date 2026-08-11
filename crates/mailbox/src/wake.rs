@@ -43,6 +43,7 @@
 //! awake to hear the answer.
 
 use std::fmt::Write as _;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
@@ -68,7 +69,7 @@ pub const PREFIX: &str = "[agent-mailbox]";
 /// starts being the read it is supposed to prompt. What is left out is not lost —
 /// it is in the durable log, which is the point of the `mailbox read` the wake ends
 /// with — so the overflow is stated (`…and N earlier`) rather than hidden.
-pub const SUBJECTS_PER_TOPIC: u32 = 3;
+pub const SUBJECTS_PER_TOPIC: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 /// How many topics a wake describes before it summarises the rest.
 ///
@@ -410,6 +411,22 @@ agent.983eae5f — 1 unread
         assert!(line.ends_with("…and 3 more topics\n"), "{line}");
     }
 
+    /// Exactly at the cap there is nothing left out, so the wake must not claim
+    /// there is — the off-by-one that would say "…and 0 more topics".
+    #[test]
+    fn exactly_the_cap_summarises_nothing() {
+        let unread: Vec<TopicDigest> = (0..MAX_TOPICS)
+            .map(|i| digest(&format!("t.{i:02}"), 1, vec![subject("hi", None)]))
+            .collect();
+        let line = reminder(&unread);
+
+        assert!(
+            line.contains(&format!("t.{:02} — 1 unread", MAX_TOPICS - 1)),
+            "{line}"
+        );
+        assert!(!line.contains("more topic"), "nothing was left out: {line}");
+    }
+
     /// **The invariant this whole module exists to keep.** A subject describes an
     /// event; it is not a copy of one. Nothing an adapter puts in a body can reach
     /// the wake wire, so the durable log stays the only place the truth lives.
@@ -474,11 +491,12 @@ agent.983eae5f — 1 unread
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the session should have received a frame");
         let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(parsed["message"]["content"], reminder(&unread));
-        let content = parsed["message"]["content"].as_str().unwrap();
-        assert!(content.starts_with(PREFIX), "{content}");
-        assert!(content.contains("t.a — 1 unread"), "{content}");
-        assert!(content.contains("· new comment"), "{content}");
+        // A literal, not `reminder(&unread)`: comparing the wire against the function
+        // that produced it would pass no matter what that function started rendering.
+        assert_eq!(
+            parsed["message"]["content"],
+            "[agent-mailbox] mail on 1 topic — run `mailbox read`\n\nt.a — 1 unread\n  · new comment\n"
+        );
     }
 
     /// A session Claude Code never gave a socket cannot be woken by anyone. That is

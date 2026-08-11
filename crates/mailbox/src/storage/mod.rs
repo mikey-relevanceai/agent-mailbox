@@ -43,8 +43,8 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicDigest,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -509,11 +509,11 @@ impl Storage {
     }
 
     /// What `session` has waiting: per subscribed topic with at least one unread
-    /// event, the count and the subjects of the newest `subjects_per_topic` of
-    /// them, in ascending topic order.
+    /// event, the count and the subjects of the newest few of them (see
+    /// [`SubjectBudget`]), in ascending topic order.
     ///
     /// The read behind the wake wire (ADR-0022) and the card-06 `status` command,
-    /// which asks for `0` subjects because it prints counts. "Unread" is exactly
+    /// which asks for [`SubjectBudget::CountsOnly`]. "Unread" is exactly
     /// the bus definition (offset strictly beyond the session's delivery cursor,
     /// cursor treated as `-1` when absent) — the counting twin of
     /// [`ReadOnlyStore::topics_with_unread`](crate::storage::ReadOnlyStore). It is
@@ -522,11 +522,11 @@ impl Storage {
     pub async fn unread_digest(
         &self,
         session: SessionId,
-        subjects_per_topic: u32,
+        subjects: SubjectBudget,
     ) -> Result<Vec<TopicDigest>, StorageError> {
         self.call(|reply| Command::UnreadDigest {
             session,
-            subjects_per_topic,
+            subjects,
             reply,
         })
         .await

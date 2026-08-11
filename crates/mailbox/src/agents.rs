@@ -201,6 +201,11 @@ pub async fn send(
         }
     }
 
+    // Recorded before the subject is composed: the log line below reports whether
+    // the SENDER described the message, not whether the bridge ended up with a
+    // subject (it always does — see `message_subject`).
+    let described = subject.is_some();
+
     // A normal publish: durable append, then the wake to every subscriber of the
     // inbox topic (the recipient).
     let event = bus
@@ -209,7 +214,7 @@ pub async fn send(
             AdapterId(AGENT_ADAPTER.to_string()),
             Timestamp(now_millis()),
             Value::Object(body),
-            message_subject(subject, from.as_ref()),
+            Some(message_subject(subject, from.as_ref())),
         )
         .await?;
 
@@ -218,7 +223,11 @@ pub async fn send(
         to = to.as_str(),
         topic = topic.as_str(),
         offset = event.offset.0,
-        // Never the body: a peer message is untrusted content like any other.
+        // Whether the sender described the message, not what it said: the flag
+        // explains what the recipient's wake looked like, which is the thing an
+        // operator is reconstructing here. Never the body — a peer message is
+        // untrusted content like any other.
+        described,
         "delivered a message to a peer agent's inbox"
     );
     Ok(Sent { to, topic, event })
@@ -246,7 +255,7 @@ pub async fn send(
 /// a long subject eats. Leading with the attribution makes "who is asking" the one
 /// part that cannot be crowded out — by an over-long subject, or by one written to
 /// push the identity off the line.
-fn message_subject(subject: Option<Subject>, from: Option<&SessionId>) -> Option<Subject> {
+fn message_subject(subject: Option<Subject>, from: Option<&SessionId>) -> Subject {
     // The bridge states the sender it VERIFIED, or says plainly that there is none.
     // Never a placeholder that reads like an address (see the module docs).
     let sender = match from {
@@ -262,9 +271,11 @@ fn message_subject(subject: Option<Subject>, from: Option<&SessionId>) -> Option
     // The sender's link travels untouched — only the text gains the attribution, and
     // where the sender was pointing is not ours to rewrite.
     let link = subject.as_ref().and_then(Subject::link);
-    // A peer message with no describable subject is still delivered; it just wakes
-    // with the topic and a count, like any other subject-less publish.
-    Subject::new(&text, link).ok()
+    // Total, not `Option`: every arm above formats a non-empty string around a
+    // non-empty sender, and empty text is the only thing `Subject::new` refuses. An
+    // `Option` here would be a branch no caller can reach and every reader has to
+    // disprove.
+    Subject::new(&text, link).expect("a composed message subject always names a sender")
 }
 
 /// Whether `session` is subscribed to its own inbox topic (i.e. is addressable).
@@ -331,14 +342,13 @@ mod tests {
     fn a_message_subject_states_the_sender_the_bridge_verified() {
         let alice = SessionId::new("s-alice");
 
-        let stated = message_subject(None, Some(&alice)).unwrap();
+        let stated = message_subject(None, Some(&alice));
         assert_eq!(stated.text(), "message from s-alice");
 
         let described = message_subject(
             Subject::new("PR 42 review finished", Some("https://example.com/pull/42")).ok(),
             Some(&alice),
-        )
-        .unwrap();
+        );
         assert_eq!(described.text(), "from s-alice: PR 42 review finished");
         assert_eq!(
             described.link(),
@@ -348,10 +358,10 @@ mod tests {
 
         // A human at a terminal has no reply address, and the subject says so rather
         // than naming a sender nobody checked.
-        let anonymous = message_subject(Subject::new("stop", None).ok(), None).unwrap();
+        let anonymous = message_subject(Subject::new("stop", None).ok(), None);
         assert_eq!(anonymous.text(), "from an unidentified sender: stop");
         assert_eq!(
-            message_subject(None, None).unwrap().text(),
+            message_subject(None, None).text(),
             "message from an unidentified sender"
         );
     }
@@ -363,7 +373,7 @@ mod tests {
         let alice = SessionId::new("s-alice");
         let crowding = Subject::new(&"x".repeat(mailbox_protocol::MAX_TEXT_CHARS), None).unwrap();
 
-        let composed = message_subject(Some(crowding), Some(&alice)).unwrap();
+        let composed = message_subject(Some(crowding), Some(&alice));
 
         assert!(
             composed.text().starts_with("from s-alice: "),

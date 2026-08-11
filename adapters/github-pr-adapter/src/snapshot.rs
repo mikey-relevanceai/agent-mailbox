@@ -780,6 +780,43 @@ mod tests {
         );
     }
 
+    /// Every failing check may lack a URL — a StatusContext without a `targetUrl`,
+    /// say. The subject must still name what broke; only the pointer is missing.
+    #[test]
+    fn a_ci_failure_with_no_reporting_urls_still_names_the_checks() {
+        let edge = Edge::CiFailure {
+            from: CiRollup::Success,
+            newly_failed: checks(&["build", "test"]),
+        };
+        let subject = edge.subject(Some(PR_URL)).unwrap();
+        assert_eq!(subject.text(), "CI failed: build, test");
+        assert_eq!(
+            subject.link(),
+            None,
+            "no check reported anywhere, so there is nowhere to send the reader"
+        );
+    }
+
+    /// The link is the first check that HAS one, not the first check — a run to open
+    /// beats no link at all when only a later check reported one.
+    #[test]
+    fn a_ci_failure_links_to_the_first_check_that_reports_one() {
+        let edge = Edge::CiFailure {
+            from: CiRollup::Success,
+            newly_failed: vec![
+                FailedCheck::new("build"),
+                FailedCheck {
+                    name: "test".to_string(),
+                    url: Some("https://ci.example.com/test/9".to_string()),
+                },
+            ],
+        };
+        assert_eq!(
+            edge.subject(Some(PR_URL)).unwrap().link(),
+            Some("https://ci.example.com/test/9")
+        );
+    }
+
     /// No URL from gh means no link — never a fabricated `github.com` one, which
     /// would be wrong on every GitHub Enterprise host. The description survives,
     /// because knowing WHAT changed is most of the value.

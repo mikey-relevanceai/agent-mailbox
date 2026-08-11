@@ -55,7 +55,12 @@ const AGENT_INBOX_PREFIX: &str = "agent.";
 /// Deserialization goes through [`Topic::try_from`] (`#[serde(try_from)]`), so a
 /// `Topic` decoded from an untrusted line is guaranteed to satisfy the grammar
 /// — there is no way to construct an invalid one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord` is the underlying string's byte order, which is exactly SQLite's default
+/// TEXT collation — so a `BTreeMap` keyed by topic and an `ORDER BY topic ASC`
+/// agree, and the storage layer can group by topic without depending on the row
+/// order it happens to be handed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Topic(String);
 

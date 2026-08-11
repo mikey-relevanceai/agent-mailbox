@@ -150,11 +150,19 @@ fn normalize_link(raw: &str) -> Option<String> {
     if link.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
         return None;
     }
-    let scheme = ALLOWED_LINK_SCHEMES.iter().find(|scheme| {
-        link.len() > scheme.len() && link[..scheme.len()].eq_ignore_ascii_case(scheme)
+    // Compared as BYTES, never by slicing the `&str`: `scheme.len()` is a byte
+    // count, so `link[..8]` lands mid-character on any candidate whose eighth byte
+    // is inside a multi-byte one — and panics. That is unacceptable here twice over.
+    // This function's whole contract is that an unusable link is *dropped*, and its
+    // input is untrusted: a third-party CI's `targetUrl`, a `--link` flag, or a
+    // peer's JSON on the control socket, where a panic takes the daemon's connection
+    // task with it. Bytes cannot straddle a character.
+    ALLOWED_LINK_SCHEMES.iter().find(|scheme| {
+        // A scheme with nothing after it addresses nothing, so the length test is
+        // strictly greater — it is a rule, not just a bounds check.
+        link.len() > scheme.len()
+            && link.as_bytes()[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
     })?;
-    // A scheme with nothing after it addresses nothing.
-    debug_assert!(link.len() > scheme.len());
     Some(link.to_string())
 }
 
@@ -261,6 +269,11 @@ mod tests {
 
     /// An unusable link costs the pointer, never the description: dropping it is
     /// the degrade rule the module docs describe.
+    ///
+    /// The non-ASCII candidates are not decoration. The scheme test compares bytes
+    /// because a `&str` slice at the scheme's byte length lands mid-character on a
+    /// candidate like `abcdefgé--` and PANICS — in a function whose contract is to
+    /// drop what it cannot use, reached from a peer's JSON on the control socket.
     #[test]
     fn an_unusable_link_is_dropped_and_the_text_survives() {
         for raw in [
@@ -270,6 +283,10 @@ mod tests {
             "https://",
             "",
             "https://example.com/a b",
+            "abcdefgé--",
+            "héllo",
+            "🚀🚀🚀",
+            "https://example.com/a\u{0}b",
         ] {
             let subject = Subject::new("new comment", Some(raw)).unwrap();
             assert_eq!(subject.link(), None, "should have dropped {raw:?}");
