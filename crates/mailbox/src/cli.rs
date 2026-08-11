@@ -740,7 +740,7 @@ fn status_without_bridge(
                 "result": "error",
                 "message": message,
                 "session": session.as_str(),
-                "wake": wake.label(),
+                "wake": wake,
                 "inbox_topic": inbox.as_ref().map(Topic::as_str),
                 "bridge": "unreachable",
             })
