@@ -41,11 +41,11 @@ use crate::claude_registry::ClaudeRegistry;
 
 /// What to do about [`Reachability::NoInbox`], the one fault.
 ///
-/// A constant rather than only a `remedy()` arm, so the callers that KNOW they are on
-/// the fault path — the `subscribe`/`watch` refusal and `status`'s `wake:` line — can
-/// state the remedy without unwrapping an `Option` they would have to paper over. A
-/// restructure of [`Reachability::remedy`] then cannot silently degrade either of them
-/// to a dangling "no-inbox — ".
+/// A constant rather than a per-variant `Option` lookup, because every caller reaches
+/// it having ALREADY established it is on the fault path — the `subscribe`/`watch`
+/// refusal, `status`'s `wake:` line, and `doctor`'s footer. Handed an `Option` each of
+/// them had to paper over the impossible `None`, and the papering-over is what could go
+/// quiet: a fault reported with nothing to do about it, or a dangling "no-inbox — ".
 pub const NO_INBOX_REMEDY: &str = "Claude Code bound this session no inbox socket, so nothing can wake it. \
      Restart the session. If it persists, the cross-session messaging feature \
      is off for it — check `claude --version` (2.1.226+) and that none of \
@@ -92,14 +92,6 @@ impl Reachability {
             Reachability::Unregistered => "unregistered",
         }
     }
-
-    /// What a human should do about it, or `None` when there is nothing to do.
-    pub fn remedy(&self) -> Option<&'static str> {
-        match self {
-            Reachability::Reachable | Reachability::Gone | Reachability::Unregistered => None,
-            Reachability::NoInbox => Some(NO_INBOX_REMEDY),
-        }
-    }
 }
 
 /// What we know about whether a session can be woken — **including not knowing**.
@@ -130,6 +122,15 @@ impl WakeVerdict {
             WakeVerdict::Known(reachability) => reachability.label(),
             WakeVerdict::Unknown => "unknown",
         }
+    }
+}
+
+/// Serialised as its [`WakeVerdict::label`], so every `--json` emission site gets the
+/// same word from the type rather than from remembering to ask for it. Hand-written
+/// rather than derived because the wire form is that one word, not a tagged enum.
+impl serde::Serialize for WakeVerdict {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
     }
 }
 

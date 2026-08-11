@@ -627,35 +627,46 @@ async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
     if let Response::Error { message } = &response {
         return Err(fail(format, message));
     }
-    // Narrowed before rendering so the wake verdict can only ever be attached to a
-    // status snapshot. Flattening some other reply would emit a document carrying both
-    // `"result": "topics"` and a `wake` key — which a status line would read as a
-    // status.
-    let Response::Status(report) = &response else {
-        return Err(fail(
-            format,
-            "the bridge answered `status` with a different kind of reply",
-        ));
-    };
+    let report = expect_status(&response).map_err(|message| fail(format, message))?;
 
     // Read ONCE, here, and handed to whichever renderer runs: the two output formats of
     // one command must not source the same fact from two places. It is read locally
     // rather than asked of the daemon because a session that cannot be woken must learn
     // so even when the bridge is the broken thing.
-    let wake = mailbox::doctor::wake_verdict(&report.session);
+    //
+    // Keyed on the session WE resolved, not the one the daemon echoed: `wake_line`'s
+    // reasoning ("`Gone` cannot be the caller — it is running this command") is only
+    // sound for the caller's own id, and the bridge-down path keys it the same way.
+    let wake = mailbox::doctor::wake_verdict(&session);
 
     if format.is_json() {
         println!(
             "{}",
             serde_json::to_string(&StatusJson {
                 response: &response,
-                wake: wake.label(),
+                wake,
             })?
         );
     } else {
         render_status(report, wake);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Narrow the daemon's reply to the status snapshot `status` asked for.
+///
+/// The wake verdict may only ever be attached to a status snapshot: `StatusJson`
+/// flattens whatever it is given, so some other reply would emit a document carrying
+/// both `"result": "topics"` and a `wake` key — which a status line reads as a status.
+///
+/// Pure, and returning the message rather than printing it, so the mismatch branch can
+/// be exercised without a daemon; the caller routes it through [`fail`] to keep the
+/// `--json` typed-error contract.
+fn expect_status(response: &Response) -> Result<&StatusReport, &'static str> {
+    match response {
+        Response::Status(report) => Ok(report),
+        _ => Err("the bridge answered `status` with a different kind of reply"),
+    }
 }
 
 /// `status`'s `--json` document: the daemon's typed reply with the locally-derived
@@ -669,15 +680,18 @@ async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
 struct StatusJson<'a> {
     #[serde(flatten)]
     response: &'a Response,
-    wake: &'static str,
+    /// Serialised as its label by [`WakeVerdict`] itself, so the word in the JSON is a
+    /// consequence of the verdict rather than of each emission site remembering to ask
+    /// for it.
+    wake: WakeVerdict,
 }
 
 /// The human `wake:` line: the verdict, and what to do about it when there is anything
 /// to do.
 ///
-/// Matched exhaustively rather than driven by [`Reachability::remedy`] alone, so a new
-/// verdict breaks compilation here — this is the line an idle agent reads to decide
-/// whether it can trust being woken, and the wrong word sends it back to polling.
+/// Matched exhaustively rather than driven by a lookup, so a new verdict breaks
+/// compilation here — this is the line an idle agent reads to decide whether it can
+/// trust being woken, and the wrong word sends it back to polling.
 fn wake_line(wake: WakeVerdict) -> String {
     let label = wake.label();
     match wake {
@@ -966,10 +980,12 @@ fn render_human(response: &Response) {
         },
         // `status` is rendered by `run_status`, which pairs this snapshot with the wake
         // verdict it read locally; nothing routes a status reply through this generic
-        // renderer, which stays a pure formatter of what it was handed. `Unknown` is
-        // the honest word for a verdict nobody read, and it can never be mistaken for
-        // a fault.
-        Response::Status(report) => render_status(report, WakeVerdict::Unknown),
+        // renderer. So it prints the bridge's half and stays a pure formatter of what
+        // it was handed, rather than inventing a verdict nobody looked up.
+        Response::Status(report) => {
+            println!("session: {}", report.session.as_str());
+            render_status_body(report);
+        }
         Response::Sent {
             to,
             topic,
@@ -1082,6 +1098,15 @@ fn render_status(report: &StatusReport, wake: WakeVerdict) {
     // own topic on the bus) — and reading the second as the first is what once had an
     // agent distrust a correct `watch` refusal and go back to polling.
     println!("wake: {}", wake_line(wake));
+    render_status_body(report);
+}
+
+/// Everything in a status snapshot that comes from the bridge, with no wake verdict.
+///
+/// Split out so a caller holding no verdict has none to invent: `WakeVerdict::Unknown`
+/// is the specific claim "the session registry could not be read", and printing it for
+/// a verdict nobody looked up would be a sentence nothing established.
+fn render_status_body(report: &StatusReport) {
     // The inbox-topic line answers "can peers reach me?" — the topic AND whether the
     // session is actually subscribed to it (registration is what makes a `send`
     // deliverable; see ADR-0007).
@@ -1801,10 +1826,11 @@ fn render_doctor(report: &mailbox::doctor::FleetReport, show_all: bool) {
         report.no_inbox(),
         report.gone()
     );
-    if report.no_inbox() > 0
-        && let Some(remedy) = mailbox::doctor::Reachability::NoInbox.remedy()
-    {
-        println!("\n{remedy}");
+    // Having proved we are on the fault path, state the remedy outright rather than
+    // re-asking for it: an `Option` here could only ever go quiet, printing a fault
+    // with nothing to do about it.
+    if report.no_inbox() > 0 {
+        println!("\n{}", mailbox::doctor::NO_INBOX_REMEDY);
     }
 }
 
@@ -1857,29 +1883,59 @@ mod tests {
             "reachable"
         );
 
-        let no_inbox = line(WakeVerdict::Known(Reachability::NoInbox));
-        assert!(
-            no_inbox.starts_with("no-inbox — ") && no_inbox.contains("Restart the session"),
-            "the fault must carry its remedy, never a dangling dash: {no_inbox}"
+        // Asserted whole rather than by prefix: a corruption in the middle of the
+        // remedy is as bad as a missing one, and the expected string is knowable here.
+        assert_eq!(
+            line(WakeVerdict::Known(Reachability::NoInbox)),
+            format!("no-inbox — {}", mailbox::doctor::NO_INBOX_REMEDY),
+            "the fault must carry its remedy, never a dangling dash"
         );
 
-        let unregistered = line(WakeVerdict::Known(Reachability::Unregistered));
-        assert!(
-            unregistered.starts_with("unregistered — ")
-                && unregistered.contains("no record of this session"),
-            "not a fault, and it must not read like one: {unregistered}"
+        assert_eq!(
+            line(WakeVerdict::Known(Reachability::Unregistered)),
+            "unregistered — Claude Code has no record of this session",
+            "not a fault, and it must not read like one"
         );
 
-        let gone = line(WakeVerdict::Known(Reachability::Gone));
-        assert!(
-            gone.starts_with("gone — ") && gone.contains("no live process"),
-            "unreachable for the caller, but said plainly rather than panicked on: {gone}"
+        assert_eq!(
+            line(WakeVerdict::Known(Reachability::Gone)),
+            "gone — no live process for this session",
+            "unreachable for the caller, but said plainly rather than panicked on"
         );
 
-        let unknown = line(WakeVerdict::Unknown);
-        assert!(
-            unknown.starts_with("unknown — ") && unknown.contains("not evidence either way"),
-            "an unreadable registry is not evidence of a fault (ADR-0009): {unknown}"
+        assert_eq!(
+            line(WakeVerdict::Unknown),
+            "unknown — could not read Claude Code's session registry, which is not \
+             evidence either way",
+            "an unreadable registry is not evidence of a fault (ADR-0009)"
+        );
+    }
+
+    /// The wake verdict may only ever ride on a status snapshot: `StatusJson` flattens
+    /// whatever it is handed, so a mismatched reply would emit a document tagged as
+    /// something else while carrying a `wake` key — which a status line reads as a
+    /// status. Unreachable today (the daemon answers a `Status` request with `Status`),
+    /// which is exactly why it is pinned by a test rather than by trust.
+    #[test]
+    fn a_reply_that_is_not_a_status_snapshot_is_refused() {
+        let snapshot = StatusReport {
+            session: SessionId::new("s"),
+            inbox: None,
+            watches: Vec::new(),
+            subscriptions: Vec::new(),
+            subscription_count: 0,
+            unread: Vec::new(),
+        };
+        assert!(expect_status(&Response::Status(snapshot)).is_ok());
+
+        let wrong = Response::SessionEnded {
+            subscriptions_dropped: 0,
+            interests_dropped: 0,
+            adapters_stopped: 0,
+        };
+        assert_eq!(
+            expect_status(&wrong),
+            Err("the bridge answered `status` with a different kind of reply")
         );
     }
 
