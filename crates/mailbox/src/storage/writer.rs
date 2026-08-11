@@ -710,15 +710,21 @@ impl EventRow {
     fn into_event(self, topic: &Topic) -> Result<Event, StorageError> {
         let body: Value = serde_json::from_str(&self.body_text)?;
         let subject = self.subject.and_then(|text| {
-            let subject = Subject::new(&text, self.subject_link.as_deref());
-            if subject.is_err() {
-                warn!(
-                    topic = topic.as_str(),
-                    offset = self.offset,
-                    "dropped an unreadable stored subject; the event itself is unaffected"
-                );
+            // Same corruption, same detail as the digest path's warning: an operator
+            // debugging this through `read` must not learn less than one debugging it
+            // through a wake.
+            match Subject::new(&text, self.subject_link.as_deref()) {
+                Ok(subject) => Some(subject),
+                Err(error) => {
+                    warn!(
+                        topic = topic.as_str(),
+                        offset = self.offset,
+                        %error,
+                        "dropped an unreadable stored subject; the event itself is unaffected"
+                    );
+                    None
+                }
             }
-            subject.ok()
         });
         Ok(Event {
             id: EventId(self.event_id),
@@ -1430,6 +1436,32 @@ fn build_watch(
     })
 }
 
+/// One row of [`do_unread_digest`]'s result: a topic's unread count, plus at most
+/// one of its newest subjects (the LEFT JOIN yields one row per subject, or a single
+/// row with no subject for a topic that has none).
+///
+/// A named struct read by column name for the same reason [`EventRow`] is one:
+/// `subject` and `subject_link` are both `Option<String>`, so a positional tuple
+/// destructured the wrong way round would render a URL as the wake's description and
+/// nothing would object.
+struct DigestRow {
+    topic: String,
+    unread: i64,
+    subject: Option<String>,
+    subject_link: Option<String>,
+}
+
+impl DigestRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(DigestRow {
+            topic: row.get("topic")?,
+            unread: row.get("unread")?,
+            subject: row.get("subject")?,
+            subject_link: row.get("subject_link")?,
+        })
+    }
+}
+
 /// What a session has waiting: per topic, how many events and what the newest of
 /// them are about (the wake digest, ADR-0022; also card-06 `status`).
 ///
@@ -1482,13 +1514,10 @@ fn do_unread_digest(
          LEFT JOIN newest n ON n.topic = c.topic AND n.rank <= ?2
          ORDER BY c.topic ASC, n.rank ASC",
     )?;
-    let rows = stmt.query_map(params![session.as_str(), subjects.rank_cutoff()], |row| {
-        let topic: String = row.get("topic")?;
-        let unread: i64 = row.get("unread")?;
-        let subject: Option<String> = row.get("subject")?;
-        let subject_link: Option<String> = row.get("subject_link")?;
-        Ok((topic, unread, subject, subject_link))
-    })?;
+    let rows = stmt.query_map(
+        params![session.as_str(), subjects.rank_cutoff()],
+        DigestRow::read,
+    )?;
 
     // Keyed by topic rather than accumulated into whichever entry the PREVIOUS row
     // opened: grouping then holds on its own, instead of resting on the SQL's
@@ -1498,7 +1527,12 @@ fn do_unread_digest(
     // digest is returned in, which is the order `ORDER BY c.topic ASC` intended.
     let mut by_topic: BTreeMap<Topic, TopicDigest> = BTreeMap::new();
     for row in rows {
-        let (topic_str, unread, subject, subject_link) = row?;
+        let DigestRow {
+            topic: topic_str,
+            unread,
+            subject,
+            subject_link,
+        } = row?;
         // A subscription row can only hold a topic the bridge accepted, so a value
         // that fails the grammar now is corrupt storage, not user input.
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
@@ -1511,6 +1545,11 @@ fn do_unread_digest(
                 unread: unread.max(0) as u64,
                 subjects: Vec::new(),
             });
+        // Subjects land in `ORDER BY n.rank ASC` order — newest first, which is what
+        // `TopicDigest::subjects` promises. That is the query's ordering doing its
+        // job, not an accident of adjacency: unlike the topic grouping above, this
+        // needs no key, because a single ORDER BY is exactly the guarantee SQL gives.
+        //
         // A stored subject that no longer parses is dropped, never fatal: the same
         // degrade rule `EventRow::into_event` follows — including its warning, so
         // that a corrupt subject is equally visible on the path most wakes take.

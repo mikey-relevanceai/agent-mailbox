@@ -283,14 +283,24 @@ impl SubjectArgs {
     ///
     /// The text is normalized by [`Subject::new`] — collapsed to one line and
     /// bounded — so what reaches the wire is what the wake will render, not what the
-    /// shell handed over. An unusable `--link` is dropped there rather than refused
+    /// shell handed over. An *unusable* `--link` is dropped there rather than refused
     /// here: the same degrade rule an adapter's link follows, and the CLI has no
     /// better answer than the type does.
+    ///
+    /// A link with no subject is refused, though, rather than silently discarded.
+    /// `requires = "subject"` already stops clap producing that combination, but this
+    /// struct is shared by two commands and constructible in code — so the rule lives
+    /// here too, where dropping the attribute costs an error message instead of a
+    /// link.
     fn parse(&self) -> anyhow::Result<Option<Subject>> {
-        self.subject
-            .as_deref()
-            .map(|text| Subject::new(text, self.link.as_deref()).context("--subject"))
-            .transpose()
+        match (self.subject.as_deref(), self.link.as_deref()) {
+            (None, Some(link)) => anyhow::bail!(
+                "--link {link:?} needs a --subject: a link with nothing to describe it                  has nowhere to appear in a wake"
+            ),
+            (text, link) => text
+                .map(|text| Subject::new(text, link).context("--subject"))
+                .transpose(),
+        }
     }
 }
 
@@ -1865,6 +1875,13 @@ mod tests {
         // no-op: the flag was passed on purpose.
         let err = subject_args(Some("   "), None).parse().unwrap_err();
         assert!(format!("{err}").contains("--subject"), "{err}");
+
+        // Likewise a link with nothing to describe it. clap's `requires` normally
+        // stops this reaching us; the rule lives here so it holds anyway.
+        let err = subject_args(None, Some("https://example.com/x"))
+            .parse()
+            .unwrap_err();
+        assert!(format!("{err}").contains("needs a --subject"), "{err}");
     }
 
     #[test]
