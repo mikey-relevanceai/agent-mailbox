@@ -50,9 +50,16 @@ fn a_subscriber_with_an_inbox_socket_is_woken() {
         .expect("the daemon should have delivered a wake onto the inbox socket");
     assert_eq!(frame["type"], "user");
     assert_eq!(frame["message"]["role"], "user");
-    assert_eq!(
-        frame["message"]["content"], "mail on topic stub.demo",
-        "the wake names the topic and nothing else"
+    let content = frame["message"]["content"]
+        .as_str()
+        .expect("string content");
+    assert!(
+        content.starts_with("[agent-mailbox]"),
+        "the tag that tells the agent who woke it: {content}"
+    );
+    assert!(
+        content.contains("stub.demo — 1 unread"),
+        "the wake names the topic and what is waiting on it: {content}"
     );
 }
 
@@ -84,11 +91,11 @@ fn a_subscriber_without_an_inbox_socket_is_not_woken_but_keeps_its_mail() {
     assert_eq!(events[0]["topic"], topic);
 }
 
-/// Wake is payload-free (ADR-0001), and a change of transport must not quietly end
-/// that. The socket COULD carry the event body; it must not. The body stays in the
-/// durable log until the agent's `read`.
+/// A wake points at mail; it never carries it (ADR-0022, over ADR-0001). The socket
+/// COULD carry the event body — it must not, no matter what else the frame gained.
+/// The body stays in the durable log until the agent's `read`.
 #[test]
-fn the_peer_frame_carries_topic_names_and_never_the_event_body() {
+fn the_peer_frame_describes_the_mail_and_never_carries_the_event_body() {
     let env = Env::new();
     let mut guard = env.leak_guard();
     let daemon = env.start_daemon();
@@ -105,8 +112,12 @@ fn the_peer_frame_carries_topic_names_and_never_the_event_body() {
             topic,
             "--body",
             r#"{"secret":"do-not-put-me-on-the-wake-wire"}"#,
+            "--subject",
+            "something changed",
+            "--link",
+            "https://example.com/the-thing",
         ],
-        "publish with a body",
+        "publish with a body and a subject",
     );
 
     let frame = peer.next_frame(DELIVERY).expect("a wake should arrive");
@@ -115,9 +126,19 @@ fn the_peer_frame_carries_topic_names_and_never_the_event_body() {
         !wire.contains("do-not-put-me-on-the-wake-wire"),
         "the event body must never cross the wake boundary: {wire}"
     );
-    assert_eq!(frame["message"]["content"], "mail on topic stub.demo");
+    let content = frame["message"]["content"]
+        .as_str()
+        .expect("string content");
+    assert!(content.contains("stub.demo — 1 unread"), "{content}");
+    // What DOES cross: the one line the publisher wrote for this purpose, and the
+    // link it points at.
+    assert!(content.contains("· something changed"), "{content}");
+    assert!(
+        content.contains("https://example.com/the-thing"),
+        "{content}"
+    );
 
-    // The body is still there to be read — payload-free wake, durable payload.
+    // The body is still there to be read — a wake describes, `read` delivers.
     let read = env.run_as_ok(session, &["read"], "read");
     assert!(
         String::from_utf8_lossy(&read.stdout).contains("do-not-put-me-on-the-wake-wire"),

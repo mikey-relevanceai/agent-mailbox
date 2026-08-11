@@ -46,11 +46,11 @@
 use serde_json::Value;
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, Event, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, Event, Subject, Timestamp, Topic};
 
 use crate::clock::now_millis;
 use crate::storage::{Storage, StorageError};
-use crate::wake::Waker;
+use crate::wake::{self, Waker};
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
 pub use crate::storage::{SessionId, SubscribeKind, SubscribeOutcome};
@@ -120,10 +120,9 @@ impl Delivery {
 /// Cheap to clone — it holds a [`Storage`] handle, which is itself just a channel
 /// to the single writer. Every clone talks to the same durable log.
 ///
-/// A bus optionally carries a [`Waker`]: when present, [`Bus::publish`] writes the
-/// wake sentinel of every session subscribed to the published topic (payload-free
-/// wake). Without one, publish is a pure durable append — useful for tests and for
-/// any caller that does not own the wake channel.
+/// A bus optionally carries a [`Waker`]: when present, [`Bus::publish`] wakes every
+/// session subscribed to the published topic. Without one, publish is a pure durable
+/// append — useful for tests and for any caller that does not own the wake channel.
 #[derive(Clone, Debug)]
 pub struct Bus {
     storage: Storage,
@@ -171,13 +170,14 @@ impl Bus {
     /// publish carries no bus-level policy over the body — it is stored verbatim
     /// and never interpreted (ADR-0001).
     ///
-    /// # Wake-on-publish (payload-free)
+    /// # Wake-on-publish (pointer, not payload)
     ///
-    /// After the event is durably appended, a bus with a [`Waker`] writes the wake
-    /// sentinel of every session subscribed to `topic`. The sentinel carries topic
-    /// NAMES only — no body ever crosses the wake boundary. The write happens
-    /// *after* the durable append and in the same process, so there is no window in
-    /// which a wake could name mail that is not yet readable.
+    /// After the event is durably appended, a bus with a [`Waker`] writes the inbox
+    /// socket of every session subscribed to `topic`. That wake carries topic names,
+    /// unread counts, and the publisher's `subject` lines — never a body, which
+    /// stays in the durable log until the agent's `read` (ADR-0022). The write
+    /// happens *after* the durable append and in the same process, so there is no
+    /// window in which a wake could describe mail that is not yet readable.
     ///
     /// Waking is best-effort and must never fail a publish: the event is already
     /// durable. If listing the subscribers itself fails (a store error on the read
@@ -189,10 +189,11 @@ impl Bus {
         adapter: AdapterId,
         timestamp: Timestamp,
         body: Value,
+        subject: Option<Subject>,
     ) -> Result<Event, BusError> {
         let event = self
             .storage
-            .publish(topic.clone(), adapter, timestamp, body)
+            .publish(topic.clone(), adapter, timestamp, body, subject)
             .await?;
 
         self.wake_subscribers(&topic).await;
@@ -201,21 +202,21 @@ impl Bus {
     }
 
     /// Wake every session subscribed to `topic` — the publisher included (ADR-0014)
-    /// — by writing its currently-unread topic set into its wake sentinel.
+    /// — with everything it currently has unread.
     ///
     /// # Why each subscriber's WHOLE unread set, not just this topic
     ///
-    /// The sentinel is the session's payload-free statement of "you have mail on
-    /// these topics", and the `Stop`-hook re-trigger writes the same thing. Writing
-    /// only the just-published topic would make the two disagree, so a session that
-    /// was already sitting on mail elsewhere would see that mail vanish from the file
-    /// between one publish and the next. It costs one extra read per subscriber — the
-    /// same unread predicate the wake hook itself uses (`storage::reader`).
+    /// A wake is the session's statement of what is waiting, and the very next thing
+    /// the agent does is `read`, which returns **all** its unread mail across every
+    /// topic. Naming only the just-published topic would describe less than the read
+    /// delivers, so an agent sitting on mail elsewhere would be handed events the
+    /// wake never mentioned. It costs one extra read per subscriber — the same unread
+    /// predicate the read path itself uses.
     ///
     /// Best-effort throughout: it must never fail a publish, because the event is
     /// already durable. If listing the subscribers or reading one session's unread
-    /// fails, we log and move on — the mail is still there, and the session's next
-    /// turn boundary re-triggers for it (ADR-0012).
+    /// fails, we log and move on — the mail is still there, and surfaces on that
+    /// session's next `read`.
     async fn wake_subscribers(&self, topic: &Topic) {
         let Some(waker) = &self.waker else {
             return;
@@ -227,7 +228,7 @@ impl Bus {
                     topic = topic.as_str(),
                     error = %err,
                     "could not list subscribers to wake after publish; \
-                     the mail is durable and surfaces at their next turn boundary"
+                     the mail is durable and surfaces on their next read"
                 );
                 return;
             }
@@ -235,16 +236,18 @@ impl Bus {
 
         let mut unread_by_session = Vec::with_capacity(sessions.len());
         for session in sessions {
-            match self.storage.unread_counts(session.clone()).await {
-                Ok(counts) => {
-                    unread_by_session.push((session, counts.into_iter().map(|(t, _)| t).collect()))
-                }
+            match self
+                .storage
+                .unread_digest(session.clone(), wake::SUBJECTS_PER_TOPIC)
+                .await
+            {
+                Ok(digest) => unread_by_session.push((session, digest)),
                 Err(err) => warn!(
                     session = session.as_str(),
                     topic = topic.as_str(),
                     error = %err,
-                    "could not read a subscriber's unread topics to wake it; skipping \
-                     (the mail is durable and surfaces at its next turn boundary)"
+                    "could not read a subscriber's unread mail to wake it; skipping \
+                     (the mail is durable and surfaces on its next read)"
                 ),
             }
         }

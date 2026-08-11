@@ -34,13 +34,10 @@ fn main() -> ExitCode {
     // clap handles --help/--version and prints usage errors itself (exit 2).
     let cli = Cli::parse();
 
-    // Route `tracing` events. For the hooks, the process stderr is a WIRE channel:
-    // on exit 2 Claude Code surfaces it to the agent as the "mail on topic X"
-    // reminder (payload-free wake). A `RUST_LOG=info` tracing line on that stderr
-    // would pollute the reminder, so those commands send tracing to a log file under
-    // the mailbox dir (or suppress it) — the reminder is written with a bare
-    // `eprintln!`, keeping the wire clean regardless of `RUST_LOG`. Every other
-    // command keeps logs on stderr (stdout stays clean for `--json`).
+    // Route `tracing` events. The hooks send tracing to a log file under the mailbox
+    // dir (or suppress it) rather than to stderr, so a `RUST_LOG=info` line can never
+    // land in a hook's output. Every other command keeps logs on stderr (stdout stays
+    // clean for `--json`).
     init_tracing(&cli.command);
 
     match cli.command {
@@ -107,8 +104,7 @@ fn init_tracing(command: &Command) {
         // Default to INFO for the harness log: the hooks' decisions must be visible
         // at the DEFAULT level, or the next wake bug is again invisible. A
         // set `RUST_LOG` still wins. This raises verbosity ONLY on the harness.log
-        // sink — no other command's stderr is affected, and the exit-2 stderr wire
-        // stays payload-free regardless (tracing never goes there).
+        // sink — no other command's stderr is affected.
         let filter = EnvFilter::builder()
             .with_default_directive(LevelFilter::INFO.into())
             .from_env_lossy();

@@ -512,7 +512,7 @@ fn scenario_6_bridge_restart_with_no_live_interest_does_not_resume() {
 
 /// A REAL supervised adapter's publish wakes an idle session: `watch stub` subscribes
 /// the session and starts the stub poller; the stub's next publish makes the daemon
-/// deliver the payload-free topic reminder to that session's inbox socket. This is the
+/// deliver the wake to that session's inbox socket. This is the
 /// full watch → adapter → bridge → session chain the other suites don't drive end to
 /// end.
 #[test]

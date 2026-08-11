@@ -13,11 +13,15 @@
 //! [`Subscribe`], [`Unsubscribe`], [`ReadRequest`], [`Event`], [`ReadResponse`],
 //! [`Ack`], and [`ProtocolError`]. See [`message`] for the shape of each.
 //!
-//! # Untrusted bodies
+//! # Untrusted bodies, and the one line that may be shown
 //!
 //! Event and publish bodies are opaque `serde_json::Value` that this crate
 //! never interprets — adapter output is untrusted content (ADR-0001). Keeping
 //! them schemaless here stops higher layers from accidentally trusting them.
+//!
+//! The exception is [`Subject`]: a bounded, single-line description an adapter
+//! writes for the wake wire, which IS parsed here precisely because it is the one
+//! piece of adapter text a model sees before reading its mail (ADR-0022).
 //!
 //! # Compatibility rule: reject-newer
 //!
@@ -40,22 +44,13 @@ mod framing;
 mod ids;
 mod message;
 mod session;
+mod subject;
 mod topic;
 
 /// Protocol schema version carried on every framed line so peers reject frames
 /// newer than they understand (see the module docs for the reject-newer rule).
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The fixed basename of the per-session wake sentinel (ADR-0008), and — because
-/// Claude Code's `FileChanged` matcher matches by basename — the STATIC matcher the
-/// harness writes into `settings.json`.
-///
-/// It lives here, in the one crate both the bridge (which writes the sentinel path)
-/// and the harness-installer (which writes the matcher) depend on, for the SAME
-/// reason [`SessionId::encode_filename`] does: the two must agree exactly or a
-/// `FileChanged` would watch a file no one bumps. It is deliberately dotted and
-/// mailbox-specific — not the bare word `wake` — so a stray file in a recursively
-/// watched cwd cannot trip the hook.
 pub use error::{FramingError, IncompatibleVersion, LineError, TopicError, check_version};
 pub use framing::{decode_line, encode_line, read_lines, write_line};
 pub use ids::{AdapterId, Cursor, EventId, Offset, Timestamp};
@@ -64,4 +59,5 @@ pub use message::{
     Subscribe, Unsubscribe,
 };
 pub use session::SessionId;
+pub use subject::{MAX_LINK_BYTES, MAX_TEXT_CHARS, Subject, SubjectError};
 pub use topic::{GithubPr, Topic, inbox_topic, stub_topic};

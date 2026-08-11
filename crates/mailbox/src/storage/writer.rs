@@ -23,12 +23,14 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
-use mailbox_protocol::{AdapterId, Cursor, Event, EventId, Offset, Timestamp, Topic, inbox_topic};
+use mailbox_protocol::{
+    AdapterId, Cursor, Event, EventId, Offset, Subject, Timestamp, Topic, inbox_topic,
+};
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
-    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicDigest,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -85,6 +87,9 @@ pub(crate) enum Command {
         adapter: AdapterId,
         timestamp: Timestamp,
         body: Value,
+        /// The publisher's one-line description, stored beside the body so the
+        /// wake digest can select it without parsing opaque content (ADR-0022).
+        subject: Option<Subject>,
         reply: oneshot::Sender<Result<Event, StorageError>>,
     },
     ReadEvents {
@@ -222,11 +227,14 @@ pub(crate) enum Command {
     ListWatches {
         reply: oneshot::Sender<Result<Vec<Watch>, StorageError>>,
     },
-    /// Per-topic unread counts for a session (card-06 `status`). A non-advancing
-    /// read: it reports what a read *would* deliver without consuming it.
-    UnreadCounts {
+    /// Per-topic unread counts for a session, plus the subjects of its newest
+    /// unread events (the wake digest, ADR-0022; also card-06 `status`, which asks
+    /// for no subjects). A non-advancing read: it reports what a read *would*
+    /// deliver without consuming it.
+    UnreadDigest {
         session: SessionId,
-        reply: oneshot::Sender<Result<Vec<(Topic, u64)>, StorageError>>,
+        subjects_per_topic: u32,
+        reply: oneshot::Sender<Result<Vec<TopicDigest>, StorageError>>,
     },
     /// The sessions with a registered agent inbox (card-16 `agents`). A read
     /// routed through the writer channel like every other op.
@@ -333,9 +341,10 @@ fn handle(conn: &mut Connection, cmd: Command) {
             adapter,
             timestamp,
             body,
+            subject,
             reply,
         } => {
-            let result = do_publish(conn, &topic, &adapter, timestamp, body);
+            let result = do_publish(conn, &topic, &adapter, timestamp, body, subject);
             log_on_err(&result, "publish", || format!("topic={}", topic.as_str()));
             let _ = reply.send(result);
         }
@@ -521,9 +530,13 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "list_watches", String::new);
             let _ = reply.send(result);
         }
-        Command::UnreadCounts { session, reply } => {
-            let result = do_unread_counts(conn, &session);
-            log_on_err(&result, "unread_counts", || {
+        Command::UnreadDigest {
+            session,
+            subjects_per_topic,
+            reply,
+        } => {
+            let result = do_unread_digest(conn, &session, subjects_per_topic);
+            log_on_err(&result, "unread_digest", || {
                 format!("session={}", session.as_str())
             });
             let _ = reply.send(result);
@@ -579,9 +592,10 @@ fn do_publish(
     adapter: &AdapterId,
     timestamp: Timestamp,
     body: Value,
+    subject: Option<Subject>,
 ) -> Result<Event, StorageError> {
     let tx = conn.transaction()?;
-    let event = append_event_tx(&tx, topic, adapter, timestamp, body)?;
+    let event = append_event_tx(&tx, topic, adapter, timestamp, body, subject)?;
     tx.commit()?;
     Ok(event)
 }
@@ -594,6 +608,7 @@ fn append_event_tx(
     adapter: &AdapterId,
     timestamp: Timestamp,
     body: Value,
+    subject: Option<Subject>,
 ) -> Result<Event, StorageError> {
     let body_text = serde_json::to_string(&body)?;
 
@@ -614,8 +629,8 @@ fn append_event_tx(
     // (topic, offset) is unique, so it never collides with a committed row.
     let temp_id = format!("pending:{}:{offset}", topic.as_str());
     tx.execute(
-        "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, subject, subject_link)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             topic.as_str(),
             offset,
@@ -623,6 +638,8 @@ fn append_event_tx(
             adapter.0,
             timestamp.0,
             body_text,
+            subject.as_ref().map(Subject::text),
+            subject.as_ref().and_then(Subject::link),
         ],
     )?;
     let row_id = tx.last_insert_rowid();
@@ -638,7 +655,74 @@ fn append_event_tx(
         topic: topic.clone(),
         timestamp,
         body,
+        subject,
     })
+}
+
+/// The `event` columns every read below selects, in the order [`EventRow::read`]
+/// expects them.
+///
+/// One definition because there are two read paths (a topic page and a session's
+/// unread) that must return the same event: when they drifted, only one of them
+/// would carry a new column.
+const EVENT_COLUMNS: &str = "offset, event_id, timestamp, body, subject, subject_link";
+
+/// One `event` row as SQLite hands it over, before the fallible decoding of the
+/// body and subject.
+///
+/// Split from [`Event`] because `query_map`'s closure can only fail with a
+/// `rusqlite::Error`, while turning the row into an event can fail as JSON or as a
+/// subject — so the row is collected first and decoded after.
+struct EventRow {
+    offset: i64,
+    event_id: String,
+    timestamp: i64,
+    body_text: String,
+    subject: Option<String>,
+    subject_link: Option<String>,
+}
+
+impl EventRow {
+    /// Read a row selected with [`EVENT_COLUMNS`].
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(EventRow {
+            offset: row.get(0)?,
+            event_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            body_text: row.get(3)?,
+            subject: row.get(4)?,
+            subject_link: row.get(5)?,
+        })
+    }
+
+    /// Decode the row into the event it stores.
+    ///
+    /// A subject that no longer parses is dropped rather than failing the read:
+    /// only parsed subjects are ever written, so this cannot happen without the
+    /// column being tampered with — and even then, a description we cannot show is
+    /// a reason to show none, never a reason to withhold the mail itself.
+    fn into_event(self, topic: &Topic) -> Result<Event, StorageError> {
+        let body: Value = serde_json::from_str(&self.body_text)?;
+        let subject = self.subject.and_then(|text| {
+            let subject = Subject::new(&text, self.subject_link.as_deref());
+            if subject.is_err() {
+                warn!(
+                    topic = topic.as_str(),
+                    offset = self.offset,
+                    "dropped an unreadable stored subject; the event itself is unaffected"
+                );
+            }
+            subject.ok()
+        });
+        Ok(Event {
+            id: EventId(self.event_id),
+            offset: sqlite_to_offset(self.offset)?,
+            topic: topic.clone(),
+            timestamp: Timestamp(self.timestamp),
+            body,
+            subject,
+        })
+    }
 }
 
 fn do_read_events(
@@ -666,32 +750,18 @@ fn do_read_events(
     // Clamp the page size to a hard maximum regardless of what the caller asked.
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT) as i64;
 
-    let mut stmt = conn.prepare(
-        "SELECT offset, event_id, timestamp, body
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_COLUMNS}
          FROM event
          WHERE topic = ?1 AND offset > ?2
          ORDER BY offset ASC
-         LIMIT ?3",
-    )?;
-    let rows = stmt.query_map(params![topic.as_str(), after, limit], |row| {
-        let offset: i64 = row.get(0)?;
-        let event_id: String = row.get(1)?;
-        let timestamp: i64 = row.get(2)?;
-        let body_text: String = row.get(3)?;
-        Ok((offset, event_id, timestamp, body_text))
-    })?;
+         LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![topic.as_str(), after, limit], EventRow::read)?;
 
     let mut events = Vec::new();
     for row in rows {
-        let (offset, event_id, timestamp, body_text) = row?;
-        let body: Value = serde_json::from_str(&body_text)?;
-        events.push(Event {
-            id: EventId(event_id),
-            offset: sqlite_to_offset(offset)?,
-            topic: topic.clone(),
-            timestamp: Timestamp(timestamp),
-            body,
-        });
+        events.push(row?.into_event(topic)?);
     }
 
     // Next cursor points just past the last row returned; on an empty page we
@@ -1129,32 +1199,18 @@ fn read_topic_unread(
         .unwrap_or(-1);
 
     let events: Vec<Event> = {
-        let mut stmt = tx.prepare(
-            "SELECT offset, event_id, timestamp, body
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {EVENT_COLUMNS}
              FROM event
              WHERE topic = ?1 AND offset > ?2
              ORDER BY offset ASC
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![topic_str, after, limit], |row| {
-            let offset: i64 = row.get(0)?;
-            let event_id: String = row.get(1)?;
-            let timestamp: i64 = row.get(2)?;
-            let body_text: String = row.get(3)?;
-            Ok((offset, event_id, timestamp, body_text))
-        })?;
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![topic_str, after, limit], EventRow::read)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (offset, event_id, timestamp, body_text) = row?;
-            let body: Value = serde_json::from_str(&body_text)?;
-            out.push(Event {
-                id: EventId(event_id),
-                offset: sqlite_to_offset(offset)?,
-                topic: topic.clone(),
-                timestamp: Timestamp(timestamp),
-                body,
-            });
+            out.push(row?.into_event(&topic)?);
         }
         out
     };
@@ -1368,44 +1424,94 @@ fn build_watch(
     })
 }
 
-/// Per-topic count of a session's unread events (card-06 `status`).
+/// What a session has waiting: per topic, how many events and what the newest of
+/// them are about (the wake digest, ADR-0022; also card-06 `status`).
 ///
 /// Mirrors the unread predicate in `read_topic_unread` / `ReadOnlyStore` — an
 /// event is unread when its offset is strictly beyond the session's delivery
 /// cursor on that topic (cursor treated as `-1` when no row exists yet). Only
 /// topics with a positive count are returned, in ascending topic order for a
-/// deterministic status view. This is a pure read: no cursor is advanced.
-fn do_unread_counts(
+/// deterministic view. This is a pure read: no cursor is advanced.
+///
+/// # Why the count and the subjects come out of one query
+///
+/// They are two answers about the same set, and the wake states both in one
+/// sentence ("2 unread", then what those events were). Asking twice would let the
+/// count and the subjects disagree — the second query runs against a log the first
+/// one no longer describes — so the wake could say "3 unread" and then describe
+/// four things. The `unread` CTE is the single definition both halves read.
+///
+/// `subjects_per_topic` bounds the per-topic subject list (newest first); events
+/// published without a subject are counted but contribute nothing to it. **Zero is
+/// a supported value** — `status` wants counts only — which is why the subjects are
+/// a LEFT JOIN onto the counts rather than a filter over them: at zero, every topic
+/// still reports its count, with no subjects attached.
+fn do_unread_digest(
     conn: &Connection,
     session: &SessionId,
-) -> Result<Vec<(Topic, u64)>, StorageError> {
+    subjects_per_topic: u32,
+) -> Result<Vec<TopicDigest>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT s.topic, COUNT(e.offset)
-         FROM subscription s
-         JOIN event e ON e.topic = s.topic
-            AND e.offset > COALESCE(
-                (SELECT dc.offset FROM delivery_cursor dc
-                 WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
-                -1)
-         WHERE s.session_id = ?1
-         GROUP BY s.topic
-         ORDER BY s.topic ASC",
+        "WITH unread AS (
+             SELECT s.topic AS topic, e.offset AS offset,
+                    e.subject AS subject, e.subject_link AS subject_link
+             FROM subscription s
+             JOIN event e ON e.topic = s.topic
+                AND e.offset > COALESCE(
+                    (SELECT dc.offset FROM delivery_cursor dc
+                     WHERE dc.session_id = s.session_id AND dc.topic = s.topic),
+                    -1)
+             WHERE s.session_id = ?1
+         ),
+         counts AS (
+             SELECT topic, COUNT(*) AS unread FROM unread GROUP BY topic
+         ),
+         newest AS (
+             SELECT topic, subject, subject_link,
+                    ROW_NUMBER() OVER (PARTITION BY topic ORDER BY offset DESC) AS rank
+             FROM unread WHERE subject IS NOT NULL
+         )
+         SELECT c.topic, c.unread, n.subject, n.subject_link
+         FROM counts c
+         LEFT JOIN newest n ON n.topic = c.topic AND n.rank <= ?2
+         ORDER BY c.topic ASC, n.rank ASC",
     )?;
-    let rows = stmt.query_map(params![session.as_str()], |row| {
+    let rows = stmt.query_map(params![session.as_str(), subjects_per_topic], |row| {
         let topic: String = row.get(0)?;
-        let count: i64 = row.get(1)?;
-        Ok((topic, count))
+        let unread: i64 = row.get(1)?;
+        let subject: Option<String> = row.get(2)?;
+        let subject_link: Option<String> = row.get(3)?;
+        Ok((topic, unread, subject, subject_link))
     })?;
 
-    let mut out = Vec::new();
+    // One digest per topic, accumulating the (already ordered) subject rows into
+    // the entry the previous row opened.
+    let mut out: Vec<TopicDigest> = Vec::new();
     for row in rows {
-        let (topic_str, count) = row?;
+        let (topic_str, unread, subject, subject_link) = row?;
         // A subscription row can only hold a topic the bridge accepted, so a value
         // that fails the grammar now is corrupt storage, not user input.
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
-        out.push((topic, count.max(0) as u64));
+        let digest = match out.last_mut() {
+            Some(last) if last.topic == topic => last,
+            _ => {
+                out.push(TopicDigest {
+                    topic,
+                    unread: unread.max(0) as u64,
+                    subjects: Vec::new(),
+                });
+                out.last_mut().expect("just pushed")
+            }
+        };
+        // A stored subject that no longer parses is dropped, never fatal: the same
+        // degrade rule `EventRow::into_event` follows.
+        if let Some(text) = subject
+            && let Ok(subject) = Subject::new(&text, subject_link.as_deref())
+        {
+            digest.subjects.push(subject);
+        }
     }
     Ok(out)
 }
@@ -1896,12 +2002,23 @@ mod tests {
 
     /// A publish, at the writer level.
     fn publish(conn: &mut Connection, topic: &Topic, body: &str) {
+        publish_with_subject(conn, topic, body, None);
+    }
+
+    /// A publish that describes itself, for the digest tests.
+    fn publish_with_subject(
+        conn: &mut Connection,
+        topic: &Topic,
+        body: &str,
+        subject: Option<Subject>,
+    ) {
         do_publish(
             conn,
             topic,
             &AdapterId("cli".to_string()),
             Timestamp(1),
             serde_json::from_str(body).unwrap(),
+            subject,
         )
         .unwrap();
     }
@@ -1909,11 +2026,11 @@ mod tests {
     /// The unread count as `status` reports it: EVERY event beyond the cursor, whoever
     /// wrote it.
     fn unread_of(conn: &Connection, session: &str, topic: &Topic) -> u64 {
-        do_unread_counts(conn, &SessionId::new(session))
+        do_unread_digest(conn, &SessionId::new(session), 0)
             .unwrap()
             .into_iter()
-            .find(|(t, _)| t == topic)
-            .map(|(_, n)| n)
+            .find(|digest| &digest.topic == topic)
+            .map(|digest| digest.unread)
             .unwrap_or(0)
     }
 

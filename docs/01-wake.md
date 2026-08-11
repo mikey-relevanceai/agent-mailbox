@@ -6,7 +6,8 @@ command, no re-arm, nothing on a timer.
 
 The design in force is [ADR-0021](adr/0021-delete-the-sentinel-fallback.md) (the
 inbox socket is the only wake wire) over
-[ADR-0020](adr/0020-peer-inbox-socket-is-the-wake-wire.md) (how that socket works).
+[ADR-0020](adr/0020-peer-inbox-socket-is-the-wake-wire.md) (how that socket works),
+plus [ADR-0022](adr/0022-the-wake-carries-a-subject.md) (what the wake says).
 
 ## The whole mechanism
 
@@ -42,15 +43,36 @@ An idle subscribed session costs **zero** model turns until real mail arrives.
 ## The frame
 
 ```json
-{"type":"user","message":{"role":"user","content":"mail on topic github.pr.owner/repo#42"}}
+{"type":"user","message":{"role":"user","content":"[agent-mailbox] mail on 2 topics …"}}
 ```
 
-Newline-terminated, written to the session's `messagingSocketPath`. Three properties
-are deliberate, and each is pinned by a test:
+Newline-terminated, written to the session's `messagingSocketPath`. What the agent
+reads is:
 
-- **Payload-free.** `content` is topic names only. The event body stays in the durable
-  log until the agent's `read`. The socket *could* carry a body; it must not, or the
-  agent would have two places to look for the truth.
+```
+[agent-mailbox] mail on 2 topics — run `mailbox read`
+
+github.pr.acme/web#42 — 2 unread
+  · CI failed: build
+    https://github.com/acme/web/actions/runs/9/job/2
+  · new comment
+    https://github.com/acme/web/pull/42#issuecomment-2145678
+
+agent.983eae5f-0b09 — 1 unread
+  · from 700a3bf5-1c4d: PR 42 review finished
+```
+
+Four properties are deliberate, and each is pinned by a test:
+
+- **Pointer, not payload** ([ADR-0022](adr/0022-the-wake-carries-a-subject.md)).
+  `content` carries topic names, unread counts, and each event's `subject` — one line
+  its publisher wrote saying *what* changed, and a link to it. The event **body** stays
+  in the durable log until the agent's `read`. The socket *could* carry a body; it must
+  not, or the agent would have two places to look for the truth.
+- **Tagged `[agent-mailbox]`.** The first thing on the wire, so a woken agent knows
+  which system started its turn and which skill to load. A `Subject` cannot contain a
+  newline, so nothing after that line can forge another one — or a second bullet, or a
+  second topic block.
 - **No permission class asserted.** The richer envelope `SendMessage` writes carries a
   `from-mode` field claiming whether the sender bypasses permission prompts. It is
   believed without verification — and claiming `bypass` is exactly what makes an
@@ -59,6 +81,25 @@ are deliberate, and each is pinned by a test:
 - **Never empty.** Delivery *is* the turn; there is no second opinion between the
   socket and the model. A wake with nothing unread would spend a model turn announcing
   nothing, so it is not sent.
+
+### Subjects
+
+A subject is optional at every layer. An adapter that has nothing useful to say omits
+it, and its subscribers are woken with the topic and a count — the pre-subject
+behaviour, with a prefix.
+
+| Rule | Why |
+|---|---|
+| One line, ≤120 chars, control characters collapsed | The frame's layout must be unforgeable by adapter text |
+| Links must be `http(s)`, bounded, whitespace-free | It is rendered for a model to follow |
+| Over-long text truncates; an unusable link is dropped | A wake degrades to a *worse* subject, never to no subject |
+| Newest 3 per topic, 8 topics, overflow stated (`…and 4 earlier`) | A wake is a summary, not the read it prompts |
+| The count is of EVERYTHING unread | The wake may under-describe what `read` returns, never over-describe |
+
+Publishers set one with `mailbox publish --subject "…" [--link URL]`, or
+`mailbox send --subject "…"` for a peer message — where the bridge composes
+`from <sender>: <subject>` from the `from` it verified. **The message text is never
+used as the subject**: a wake says what is waiting, not what it says.
 
 ## Finding the session: Claude Code's registry
 
@@ -248,10 +289,10 @@ sequenceDiagram
     Adapter->>Bridge: publish(topic, event)
     Bridge->>Bridge: append durable log; advance offset
     Bridge->>Bridge: look up subscribers in ~/.claude/sessions
-    Bridge->>Claude: write the inbox socket ("mail on topic X")
+    Bridge->>Claude: write the inbox socket ("[agent-mailbox] mail on X — · what changed")
     Claude->>Agent: start a turn with the message
     Agent->>Bridge: read(my cursors)
-    Bridge-->>Agent: unread events (bodies live here, not on the wire)
+    Bridge-->>Agent: unread events (bodies live here, never on the wake wire)
     Agent->>Agent: react (tools, edits, replies)
 ```
 

@@ -899,13 +899,16 @@ async fn handle_line(
             }
             let topic = publish.topic.clone();
             // Stamp OUR identity (provenance), ignoring publish.adapter. Stamp the
-            // timestamp here, like the durable bridge does (one clock).
+            // timestamp here, like the durable bridge does (one clock). The subject
+            // travels as the adapter wrote it — it is already parsed, so the host has
+            // nothing left to enforce about it (ADR-0022).
             match bus
                 .publish(
                     publish.topic,
                     adapter_id.clone(),
                     Timestamp(crate::clock::now_millis()),
                     publish.body,
+                    publish.subject,
                 )
                 .await
             {
@@ -1406,6 +1409,7 @@ mod tests {
             topic: gh_topic(),
             adapter: AdapterId("self-reported".to_string()),
             body: json!({ "hello": "world" }),
+            subject: None,
         }))
         .unwrap();
         handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
@@ -1430,6 +1434,7 @@ mod tests {
             topic,
             adapter: AdapterId("self-reported".to_string()),
             body: json!({}),
+            subject: None,
         }))
         .unwrap();
         handle_line(line.as_bytes(), 1, &bus, &adapter, &health, None, None).await;
@@ -1455,6 +1460,7 @@ mod tests {
             topic: foreign,
             adapter: AdapterId("self-reported".to_string()),
             body: json!({ "edge": "mergeable_conflicting" }),
+            subject: None,
         }))
         .unwrap();
         handle_line(
@@ -1485,6 +1491,7 @@ mod tests {
             topic: expected.clone(),
             adapter: AdapterId("self-reported".to_string()),
             body: json!({ "edge": "new_reviews" }),
+            subject: None,
         }))
         .unwrap();
         handle_line(

@@ -320,7 +320,15 @@ pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView,
         });
     }
     let subscriptions = storage.session_subscriptions(session.clone()).await?;
-    let unread = storage.unread_counts(session).await?;
+    // Counts, not subjects: `status` answers "is there anything waiting?", and what
+    // that mail is about is what `read` is for. Asking for zero subjects is the same
+    // query the wake uses, so the two can never disagree about what "unread" means.
+    let unread = storage
+        .unread_digest(session, 0)
+        .await?
+        .into_iter()
+        .map(|digest| (digest.topic, digest.unread))
+        .collect();
     Ok(StatusView {
         watches,
         subscriptions,
@@ -572,6 +580,7 @@ mod tests {
             AdapterId("a".to_string()),
             Timestamp(0),
             serde_json::json!({"i": 0}),
+            None,
         )
         .await
         .unwrap();

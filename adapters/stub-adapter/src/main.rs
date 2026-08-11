@@ -68,7 +68,9 @@ use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, error, info};
 
-use mailbox_protocol::{AdapterId, FramingError, Message, Publish, Topic, TopicError, encode_line};
+use mailbox_protocol::{
+    AdapterId, FramingError, Message, Publish, Subject, Topic, TopicError, encode_line,
+};
 
 /// Interval used when config omits `interval_ms` or sets it to `0`. A sane floor
 /// so a missing/zero interval is a slow heartbeat, never a 100%-CPU busy loop.
@@ -260,6 +262,11 @@ async fn publish(stdout: &mut Stdout, topic: &Topic, seq: u64) -> Result<(), Stu
         topic: topic.clone(),
         adapter: AdapterId(ADAPTER_ID.to_string()),
         body: serde_json::json!({ "source": "stub", "seq": seq }),
+        // The stub's subject is its sequence number: it says nothing interesting,
+        // which is the point — it exercises the wake wire's subject path end to end
+        // with content that could not be mistaken for a real signal. No link: this
+        // event does not point at anything that exists.
+        subject: Subject::new(&format!("stub event {seq}"), None).ok(),
     });
     let line = encode_line(&message)?;
     // stdout is block-buffered when piped, so flush every line to keep ordering

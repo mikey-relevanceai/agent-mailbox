@@ -29,6 +29,20 @@ and nothing on a timer
 ([ADR-0021](docs/adr/0021-delete-the-sentinel-fallback.md),
 [ADR-0020](docs/adr/0020-peer-inbox-socket-is-the-wake-wire.md)).
 
+The woken agent is told what changed and where — never the event body, which stays in
+the durable log until it runs `mailbox read`
+([ADR-0022](docs/adr/0022-the-wake-carries-a-subject.md)):
+
+```text
+[agent-mailbox] mail on 1 topic — run `mailbox read`
+
+github.pr.acme/web#42 — 2 unread
+  · CI failed: build
+    https://github.com/acme/web/actions/runs/9/job/2
+  · new comment
+    https://github.com/acme/web/pull/42#issuecomment-2145678
+```
+
 Requires **Claude Code 2.1.226+**. A session Claude Code gave no inbox socket cannot
 be woken by anything, so `mailbox watch` and `mailbox subscribe` refuse up front
 rather than leaving an agent waiting on a wake that will never come.
@@ -70,8 +84,8 @@ both take an override: `--skills-dir <path>` and `--settings <path>`.
 
 **If your sessions run `--dangerously-skip-permissions`**, they will *hold* an
 inbox-socket wake for an approval nobody is there to give, and drop it after five
-minutes — so they wake only through the slower fallback path. There is a third,
-**opt-in** command that fixes it:
+minutes — and there is no second channel behind it, so those sessions simply do not
+wake. There is a third, **opt-in** command that fixes it:
 
 ```bash
 mailbox harness install-inbound --settings <file>   # crossSessionInbound: "accept"

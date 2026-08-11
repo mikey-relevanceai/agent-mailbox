@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox_harness::hook::HookInput;
-use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
+use mailbox_protocol::{AdapterId, GithubPr, Subject, Topic, inbox_topic, stub_topic};
 
 use crate::client;
 use crate::control::{
@@ -257,6 +257,12 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
+    /// One line saying what this is, shown to subscribers when they wake.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// A URL to the thing the subject describes. Requires `--subject`.
+    #[arg(long, requires = "subject")]
+    pub link: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -273,6 +279,11 @@ pub struct TopicArgs {
 /// sending one is still identified by the `from` the bridge stamps. A HUMAN's poke
 /// carries no `from` at all, so an empty body says genuinely nothing; give it a
 /// `--text` if the agent is meant to act on something in particular.
+///
+/// `--subject` is a third, separate thing: the message text is what the recipient
+/// reads on `read`, while the subject is what it sees on WAKE, before it has read
+/// anything (ADR-0022). Without one, the recipient wakes knowing only that you
+/// messaged it — enough to go and read, which is all a wake owes anyone.
 #[derive(Args, Debug)]
 pub struct SendArgs {
     /// The agent to message: a bare session id, or its full `agent.<id>` topic.
@@ -283,6 +294,13 @@ pub struct SendArgs {
     /// A JSON **object** body (stored verbatim; the bridge only adds `from`).
     #[arg(long)]
     pub body: Option<String>,
+    /// One line saying what this message is about, shown when the peer wakes.
+    /// The bridge appends who it is from.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// A URL to whatever the subject refers to. Requires `--subject`.
+    #[arg(long, requires = "subject")]
+    pub link: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -415,9 +433,22 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
             topic,
             adapter: AdapterId(args.adapter),
             body,
+            subject: parse_subject(args.subject.as_deref(), args.link.as_deref())?,
         },
     )
     .await
+}
+
+/// Build the optional [`Subject`] two commands share (`publish` and `send`).
+///
+/// The text is normalized by [`Subject::new`] — collapsed to one line and bounded —
+/// so what reaches the wire is what the wake will render, not what the shell handed
+/// over. An unusable `--link` is dropped there rather than refused here: the same
+/// degrade rule an adapter's link follows, and the CLI has no better answer than the
+/// type does.
+fn parse_subject(text: Option<&str>, link: Option<&str>) -> anyhow::Result<Option<Subject>> {
+    text.map(|text| Subject::new(text, link).context("--subject"))
+        .transpose()
 }
 
 async fn run_subscribe(format: OutputFormat, args: TopicArgs) -> anyhow::Result<ExitCode> {
@@ -482,7 +513,16 @@ async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCo
             to.as_str()
         );
     }
-    request(format, Request::Send { from, to, body }).await
+    request(
+        format,
+        Request::Send {
+            from,
+            to,
+            body,
+            subject: parse_subject(args.subject.as_deref(), args.link.as_deref())?,
+        },
+    )
+    .await
 }
 
 /// Build the message body from the mutually-exclusive `--text` / `--body` flags.
@@ -857,8 +897,9 @@ fn render_human(response: &Response) {
             } else {
                 println!("{} unread event(s):", events.len());
                 for event in events {
-                    // The body is what `read` exists to surface, so showing it
-                    // here is correct (unlike wake, which is payload-free).
+                    // The body is what `read` exists to surface, so showing it here
+                    // is correct — this is the side of the boundary where bodies
+                    // live (the wake wire only ever gets the subject).
                     println!(
                         "  [{}] offset={} id={} body={}",
                         event.topic.as_str(),
@@ -866,6 +907,15 @@ fn render_human(response: &Response) {
                         event.id.0,
                         event.body
                     );
+                    // Under the body, indented: the subject is a label for the event
+                    // above it, and it is the line the agent already saw on wake —
+                    // repeating it here is what ties the two together.
+                    if let Some(subject) = &event.subject {
+                        match subject.link() {
+                            Some(link) => println!("      {} — {link}", subject.text()),
+                            None => println!("      {}", subject.text()),
+                        }
+                    }
                 }
             }
         }

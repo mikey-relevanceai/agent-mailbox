@@ -25,7 +25,9 @@
 > new reviews / review threads / PR comments (diffed by highest-seen **id**, not a
 > bare count, so an add is never missed when a concurrent delete cancels the
 > count), and whole-PR **CI rollup** transitions **into failure** (event body lists
-> the newly-failed check names). The baseline
+> the newly-failed checks with the URL each reports at). Every edge also publishes a
+> one-line `subject` linking to the thing that changed
+> ([ADR-0022](../adr/0022-the-wake-carries-a-subject.md)). The baseline
 > **persists through the bridge via the protocol** (never adapter-side SQLite —
 > ADR-0001): the supervisor injects the last persisted baseline into the adapter's
 > spawn config and relays the adapter's new `Baseline` protocol messages to the
@@ -254,6 +256,10 @@ No `ipc-arm.sh` step.
 - ~~How finely to model CI edges (whole-PR rollup vs per-check) for the first
   cut.~~ **Settled (card 10):** whole-PR **rollup** (pending/success/failure); the
   event fires on a transition **into failure** (or the failed-check set gaining
-  names while already failing) and carries the newly-failed check *names* in its
-  body — not one event per check, and not on success/pending transitions (which
-  would storm on a flapping check).
+  names while already failing) and carries the newly-failed checks in its body as
+  `{name, url}` objects — not one event per check, and not on success/pending
+  transitions (which would storm on a flapping check). The **name** is the diff key
+  (the baseline remembers names, and a URL points at one particular run, so
+  comparing URLs would re-report the same check on every re-run); the **url** is
+  `detailsUrl`/`targetUrl` as GitHub reported it, and is what the event's `subject`
+  links to so a woken agent lands on the failing run rather than the PR.

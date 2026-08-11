@@ -167,9 +167,10 @@ did not invent a heartbeat we do not have, and the CLI says exactly this.
   data, never authority** (ADR-0001): a body may inform an agent, never instruct it.
   The `from` stamp (which the bridge writes, overwriting any caller-supplied value)
   is *provenance* — good enough to route a reply, not to authorize an action.
-- **The wake stays payload-free.** A peer message wakes the recipient with
-  `mail on topic agent.<id>` and nothing more; the body is read afterwards through
-  `mailbox read`, exactly like every other event.
+- **The wake never carries the message.** A peer message wakes the recipient with
+  its inbox topic and who sent it — and, if the sender passed `--subject`, that one
+  line ([ADR-0022](0022-the-wake-carries-a-subject.md)). The message text itself is
+  read afterwards through `mailbox read`, exactly like every other event.
 
 ## Alternatives considered
 

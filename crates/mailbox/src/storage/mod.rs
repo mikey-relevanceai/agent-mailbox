@@ -36,15 +36,15 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use mailbox_protocol::{AdapterId, Event, Offset, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, Event, Offset, Subject, Timestamp, Topic};
 
 pub use error::StorageError;
 // Re-exported so callers of the public read API (e.g. `read_events`) can name
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary,
-    Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, Pid, ReadPage, SessionId, SubscribeKind, SubscribeOutcome, TopicDigest,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -250,12 +250,14 @@ impl Storage {
         adapter: AdapterId,
         timestamp: Timestamp,
         body: Value,
+        subject: Option<Subject>,
     ) -> Result<Event, StorageError> {
         self.call(|reply| Command::Publish {
             topic,
             adapter,
             timestamp,
             body,
+            subject,
             reply,
         })
         .await
@@ -361,11 +363,10 @@ impl Storage {
 
     /// List the sessions currently subscribed to `topic`.
     ///
-    /// The kick side of wake: after a publish lands, the bridge asks this so it
-    /// can signal each subscribed session's waiter FIFO (payload-free — only the
-    /// fact "there is mail on this topic" crosses the wake boundary). A read that
-    /// travels the single-writer channel like every other op, so it observes a
-    /// consistent view relative to the publish that preceded it.
+    /// The delivery side of wake: after a publish lands, the bridge asks this so it
+    /// knows whose inbox socket to write. A read that travels the single-writer
+    /// channel like every other op, so it observes a consistent view relative to the
+    /// publish that preceded it.
     pub async fn sessions_subscribed(&self, topic: Topic) -> Result<Vec<SessionId>, StorageError> {
         self.call(|reply| Command::SessionsSubscribed { topic, reply })
             .await
@@ -507,21 +508,28 @@ impl Storage {
         self.call(|reply| Command::ListWatches { reply }).await
     }
 
-    /// Per-topic count of `session`'s currently unread events, for every
-    /// subscribed topic that has at least one, in ascending topic order.
+    /// What `session` has waiting: per subscribed topic with at least one unread
+    /// event, the count and the subjects of the newest `subjects_per_topic` of
+    /// them, in ascending topic order.
     ///
-    /// Added for the card-06 `status` command. "Unread" is exactly the bus
-    /// definition (offset strictly beyond the session's delivery cursor, cursor
-    /// treated as `-1` when absent) — the counting twin of
+    /// The read behind the wake wire (ADR-0022) and the card-06 `status` command,
+    /// which asks for `0` subjects because it prints counts. "Unread" is exactly
+    /// the bus definition (offset strictly beyond the session's delivery cursor,
+    /// cursor treated as `-1` when absent) — the counting twin of
     /// [`ReadOnlyStore::topics_with_unread`](crate::storage::ReadOnlyStore). It is
     /// a pure `SELECT` and, unlike [`read_unread`](Self::read_unread), does **not**
-    /// advance any cursor — `status` observes without consuming.
-    pub async fn unread_counts(
+    /// advance any cursor — observing mail is not reading it.
+    pub async fn unread_digest(
         &self,
         session: SessionId,
-    ) -> Result<Vec<(Topic, u64)>, StorageError> {
-        self.call(|reply| Command::UnreadCounts { session, reply })
-            .await
+        subjects_per_topic: u32,
+    ) -> Result<Vec<TopicDigest>, StorageError> {
+        self.call(|reply| Command::UnreadDigest {
+            session,
+            subjects_per_topic,
+            reply,
+        })
+        .await
     }
 
     /// The topics `session` is currently subscribed to, in ascending topic order.

@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mailbox_protocol::{
-    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, Topic, check_version,
-    inbox_topic,
+    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, Subject, Topic,
+    check_version, inbox_topic,
 };
 
 use mailbox::storage::{
@@ -67,6 +67,11 @@ pub enum Request {
         topic: Topic,
         adapter: AdapterId,
         body: Value,
+        /// One line describing what this event is, for the wake wire (ADR-0022).
+        /// Optional at every layer: an event with nothing worth saying wakes its
+        /// subscribers with the topic and a count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<Subject>,
     },
     /// Subscribe `session` to `topic` (baseline-on-subscribe). `kind` distinguishes
     /// an explicit user/agent subscribe from the automatic `harness arm` inbox
@@ -131,6 +136,12 @@ pub enum Request {
         from: Option<SessionId>,
         to: SessionId,
         body: serde_json::Map<String, Value>,
+        /// What the sender says the message is about, if anything. The daemon
+        /// composes the delivered subject from this and the verified `from`
+        /// ([`mailbox::agents::send`]) — a sender cannot state its own identity
+        /// here any more than it can in the body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<Subject>,
     },
     /// List the sessions with a registered agent inbox (card-16 discovery).
     /// `session` is the *caller*, so the reply can mark which agent is itself —
@@ -530,6 +541,7 @@ mod tests {
             topic: Topic::parse("github.pr.o/r#1").unwrap(),
             adapter: AdapterId("cli".to_string()),
             body: serde_json::json!({ "hello": "world" }),
+            subject: Subject::new("new comment", Some("https://example.com/c/1")).ok(),
         });
         round_trip_request(Request::Subscribe {
             session: SessionId::new("s1"),
@@ -565,6 +577,7 @@ mod tests {
                 from,
                 to: SessionId::new("s-b"),
                 body: serde_json::Map::new(),
+                subject: None,
             });
         }
         for session in [Some(SessionId::new("s-a")), None] {

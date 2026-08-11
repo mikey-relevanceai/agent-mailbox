@@ -19,8 +19,8 @@ use super::error::StorageError;
 /// adds `session_tombstone` for the inbox-resurrection guard — see [`SCHEMA_V4`].
 /// v5 (card 19) stamps the AUTHORING session on an event — see [`SCHEMA_V5`].
 /// v6 drops that column again, along with the one rule that read it — see
-/// [`SCHEMA_V6`].
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+/// [`SCHEMA_V6`]. v7 (ADR-0022) adds the event's subject line — see [`SCHEMA_V7`].
+pub(crate) const SCHEMA_VERSION: u32 = 7;
 
 /// Version 1 of the schema.
 ///
@@ -196,6 +196,23 @@ const SCHEMA_V6: &str = r#"
 ALTER TABLE event DROP COLUMN author_session;
 "#;
 
+/// Version 7 of the schema (ADR-0022): the event's subject line.
+///
+/// `subject` is the publisher's one-line description of what changed, and
+/// `subject_link` an optional URL pointing at it. Both nullable: a subject is
+/// optional at every layer, and an event published before this migration (or by an
+/// adapter that has nothing to say) simply has none.
+///
+/// Two flat columns rather than one JSON blob, because unlike `body` this is data
+/// the bridge genuinely reads — the wake digest selects it per topic — and a column
+/// it can select is the difference between a query and a parse. It is still bounded
+/// and inert by the time it lands here: only a parsed `Subject` is ever written, so
+/// the single-line and length rules hold in the database too.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE event ADD COLUMN subject TEXT;
+ALTER TABLE event ADD COLUMN subject_link TEXT;
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -236,6 +253,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 6 {
         sql.push_str(SCHEMA_V6);
+    }
+    if current < 7 {
+        sql.push_str(SCHEMA_V7);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -451,6 +471,65 @@ mod tests {
             err.is_err(),
             "event.author_session must not exist after the v6 migration"
         );
+    }
+
+    /// A v6 database on disk — every event in it published before subjects existed —
+    /// migrates forward with its mail intact and simply has nothing to say about
+    /// those events. The upgrade must be invisible to an agent mid-watch: its unread
+    /// mail stays unread, and its next wake describes what it can.
+    #[test]
+    fn on_disk_v6_to_v7_migration_keeps_every_event_and_leaves_it_subject_less() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mailbox.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
+                 VALUES ('t.a', 0, 'evt-1', 'github-pr', 123, '{\"edge\":\"ci\"}'),
+                        ('t.a', 1, 'evt-2', 'cli', 124, '{}')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA user_version = 6").unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let (count, subjects): (i64, i64) = conn
+            .query_row("SELECT COUNT(*), COUNT(subject) FROM event", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(count, 2, "no pre-subject event is lost");
+        assert_eq!(subjects, 0, "and none of them claims a subject");
+
+        // The columns are writable, so the next publish can describe itself.
+        conn.execute(
+            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body, subject, subject_link)
+             VALUES ('t.a', 2, 'evt-3', 'github-pr', 125, '{}', 'new comment', 'https://example.com/c/1')",
+            [],
+        )
+        .unwrap();
+        let (subject, link): (String, String) = conn
+            .query_row(
+                "SELECT subject, subject_link FROM event WHERE event_id = 'evt-3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(subject, "new comment");
+        assert_eq!(link, "https://example.com/c/1");
     }
 
     #[test]

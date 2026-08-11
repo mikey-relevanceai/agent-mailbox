@@ -12,7 +12,7 @@ use mailbox::storage::{
     SessionId, Storage, StorageConfig, StorageError, SubscribeKind, WatchSpec, WatchState,
     WatchTarget,
 };
-use mailbox_protocol::{AdapterId, Cursor, GithubPr, Offset, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, Cursor, GithubPr, Offset, Subject, Timestamp, Topic};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -61,11 +61,23 @@ async fn ac1_all_writes_share_one_writer_via_cloned_handle() {
     let clone_b = storage.clone();
 
     let a = clone_a
-        .publish(topic.clone(), adapter(), Timestamp(1), json!({"n": "a"}))
+        .publish(
+            topic.clone(),
+            adapter(),
+            Timestamp(1),
+            json!({"n": "a"}),
+            None,
+        )
         .await
         .unwrap();
     let b = clone_b
-        .publish(topic.clone(), adapter(), Timestamp(2), json!({"n": "b"}))
+        .publish(
+            topic.clone(),
+            adapter(),
+            Timestamp(2),
+            json!({"n": "b"}),
+            None,
+        )
         .await
         .unwrap();
 
@@ -98,7 +110,13 @@ async fn ac2_concurrent_publish_burst_is_ordered_and_contiguous() {
         let topic = topic.clone();
         handles.push(tokio::spawn(async move {
             storage
-                .publish(topic, adapter(), Timestamp(i as i64), json!({ "i": i }))
+                .publish(
+                    topic,
+                    adapter(),
+                    Timestamp(i as i64),
+                    json!({ "i": i }),
+                    None,
+                )
                 .await
         }));
     }
@@ -136,12 +154,12 @@ async fn ac2_per_topic_offsets_are_independent() {
 
     for _ in 0..3 {
         storage
-            .publish(t1.clone(), adapter(), Timestamp(0), json!({}))
+            .publish(t1.clone(), adapter(), Timestamp(0), json!({}), None)
             .await
             .unwrap();
     }
     let e = storage
-        .publish(t2.clone(), adapter(), Timestamp(0), json!({}))
+        .publish(t2.clone(), adapter(), Timestamp(0), json!({}), None)
         .await
         .unwrap();
     // t2's first event is offset 0 regardless of t1's three events.
@@ -174,6 +192,7 @@ async fn ac3_survives_unclean_shutdown_via_wal() {
                     adapter(),
                     Timestamp(i as i64),
                     json!({ "i": i }),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -219,6 +238,7 @@ async fn ac4_fresh_create_then_idempotent_reopen() {
                 adapter(),
                 Timestamp(1),
                 json!({"first": true}),
+                None,
             )
             .await
             .unwrap();
@@ -282,6 +302,7 @@ async fn two_subscribers_have_independent_cursors() {
                 adapter(),
                 Timestamp(i as i64),
                 json!({ "i": i }),
+                None,
             )
             .await
             .unwrap();
@@ -320,6 +341,7 @@ async fn read_after_cursor_returns_only_newer_events() {
                 adapter(),
                 Timestamp(i as i64),
                 json!({ "i": i }),
+                None,
             )
             .await
             .unwrap();
@@ -523,6 +545,7 @@ async fn out_of_range_offsets_do_not_wrap() {
                 adapter(),
                 Timestamp(i as i64),
                 json!({ "i": i }),
+                None,
             )
             .await
             .unwrap();
@@ -589,6 +612,7 @@ async fn crash_writer_child_mode() {
                 adapter(),
                 Timestamp(i as i64),
                 json!({ "i": i }),
+                None,
             )
             .await
             .unwrap();
@@ -699,10 +723,10 @@ async fn list_watches_enumerates_all_watches() {
     assert_eq!(prs, vec![1, 2], "stable id order");
 }
 
-/// `unread_counts` reports per-topic unread counts for a session without
-/// advancing any cursor (status observes, never consumes).
+/// `unread_digest` reports per-topic unread counts for a session without
+/// advancing any cursor (observing mail is not reading it).
 #[tokio::test]
-async fn unread_counts_reports_per_topic_and_does_not_consume() {
+async fn unread_digest_reports_per_topic_and_does_not_consume() {
     let (storage, _dir) = fresh_store().await;
     let bus = mailbox::bus::Bus::new(storage.clone());
     let session = SessionId::new("s-status");
@@ -713,27 +737,116 @@ async fn unread_counts_reports_per_topic_and_does_not_consume() {
         .unwrap();
 
     // Two events on t1, one on t2 — all published after subscribe, so all unread.
-    bus.publish(t1.clone(), adapter(), Timestamp(0), json!({"i": 0}))
+    bus.publish(t1.clone(), adapter(), Timestamp(0), json!({"i": 0}), None)
         .await
         .unwrap();
-    bus.publish(t1.clone(), adapter(), Timestamp(1), json!({"i": 1}))
+    bus.publish(t1.clone(), adapter(), Timestamp(1), json!({"i": 1}), None)
         .await
         .unwrap();
-    bus.publish(t2.clone(), adapter(), Timestamp(2), json!({"i": 2}))
+    bus.publish(t2.clone(), adapter(), Timestamp(2), json!({"i": 2}), None)
         .await
         .unwrap();
 
-    let counts = storage.unread_counts(session.clone()).await.unwrap();
+    let digest = storage.unread_digest(session.clone(), 0).await.unwrap();
     assert_eq!(
-        counts,
+        digest
+            .iter()
+            .map(|d| (d.topic.clone(), d.unread))
+            .collect::<Vec<_>>(),
         vec![(t1.clone(), 2), (t2.clone(), 1)],
         "per-topic unread counts, in topic order"
+    );
+    assert!(
+        digest.iter().all(|d| d.subjects.is_empty()),
+        "asking for zero subjects returns the counts alone"
     );
 
     // Counting did NOT advance the cursor: a real read still returns all three.
     assert_eq!(bus.read(session.clone(), None).await.unwrap().len(), 3);
     // After reading, nothing is unread.
-    assert!(storage.unread_counts(session).await.unwrap().is_empty());
+    assert!(storage.unread_digest(session, 0).await.unwrap().is_empty());
+}
+
+/// The digest behind the wake wire (ADR-0022): the newest few subjects per topic,
+/// newest first, alongside a count of EVERYTHING unread — so a wake can say "6
+/// unread" and describe three of them without the two numbers being derived from
+/// different reads of the log.
+#[tokio::test]
+async fn unread_digest_returns_the_newest_subjects_per_topic_with_the_full_count() {
+    let (storage, _dir) = fresh_store().await;
+    let bus = mailbox::bus::Bus::new(storage.clone());
+    let session = SessionId::new("s-digest");
+    let topic = pr_topic(1);
+    bus.subscribe(session.clone(), std::slice::from_ref(&topic))
+        .await
+        .unwrap();
+
+    for i in 0..5u64 {
+        bus.publish(
+            topic.clone(),
+            adapter(),
+            Timestamp(i as i64),
+            json!({ "i": i }),
+            Subject::new(&format!("event {i}"), Some("https://example.com/1")).ok(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let digest = storage.unread_digest(session.clone(), 3).await.unwrap();
+    assert_eq!(digest.len(), 1);
+    assert_eq!(digest[0].unread, 5, "the count is of everything unread");
+    assert_eq!(
+        digest[0]
+            .subjects
+            .iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>(),
+        vec!["event 4", "event 3", "event 2"],
+        "the newest three, newest first"
+    );
+    assert_eq!(digest[0].subjects[0].link(), Some("https://example.com/1"));
+}
+
+/// An event published without a subject is counted but describes nothing, and it
+/// does not consume a slot that a described event could have used — the wake still
+/// says what it can about what it can.
+#[tokio::test]
+async fn unread_digest_counts_subject_less_events_without_describing_them() {
+    let (storage, _dir) = fresh_store().await;
+    let bus = mailbox::bus::Bus::new(storage.clone());
+    let session = SessionId::new("s-quiet");
+    let topic = pr_topic(2);
+    bus.subscribe(session.clone(), std::slice::from_ref(&topic))
+        .await
+        .unwrap();
+
+    bus.publish(
+        topic.clone(),
+        adapter(),
+        Timestamp(0),
+        json!({}),
+        Subject::new("the only description", None).ok(),
+    )
+    .await
+    .unwrap();
+    for i in 1..4i64 {
+        bus.publish(topic.clone(), adapter(), Timestamp(i), json!({}), None)
+            .await
+            .unwrap();
+    }
+
+    let digest = storage.unread_digest(session, 3).await.unwrap();
+    assert_eq!(digest[0].unread, 4);
+    assert_eq!(
+        digest[0]
+            .subjects
+            .iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>(),
+        vec!["the only description"],
+        "the three later, undescribed events are counted and not described"
+    );
 }
 
 // ---- card-08 additions: interest last-seen, touch, TTL sweep, v1->v2 ----------
