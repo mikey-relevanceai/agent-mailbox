@@ -139,25 +139,38 @@ impl Daemon {
 
     /// Run a `mailbox` client command against this daemon's DB.
     fn run(&self, args: &[&str]) -> Output {
-        mailbox_command()
-            .args(args)
-            .env("AGENT_MAILBOX_DB", &self.db_path)
-            .env("RUST_LOG", "error")
-            .output()
-            .expect("run mailbox client")
+        self.client(args).output().expect("run mailbox client")
     }
 
     /// Run a one-shot `mailbox` client command **as `session`**, via the env var
     /// Claude Code exports into every tool call. That is the only way a command
     /// learns whose session it is — there is no `--session` flag.
     fn run_as(&self, session: &str, args: &[&str]) -> Output {
-        mailbox_command()
-            .args(args)
-            .env("AGENT_MAILBOX_DB", &self.db_path)
+        self.client(args)
             .env("CLAUDE_CODE_SESSION_ID", session)
-            .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
+    }
+
+    /// A client command pointed at this daemon's DB **and** its tempdir registry.
+    ///
+    /// Client commands read Claude Code's session registry too — `status` reports the
+    /// caller's wake verdict from it, `subscribe`/`watch` refuse on it — so they get
+    /// the same tempdir the daemon does. Without it a test would read the developer's
+    /// real `~/.claude/sessions` and answer differently on a laptop than in CI.
+    fn client(&self, args: &[&str]) -> Command {
+        let mut cmd = mailbox_command();
+        cmd.args(args)
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env(
+                "MAILBOX_CLAUDE_SESSIONS_DIR",
+                self.db_path
+                    .parent()
+                    .expect("db path has a parent")
+                    .join("claude-sessions"),
+            )
+            .env("RUST_LOG", "error");
+        cmd
     }
 
     /// Send a raw control line (a newline is appended) over the socket and return
@@ -332,6 +345,7 @@ fn status_still_answers_who_am_i_when_the_bridge_is_down() {
         .args(["status"])
         .env("CLAUDE_CODE_SESSION_ID", "s-alone")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_CLAUDE_SESSIONS_DIR", dir.path().join("sessions"))
         .env("RUST_LOG", "error")
         .output()
         .expect("run status with no daemon");
@@ -342,7 +356,7 @@ fn status_still_answers_who_am_i_when_the_bridge_is_down() {
     );
     let out = stdout(&output);
     assert!(
-        out.contains("session: s-alone") && out.contains("inbox: agent.s-alone"),
+        out.contains("session: s-alone") && out.contains("inbox topic: agent.s-alone"),
         "the identity fields are always knowable; got: {out}"
     );
     assert!(
@@ -360,6 +374,7 @@ fn status_still_answers_who_am_i_when_the_bridge_is_down() {
         .args(["--json", "status"])
         .env("CLAUDE_CODE_SESSION_ID", "s-alone")
         .env("AGENT_MAILBOX_DB", &db_path)
+        .env("MAILBOX_CLAUDE_SESSIONS_DIR", dir.path().join("sessions"))
         .env("RUST_LOG", "error")
         .output()
         .expect("run json status with no daemon");
@@ -368,6 +383,9 @@ fn status_still_answers_who_am_i_when_the_bridge_is_down() {
     assert_eq!(value["session"], "s-alone");
     assert_eq!(value["inbox_topic"], "agent.s-alone");
     assert_eq!(value["bridge"], "unreachable");
+    // Derived locally, so it is knowable here too — `wake.rs` covers the verdict that
+    // matters (a live session with no socket) end to end.
+    assert_eq!(value["wake"], "unknown");
 }
 
 #[test]

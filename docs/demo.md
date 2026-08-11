@@ -79,7 +79,8 @@ $ mailbox watch stub demo --interval-ms 500
 watching stub.demo (interest=1, subscription: new, empty topic (no baseline))
 $ mailbox status
 session: demo-session
-inbox: agent.demo-session (registered)
+wake: reachable
+inbox topic: agent.demo-session (registered)
 watches:
   stub demo  state=running interest=1 interval=500ms child=pid 47934
 subscriptions (3):
@@ -99,7 +100,8 @@ $ mailbox unwatch stub demo
 unwatched stub.demo (remaining interest=0)
 $ mailbox status
 session: demo-session
-inbox: agent.demo-session (registered)
+wake: reachable
+inbox topic: agent.demo-session (registered)
 watches:
   stub demo  state=stopped interest=0 interval=500ms child=stopped
 subscriptions (2):

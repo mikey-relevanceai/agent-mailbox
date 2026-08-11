@@ -28,6 +28,9 @@ The ADRs in force for that path are:
   `bypassPermissions` session has to opt past.
 - [**0018**](0018-publish-has-one-rule.md) — a publish goes to the topic and wakes
   every subscriber, its author included. That is the whole contract.
+- [**0023**](0023-status-reports-the-wake-verdict.md) — `status` says whether this
+  session can be woken, from the same read `watch` refuses on, so the self-check and
+  the refusal cannot disagree.
 
 Eight ADRs describe the wake path that was **deleted** in 0021 — 0008 and 0017 (the
 sentinel), 0012 (the turn-boundary re-trigger), 0016 (the active probe), and the
@@ -63,6 +66,7 @@ the reasoning, not for the mechanism.
 | [0019](0019-remove-the-observability-and-re-arm-surfaces.md) | Delete `harness arm`, `mailbox wait` and the whole max-block apparatus (retained primitives nothing invoked), and `mailbox dashboard` (inferred wake health, measured wrong in BOTH directions against 0016's probe). `doctor` is the only wake-health surface | Accepted |
 | [0020](0020-peer-inbox-socket-is-the-wake-wire.md) | The peer inbox socket is the wake wire: publish writes Claude Code's per-session Unix socket directly and the idle session takes a turn, with the sentinel + `FileChanged` path retained as the fallback for sessions whose socket the `agents_cross_session_inbox` gate never bound. Claim no permission class; stay payload-free; never set `crossSessionInbound` for the operator | Accepted; **its fallback is deleted by 0021** |
 | [0021](0021-delete-the-sentinel-fallback.md) | Delete the sentinel fallback: the inbox socket is the ONLY wake wire. Removes `sentinel.rs`, `watchPaths`, the `FileChanged`/`asyncRewake` exit-2 hook, ADR-0012's turn-boundary re-trigger and ADR-0016's active probe (the hook set drops from five to two, neither able to wake). `doctor` becomes a read; `subscribe`/`watch` refuse for a session nothing can wake. Written after watching the fallback go silently deaf for 6.3h with everything configured correctly | Accepted |
+| [0023](0023-status-reports-the-wake-verdict.md) | `status` reports the wake verdict, derived locally from the same `doctor::reachability_of` that `watch` refuses on — so the command an agent checks itself with cannot contradict the command that refuses it. `unknown` stays an answer and never a verdict; the human label becomes `inbox topic:` while the `inbox` JSON key is left alone. Written after an agent distrusted a correct refusal and went back to polling | Accepted |
 
 ## When to write one
 

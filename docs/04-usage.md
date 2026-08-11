@@ -251,7 +251,7 @@ session's inbox socket directly, and Claude Code starts a turn on it.
 
 ## Recovering a session whose inbox lapsed
 
-Symptom: `mailbox status` reports `inbox: agent.<id> (NOT registered)` and
+Symptom: `mailbox status` reports `inbox topic: agent.<id> (NOT registered)` and
 `subscriptions: none`, peers' `mailbox send` to you fails, and you never wake. Since
 [ADR-0013](adr/0013-re-register-inbox-and-watchpaths-on-resume.md) this should heal
 itself on your next `SessionStart` **or** turn boundary — so first just **take a
@@ -272,6 +272,10 @@ Two things to know about that manual path:
   that.
 - **Confirm with `mailbox doctor`, not by reading logs.** It reads whether your process
   is alive and whether Claude Code bound you a socket, which is the whole answer.
+  `mailbox status`'s `wake:` line is that same verdict for the calling session
+  ([ADR-0023](adr/0023-status-reports-the-wake-verdict.md)), which is why the two lines
+  it prints — `wake` and `inbox topic` — are exactly the addressable/wakeable split
+  above.
 
 ### 2b. Install the skill
 
@@ -611,7 +615,8 @@ mailbox status
 
 ```text
 session: my-session
-inbox: agent.my-session (registered)
+wake: reachable
+inbox topic: agent.my-session (registered)
 watches:
   github-pr myrepo#42  state=running interest=1 interval=60s child=pid 51234
 subscriptions (2):
@@ -621,10 +626,26 @@ unread:
   [github.pr.me/myrepo#42] 1
 ```
 
-- **session / inbox** — who this session is, and its peer-messaging address, plus
-  whether that address is `registered` (the `SessionStart` hook does that). If it says
-  `NOT registered`, peers cannot `send` to this session — check the hooks are
-  installed and the daemon is up.
+- **session** — who this session is.
+- **wake** — whether anything can wake this session, and the load-bearing line of the
+  three. It is the SAME verdict `mailbox doctor` reports and `subscribe`/`watch` refuse
+  on ([ADR-0023](adr/0023-status-reports-the-wake-verdict.md)), read from Claude Code's
+  own registry rather than asked of the bridge:
+  - `reachable` — Claude Code bound this session an inbox socket. Mail arrives while it
+    is idle.
+  - `no-inbox` — it did not, so **nothing can wake this session**. The one fault, and
+    only a restart fixes it; the line carries the same remedy `doctor` prints.
+  - `unregistered` — Claude Code has no record of this session (a non-Claude harness
+    looks like this, and so does a Claude Code too old to register itself). Not a fault.
+  - `unknown` — the session registry could not be read, which is not evidence either
+    way. Never reported as a fault, for [ADR-0009](adr/0009-interest-liveness-from-the-waiter-pidfile.md)'s
+    reason.
+- **inbox topic** — this session's peer-messaging address, plus whether that address is
+  `registered` (the `SessionStart` hook does that). If it says `NOT registered`, peers
+  cannot `send` to this session — check the hooks are installed and the daemon is up.
+  A different question from `wake`: this one is about the bus, that one is about the
+  process. A `registered` topic on a `no-inbox` session means mail lands durably with
+  nothing to announce it.
 - **watches** — each supervised watch, its `state`
   (`desired`/`running`/`stopped`/`failed`), how many sessions are `interest`ed,
   the poll `interval`, and the adapter's `child` pid when the supervisor is
@@ -632,17 +653,28 @@ unread:
 - **subscriptions** — the topics this session listens on, headed by how many
   there are. The count includes this session's own `agent.<id>` inbox, so an
   armed session with no watches reads `1`, not `0` — the inbox is a real
-  subscription, and the `inbox` line above says whether it is registered.
+  subscription, and the `inbox topic` line above says whether it is registered.
 - **unread** — per-topic count of events past this session's cursor. `read`
   drains these.
 
-**With the bridge down**, `status` still prints the two identity lines — they are
-derived locally, not fetched — and replaces the rest with an explicit
+**With the bridge down**, `status` still prints the three local lines — session, wake
+and inbox topic are derived here, not fetched — and replaces the rest with an explicit
 `bridge: UNREACHABLE`. It still exits non-zero
 ([ADR-0004](adr/0004-cli-serve-daemon-and-socket.md)): most of the report is genuinely
 missing, so exiting 0 would report "fine" for a command whose main content is absent.
 In `--json` that is one object — the usual `"result": "error"` shape with `session`,
-`inbox_topic` and `"bridge": "unreachable"` added.
+`wake`, `inbox_topic` and `"bridge": "unreachable"` added.
+
+> The wake verdict is deliberately in the local half. A session nothing can wake must
+> be told so even when the daemon is the dead thing — that is the moment it is most
+> likely to be waiting on mail nobody will announce.
+
+In `--json` on the normal path the verdict is the `wake` key, alongside the existing
+`inbox` one:
+
+```bash
+mailbox status --json | jq -r .wake      # reachable | no-inbox | unregistered | unknown
+```
 
 ### Putting the subscription count in a Claude Code status line
 

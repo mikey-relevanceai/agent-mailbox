@@ -600,12 +600,12 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
 
 /// `status`: this session's identity, plus everything the bridge knows about it.
 ///
-/// **The identity half never depends on the bridge.** A session's id and its inbox
-/// topic are derivable locally, so when the daemon is down `status` still answers
-/// "who am I, and what is my address" — and says plainly that the rest (watches,
-/// subscriptions, unread counts) is unknown because the bridge is unreachable. That is
-/// what the separate `whoami` command used to be for; it was otherwise a strict subset
-/// of this output, so it is gone.
+/// **The identity half never depends on the bridge.** A session's id, its inbox topic
+/// and its wake verdict are derivable locally, so when the daemon is down `status`
+/// still answers "who am I, what is my address, and can anything wake me" — and says
+/// plainly that the rest (watches, subscriptions, unread counts) is unknown because the
+/// bridge is unreachable. That is what the separate `whoami` command used to be for; it
+/// was otherwise a strict subset of this output, so it is gone.
 ///
 /// It still exits NON-ZERO when the bridge is down (ADR-0004: socket clients fail
 /// loud). The degradation is in what it can tell you, not in whether it admits the
@@ -627,11 +627,78 @@ async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
         return Err(fail(format, message));
     }
     if format.is_json() {
-        println!("{}", serde_json::to_string(&response)?);
+        // The wake verdict is added HERE rather than asked of the daemon, for the same
+        // reason the human path derives it: it is a local read, and a session that
+        // cannot be woken must learn so even when the bridge is the broken thing.
+        println!(
+            "{}",
+            serde_json::to_string(&StatusJson {
+                response: &response,
+                wake: wake_label(mailbox::doctor::local_reachability(&session)),
+            })?
+        );
     } else {
         render_human(&response);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `status`'s `--json` document: the daemon's typed reply with the locally-derived
+/// `wake` verdict added.
+///
+/// Flattened onto the reply so every existing key keeps its exact place and its exact
+/// name. A Claude Code **status line** reads this object on every prompt (that is what
+/// `subscription_count` exists for), so nesting or renaming a key breaks a consumer
+/// silently — `wake` is purely additive.
+#[derive(serde::Serialize)]
+struct StatusJson<'a> {
+    #[serde(flatten)]
+    response: &'a Response,
+    wake: &'static str,
+}
+
+/// The stable one-word answer to "can this session be woken?", for `--json` and for
+/// the head of the human `wake:` line.
+///
+/// `unknown` is a real answer and never a verdict: an unreadable registry is not
+/// evidence that nothing can wake this session (ADR-0009). It is deliberately a word
+/// rather than a null, because the consumer is a status line that prints what it reads.
+fn wake_label(wake: Option<mailbox::doctor::Reachability>) -> &'static str {
+    match wake {
+        Some(verdict) => verdict.label(),
+        None => "unknown",
+    }
+}
+
+/// The human `wake:` line: the verdict, and what to do about it when there is anything
+/// to do.
+///
+/// Matched exhaustively rather than driven by [`Reachability::remedy`] alone, so a new
+/// verdict breaks compilation here — this is the line an idle agent reads to decide
+/// whether it can trust being woken, and the wrong word sends it back to polling.
+fn wake_line(wake: Option<mailbox::doctor::Reachability>) -> String {
+    use mailbox::doctor::Reachability;
+
+    let label = wake_label(wake);
+    let Some(verdict) = wake else {
+        return format!(
+            "{label} — could not read Claude Code's session registry, which is not \
+             evidence either way"
+        );
+    };
+    match verdict {
+        Reachability::Reachable => label.to_string(),
+        Reachability::NoInbox => format!("{label} — {}", verdict.remedy().unwrap_or_default()),
+        // Not a fault and not alarming: a harness that is not Claude Code looks exactly
+        // like this, and so does a Claude Code too old to register itself.
+        Reachability::Unregistered => {
+            format!("{label} — Claude Code has no record of this session")
+        }
+        // Unreachable for the caller, which is the process running this command. Said
+        // plainly rather than asserted away: a wrong panic here would be worse than a
+        // surprising line.
+        Reachability::Gone => format!("{label} — no live process for this session"),
+    }
 }
 
 /// Render the bridge-down `status`: the identity fields that are always knowable, and
@@ -646,6 +713,10 @@ fn status_without_bridge(
     message: &str,
 ) -> anyhow::Error {
     let inbox = inbox_topic(session).ok();
+    // Wakeability is a local read, so it belongs to the half that survives this. A
+    // session nothing can wake must be told so even when the daemon is the dead thing —
+    // withholding it here would leave the agent that most needs the answer without one.
+    let wake = mailbox::doctor::local_reachability(session);
     if format.is_json() {
         println!(
             "{}",
@@ -653,15 +724,17 @@ fn status_without_bridge(
                 "result": "error",
                 "message": message,
                 "session": session.as_str(),
+                "wake": wake_label(wake),
                 "inbox_topic": inbox.as_ref().map(Topic::as_str),
                 "bridge": "unreachable",
             })
         );
     } else {
         println!("session: {}", session.as_str());
+        println!("wake: {}", wake_line(wake));
         match &inbox {
-            Some(inbox) => println!("inbox: {}", inbox.as_str()),
-            None => println!("inbox: none (this session id cannot form an inbox topic)"),
+            Some(inbox) => println!("inbox topic: {}", inbox.as_str()),
+            None => println!("inbox topic: none (this session id cannot form an inbox topic)"),
         }
         println!(
             "bridge: UNREACHABLE — watches, subscriptions and unread counts are unknown \
@@ -749,30 +822,25 @@ fn resolve_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
 ///
 /// # One definition of "wakeable", matched exhaustively
 ///
-/// The verdict comes from [`mailbox::doctor::reachability_of`], the same function
-/// `doctor` reports from. This used to be a hand-rolled `if`-chain here with a subtly
+/// The verdict comes from [`mailbox::doctor::local_reachability`], which is
+/// [`mailbox::doctor::reachability_of`] — the same function `doctor` reports from and
+/// `status` prints. This used to be a hand-rolled `if`-chain here with a subtly
 /// different state space, which meant a change to one did not reach the other and the
 /// compiler could not say so. Now a new [`Reachability`] variant breaks compilation in
-/// both places.
+/// every place that decides something.
 fn resolve_wakeable_session_or_fail(format: OutputFormat) -> anyhow::Result<SessionId> {
     use mailbox::doctor::Reachability;
 
     let session = resolve_session_or_fail(format)?;
 
-    // A registry we cannot read is not evidence of anything, so it must not produce a
-    // refusal. `live_from` returns None for exactly that case.
-    let Ok(registry) = mailbox::claude_registry::ClaudeRegistry::open() else {
-        return Ok(session);
-    };
-    let Some(live) = mailbox::doctor::live_from(&registry) else {
-        return Ok(session);
-    };
-
-    match mailbox::doctor::reachability_of(&session, &registry, &live) {
+    match mailbox::doctor::local_reachability(&session) {
+        // A registry we cannot read is not evidence of anything, so it must not produce
+        // a refusal.
+        None => Ok(session),
         // Refuse ONLY on unambiguous evidence: Claude Code knows this session and gave
         // it no socket. `Unregistered` may be a harness that is not Claude Code, and
         // `Gone` cannot be the caller (it is running this command).
-        Reachability::NoInbox => Err(fail(
+        Some(Reachability::NoInbox) => Err(fail(
             format,
             &format!(
                 "{} has no Claude Code inbox socket, so nothing can wake it — subscribing \
@@ -781,7 +849,9 @@ fn resolve_wakeable_session_or_fail(format: OutputFormat) -> anyhow::Result<Sess
                 Reachability::NoInbox.remedy().unwrap_or_default()
             ),
         )),
-        Reachability::Reachable | Reachability::Unregistered | Reachability::Gone => Ok(session),
+        Some(Reachability::Reachable | Reachability::Unregistered | Reachability::Gone) => {
+            Ok(session)
+        }
     }
 }
 
@@ -894,7 +964,12 @@ fn render_human(response: &Response) {
                 );
             }
         },
-        Response::Status(report) => render_status(report),
+        // The one response whose rendering needs a fact the bridge never sends: whether
+        // the session can be woken. It is read here, locally, from the session the
+        // report is about (`doctor` needs no daemon).
+        Response::Status(report) => {
+            render_status(report, mailbox::doctor::local_reachability(&report.session))
+        }
         Response::Sent {
             to,
             topic,
@@ -993,9 +1068,21 @@ fn render_topics(topics: &[TopicStatus]) {
     }
 }
 
-fn render_status(report: &StatusReport) {
+/// Render a `status` snapshot, with the wake verdict the caller read locally.
+///
+/// The verdict is a parameter rather than something read in here: this stays a
+/// renderer, and the one derivation lives at the edge that also has to answer for the
+/// bridge being down.
+fn render_status(report: &StatusReport, wake: Option<mailbox::doctor::Reachability>) {
     println!("session: {}", report.session.as_str());
-    // The inbox line answers "can peers reach me?" — the topic AND whether the
+    // Above the inbox topic because it is the more load-bearing fact: an agent that
+    // cannot be woken has nothing to gain from being addressable. The two lines answer
+    // genuinely different questions — "can anything wake me?" (Claude Code bound this
+    // process a socket) versus "can peers reach me?" (this session is subscribed to its
+    // own topic on the bus) — and reading the second as the first is what once had an
+    // agent distrust a correct `watch` refusal and go back to polling.
+    println!("wake: {}", wake_line(wake));
+    // The inbox-topic line answers "can peers reach me?" — the topic AND whether the
     // session is actually subscribed to it (registration is what makes a `send`
     // deliverable; see ADR-0007).
     match &report.inbox {
@@ -1005,9 +1092,9 @@ fn render_status(report: &StatusReport) {
             } else {
                 "NOT registered — peers cannot send to this session"
             };
-            println!("inbox: {} ({registered})", inbox.as_str());
+            println!("inbox topic: {} ({registered})", inbox.as_str());
         }
-        None => println!("inbox: none (this session id cannot form an inbox topic)"),
+        None => println!("inbox topic: none (this session id cannot form an inbox topic)"),
     }
     if report.watches.is_empty() {
         println!("watches: none");

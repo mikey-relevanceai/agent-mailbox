@@ -223,3 +223,166 @@ fn subscribe_allows_a_session_claude_code_has_never_heard_of() {
     // No register_peer, no register_socketless: absent from the registry entirely.
     env.run_as_ok("stranger", &["subscribe", "stub.demo"], "subscribe");
 }
+
+// ==== `status` answers "can I be woken?" — the same verdict, from the same read ====
+//
+// ADR-0023. `status` is the command an agent runs to check itself, and it used to
+// report only its inbox TOPIC — a fact about the bus — while `watch` refused on the
+// inbox SOCKET. An agent read the two as contradicting each other, distrusted the
+// refusal, and went back to polling.
+
+/// The wake verdict out of `status --json`, which is the field a status line reads.
+fn wake_of(out: &std::process::Output) -> String {
+    let value: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("status must emit one JSON document");
+    value["wake"]
+        .as_str()
+        .unwrap_or_else(|| panic!("status --json must carry a wake verdict: {value}"))
+        .to_string()
+}
+
+/// A session Claude Code bound a socket reads `reachable` — and the JSON keys that
+/// were already there keep their exact names, because a Claude Code status line reads
+/// this object on every prompt.
+#[test]
+fn status_reports_a_session_with_an_inbox_socket_as_reachable() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "status-has-inbox";
+
+    let _inbox = env.register_peer(session);
+
+    let out = env.run_as_ok(session, &["--json", "status"], "status");
+    assert_eq!(wake_of(&out), "reachable");
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("status json");
+    assert_eq!(
+        value["inbox"],
+        format!("agent.{session}"),
+        "the pre-existing `inbox` key must NOT be renamed: a status line reads it"
+    );
+
+    let human = env.run_as_ok(session, &["status"], "status");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("wake: reachable"),
+        "the human line must answer it too: {text}"
+    );
+    assert!(
+        text.contains(&format!("inbox topic: agent.{session}")),
+        "the topic line says `inbox topic`, so the two senses of `inbox` stop \
+         colliding on screen: {text}"
+    );
+}
+
+/// **The failure this whole change exists for.** A live session Claude Code gave no
+/// socket is one nothing can wake, `watch` refuses it — and `status` used to reassure
+/// it that everything was fine.
+///
+/// Asserted together, in one test, on one session: the point is not that each command
+/// is individually right, it is that they cannot disagree.
+#[test]
+fn status_and_watch_agree_a_socketless_session_cannot_be_woken() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "status-no-inbox";
+
+    env.register_socketless(session);
+
+    let out = env.run_as_ok(session, &["--json", "status"], "status");
+    assert_eq!(
+        wake_of(&out),
+        "no-inbox",
+        "status must report the fault, not just the inbox topic"
+    );
+
+    let human = env.run_as_ok(session, &["status"], "status");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("wake: no-inbox"),
+        "the verdict leads the line: {text}"
+    );
+    assert!(
+        text.contains("Restart the session"),
+        "and carries the same remedy the refusal does: {text}"
+    );
+
+    let refused = env.run_as(session, &["watch", "stub", "demo"]);
+    assert!(
+        !refused.status.success(),
+        "the command that refuses and the command that reports must agree"
+    );
+    guard.assert_clean();
+}
+
+/// **An unreadable registry is not evidence of `no-inbox`.** Absence of evidence is not
+/// evidence of absence (ADR-0009): `status` must say `unknown` and nothing stronger,
+/// exactly as `subscribe`/`watch` decline to refuse on it.
+#[test]
+fn status_reports_unknown_when_the_registry_cannot_be_read() {
+    let env = Env::new();
+    let mut guard = env.leak_guard();
+    let daemon = env.start_daemon();
+    guard.track_daemon(daemon.pid());
+    let session = "status-unknown";
+
+    // Deliberately NOT `run_as`, which always points at this env's sessions dir: the
+    // case under test is a registry the CLI cannot read at all.
+    let missing = env.db_path().parent().unwrap().join("no-such-sessions-dir");
+    let out = common::mailbox_command()
+        .args(["--json", "status"])
+        .env("AGENT_MAILBOX_DB", env.db_path())
+        .env("CLAUDE_CODE_SESSION_ID", session)
+        .env("MAILBOX_CLAUDE_SESSIONS_DIR", &missing)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run status with an unreadable registry");
+
+    assert!(
+        out.status.success(),
+        "an unreadable registry is not a failure of `status`"
+    );
+    assert_eq!(
+        wake_of(&out),
+        "unknown",
+        "unknown must render as unknown, never as a verdict"
+    );
+}
+
+/// The verdict is derived LOCALLY — `doctor` needs no daemon — so the session that most
+/// needs the answer still gets it when the bridge is the broken thing.
+#[test]
+fn status_still_reports_the_wake_verdict_with_the_bridge_down() {
+    let env = Env::new();
+    let session = "status-no-bridge";
+
+    // No `start_daemon`: this is the degraded path.
+    env.register_socketless(session);
+
+    let out = env.run_as(session, &["status"]);
+
+    assert!(
+        !out.status.success(),
+        "the bridge being down is still a loud failure (ADR-0004)"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("wake: no-inbox"),
+        "the wake verdict belongs to the half that survives a dead bridge: {text}"
+    );
+    assert!(
+        text.contains("bridge: UNREACHABLE"),
+        "and it still says what it could not tell you: {text}"
+    );
+
+    let json = env.run_as(session, &["--json", "status"]);
+    assert_eq!(
+        wake_of(&json),
+        "no-inbox",
+        "the bridge-down document carries the verdict too"
+    );
+}

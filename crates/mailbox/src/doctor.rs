@@ -186,6 +186,27 @@ pub fn reachability_of(
     }
 }
 
+/// Read one session's verdict from the registry on disk, with no daemon involved.
+///
+/// The convenience wrapper the CLI uses when it has a session and no registry in hand:
+/// `status` to report the verdict, `subscribe`/`watch` to refuse on it. Both get the
+/// answer from [`reachability_of`], so the command that reports and the command that
+/// refuses cannot disagree — an agent told `wake: reachable` by one and "nothing can
+/// wake it" by the other distrusts both, and falls back to polling.
+///
+/// `None` means **UNKNOWN** — the sessions directory could not be located or read —
+/// and is a first-class answer, never a stand-in for a verdict. Absence of evidence is
+/// not evidence of absence (ADR-0009): a caller must say "unknown" or decline to act,
+/// never report `no-inbox`.
+///
+/// Deliberately local, so the answer survives the bridge being down: it reads Claude
+/// Code's registry and the process table, exactly as `doctor` does.
+pub fn local_reachability(session: &SessionId) -> Option<Reachability> {
+    let registry = ClaudeRegistry::open().ok()?;
+    let live = live_from(&registry)?;
+    Some(reachability_of(session, &registry, &live))
+}
+
 /// The session ids that currently have a live Claude Code process.
 ///
 /// Claude Code registers every session in `~/.claude/sessions/<pid>.json`, so the id →
