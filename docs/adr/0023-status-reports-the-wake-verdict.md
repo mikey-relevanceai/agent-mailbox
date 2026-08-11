@@ -60,20 +60,26 @@ watches: none
 Four things make this more than a new line of output:
 
 1. **One read, so the two commands cannot disagree.** Both go through
-   `doctor::local_reachability`, a thin wrapper over `reachability_of`. The verdict
-   `status` prints is the verdict `watch` would refuse on, in the same process, from
-   the same registry read. There is no second definition to drift.
+   `doctor::wake_verdict`, a thin wrapper over `reachability_of`. The verdict `status`
+   prints is the verdict `watch` would refuse on, in the same process, from the same
+   registry read. There is no second definition to drift, and within `status` the read
+   happens once and is handed to whichever renderer runs — the human and `--json`
+   paths cannot describe the same session differently.
 2. **Derived locally, so it survives a dead bridge.** `doctor` opens no store
    (ADR-0021), so the verdict belongs to `status`'s locally-derived identity half — the
    half that already answers "who am I" with `bridge: UNREACHABLE`. A session that
    cannot be woken learns so even when the daemon is the broken thing, which is
    precisely when it most needs to know.
-3. **Unknown is an answer, not a verdict.** An unreadable registry reports `unknown`
-   and never `no-inbox`. Absence of evidence is not evidence of absence (ADR-0009), and
-   `subscribe`/`watch` already decline to refuse on it; a `status` that guessed
-   `no-inbox` from a missing `~/.claude` would be the same bug pointed the other way.
-   `unregistered` is likewise reported plainly and is not a fault: a harness that is not
-   Claude Code looks exactly like it.
+3. **Unknown is an answer, not a verdict — and it is a type.** An unreadable registry
+   reports `unknown` and never `no-inbox`. Absence of evidence is not evidence of
+   absence (ADR-0009), and `subscribe`/`watch` already decline to refuse on it; a
+   `status` that guessed `no-inbox` from a missing `~/.claude` would be the same bug
+   pointed the other way. So the read returns `WakeVerdict::{Known(Reachability),
+   Unknown}` rather than an `Option<Reachability>`: an `Option` invites exactly the
+   collapse the rule forbids — `unwrap_or(NoInbox)`, or an `if let Some` that quietly
+   skips the case — while a variant has to be matched. `unregistered` is likewise
+   reported plainly and is not a fault: a harness that is not Claude Code looks exactly
+   like it.
 4. **The human label is renamed, the JSON key is not.** `inbox:` becomes
    `inbox topic:`, so the two senses stop colliding on screen. The `inbox` key in
    `--json` keeps its name — a Claude Code **status line** reads this object every
