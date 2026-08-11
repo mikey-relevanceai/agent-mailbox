@@ -66,13 +66,14 @@ $ mailbox read
 == 2. wake an idle session (the inbox-socket contract) ==
 running the SessionStart hook (registers this session's agent inbox) ...
 publishing while the session is idle ...
-$ mailbox publish demo.hello --body '{"msg":"wake up"}'
+$ mailbox publish demo.hello --body '{"msg":"wake up"}' --subject 'the demo said hello' --link 'https://example.com/demo'
 published event evt-2 at offset 1
-the wake delivered to the session's inbox (topic NAMES only, never a body):
-    {"message":{"content":"mail on topic demo.hello","role":"user"},"type":"user"}
+the wake delivered to the session's inbox (what changed and where — never the body):
+    {"message":{"content":"[agent-mailbox] mail on 1 topic — run `mailbox read`\n\ndemo.hello — 1 unread\n  · the demo said hello\n    https://example.com/demo\n","role":"user"},"type":"user"}
 $ mailbox read
 1 unread event(s):
   [demo.hello] offset=1 id=evt-2 body={"msg":"wake up"}
+      the demo said hello — https://example.com/demo
 
 == 3. supervised adapter: watch stub, see it running, read its edges ==
 $ mailbox watch stub demo --interval-ms 500
@@ -92,8 +93,11 @@ unread:
 $ mailbox read --limit 5
 3 unread event(s):
   [stub.demo] offset=0 id=evt-3 body={"seq":0,"source":"stub"}
+      stub event 0
   [stub.demo] offset=1 id=evt-4 body={"seq":1,"source":"stub"}
+      stub event 1
   [stub.demo] offset=2 id=evt-5 body={"seq":2,"source":"stub"}
+      stub event 2
 
 == 4. unwatch -> the supervisor stops the adapter (no zombie poller) ==
 $ mailbox unwatch stub demo
@@ -177,7 +181,17 @@ local stack can stand in for.
 
 5. **Watch the idle session wake.** Within ~one poll interval the adapter publishes
    the edge, the daemon writes the session's inbox socket, and Claude Code starts a
-   turn with `mail on topic github.pr.OWNER/REPO#N`. The agent then:
+   turn with a message like:
+
+   ```text
+   [agent-mailbox] mail on 1 topic — run `mailbox read`
+
+   github.pr.OWNER/REPO#N — 1 unread
+     · CI failed: build
+       https://github.com/OWNER/REPO/actions/runs/…
+   ```
+
+   The agent then:
 
    ```bash
    mailbox read
@@ -189,7 +203,9 @@ local stack can stand in for.
    `"edge":"pr_merged"` when the PR merges, `"edge":"mergeable_conflicting"` for a
    conflict, `"edge":"new_reviews"` with `previous_max_id`/`current_max_id` for a
    review, or `"edge":"ci_failure"` with `"rollup":"failure"` and a `newly_failed`
-   list of check names for CI.
+   list of `{name, url}` checks for CI. Each event also carries the one-line
+   `subject` the wake showed, with a link to the comment, review or failing run
+   itself ([ADR-0022](adr/0022-the-wake-carries-a-subject.md)).
 
    and reacts (react to the merge, fix the conflict, address the review, fix CI).
 

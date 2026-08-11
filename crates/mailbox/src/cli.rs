@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use mailbox::doctor::{Reachability, WakeVerdict};
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox_harness::hook::HookInput;
-use mailbox_protocol::{AdapterId, GithubPr, Topic, inbox_topic, stub_topic};
+use mailbox_protocol::{AdapterId, GithubPr, Subject, Topic, inbox_topic, stub_topic};
 
 use crate::client;
 use crate::control::{
@@ -258,6 +258,51 @@ pub struct PublishArgs {
     /// Publisher provenance label (a name, not authority).
     #[arg(long, default_value = "cli")]
     pub adapter: String,
+    #[command(flatten)]
+    pub subject: SubjectArgs,
+}
+
+/// The `--subject` / `--link` pair, shared by `publish` and `send`.
+///
+/// Defined once and flattened into both commands rather than declared twice: they
+/// are two `Option<String>`s that mean entirely different things, so a hand-rolled
+/// second copy is a transposition — the URL becomes the description and the
+/// description is dropped as an unusable link — that compiles and fails quietly.
+#[derive(Args, Debug)]
+pub struct SubjectArgs {
+    /// One line saying what this is, shown to subscribers when they wake.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// A URL to the thing the subject describes. Requires `--subject`.
+    #[arg(long, requires = "subject")]
+    pub link: Option<String>,
+}
+
+impl SubjectArgs {
+    /// Parse the flags into the [`Subject`] the wire carries, or `None` when the
+    /// caller gave no `--subject`.
+    ///
+    /// The text is normalized by [`Subject::new`] — collapsed to one line and
+    /// bounded — so what reaches the wire is what the wake will render, not what the
+    /// shell handed over. An *unusable* `--link` is dropped there rather than refused
+    /// here: the same degrade rule an adapter's link follows, and the CLI has no
+    /// better answer than the type does.
+    ///
+    /// A link with no subject is refused, though, rather than silently discarded.
+    /// `requires = "subject"` already stops clap producing that combination, but this
+    /// struct is shared by two commands and constructible in code — so the rule lives
+    /// here too, where dropping the attribute costs an error message instead of a
+    /// link.
+    fn parse(&self) -> anyhow::Result<Option<Subject>> {
+        match (self.subject.as_deref(), self.link.as_deref()) {
+            (None, Some(link)) => anyhow::bail!(
+                "--link {link:?} needs a --subject: a link with nothing to describe it                  has nowhere to appear in a wake"
+            ),
+            (text, link) => text
+                .map(|text| Subject::new(text, link).context("--subject"))
+                .transpose(),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -274,6 +319,11 @@ pub struct TopicArgs {
 /// sending one is still identified by the `from` the bridge stamps. A HUMAN's poke
 /// carries no `from` at all, so an empty body says genuinely nothing; give it a
 /// `--text` if the agent is meant to act on something in particular.
+///
+/// `--subject` is a third, separate thing: the message text is what the recipient
+/// reads on `read`, while the subject is what it sees on WAKE, before it has read
+/// anything (ADR-0022). Without one, the recipient wakes knowing only that you
+/// messaged it — enough to go and read, which is all a wake owes anyone.
 #[derive(Args, Debug)]
 pub struct SendArgs {
     /// The agent to message: a bare session id, or its full `agent.<id>` topic.
@@ -284,6 +334,8 @@ pub struct SendArgs {
     /// A JSON **object** body (stored verbatim; the bridge only adds `from`).
     #[arg(long)]
     pub body: Option<String>,
+    #[command(flatten)]
+    pub subject: SubjectArgs,
 }
 
 #[derive(Args, Debug)]
@@ -416,6 +468,7 @@ async fn run_publish(format: OutputFormat, args: PublishArgs) -> anyhow::Result<
             topic,
             adapter: AdapterId(args.adapter),
             body,
+            subject: args.subject.parse()?,
         },
     )
     .await
@@ -483,7 +536,16 @@ async fn run_send(format: OutputFormat, args: SendArgs) -> anyhow::Result<ExitCo
             to.as_str()
         );
     }
-    request(format, Request::Send { from, to, body }).await
+    request(
+        format,
+        Request::Send {
+            from,
+            to,
+            body,
+            subject: args.subject.parse()?,
+        },
+    )
+    .await
 }
 
 /// Build the message body from the mutually-exclusive `--text` / `--body` flags.
@@ -941,8 +1003,9 @@ fn render_human(response: &Response) {
             } else {
                 println!("{} unread event(s):", events.len());
                 for event in events {
-                    // The body is what `read` exists to surface, so showing it
-                    // here is correct (unlike wake, which is payload-free).
+                    // The body is what `read` exists to surface, so showing it here
+                    // is correct — this is the side of the boundary where bodies
+                    // live (the wake wire only ever gets the subject).
                     println!(
                         "  [{}] offset={} id={} body={}",
                         event.topic.as_str(),
@@ -950,6 +1013,15 @@ fn render_human(response: &Response) {
                         event.id.0,
                         event.body
                     );
+                    // Under the body, indented: the subject is a label for the event
+                    // above it, and it is the line the agent already saw on wake —
+                    // repeating it here is what ties the two together.
+                    if let Some(subject) = &event.subject {
+                        match subject.link() {
+                            Some(link) => println!("      {} — {link}", subject.text()),
+                            None => println!("      {}", subject.text()),
+                        }
+                    }
                 }
             }
         }
@@ -1964,6 +2036,37 @@ mod tests {
         assert_eq!(session_from_env_value(""), None);
         assert_eq!(session_from_env_value("   "), None);
         assert_eq!(session_from_env_value("\n"), None);
+    }
+
+    fn subject_args(subject: Option<&str>, link: Option<&str>) -> SubjectArgs {
+        SubjectArgs {
+            subject: subject.map(str::to_string),
+            link: link.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn subject_flags_parse_into_the_subject_the_wire_carries() {
+        assert_eq!(subject_args(None, None).parse().unwrap(), None);
+
+        let parsed = subject_args("  new   comment ".into(), Some("https://example.com/c/1"))
+            .parse()
+            .unwrap()
+            .expect("a subject");
+        assert_eq!(parsed.text(), "new comment", "normalized on the way in");
+        assert_eq!(parsed.link(), Some("https://example.com/c/1"));
+
+        // A subject that says nothing is a mistake worth reporting, not a silent
+        // no-op: the flag was passed on purpose.
+        let err = subject_args(Some("   "), None).parse().unwrap_err();
+        assert!(format!("{err}").contains("--subject"), "{err}");
+
+        // Likewise a link with nothing to describe it. clap's `requires` normally
+        // stops this reaching us; the rule lives here so it holds anyway.
+        let err = subject_args(None, Some("https://example.com/x"))
+            .parse()
+            .unwrap_err();
+        assert!(format!("{err}").contains("needs a --subject"), "{err}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! # The frame
 //!
 //! ```json
-//! {"type":"user","message":{"role":"user","content":"mail on topic …"}}
+//! {"type":"user","message":{"role":"user","content":"[agent-mailbox] mail on …"}}
 //! ```
 //!
 //! This minimal form is the one Claude Code itself publishes in its startup debug
@@ -29,12 +29,13 @@
 //! `bypassPermissions` fleet opts in explicitly with
 //! `mailbox harness install-inbound`.
 //!
-//! # Payload-free, still
+//! # Body-free, still
 //!
-//! The socket *could* carry an event body; it must not. `content` is
-//! [`crate::wake::reminder`] — topic names only. The body stays in the durable log
-//! until the agent's `read`. This is the ADR-0001 invariant, preserved across a change
-//! of transport.
+//! The socket *could* carry an event body; it must not. `content` is whatever
+//! [`crate::wake::reminder`] composed — topic names, counts, and bounded subject
+//! lines — and the body stays in the durable log until the agent's `read`. This
+//! module takes the content as an opaque string and does not decide what may be in
+//! it; that decision lives in one place, and it is [`crate::wake`].
 //!
 //! # Why this lives in the daemon
 //!
@@ -173,10 +174,11 @@ mod tests {
     /// we do not own: the minimal frame Claude Code's own startup log documents.
     #[test]
     fn the_frame_is_the_minimal_documented_shape() {
-        let wire = frame("mail on topic t.a");
+        let wire = frame("[agent-mailbox] mail on 1 topic");
         assert_eq!(
             wire,
-            "{\"message\":{\"content\":\"mail on topic t.a\",\"role\":\"user\"},\"type\":\"user\"}\n"
+            "{\"message\":{\"content\":\"[agent-mailbox] mail on 1 topic\",\"role\":\"user\"},\
+             \"type\":\"user\"}\n"
         );
         assert!(
             wire.ends_with('\n'),
@@ -184,11 +186,31 @@ mod tests {
         );
     }
 
+    /// A wake is several lines of text, and NDJSON is one line per frame — so the
+    /// newlines have to travel escaped, not raw.
+    #[test]
+    fn multi_line_content_stays_one_physical_line() {
+        let wire = frame("[agent-mailbox] mail on 1 topic\n\nt.a — 1 unread\n  · new comment\n");
+        assert_eq!(
+            wire.matches('\n').count(),
+            1,
+            "one frame is one line: {wire}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(wire.trim_end()).unwrap();
+        assert!(
+            parsed["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("\n  · new comment"),
+            "the receiver still gets the layout back"
+        );
+    }
+
     /// We assert no permission class. A `from-mode` here would reach bypass
     /// receivers, and would be held by every prompting one — see ADR-0020.
     #[test]
     fn the_frame_asserts_no_permission_class_and_impersonates_no_one() {
-        let wire = frame("mail on topic t.a");
+        let wire = frame("[agent-mailbox] mail on 1 topic");
         assert!(!wire.contains("from-mode"), "we claim no permission class");
         assert!(
             !wire.contains("cross-session-message"),
@@ -196,16 +218,14 @@ mod tests {
         );
     }
 
-    /// Topic names are attacker-adjacent input (they come from a repo slug), so the
-    /// frame must be built by a JSON serialiser, not a format string.
+    /// Topic names and subject lines are attacker-adjacent input (they come from a
+    /// repo slug and from adapter output), so the frame must be built by a JSON
+    /// serialiser, not a format string.
     #[test]
     fn content_with_quotes_stays_valid_json() {
-        let wire = frame(r#"mail on topic "weird" \ topic"#);
+        let wire = frame(r#"mail on "weird" \ topic"#);
         let parsed: serde_json::Value = serde_json::from_str(wire.trim_end()).unwrap();
-        assert_eq!(
-            parsed["message"]["content"],
-            r#"mail on topic "weird" \ topic"#
-        );
+        assert_eq!(parsed["message"]["content"], r#"mail on "weird" \ topic"#);
     }
 
     #[test]
@@ -214,14 +234,17 @@ mod tests {
         let socket = dir.path().join("inbox.sock");
         let rx = capture_one(socket.clone());
 
-        deliver(&socket, "mail on topic t.a").unwrap();
+        deliver(&socket, "[agent-mailbox] mail on 1 topic").unwrap();
 
         let line = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the listener should have received the frame");
         let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(parsed["type"], "user");
-        assert_eq!(parsed["message"]["content"], "mail on topic t.a");
+        assert_eq!(
+            parsed["message"]["content"],
+            "[agent-mailbox] mail on 1 topic"
+        );
     }
 
     /// **A wedged peer must not wedge the daemon.** This delivery runs inside the
@@ -263,7 +286,7 @@ mod tests {
     #[test]
     fn a_missing_socket_is_a_connect_error_not_a_panic() {
         let dir = tempfile::TempDir::new().unwrap();
-        let err = deliver(&dir.path().join("nope.sock"), "mail on topic t.a").unwrap_err();
+        let err = deliver(&dir.path().join("nope.sock"), "[agent-mailbox] mail").unwrap_err();
         assert!(matches!(err, PeerDeliveryError::Connect { .. }));
     }
 }

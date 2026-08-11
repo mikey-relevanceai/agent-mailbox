@@ -50,8 +50,8 @@ fn agent_row(env: &Env, caller: &str, session: &str) -> Option<Value> {
 // ==== the headline: two idle agents poke each other, no human in the loop =======
 
 /// A and B are both registered, and both have an inbox socket. A sends to B: the
-/// daemon delivers to B's socket naming only the topic (and nothing else —
-/// payload-free), B reads the message and sees `from: A`; B replies; A wakes the
+/// daemon delivers to B's socket, naming the topic and who sent it but never the
+/// message itself; B reads the message and sees `from: A`; B replies; A wakes the
 /// same way.
 #[test]
 fn round_trip_two_idle_agents_wake_each_other() {
@@ -76,8 +76,9 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "send a->b",
     );
 
-    // The daemon delivers to B's inbox socket, naming only the topic — that frame IS
-    // the wake wire, so it is where payload-freeness has to hold.
+    // The daemon delivers to B's inbox socket, naming the topic and saying a message
+    // arrived and who from — that frame IS the wake wire, so it is where "describe,
+    // never deliver" has to hold (ADR-0022).
     let frame = inbox_b.next_frame(SETTLE).expect("B is woken on its inbox");
     let content = frame["message"]["content"].as_str().unwrap_or_default();
     assert!(
@@ -85,8 +86,12 @@ fn round_trip_two_idle_agents_wake_each_other() {
         "the wake names B's inbox topic: {content}"
     );
     assert!(
+        content.contains(&format!("message from {a}")),
+        "and who it is from, so B knows who to reply to: {content}"
+    );
+    assert!(
         !content.contains("please review PR 42"),
-        "the wake must not carry the body: {content}"
+        "the wake must not carry the message text: {content}"
     );
 
     // B reads its mail and can see who to reply to.
@@ -178,12 +183,16 @@ fn a_human_with_no_session_can_list_agents_and_poke_one() {
     let frame = inbox_b
         .next_frame(SETTLE)
         .expect("a human's message wakes B like any other");
+    let content = frame["message"]["content"].as_str().unwrap_or_default();
     assert!(
-        frame["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(&format!("agent.{b}")),
-        "the wake names B's inbox topic"
+        content.contains(&format!("agent.{b}")),
+        "the wake names B's inbox topic: {content}"
+    );
+    // The bridge stamps what it VERIFIED, so an unstamped message says so rather
+    // than naming a sender nobody checked.
+    assert!(
+        content.contains("message from an unidentified sender"),
+        "a message with no reply address says so on the wake wire: {content}"
     );
 
     // 4. B reads it. The content is there; `from` is ABSENT, not null and not a
@@ -197,6 +206,68 @@ fn a_human_with_no_session_can_list_agents_and_poke_one() {
         events[0]["body"]
     );
 
+    let _ = env.cleanup(b);
+    guard.assert_clean();
+}
+
+/// `send --subject` is how a sender says what a message is ABOUT without putting
+/// what it SAYS on the wake wire (ADR-0022). The recipient wakes knowing the topic,
+/// the subject, and who sent it — and still has to `read` for the message itself.
+#[test]
+fn a_sent_subject_reaches_the_peer_wake_but_the_message_text_does_not() {
+    let env = Env::new();
+    let daemon = env.start_daemon();
+    let mut guard = env.leak_guard();
+    guard.track_daemon(daemon.pid());
+
+    let (a, b) = ("s-alice", "s-bob");
+    arm_idle(&env, a);
+    arm_idle(&env, b);
+    let inbox_b = env.register_peer(b);
+
+    env.run_as_ok(
+        a,
+        &[
+            "send",
+            b,
+            "--text",
+            "the migration in 0007 drops the wrong column",
+            "--subject",
+            "stop rebasing, PR 42 is wrong",
+            "--link",
+            "https://github.com/acme/web/pull/42",
+        ],
+        "send with a subject",
+    );
+
+    let frame = inbox_b.next_frame(SETTLE).expect("B is woken");
+    let content = frame["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        content.contains(&format!("· from {a}: stop rebasing, PR 42 is wrong")),
+        "the sender's subject, attributed to the sender the BRIDGE verified: {content}"
+    );
+    assert!(
+        content.contains("https://github.com/acme/web/pull/42"),
+        "and the link it pointed at: {content}"
+    );
+    assert!(
+        !content.contains("drops the wrong column"),
+        "the message text still stays in the log until B reads it: {content}"
+    );
+
+    // …where it is waiting, subject and all.
+    let events = env.read_events(b);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["body"]["text"],
+        "the migration in 0007 drops the wrong column"
+    );
+    assert_eq!(
+        events[0]["subject"]["text"],
+        format!("from {a}: stop rebasing, PR 42 is wrong")
+    );
+
+    let _ = env.cleanup(a);
     let _ = env.cleanup(b);
     guard.assert_clean();
 }

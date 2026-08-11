@@ -287,7 +287,15 @@ async fn run() -> Result<(), AdapterError> {
             Some(prior) => {
                 let (next, edges) = apply(prior, &observation);
                 for edge in &edges {
-                    publish_edge(&mut stdout, &topic, edge, &repo_slug, number).await?;
+                    publish_edge(
+                        &mut stdout,
+                        &topic,
+                        edge,
+                        &repo_slug,
+                        number,
+                        observation.pr_url.as_deref(),
+                    )
+                    .await?;
                 }
                 let changed = &next != prior;
                 if changed {
@@ -459,18 +467,21 @@ fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
 }
 
 /// Write one edge as a `Publish` NDJSON line. The body is small opaque content
-/// (never a gh dump — ADR-0001).
+/// (never a gh dump — ADR-0001); the subject is the one line of it the bridge will
+/// show on the wake wire (ADR-0022).
 async fn publish_edge(
     stdout: &mut Stdout,
     topic: &Topic,
     edge: &Edge,
     repo: &str,
     pr: u64,
+    pr_url: Option<&str>,
 ) -> Result<(), AdapterError> {
     let message = Message::Publish(Publish {
         topic: topic.clone(),
         adapter: AdapterId(ADAPTER_ID.to_string()),
         body: edge.body(repo, pr),
+        subject: edge.subject(pr_url),
     });
     write_message(stdout, &message).await?;
     // The highest-value line: log the fired edge with its decision data at info

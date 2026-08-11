@@ -104,13 +104,17 @@ mod tests {
     use crate::error::FramingError;
     use crate::ids::AdapterId;
     use crate::message::{Publish, Subscribe};
+    use crate::subject::Subject;
     use crate::topic::GithubPr;
 
+    /// Carries a subject, so the one-line framing assertion below covers the
+    /// field most able to break it.
     fn sample() -> Message {
         Message::Publish(Publish {
             topic: GithubPr::new("octocat", "hello-world", 42).unwrap().topic(),
             adapter: AdapterId("github-watch".to_string()),
             body: serde_json::json!({ "action": "synchronize" }),
+            subject: Some(Subject::new("new commit", Some("https://example.com/pull/42")).unwrap()),
         })
     }
 

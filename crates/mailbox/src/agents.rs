@@ -9,9 +9,10 @@
 //! into its session to arrange it.
 //!
 //! Nothing about the bus changes: an inbox is an ordinary topic, a `send` is an
-//! ordinary publish, and the wake it produces is the ordinary payload-free kick.
-//! This module is the thin policy that makes those primitives usable as agent
-//! addressing.
+//! ordinary publish, and the wake it produces is the ordinary one — the recipient
+//! is told a message arrived and who from, never what it says (see
+//! [`message_subject`]). This module is the thin policy that makes those primitives
+//! usable as agent addressing.
 //!
 //! # Why `send` to an unregistered agent is an ERROR, not a publish
 //!
@@ -50,7 +51,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, Event, Timestamp, Topic, TopicError, inbox_topic};
+use mailbox_protocol::{AdapterId, Event, Subject, Timestamp, Topic, TopicError, inbox_topic};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
@@ -153,12 +154,16 @@ pub struct Sent {
 /// that arrived carrying one, so an anonymous sender cannot forge a reply address
 /// the bridge did not verify. See the module docs for why absent beats a
 /// placeholder.
+///
+/// `subject` is the sender's optional description of what the message is about; the
+/// bridge composes the final subject line around it (see [`message_subject`]).
 pub async fn send(
     bus: &Bus,
     storage: &Storage,
     from: Option<SessionId>,
     to: SessionId,
     mut body: Map<String, Value>,
+    subject: Option<Subject>,
 ) -> Result<Sent, SendError> {
     let topic = inbox_topic(&to)?;
     // One rendering of "who sent this" for every log line below; a send with no
@@ -196,14 +201,20 @@ pub async fn send(
         }
     }
 
-    // A normal publish: durable append, then the payload-free kick to every
-    // subscriber of the inbox topic (the recipient's waiter).
+    // Recorded before the subject is composed: the log line below reports whether
+    // the SENDER described the message, not whether the bridge ended up with a
+    // subject (it always does — see `message_subject`).
+    let described = subject.is_some();
+
+    // A normal publish: durable append, then the wake to every subscriber of the
+    // inbox topic (the recipient).
     let event = bus
         .publish(
             topic.clone(),
             AdapterId(AGENT_ADAPTER.to_string()),
             Timestamp(now_millis()),
             Value::Object(body),
+            Some(message_subject(subject, from.as_ref())),
         )
         .await?;
 
@@ -212,10 +223,59 @@ pub async fn send(
         to = to.as_str(),
         topic = topic.as_str(),
         offset = event.offset.0,
-        // Never the body: a peer message is untrusted content like any other.
+        // Whether the sender described the message, not what it said: the flag
+        // explains what the recipient's wake looked like, which is the thing an
+        // operator is reconstructing here. Never the body — a peer message is
+        // untrusted content like any other.
+        described,
         "delivered a message to a peer agent's inbox"
     );
     Ok(Sent { to, topic, event })
+}
+
+/// The subject line a peer message wakes its recipient with.
+///
+/// Composed HERE rather than at the CLI so every caller of `send` — the command, a
+/// script on the control socket, a future adapter — produces the same line, and so
+/// the sender is stamped by the bridge that verified it rather than claimed by the
+/// message.
+///
+/// # Why the message text is not the subject
+///
+/// A wake describes what is waiting; it does not deliver it. Folding the message
+/// body into the wake would make the mail readable without `read`, which is the one
+/// thing the wake wire is not for (ADR-0022) — and it would put a peer's words into
+/// a turn the recipient has not chosen to spend on them yet. So the default says
+/// only that a message arrived and who from, and a sender with something more useful
+/// to say says it deliberately, with `--subject`.
+///
+/// # Why the sender comes FIRST
+///
+/// A `Subject` truncates from the end, so anything after the sender's text is what
+/// a long subject eats. Leading with the attribution makes "who is asking" the one
+/// part that cannot be crowded out — by an over-long subject, or by one written to
+/// push the identity off the line.
+fn message_subject(subject: Option<Subject>, from: Option<&SessionId>) -> Subject {
+    // The bridge states the sender it VERIFIED, or says plainly that there is none.
+    // Never a placeholder that reads like an address (see the module docs).
+    let sender = match from {
+        Some(from) => from.as_str(),
+        None => "an unidentified sender",
+    };
+    let text = match &subject {
+        Some(subject) => format!("from {sender}: {}", subject.text()),
+        // Nothing to describe: all we can honestly report is that something arrived,
+        // which is still worth a turn — there is mail to read.
+        None => format!("message from {sender}"),
+    };
+    // The sender's link travels untouched — only the text gains the attribution, and
+    // where the sender was pointing is not ours to rewrite.
+    let link = subject.as_ref().and_then(Subject::link);
+    // Total, not `Option`: every arm above formats a non-empty string around a
+    // non-empty sender, and empty text is the only thing `Subject::new` refuses. An
+    // `Option` here would be a branch no caller can reach and every reader has to
+    // disprove.
+    Subject::new(&text, link).expect("a composed message subject always names a sender")
 }
 
 /// Whether `session` is subscribed to its own inbox topic (i.e. is addressable).
@@ -278,6 +338,51 @@ mod tests {
         (bus, storage, dir)
     }
 
+    #[test]
+    fn a_message_subject_states_the_sender_the_bridge_verified() {
+        let alice = SessionId::new("s-alice");
+
+        let stated = message_subject(None, Some(&alice));
+        assert_eq!(stated.text(), "message from s-alice");
+
+        let described = message_subject(
+            Subject::new("PR 42 review finished", Some("https://example.com/pull/42")).ok(),
+            Some(&alice),
+        );
+        assert_eq!(described.text(), "from s-alice: PR 42 review finished");
+        assert_eq!(
+            described.link(),
+            Some("https://example.com/pull/42"),
+            "the sender's link is carried, not rewritten"
+        );
+
+        // A human at a terminal has no reply address, and the subject says so rather
+        // than naming a sender nobody checked.
+        let anonymous = message_subject(Subject::new("stop", None).ok(), None);
+        assert_eq!(anonymous.text(), "from an unidentified sender: stop");
+        assert_eq!(
+            message_subject(None, None).text(),
+            "message from an unidentified sender"
+        );
+    }
+
+    /// A subject long enough to overflow the line must lose its own tail, never the
+    /// sender: "who is asking" is the part the recipient cannot reconstruct.
+    #[test]
+    fn a_crowding_subject_cannot_push_the_sender_off_the_line() {
+        let alice = SessionId::new("s-alice");
+        let crowding = Subject::new(&"x".repeat(mailbox_protocol::MAX_TEXT_CHARS), None).unwrap();
+
+        let composed = message_subject(Some(crowding), Some(&alice));
+
+        assert!(
+            composed.text().starts_with("from s-alice: "),
+            "{}",
+            composed.text()
+        );
+        assert!(composed.text().ends_with('…'), "{}", composed.text());
+    }
+
     /// Register `session`'s inbox exactly as `harness arm` does — via the guarded
     /// auto-inbox path (the only path the tombstone scopes to).
     async fn register(bus: &Bus, session: &SessionId) {
@@ -300,6 +405,7 @@ mod tests {
             Some(a.clone()),
             b.clone(),
             body.as_object().unwrap().clone(),
+            None,
         )
         .await
         .unwrap();
@@ -328,6 +434,7 @@ mod tests {
             Some(a),
             b.clone(),
             body.as_object().unwrap().clone(),
+            None,
         )
         .await
         .unwrap();
@@ -357,6 +464,7 @@ mod tests {
             None,
             b.clone(),
             body.as_object().unwrap().clone(),
+            None,
         )
         .await
         .unwrap();
@@ -387,6 +495,7 @@ mod tests {
             None,
             b.clone(),
             body.as_object().unwrap().clone(),
+            None,
         )
         .await
         .unwrap();
@@ -409,6 +518,7 @@ mod tests {
             Some(SessionId::new("s-a")),
             ghost.clone(),
             Map::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -439,6 +549,7 @@ mod tests {
             Some(SessionId::new("s-a")),
             b.clone(),
             Map::new(),
+            None,
         )
         .await
         .unwrap_err();

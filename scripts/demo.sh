@@ -5,9 +5,9 @@
 #
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
 #   2. an *idle* session wakes when mail lands (the daemon writes that session's
-#      Claude Code inbox socket as part of the publish, delivering a payload-free
-#      "mail on topic X"
-#      reminder);
+#      Claude Code inbox socket as part of the publish, delivering an
+#      "[agent-mailbox] mail on ..." reminder that names the topic and what
+#      changed on it — never the event body);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
 #   4. `unwatch` / end-session tears the adapter down (no zombie pollers).
@@ -63,6 +63,7 @@ SESSION="demo-session"
 # session, and a hook reads `session_id` from its payload on stdin.)
 export CLAUDE_CODE_SESSION_ID="${SESSION}"
 SERVE_PID=""
+LISTENER_PID=""
 
 cleanup() {
   # Best-effort teardown so a re-run starts clean and no daemon is left behind.
@@ -73,6 +74,13 @@ cleanup() {
   if [[ -n "${SERVE_PID}" ]] && kill -0 "${SERVE_PID}" 2>/dev/null; then
     kill "${SERVE_PID}" 2>/dev/null || true
     wait "${SERVE_PID}" 2>/dev/null || true
+  fi
+  # The fake inbox listener too. ONE exit trap kills everything this script
+  # started: a second `trap ... EXIT` would silently REPLACE this one, which is
+  # exactly how the daemon came to outlive the demo — holding the script's stdout
+  # pipe open, so a piped run appeared to hang after printing "OK".
+  if [[ -n "${LISTENER_PID}" ]] && kill -0 "${LISTENER_PID}" 2>/dev/null; then
+    kill "${LISTENER_PID}" 2>/dev/null || true
   fi
   rm -rf "${WORK_DIR}"
 }
@@ -148,7 +156,6 @@ LISTENER
 
 python3 "${WORK_DIR}/listen.py" "${INBOX}" "${FRAME}" &
 LISTENER_PID=$!
-trap 'kill "${LISTENER_PID}" 2>/dev/null || true' EXIT
 wait_for "the demo inbox socket" test -S "${INBOX}"
 
 # Register the session the way Claude Code does, naming that socket.
@@ -161,15 +168,21 @@ echo "{\"session_id\":\"${SESSION}\",\"hook_event_name\":\"SessionStart\"}" \
   | "${MAILBOX}" harness session-start
 
 echo "publishing while the session is idle ..."
-run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}'"
+run "${MAILBOX} publish demo.hello --body '{\"msg\":\"wake up\"}' --subject 'the demo said hello' --link 'https://example.com/demo'"
 
 wait_for "the wake to reach the session's inbox" test -s "${FRAME}"
-echo "the wake delivered to the session's inbox (topic NAMES only, never a body):"
+echo "the wake delivered to the session's inbox (what changed and where — never the body):"
 sed 's/^/    /' "${FRAME}"
 if grep -q "wake up" "${FRAME}"; then
-  echo "error: the wake carried the event body; it must be payload-free" >&2
+  echo "error: the wake carried the event body; it must carry only the subject" >&2
   exit 1
 fi
+for expected in "[agent-mailbox]" "demo.hello" "the demo said hello" "https://example.com/demo"; do
+  if ! grep -qF "${expected}" "${FRAME}"; then
+    echo "error: the wake did not carry ${expected}" >&2
+    exit 1
+  fi
+done
 
 run "${MAILBOX} read"
 

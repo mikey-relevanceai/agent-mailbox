@@ -38,7 +38,7 @@
 
 use serde_json::Value;
 
-use crate::snapshot::{CiRollup, MergeableObserved, Observation, PrStateObserved};
+use crate::snapshot::{CiRollup, FailedCheck, MergeableObserved, Observation, PrStateObserved};
 
 /// Env var overriding the `gh` binary (card-10 decision 2: injectable for tests).
 pub const ENV_GH_BIN: &str = "MAILBOX_GH_BIN";
@@ -138,7 +138,10 @@ impl GhClient {
                 "--repo".to_string(),
                 self.slug(),
                 "--json".to_string(),
-                "state,mergeable,statusCheckRollup".to_string(),
+                // `url` rides along on a call we already make: it costs nothing and
+                // it is the only correct way to link to a PR on a host that may not
+                // be github.com.
+                "state,mergeable,statusCheckRollup,url".to_string(),
             ])
             .await?;
         let pr = parse_pr_view(&view)?;
@@ -155,6 +158,7 @@ impl GhClient {
             max_comment_id,
             ci: pr.ci,
             failed_checks: pr.failed_checks,
+            pr_url: pr.url,
         })
     }
 
@@ -205,7 +209,9 @@ struct PrView {
     state: PrStateObserved,
     mergeable: MergeableObserved,
     ci: CiRollup,
-    failed_checks: Vec<String>,
+    failed_checks: Vec<FailedCheck>,
+    /// GitHub's own URL for this PR, when it reported one.
+    url: Option<String>,
 }
 
 /// Parse the `gh pr view` payload into lifecycle state, mergeability, the CI
@@ -241,11 +247,21 @@ fn parse_pr_view(view: &str) -> Result<PrView, GhError> {
     })?;
     let (ci, failed_checks) = reduce_ci(checks);
 
+    // NOT `required`: the URL only makes an event more legible, so a response
+    // without one is a subject with no link — never a skipped poll, and never a
+    // suppressed edge (review item A is about signals that DRIVE edges).
+    let url = view
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|url| !url.is_empty());
+
     Ok(PrView {
         state,
         mergeable,
         ci,
         failed_checks,
+        url,
     })
 }
 
@@ -305,9 +321,9 @@ fn parse_max_id(label: &str, body: &str) -> Result<u64, GhError> {
     Ok(max)
 }
 
-/// Reduce gh's `statusCheckRollup` array to a whole-PR rollup + the names of the
-/// checks that are currently failing (card-10 decision 3).
-fn reduce_ci(checks: &[Value]) -> (CiRollup, Vec<String>) {
+/// Reduce gh's `statusCheckRollup` array to a whole-PR rollup + the checks that are
+/// currently failing (card-10 decision 3).
+fn reduce_ci(checks: &[Value]) -> (CiRollup, Vec<FailedCheck>) {
     if checks.is_empty() {
         return (CiRollup::None, Vec::new());
     }
@@ -315,7 +331,10 @@ fn reduce_ci(checks: &[Value]) -> (CiRollup, Vec<String>) {
     let mut failed = Vec::new();
     for check in checks {
         match classify_check(check) {
-            CheckOutcome::Failing => failed.push(check_name(check)),
+            CheckOutcome::Failing => failed.push(FailedCheck {
+                name: check_name(check),
+                url: check_url(check),
+            }),
             CheckOutcome::Pending => any_pending = true,
             CheckOutcome::Success => {}
         }
@@ -376,6 +395,19 @@ fn check_name(check: &Value) -> String {
         .to_string()
 }
 
+/// Where a check reports: `detailsUrl` on a CheckRun, `targetUrl` on a
+/// StatusContext, and `None` when neither is present or either is blank.
+///
+/// This is the link an agent follows to the *actual* failure — the run's own log
+/// page — rather than back to the PR it was already looking at.
+fn check_url(check: &Value) -> Option<String> {
+    ["detailsUrl", "targetUrl"]
+        .iter()
+        .find_map(|field| check.get(field).and_then(Value::as_str))
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +437,7 @@ mod tests {
         let view = r#"{
             "state": "OPEN",
             "mergeable": "MERGEABLE",
+            "url": "https://github.com/acme/web/pull/42",
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
             ]
@@ -414,15 +447,22 @@ mod tests {
         assert_eq!(pr.mergeable, MergeableObserved::Mergeable);
         assert_eq!(pr.ci, CiRollup::Success);
         assert!(pr.failed_checks.is_empty());
+        assert_eq!(
+            pr.url.as_deref(),
+            Some("https://github.com/acme/web/pull/42")
+        );
     }
 
+    /// A failing check carries where it reports, so the event can point at the run
+    /// rather than back at the PR.
     #[test]
     fn parses_conflicting_with_failing_and_pending_checks() {
         let view = r#"{
             "state": "OPEN",
             "mergeable": "CONFLICTING",
             "statusCheckRollup": [
-                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE",
+                 "detailsUrl": "https://github.com/acme/web/actions/runs/9/job/2"},
                 {"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": ""},
                 {"__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS"}
             ]
@@ -430,7 +470,59 @@ mod tests {
         let pr = parse_pr_view(view).unwrap();
         assert_eq!(pr.mergeable, MergeableObserved::Conflicting);
         assert_eq!(pr.ci, CiRollup::Failure);
-        assert_eq!(pr.failed_checks, vec!["build".to_string()]);
+        assert_eq!(
+            pr.failed_checks,
+            vec![FailedCheck {
+                name: "build".to_string(),
+                url: Some("https://github.com/acme/web/actions/runs/9/job/2".to_string()),
+            }]
+        );
+    }
+
+    /// The two shapes gh returns report their URL under different keys, and a check
+    /// that reports neither is still a failing check — just one with nowhere to send
+    /// the reader.
+    #[test]
+    fn a_failing_check_takes_its_url_from_either_shape_or_none() {
+        let view = r#"{
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [
+                {"__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE",
+                 "targetUrl": "https://ci.example.com/build/9"},
+                {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED",
+                 "conclusion": "FAILURE", "detailsUrl": ""}
+            ]
+        }"#;
+        let pr = parse_pr_view(view).unwrap();
+        assert_eq!(pr.ci, CiRollup::Failure);
+        assert_eq!(
+            pr.failed_checks,
+            vec![
+                FailedCheck {
+                    name: "ci/legacy".to_string(),
+                    url: Some("https://ci.example.com/build/9".to_string()),
+                },
+                FailedCheck::new("lint"),
+            ]
+        );
+    }
+
+    /// **A missing url must never cost an edge.** It is decoration on the event, not
+    /// a signal that drives one — so unlike `state`/`mergeable`/`statusCheckRollup`
+    /// (review item A) its absence parses cleanly and simply yields no link.
+    #[test]
+    fn a_missing_url_is_not_a_parse_error() {
+        let pr =
+            parse_pr_view(r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[]}"#)
+                .unwrap();
+        assert_eq!(pr.url, None);
+
+        let pr = parse_pr_view(
+            r#"{"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[],"url":""}"#,
+        )
+        .unwrap();
+        assert_eq!(pr.url, None, "a blank url is no url");
     }
 
     #[test]

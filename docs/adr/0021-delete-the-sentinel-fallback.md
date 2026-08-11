@@ -131,7 +131,10 @@ register themselves, so they read as gone and cannot be woken.
 Their mechanisms are gone; these survive them and still bind:
 
 - **Payload-free wake** (ADR-0001): the frame carries topic names only. The socket
-  *could* carry a body and must not.
+  *could* carry a body and must not. *(Amended by
+  [ADR-0022](0022-the-wake-carries-a-subject.md) to **pointer, not payload**: the
+  frame also carries counts and each event's one-line `subject`. Bodies still never
+  cross.)*
 - **A health check must not depend on the component most likely to be broken**
   (ADR-0015/0016): `doctor` still needs no daemon.
 - **Silence is not death** (ADR-0009): an idle session is silent by design, so
