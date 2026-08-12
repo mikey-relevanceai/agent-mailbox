@@ -142,6 +142,9 @@ MVP rules:
    an interested session is still alive
    ([ADR-0011](../adr/0011-retry-failed-watches-on-sweep.md)), so a give-up caused
    by a transient upstream outage self-heals instead of needing a manual re-`watch`.
+   The error event is surfaced **once per outage**, not once per retry, and is
+   withdrawn by an `adapter_recovered` event when the adapter stays up again
+   ([ADR-0023](../adr/0023-one-give-up-notice-per-outage.md)).
 8. **No agent-owned infinite bash.** Agents declare intent; they do not hold the
    poll loop in a tool background task.
 

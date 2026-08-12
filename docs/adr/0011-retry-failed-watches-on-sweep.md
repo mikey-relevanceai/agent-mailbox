@@ -1,8 +1,10 @@
 # ADR-0011: A give-up is not permanent — the sweep retries failed watches
 
 - Status: **Accepted — but the liveness probe below is amended by
-  [ADR-0017](0017-daemon-bumps-the-sentinel.md).** The decision (retry a `Failed`
-  watch once per sweep while an interested session lives) is in force. Every
+  [ADR-0017](0017-daemon-bumps-the-sentinel.md), and the give-up event rate in
+  Consequences by [ADR-0023](0023-one-give-up-notice-per-outage.md).** The decision
+  (retry a `Failed` watch once per sweep while an interested session lives) is in
+  force. Every
   reference below to "the watcher-pidfile liveness probe (ADR-0009)" now reads the
   process table instead — `doctor::live_claude_sessions`. There is no watcher and no
   pidfile.
@@ -10,7 +12,9 @@
 - Amends: design/01 rule 7 (adapter crash → give up after N failures), and
   [ADR-0010](0010-resume-watches-on-restart.md), whose `Failed`-is-terminal carve-out
   this softens for a watch whose session is still alive.
-- Amended by: [ADR-0017](0017-daemon-bumps-the-sentinel.md) (the liveness signal).
+- Amended by: [ADR-0017](0017-daemon-bumps-the-sentinel.md) (the liveness signal),
+  and [ADR-0023](0023-one-give-up-notice-per-outage.md) (the retry still happens
+  every sweep; it no longer re-publishes the give-up each time).
 
 ## Context
 
@@ -83,6 +87,11 @@ broken adapter is re-tried at most one backoff burst per interval.
   again. That is bounded, low-rate, and visible — and stops the moment the session
   ends. The alternative (stay silent, stay dead) is the worse failure for a wake
   bus whose entire purpose is not to miss events.
+  **Amended by [ADR-0023](0023-one-give-up-notice-per-outage.md):** this estimate
+  was wrong, because the usual cause of a give-up is one broken *network*, which
+  fails every watch at once — eight topics × 13 identical events in one afternoon.
+  The retry still runs every sweep; the give-up is now announced once per outage and
+  withdrawn by an `adapter_recovered` event. This is the revisit invited below.
 
 ## Alternatives considered
 
