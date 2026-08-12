@@ -1689,10 +1689,21 @@ async fn a_watch_that_never_gave_up_announces_no_recovery() {
 /// stale by the time it fires — deterministically, with no race to lose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adapters_that_start_and_die_never_count_as_recovered() {
-    // Short enough that every armed stability timer fires within the test, so the
-    // assertion is that they all declined to publish — not that they never ran.
+    // `reset_after` has to sit in a window, and the window is why this is spelled
+    // out rather than tuned to taste. It is BOTH the stable-run threshold that
+    // resets the crash streak and the delay before a stability timer fires, so:
+    //
+    //   crash lifetime  <<  reset_after  <<  the poll_until budget (6s)
+    //
+    // Too LOW and a crash that outlived it counts as a stable run, the streak
+    // resets every time, the watch never reaches `Failed`, and this hangs — which
+    // is exactly how a 120ms value passed locally (the fixture aborts in ~1ms) and
+    // then timed out on a loaded CI runner, where spawning a process and aborting
+    // it took longer than that. Too HIGH and the timers never fire inside the test,
+    // which would pass for the wrong reason. 1.5s is ~1000x the fixture's lifetime
+    // and a quarter of the budget.
     let policy = RestartPolicy {
-        reset_after: Duration::from_millis(120),
+        reset_after: Duration::from_millis(1500),
         ..fast_policy()
     };
     let (bus, storage, supervisor, _dir) = fresh_with(FixtureResolver::crash(), policy).await;
@@ -1732,8 +1743,9 @@ async fn adapters_that_start_and_die_never_count_as_recovered() {
         })
         .await;
     }
-    // Well past `reset_after`, so every timer armed above has certainly fired.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Well past `reset_after` measured from the LAST spawn above, so every timer
+    // armed during this test has certainly fired and declined.
+    tokio::time::sleep(Duration::from_millis(1800)).await;
 
     assert_eq!(
         supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
