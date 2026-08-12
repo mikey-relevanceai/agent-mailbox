@@ -143,11 +143,21 @@ impl SupervisorEvent {
             Self::Recovered => "mailbox is watching this again: the adapter recovered".to_string(),
         };
         // `.ok()` because a subject is never worth failing a publish over — least of
-        // all these publishes, whose whole job is to surface a change of state.
+        // all these publishes, whose whole job is to surface a change of state. Both
+        // texts are statically well-formed, so `None` means one of them was EDITED
+        // into something unparseable; `subjects_are_well_formed` fails the build
+        // first, and the publish path logs if it ever happens anyway.
         Subject::new(&text, None).ok()
     }
 
     /// The opaque body, naming the entity it concerns.
+    ///
+    /// Deliberately the flat `repo`/`pr` pair for both events rather than fields
+    /// destructured per [`WatchTarget`] variant: these two are the mailbox talking
+    /// about a watch, so one shape across both keeps them readable by a consumer
+    /// that does not care which kind of entity broke. (A `Stub` watch therefore
+    /// reports its label as `repo` and `0` as `pr`, as the give-up event already
+    /// did.) The entity itself is named by the topic, which is exact.
     fn body(self, watch: &Watch) -> Value {
         let repo = watch.target.repo_column();
         let pr = watch.target.pr_column();
@@ -1182,6 +1192,18 @@ impl Actor {
             );
             return;
         };
+        // A subject-less wake says nothing but "something happened", which for the
+        // recovery event defeats its whole purpose. Unreachable for both texts as
+        // written, so if it ever fires it is a broken edit, not a bad input — and
+        // the log is the only place that would show it.
+        let subject = event.subject();
+        if subject.is_none() {
+            warn!(
+                watch = watch_id.get(),
+                event = event_kind,
+                "could not build a subject for a supervisor event; publishing it subject-less"
+            );
+        }
         match self
             .bus
             .publish(
@@ -1189,7 +1211,7 @@ impl Actor {
                 AdapterId(SUPERVISOR_ADAPTER_ID.to_string()),
                 Timestamp(now_millis()),
                 event.body(&watch),
-                event.subject(),
+                subject,
             )
             .await
         {
@@ -1482,5 +1504,69 @@ mod tests {
         // Nowhere to insert the key, so a non-object config is unchanged.
         let injected = inject_baseline(AdapterConfig::new(Value::Null), Some(json!({ "x": 1 })));
         assert_eq!(*injected.value(), Value::Null);
+    }
+
+    fn watch_fixture() -> Watch {
+        Watch {
+            id: WatchId::new(1),
+            target: WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 42,
+            },
+            interval: Duration::from_secs(60),
+            state: WatchState::Failed,
+        }
+    }
+
+    /// The give-up body carries the failure count, which is the only thing in it a
+    /// reader could not get from the topic — and the only field the integration
+    /// tests, which match on `event` alone, would not notice the loss of.
+    #[test]
+    fn giveup_body_names_the_entity_and_the_failure_count() {
+        let body = SupervisorEvent::GaveUp { failures: 5 }.body(&watch_fixture());
+        assert_eq!(body["event"], EVENT_ADAPTER_GAVE_UP);
+        assert_eq!(body["consecutive_failures"], 5);
+        assert_eq!(body["repo"], "octocat/hello-world");
+        assert_eq!(body["pr"], 42);
+        assert_eq!(body["source"], SUPERVISOR_ADAPTER_ID);
+    }
+
+    /// Recovery says only that the watch is back — no failure count, because the
+    /// outage it withdraws is over and its size is no longer actionable.
+    #[test]
+    fn recovery_body_names_the_entity_and_nothing_about_failures() {
+        let body = SupervisorEvent::Recovered.body(&watch_fixture());
+        assert_eq!(body["event"], EVENT_ADAPTER_RECOVERED);
+        assert_eq!(body["repo"], "octocat/hello-world");
+        assert_eq!(body["pr"], 42);
+        assert_eq!(
+            body.get("consecutive_failures"),
+            None,
+            "a recovery has no failure count to report"
+        );
+    }
+
+    /// Both subjects must actually parse. They are the only thing a woken agent
+    /// sees (ADR-0022), and `subject()` swallows a parse failure rather than fail a
+    /// publish — so without this, editing either text into something unparseable
+    /// would degrade a live wake to silence with nothing failing first.
+    #[test]
+    fn subjects_are_well_formed() {
+        let giveup = SupervisorEvent::GaveUp { failures: 5 }
+            .subject()
+            .expect("the give-up subject parses");
+        assert!(
+            giveup.text().contains("stopped watching this"),
+            "got {:?}",
+            giveup.text()
+        );
+        let recovered = SupervisorEvent::Recovered
+            .subject()
+            .expect("the recovery subject parses");
+        assert!(
+            recovered.text().contains("watching this again"),
+            "got {:?}",
+            recovered.text()
+        );
     }
 }
