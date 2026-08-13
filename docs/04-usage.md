@@ -374,9 +374,9 @@ them; `mailbox status` confirms who you are.
 
 | Session | Commands | Why |
 |---|---|---|
-| **required** | `read`, `status`, `subscribe`, `unsubscribe`, `watch`, `unwatch` | The caller IS the subject — "my unread", "my state", "my interest". They have no meaning without an identity, so they fail with an error naming the variable. |
-| **optional** | `send`, `agents` | The identity is a courtesy added on the way: `send` stamps a reply address, `agents` marks which row is you. Both work without one — see [§4's human poke](#a-human-poking-an-agent-from-a-terminal). |
-| **never** | `publish`, `topics`, `doctor` | `publish` resolves no caller at all (ADR-0018), `topics` is a global read, and `doctor` probes *named* sessions (it reads the ambient one only to warn that a caller cannot measure itself). |
+| **required** | `read`, `subscribe`, `unsubscribe`, `watch`, `unwatch` | The caller IS the subject — "my unread", "my interest". They have no meaning without an identity, so they fail with an error naming the variable. |
+| **optional** | `send`, `agents`, `status` | The identity buys an extra, not the answer: `send` stamps a reply address, `agents` marks which row is you, `status` adds your own half to a bridge-global watch table. All three work without one — see [§4's human poke](#a-human-poking-an-agent-from-a-terminal) and [§5](#5-mailbox-status-for-humans). |
+| **never** | `publish`, `topics`, `doctor` | `publish` resolves no caller at all (ADR-0018), `topics` is a global read, and `doctor` probes *named* sessions (since [ADR-0021](adr/0021-delete-the-sentinel-fallback.md) deleted the probe it does not read the ambient one at all — a session can measure itself). |
 
 To run a command **as a named session** from a script or by hand (there is nothing in
 the agent loop that needs this), set the variable for that one command:
@@ -566,8 +566,9 @@ still lands durably in its inbox, it simply has nobody to collect it.
 
 Peer-to-peer is the headline, but the same two commands are how **you** reach your own
 agents from an ordinary shell — no Claude Code session, no `CLAUDE_CODE_SESSION_ID`,
-nothing to set up. `agents` and `send` are the two commands that do not need a caller
-identity, precisely so this works:
+nothing to set up. `agents` and `send` do not need a caller identity, precisely so this
+works (nor does [`status`](#status-from-a-terminal-with-no-session), if you want to see
+what the bridge is doing first):
 
 ```console
 $ env -u CLAUDE_CODE_SESSION_ID mailbox agents
@@ -628,7 +629,8 @@ subscribers and no events (a fresh inbox) is listed just as honestly as a busy o
 
 `status` is the human-facing window into a session — **and the answer to "who am
 I"**, which is why there is no separate `whoami`. It never consumes events (it counts,
-it does not `read`):
+it does not `read`). A session id is **optional**: with one you get the whole report,
+without one you get [the bridge's half](#status-from-a-terminal-with-no-session):
 
 ```bash
 mailbox status
@@ -696,6 +698,39 @@ In `--json` on the normal path the verdict is the `wake` key, alongside the exis
 ```bash
 mailbox status --json | jq -r .wake      # reachable | no-inbox | unregistered | unknown
 ```
+
+### `status` from a terminal, with no session
+
+The watch table is **bridge-global** — the same rows for every caller, with `interest`
+summed across every session — so `status` answers with no `CLAUDE_CODE_SESSION_ID` at
+all. That is the human's view of the daemon: what is being watched, whether each poller
+is up, and on what pid.
+
+```bash
+$ env -u CLAUDE_CODE_SESSION_ID mailbox status
+session: none (no CLAUDE_CODE_SESSION_ID — wake, inbox, subscriptions and unread are per-session, so this is the bridge's half only)
+watches:
+  github-pr myrepo#42  state=running interest=1 interval=60s child=pid 51234
+```
+
+The session half is **absent, not blanked**. In `--json` the `session`, `wake`,
+`inbox`, `subscriptions`, `subscription_count` and `unread` keys are omitted entirely
+rather than emitted as `null` or `0`:
+
+```bash
+$ env -u CLAUDE_CODE_SESSION_ID mailbox status --json
+{"result":"status","watches":[{"kind":"github-pr","repo":"me/myrepo","pr":42,"interval_ms":60000,"interest":1,"state":"running","pid":51234}]}
+```
+
+A `subscription_count` of `0` there would answer "how many topics am I on?" for a
+caller who is nobody, and `wake: unknown` is the specific claim "the registry could not
+be read" — neither is true, so neither is said. **With** a session every key keeps its
+exact top-level place, so the status line below is unaffected.
+
+> Do not invent a session id to get past this. `CLAUDE_CODE_SESSION_ID=me mailbox
+> status` works, and answers `subscriptions: none`, `unread: none` and `wake:
+> unregistered` about a session that has never existed. If you want to prove a session
+> id is set, `mailbox read` is the honest check.
 
 ### Putting the subscription count in a Claude Code status line
 

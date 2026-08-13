@@ -522,13 +522,15 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::Unwatch { session, .. }
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
-        | Request::Status { session }
         | Request::EndSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
         // logged by the agents module with both ends) — and there may be none, when
         // a human sent it. `agents` marks its caller and otherwise ignores it, so it
-        // too may arrive without one. Both log as `session="-"`, like a publish.
-        Request::Send { from: session, .. } | Request::Agents { session } => session.as_ref(),
+        // too may arrive without one, as does `status` (whose watch table is global).
+        // All three log as `session="-"`, like a publish.
+        Request::Send { from: session, .. }
+        | Request::Agents { session }
+        | Request::Status { session } => session.as_ref(),
     }
 }
 
@@ -849,9 +851,9 @@ async fn unwatch_stub(
 }
 
 /// Thin translation over [`mailbox::watch::status`].
-async fn status(storage: &Storage, session: SessionId) -> Response {
-    match mailbox::watch::status(storage, session.clone()).await {
-        Ok(view) => Response::Status(StatusReport::from_view(session, view)),
+async fn status(storage: &Storage, session: Option<SessionId>) -> Response {
+    match mailbox::watch::status(storage, session).await {
+        Ok(view) => Response::Status(StatusReport::from_view(view)),
         Err(err) => Response::error(err.to_string()),
     }
 }
