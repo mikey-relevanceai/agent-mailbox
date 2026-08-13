@@ -33,9 +33,24 @@
 
 use std::collections::BTreeSet;
 
+use tracing::warn;
+
 use mailbox_protocol::SessionId;
 
 use crate::claude_registry::ClaudeRegistry;
+
+/// What to do about [`Reachability::NoInbox`], the one fault.
+///
+/// A constant rather than a per-variant `Option` lookup, because every caller reaches
+/// it having ALREADY established it is on the fault path — the `subscribe`/`watch`
+/// refusal, `status`'s `wake:` line, and `doctor`'s footer. Handed an `Option` each of
+/// them had to paper over the impossible `None`, and the papering-over is what could go
+/// quiet: a fault reported with nothing to do about it, or a dangling "no-inbox — ".
+pub const NO_INBOX_REMEDY: &str = "Claude Code bound this session no inbox socket, so nothing can wake it. \
+     Restart the session. If it persists, the cross-session messaging feature \
+     is off for it — check `claude --version` (2.1.226+) and that none of \
+     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC / DISABLE_TELEMETRY / \
+     DO_NOT_TRACK / DISABLE_GROWTHBOOK is set.";
 
 /// Whether a session can be woken, and if not, why not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,19 +92,45 @@ impl Reachability {
             Reachability::Unregistered => "unregistered",
         }
     }
+}
 
-    /// What a human should do about it, or `None` when there is nothing to do.
-    pub fn remedy(&self) -> Option<&'static str> {
+/// What we know about whether a session can be woken — **including not knowing**.
+///
+/// [`Reachability`] is what a registry read *concluded*; this is what the reader
+/// actually has, and the two are not the same when the registry could not be read at
+/// all. Modelled as a variant rather than an `Option<Reachability>` because
+/// [`WakeVerdict::Unknown`] is an answer with its own meaning, not a missing one:
+/// absence of evidence is not evidence of absence (ADR-0009), and an `Option` invites
+/// exactly the collapse that rule forbids — `unwrap_or(NoInbox)`, or an `if let Some`
+/// that quietly skips the case. As a variant it has to be matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeVerdict {
+    /// Read from Claude Code's registry.
+    Known(Reachability),
+    /// The sessions directory could not be located or read, so nothing is known. NOT
+    /// a fault, and never to be reported as one.
+    Unknown,
+}
+
+impl WakeVerdict {
+    /// A stable one-word label, for `--json` and for the head of a human line.
+    ///
+    /// `unknown` is deliberately a word rather than a null: the consumer is a Claude
+    /// Code status line, which prints what it reads.
+    pub fn label(&self) -> &'static str {
         match self {
-            Reachability::Reachable | Reachability::Gone | Reachability::Unregistered => None,
-            Reachability::NoInbox => Some(
-                "Claude Code bound this session no inbox socket, so nothing can wake it. \
-                 Restart the session. If it persists, the cross-session messaging feature \
-                 is off for it — check `claude --version` (2.1.226+) and that none of \
-                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC / DISABLE_TELEMETRY / \
-                 DO_NOT_TRACK / DISABLE_GROWTHBOOK is set.",
-            ),
+            WakeVerdict::Known(reachability) => reachability.label(),
+            WakeVerdict::Unknown => "unknown",
         }
+    }
+}
+
+/// Serialised as its [`WakeVerdict::label`], so every `--json` emission site gets the
+/// same word from the type rather than from remembering to ask for it. Hand-written
+/// rather than derived because the wire form is that one word, not a tagged enum.
+impl serde::Serialize for WakeVerdict {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
     }
 }
 
@@ -184,6 +225,37 @@ pub fn reachability_of(
     } else {
         Reachability::NoInbox
     }
+}
+
+/// Read one session's wake verdict from the registry on disk, with no daemon involved.
+///
+/// The convenience wrapper the CLI uses when it has a session and no registry in hand:
+/// `status` to report the verdict, `subscribe`/`watch` to refuse on it. Both get the
+/// answer from [`reachability_of`], so the command that reports and the command that
+/// refuses cannot disagree — an agent told `wake: reachable` by one and "nothing can
+/// wake it" by the other distrusts both, and falls back to polling.
+///
+/// Deliberately local, so the answer survives the bridge being down: it reads Claude
+/// Code's registry and the process table, exactly as `doctor` does.
+pub fn wake_verdict(session: &SessionId) -> WakeVerdict {
+    // Two distinct ways to know nothing, and only one of them leaves a trace of its
+    // own: `read_dir` warns about a directory it could not read, while a directory
+    // that cannot even be RESOLVED never reaches it. Logged here so a fleet of
+    // `wake: unknown` sessions is explainable rather than merely puzzling — `doctor`
+    // says the same thing on stderr for the same error.
+    let Ok(registry) = ClaudeRegistry::open().inspect_err(|error| {
+        warn!(
+            %error,
+            "could not resolve Claude Code's sessions directory; this session's wake \
+             verdict is unknown"
+        );
+    }) else {
+        return WakeVerdict::Unknown;
+    };
+    let Some(live) = live_from(&registry) else {
+        return WakeVerdict::Unknown;
+    };
+    WakeVerdict::Known(reachability_of(session, &registry, &live))
 }
 
 /// The session ids that currently have a live Claude Code process.

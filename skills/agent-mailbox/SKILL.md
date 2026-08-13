@@ -37,8 +37,9 @@ zombie pollers and lost wakes.
 
 `mailbox` knows which session you are, from the `$CLAUDE_CODE_SESSION_ID` that Claude
 Code sets for every command you run. There is **no `--session` flag** — just run the
-commands below. `mailbox status` shows who you are (and works even if the bridge is
-down, though it can only tell you your identity then).
+commands below. `mailbox status` shows who you are and whether anything can wake you
+(and works even if the bridge is down, though those two lines are all it can tell you
+then).
 
 Two commands do not need an identity and so tolerate its absence: `mailbox agents`
 (it only marks which row is you) and `mailbox send` (it only stamps a reply address).
@@ -173,20 +174,36 @@ change that. Tell your human, and suggest restarting the session. Do NOT fall ba
 polling — that is the exact habit this skill exists to remove, and durable mail is
 still readable with `mailbox read` in the meantime.
 
+`mailbox status` shows you the **same** verdict on its `wake:` line, from the same
+read — so the two commands cannot disagree, and a refusal is never something to check
+for a second opinion on.
+
 ### Check state (read-only)
 
 ```bash
 mailbox status
 ```
 
-Shows **who you are** (your session id and your `agent.<id>` inbox — the address a
-peer sends to), your watches (and whether each poller is `running` with a pid), your
-subscriptions, and per-topic unread counts. It does not consume events.
+Shows **whether anything can wake you** (`wake:`), **who you are** (your session id
+and your `agent.<id>` inbox topic — the address a peer sends to), your watches (and
+whether each poller is `running` with a pid), your subscriptions, and per-topic unread
+counts. It does not consume events.
 
-If the bridge is down it still prints your identity and says
-`bridge: UNREACHABLE`, so "who am I" is always answerable — but it **exits
-non-zero**, because the rest of the report is genuinely missing. That is the case to
-tell the user about, not to retry.
+The two top lines answer different questions, and the first is the load-bearing one:
+
+- **`wake: reachable`** — Claude Code bound this session an inbox socket; mail can
+  reach you while you are idle. `wake: no-inbox` means nothing can, and you should act
+  exactly as for a refusal above. `unregistered` (not a Claude Code session, as far as
+  Claude Code knows) and `unknown` (its session registry could not be read) are neither
+  a fault nor a promise.
+- **`inbox topic: agent.<id> (registered)`** — peers can `send` to you. This is about
+  the bus, not about being woken: a `registered` inbox topic on a `no-inbox` session
+  means mail will pile up unread with nothing to announce it.
+
+If the bridge is down it still prints those lines — they are derived locally, not
+fetched — and says `bridge: UNREACHABLE`, so "who am I, and can I be woken" is always
+answerable. It **exits non-zero**, because the rest of the report is genuinely missing.
+That is the case to tell the user about, not to retry.
 
 ### When done
 
@@ -291,7 +308,7 @@ Session identity is automatic; none of these take a session argument.
 | publish to a topic | `mailbox publish TOPIC --body '{...}'` |
 | list topics | `mailbox topics [--prefix agent.]` |
 | read on wake | `mailbox read` |
-| who am I / check state | `mailbox status` |
+| who am I / can I be woken / check state | `mailbox status` |
 | stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N` |
 | unsubscribe | `mailbox unsubscribe TOPIC` |
 

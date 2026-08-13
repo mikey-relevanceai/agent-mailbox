@@ -31,6 +31,9 @@ The ADRs in force for that path are:
 - [**0022**](0022-the-wake-carries-a-subject.md) — what the wake actually SAYS: topic
   names, unread counts, and each event's one-line `subject` and link, behind an
   `[agent-mailbox]` tag. Never a body.
+- [**0024**](0024-status-reports-the-wake-verdict.md) — `status` says whether this
+  session can be woken, from the same read `watch` refuses on, so the self-check and
+  the refusal cannot disagree.
 
 Eight ADRs describe the wake path that was **deleted** in 0021 — 0008 and 0017 (the
 sentinel), 0012 (the turn-boundary re-trigger), 0016 (the active probe), and the
@@ -68,6 +71,7 @@ the reasoning, not for the mechanism.
 | [0021](0021-delete-the-sentinel-fallback.md) | Delete the sentinel fallback: the inbox socket is the ONLY wake wire. Removes `sentinel.rs`, `watchPaths`, the `FileChanged`/`asyncRewake` exit-2 hook, ADR-0012's turn-boundary re-trigger and ADR-0016's active probe (the hook set drops from five to two, neither able to wake). `doctor` becomes a read; `subscribe`/`watch` refuse for a session nothing can wake. Written after watching the fallback go silently deaf for 6.3h with everything configured correctly | Accepted; its payload-free clause **amended by 0022** |
 | [0022](0022-the-wake-carries-a-subject.md) | The wake carries a subject — **pointer, not payload**. An event may publish one bounded, single-line `subject` (plus an optional link); the wake renders the subjects of what is unread, prefixed `[agent-mailbox]`. Bodies still never cross the wake boundary. Replaces "mail on topic X", which cost every woken agent a re-derivation of the delta the adapter already knew | Accepted |
 | [0023](0023-one-give-up-notice-per-outage.md) | One give-up notice per outage, withdrawn by an `adapter_recovered` event. 0011's sweep retry re-published `adapter_gave_up` every interval, so a laptop losing its network woke every agent watching each of eight PRs 13 times in an afternoon to say the same thing. The retry is unchanged; only the repeat announcement is suppressed, and recovery is detected by a stability timer because the adapter that recovers is the one that stops exiting | Accepted |
+| [0024](0024-status-reports-the-wake-verdict.md) | `status` reports the wake verdict, derived locally from the same `doctor::reachability_of` that `watch` refuses on — so the command an agent checks itself with cannot contradict the command that refuses it. `unknown` stays an answer and never a verdict; the human label becomes `inbox topic:` while the `inbox` JSON key is left alone. Written after an agent distrusted a correct refusal and went back to polling | Accepted |
 
 ## When to write one
 

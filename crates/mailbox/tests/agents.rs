@@ -713,7 +713,7 @@ fn status_surfaces_this_sessions_own_address() {
     let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        text.contains(&format!("inbox: agent.{s} (NOT registered")),
+        text.contains(&format!("inbox topic: agent.{s} (NOT registered")),
         "an unregistered session is told so: {text}"
     );
 
@@ -728,7 +728,7 @@ fn status_surfaces_this_sessions_own_address() {
     let out = env.run_as_ok(s, &["status"], "status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        text.contains(&format!("inbox: agent.{s} (registered)")),
+        text.contains(&format!("inbox topic: agent.{s} (registered)")),
         "an armed session's status shows its live address: {text}"
     );
 
