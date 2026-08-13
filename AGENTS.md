@@ -16,7 +16,7 @@ Local durable **topic bus** for coding agents: adapters publish world-change eve
 Adapters → publish → Bridge (topics + cursors + wake delivery) → inbox socket → Agent
 ```
 
-Requires **Claude Code 2.1.226+**. A session Claude Code bound no inbox socket cannot be woken by anything.
+Requires **Claude Code 2.1.226+**. A session Claude Code bound no inbox socket cannot be woken by anything — the gate is a rollout, forced on with `CLAUDE_CODE_HARBOR_KITE=1` in *user* settings, and read once at session start. `bypassPermissions` sessions also need `crossSessionInbound: "accept"`. Both are in [the README](README.md#setup-what-the-wake-depends-on).
 
 ## Working agreements (must follow)
 

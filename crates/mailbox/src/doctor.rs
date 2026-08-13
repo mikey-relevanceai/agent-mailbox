@@ -47,10 +47,10 @@ use crate::claude_registry::ClaudeRegistry;
 /// them had to paper over the impossible `None`, and the papering-over is what could go
 /// quiet: a fault reported with nothing to do about it, or a dangling "no-inbox — ".
 pub const NO_INBOX_REMEDY: &str = "Claude Code bound this session no inbox socket, so nothing can wake it. \
-     Restart the session. If it persists, the cross-session messaging feature \
-     is off for it — check `claude --version` (2.1.226+) and that none of \
-     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC / DISABLE_TELEMETRY / \
-     DO_NOT_TRACK / DISABLE_GROWTHBOOK is set.";
+     Restart the session. If it persists, the cross-session messaging gate is off \
+     for it: set \"env\": {\"CLAUDE_CODE_HARBOR_KITE\": \"1\"} in ~/.claude/settings.json \
+     (user scope only — project settings are ignored) and start a NEW session; the \
+     gate is read once at startup. Also check `claude --version` (2.1.226+).";
 
 /// Whether a session can be woken, and if not, why not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

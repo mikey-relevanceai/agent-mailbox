@@ -128,10 +128,14 @@ tempdir), or `CLAUDE_CONFIG_DIR` if your whole Claude config lives elsewhere.
 
 Claude Code decides which sessions bind one, via a feature gate
 (`agents_cross_session_inbox`). When it is off the session logs
-`[uds-messaging] Skipped: cross-session messaging gate off` and binds nothing, and
-**there is no setting, flag or environment variable that turns it on** —
-`CLAUDE_CODE_MESSAGING_SOCKET` is an *output* Claude Code exports to hooks, not an
-input.
+`[uds-messaging] Skipped: cross-session messaging gate off` and binds nothing.
+
+The gate is a gradual rollout, so same-version sessions on one machine disagree — but
+it **can** be forced on with `CLAUDE_CODE_HARBOR_KITE=1` in *user* settings, which
+short-circuits the remote flag entirely
+([README](../README.md#setup-what-the-wake-depends-on) has the caveats; verified on
+2.1.229). Do not confuse it with `CLAUDE_CODE_MESSAGING_SOCKET`, which is an *output*
+Claude Code exports to hooks, not an input.
 
 Such a session is not degraded, it is unwakeable. So we say so at the only moment it
 can still hear us:
@@ -260,7 +264,7 @@ See ADR-0021 for the full evidence.
 
 | Capability | Claude Code | Codex CLI |
 |---|---|---|
-| Per-session inbox socket (external process → idle wake) | Yes, 2.1.226+ — feature-gated, and the gate cannot be turned on | **No** |
+| Per-session inbox socket (external process → idle wake) | Yes, 2.1.226+ — feature-gated; forced on with `CLAUDE_CODE_HARBOR_KITE=1` | **No** |
 | Lifecycle hooks | Yes | [Yes](https://developers.openai.com/codex/hooks) |
 | Native external-event → idle wake | Yes, via the inbox socket | [Requested](https://github.com/openai/codex/issues/20312), not shipped |
 

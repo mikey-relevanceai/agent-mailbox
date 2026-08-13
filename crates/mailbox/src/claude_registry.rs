@@ -35,10 +35,11 @@
 //!
 //! # Absence is normal, not an error
 //!
-//! Most sessions have no `messagingSocketPath` at all: the gate is a gradual
-//! rollout, cannot be turned on from outside Claude Code, and differs between
-//! same-version sessions on one machine. A missing socket is the ordinary case and
-//! means "use the fallback channel", never "something is broken".
+//! Most sessions have no `messagingSocketPath` at all: the gate is a gradual rollout
+//! and differs between same-version sessions on one machine, unless the operator
+//! forces it on with `CLAUDE_CODE_HARBOR_KITE=1` in user settings. A missing socket is
+//! the ordinary case and means "use the fallback channel", never "something is
+//! broken".
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

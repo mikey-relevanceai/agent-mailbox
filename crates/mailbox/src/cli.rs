@@ -1398,7 +1398,9 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
             source,
             topic = %topic.as_str(),
             "did not register the agent inbox: session recently ended (tombstone guard); \
-             the next Stop's turn-end re-registers it once the guard lapses (ADR-0013)"
+             the next SessionStart re-registers it once the guard lapses (ADR-0013). \
+             Taking a turn does NOT heal it — the Stop hook that once did was deleted \
+             by ADR-0021"
         ),
         Ok(Response::Subscribed { outcome, .. }) => info!(
             session = %session.as_str(),

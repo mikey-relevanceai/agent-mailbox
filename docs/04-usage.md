@@ -253,10 +253,11 @@ session's inbox socket directly, and Claude Code starts a turn on it.
 
 Symptom: `mailbox status` reports `inbox topic: agent.<id> (NOT registered)` and
 `subscriptions: none`, peers' `mailbox send` to you fails, and you never wake. Since
-[ADR-0013](adr/0013-re-register-inbox-and-watchpaths-on-resume.md) this should heal
-itself on your next `SessionStart` **or** turn boundary — so first just **take a
-turn**. If you are on an older binary (or need it back immediately), re-run the
-`SessionStart` handler by hand with a synthetic payload:
+[ADR-0013](adr/0013-re-register-inbox-and-watchpaths-on-resume.md) this heals itself on
+your next **`SessionStart`** — a resume, `/clear`, or compact. Taking a turn does **not**
+fix it: the `Stop` hook that once re-registered on a turn boundary was deleted by
+[ADR-0021](adr/0021-delete-the-sentinel-fallback.md). To get it back without waiting,
+re-run the `SessionStart` handler by hand with a synthetic payload:
 
 ```bash
 # Claude Code exports CLAUDE_CODE_SESSION_ID into every tool call; `mailbox status`
@@ -741,8 +742,10 @@ For "do I have unread?", sum `.unread[].unread` from the same report.
 
 `status` answers "what does this session have?". It cannot answer "will this session
 ever be told?", because whether a session can be woken at all is Claude Code's
-decision: it binds a per-session inbox socket, or it does not, and the gate that
-decides cannot be turned on from outside.
+decision: it binds a per-session inbox socket, or it does not. The gate that decides
+is a rollout you can force on with `CLAUDE_CODE_HARBOR_KITE=1` in *user* settings
+([README](../README.md#setup-what-the-wake-depends-on)), but only for sessions started
+after you set it.
 
 ### `mailbox doctor` — can these agents be woken?
 
