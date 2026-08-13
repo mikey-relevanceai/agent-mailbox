@@ -35,6 +35,17 @@
 //! session is still alive (ADR-0011), so a give-up caused by a transient upstream
 //! outage self-heals rather than needing a manual re-`watch`.
 //!
+//! # One notice per outage (ADR-0023)
+//!
+//! Those two mechanisms compose into a wake storm if left alone: the sweep retries
+//! a `Failed` watch, the retry gives up again, and the give-up publishes again —
+//! every interval, to every subscribed agent, for as long as the fault lasts. So
+//! the give-up is announced **once per outage**. A watch that gives up again while
+//! its notice still stands retries silently; when it finally runs stably again the
+//! supervisor publishes a recovery event and re-arms the notice. An agent hears
+//! "this stopped being watched" once and "it is being watched again" once, however
+//! long the outage ran.
+//!
 //! # Bridge restart (resume iff a live session wants it)
 //!
 //! [`reconcile_startup`] restores the invariant on daemon start: it resumes a
@@ -54,7 +65,7 @@
 //! concrete adapter — tests inject a fixture, card 10 injects the real
 //! `github-pr` poller.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -81,6 +92,92 @@ use crate::storage::{
 /// buffer absorbs a burst of watch/unwatch ops plus monitor exit reports without
 /// callers waiting, while staying bounded.
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
+
+/// Provenance stamped on the events the supervisor itself publishes (give-up and
+/// recovery) — the two events on an entity topic that are about the mailbox rather
+/// than the entity. Named once so both carry the identical label.
+const SUPERVISOR_ADAPTER_ID: &str = "mailbox-supervisor";
+
+/// The `event` field of the supervisor's give-up notice, in the body an agent reads.
+/// Public so a test asserts on the same constant the publisher uses rather than a
+/// retyped literal — a mistyped event name in a "published nothing" assertion would
+/// otherwise pass by counting a name that never existed.
+pub const EVENT_ADAPTER_GAVE_UP: &str = "adapter_gave_up";
+
+/// The `event` field of the recovery notice that withdraws [`EVENT_ADAPTER_GAVE_UP`].
+pub const EVENT_ADAPTER_RECOVERED: &str = "adapter_recovered";
+
+/// One of the two events on an entity topic that are about the MAILBOX rather than
+/// the entity: the watch stopped being watched, and it started again.
+///
+/// An enum (mirroring the github-pr adapter's `Edge`) rather than two hand-rolled
+/// bodies, so each event's wire name, body, subject and log field come from one
+/// place — and so adding a third cannot compile without deciding all four.
+#[derive(Debug, Clone, Copy)]
+enum SupervisorEvent {
+    /// The supervisor exhausted its restart budget and stopped trying (design/01
+    /// rule 7). Announced once per outage (ADR-0023).
+    GaveUp { failures: u32 },
+    /// A watch that announced a give-up is running stably again, withdrawing it.
+    Recovered,
+}
+
+impl SupervisorEvent {
+    /// The `event` field on the wire, and the log field naming which event a failed
+    /// publish lost.
+    fn kind(self) -> &'static str {
+        match self {
+            Self::GaveUp { .. } => EVENT_ADAPTER_GAVE_UP,
+            Self::Recovered => EVENT_ADAPTER_RECOVERED,
+        }
+    }
+
+    /// The one line a woken agent sees (ADR-0022). Both say plainly that they are
+    /// about the mailbox, not the PR: an agent woken by the first should stop
+    /// expecting news, and one woken by the second can start expecting it again.
+    fn subject(self) -> Option<Subject> {
+        let text = match self {
+            Self::GaveUp { failures } => format!(
+                "mailbox stopped watching this: the adapter failed {failures} times in a row"
+            ),
+            Self::Recovered => "mailbox is watching this again: the adapter recovered".to_string(),
+        };
+        // `.ok()` because a subject is never worth failing a publish over — least of
+        // all these publishes, whose whole job is to surface a change of state. Both
+        // texts are statically well-formed, so `None` means one of them was EDITED
+        // into something unparseable; `subjects_are_well_formed` fails the build
+        // first, and the publish path logs if it ever happens anyway.
+        Subject::new(&text, None).ok()
+    }
+
+    /// The opaque body, naming the entity it concerns.
+    ///
+    /// Deliberately the flat `repo`/`pr` pair for both events rather than fields
+    /// destructured per [`WatchTarget`] variant: these two are the mailbox talking
+    /// about a watch, so one shape across both keeps them readable by a consumer
+    /// that does not care which kind of entity broke. (A `Stub` watch therefore
+    /// reports its label as `repo` and `0` as `pr`, as the give-up event already
+    /// did.) The entity itself is named by the topic, which is exact.
+    fn body(self, watch: &Watch) -> Value {
+        let repo = watch.target.repo_column();
+        let pr = watch.target.pr_column();
+        match self {
+            Self::GaveUp { failures } => json!({
+                "source": SUPERVISOR_ADAPTER_ID,
+                "event": self.kind(),
+                "repo": repo,
+                "pr": pr,
+                "consecutive_failures": failures,
+            }),
+            Self::Recovered => json!({
+                "source": SUPERVISOR_ADAPTER_ID,
+                "event": self.kind(),
+                "repo": repo,
+                "pr": pr,
+            }),
+        }
+    }
+}
 
 /// Resolves a watch to the adapter program that should service it.
 ///
@@ -213,8 +310,9 @@ impl Supervisor {
             policy,
             running: HashMap::new(),
             failures: HashMap::new(),
+            announced_giveup: HashSet::new(),
             restart_epoch: HashMap::new(),
-            next_gen: 0,
+            next_gen: Generation::default(),
             cmd_tx: cmd_tx.clone(),
             rx,
         };
@@ -486,7 +584,7 @@ enum Command {
     /// than resurrecting a torn-down watch.
     Restart {
         watch_id: WatchId,
-        epoch: u64,
+        epoch: RestartEpoch,
     },
     Sweep {
         ttl: Duration,
@@ -503,17 +601,58 @@ enum Command {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+    /// A stability timer firing [`RestartPolicy::reset_after`] after a spawn: if
+    /// that same instance is still up, the run has lasted long enough to count as
+    /// recovered. `generation` guards against a stale timer from a superseded
+    /// instance, exactly as [`Command::AdapterExited`] does.
+    MarkStable {
+        watch_id: WatchId,
+        generation: Generation,
+    },
     /// A monitor reporting that its adapter exited on its own (crash or natural
     /// end). `generation` guards against a stale report from a superseded instance.
     AdapterExited {
         watch_id: WatchId,
-        generation: u64,
+        generation: Generation,
         pid: u32,
         exit: AdapterExit,
     },
 }
 
 type Ack = oneshot::Sender<Result<(), SupervisorError>>;
+
+/// Identifies one adapter INSTANCE, so a late report from a superseded instance is
+/// ignored. Monotonic across the actor.
+///
+/// Branded, because the actor carries two `u64` staleness tokens with opposite
+/// lifecycles — this one and [`RestartEpoch`] — whose commands sit side by side in
+/// [`Command`] and are dispatched in the same `match`. Confusing them type-checks as
+/// bare integers, and both failure modes are silent: a give-up notice never
+/// withdrawn, or a stale timer publishing a false recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Generation(u64);
+
+impl Generation {
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identifies one SCHEDULED RESTART for a watch. Per-watch, and bumped to cancel a
+/// pending restart so it cannot resurrect a torn-down watch. See [`Generation`] for
+/// why this is a distinct type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RestartEpoch(u64);
+
+impl RestartEpoch {
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
 
 /// A running adapter as the actor tracks it. The transport itself is owned by the
 /// monitor task (via `wait()`); here we keep only what the actor needs to
@@ -522,7 +661,7 @@ struct RunningEntity {
     pid: u32,
     /// Distinguishes this instance from any predecessor/successor for the same
     /// entity, so a late exit report from an old instance is ignored.
-    generation: u64,
+    generation: Generation,
     /// When this instance was spawned. On exit, the run's duration decides
     /// whether it was stable (reset the failure streak) or a fast crash.
     spawned_at: Instant,
@@ -545,12 +684,20 @@ struct Actor {
     running: HashMap<WatchId, RunningEntity>,
     /// Consecutive-failure count per entity, for the give-up budget.
     failures: HashMap<WatchId, u32>,
+    /// Entities whose give-up has been announced and not yet withdrawn — the
+    /// once-per-outage latch of ADR-0023. A watch in here has already told its
+    /// subscribers it stopped being watched, so giving up again publishes nothing.
+    /// [`Actor::on_stable`] withdraws the notice (with a recovery event); teardown
+    /// withdraws it silently. Deliberately in memory, not storage: it is a property
+    /// of *this* daemon's conversation with its subscribers, and a daemon restart
+    /// is genuinely new information worth one fresh notice.
+    announced_giveup: HashSet<WatchId>,
     /// The epoch of the currently-scheduled restart per entity. A detached
     /// backoff task carries the epoch it was scheduled under; if the epoch has
     /// since moved (a stop/sweep/newer schedule bumped it), that task's restart is
     /// stale and must not resurrect a torn-down watch.
-    restart_epoch: HashMap<WatchId, u64>,
-    next_gen: u64,
+    restart_epoch: HashMap<WatchId, RestartEpoch>,
+    next_gen: Generation,
     /// Clone handed to monitors and scheduled restarts so they can post back.
     cmd_tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Command>,
@@ -584,6 +731,10 @@ impl Actor {
                 Command::RunningPid { watch_id, reply } => {
                     let _ = reply.send(self.running.get(&watch_id).map(|e| e.pid));
                 }
+                Command::MarkStable {
+                    watch_id,
+                    generation,
+                } => self.on_stable(watch_id, generation).await,
                 Command::AdapterExited {
                     watch_id,
                     generation,
@@ -732,7 +883,7 @@ impl Actor {
             drop(transport); // Drop backstop: group SIGKILL + reap (no orphan).
             return self.handle_failure(watch_id, None).await;
         };
-        self.next_gen += 1;
+        self.next_gen = self.next_gen.next();
         let generation = self.next_gen;
         let (stop_tx, stop_rx) = oneshot::channel();
         let monitor = tokio::spawn(monitor_adapter(
@@ -759,6 +910,21 @@ impl Actor {
                 monitor,
             },
         );
+        // Arm the stability timer. A crash-restart streak is only detectable as
+        // *over* by a run that outlives it, and an adapter that recovers runs
+        // forever — so nothing but a timer can observe the recovery of a watch that
+        // never exits again (ADR-0023).
+        let cmd_tx = self.cmd_tx.clone();
+        let reset_after = self.policy.reset_after;
+        tokio::spawn(async move {
+            tokio::time::sleep(reset_after).await;
+            let _ = cmd_tx
+                .send(Command::MarkStable {
+                    watch_id,
+                    generation,
+                })
+                .await;
+        });
         self.storage
             .set_watch_state(watch_id, WatchState::Running { pid: Pid::new(pid) })
             .await?;
@@ -768,7 +934,7 @@ impl Actor {
             repo = %watch.target.repo_column(),
             pr = watch.target.pr_column(),
             pid,
-            generation,
+            generation = generation.get(),
             "spawned adapter for entity (one per external entity)"
         );
         Ok(())
@@ -778,7 +944,7 @@ impl Actor {
     async fn on_adapter_exited(
         &mut self,
         watch_id: WatchId,
-        generation: u64,
+        generation: Generation,
         pid: u32,
         exit: AdapterExit,
     ) -> Result<(), SupervisorError> {
@@ -800,6 +966,7 @@ impl Actor {
         if interest == 0 {
             // Exited with nobody interested → a clean stop, not a crash.
             self.failures.remove(&watch_id);
+            self.forget_giveup(watch_id);
             self.storage
                 .set_watch_state(watch_id, WatchState::Stopped)
                 .await?;
@@ -824,6 +991,7 @@ impl Actor {
         // non-zero code or a signal — takes the backoff-restart path below.
         if matches!(exit, AdapterExit::Exited { code: 0 }) {
             self.failures.remove(&watch_id);
+            self.forget_giveup(watch_id);
             self.storage
                 .set_watch_state(watch_id, WatchState::Stopped)
                 .await?;
@@ -878,13 +1046,27 @@ impl Actor {
         if attempt > policy.max_consecutive_failures {
             self.failures.remove(&watch_id);
             self.cancel_pending_restart(watch_id);
-            warn!(
-                watch = watch_id.get(),
-                failures = attempt - 1,
-                max = policy.max_consecutive_failures,
-                "gave up restarting adapter after consecutive failures; publishing error and marking failed"
-            );
-            self.publish_giveup(watch_id, attempt - 1).await;
+            let failures = attempt - 1;
+            // Announce once per outage (ADR-0023). A sweep retry that gives up again
+            // is the SAME outage continuing, not news: re-publishing would wake every
+            // subscriber once per sweep interval for as long as the fault lasts.
+            if self.announced_giveup.insert(watch_id) {
+                warn!(
+                    watch = watch_id.get(),
+                    failures,
+                    max = policy.max_consecutive_failures,
+                    "gave up restarting adapter after consecutive failures; publishing error and marking failed"
+                );
+                self.publish_supervisor_event(watch_id, SupervisorEvent::GaveUp { failures })
+                    .await;
+            } else {
+                warn!(
+                    watch = watch_id.get(),
+                    failures,
+                    max = policy.max_consecutive_failures,
+                    "gave up restarting adapter again; its give-up is already surfaced, so published nothing (marked failed)"
+                );
+            }
             self.storage
                 .set_watch_state(watch_id, WatchState::Failed)
                 .await?;
@@ -903,7 +1085,7 @@ impl Actor {
         // this pending restart by moving the epoch on.
         let epoch = {
             let epoch = self.restart_epoch.entry(watch_id).or_default();
-            *epoch += 1;
+            *epoch = epoch.next();
             *epoch
         };
         info!(
@@ -921,72 +1103,126 @@ impl Actor {
         Ok(())
     }
 
+    /// A spawned adapter has now been up for [`RestartPolicy::reset_after`] — the
+    /// run is stable, so any outage it was recovering from is over.
+    ///
+    /// Withdraws an announced give-up and publishes the recovery event. A watch with
+    /// no announced give-up recovered from nothing, so this is silent: only an agent
+    /// that was told the watch went dark is told it came back.
+    ///
+    /// A stale timer is ignored — recovery means *this* instance lasted, not that
+    /// some instance started. That distinction is the whole point: while the network
+    /// is down every sweep retry starts an adapter that dies seconds later, and
+    /// treating a mere start as recovery would restore the very wake storm this
+    /// avoids, one "recovered" per interval.
+    async fn on_stable(&mut self, watch_id: WatchId, generation: Generation) {
+        let current = self
+            .running
+            .get(&watch_id)
+            .is_some_and(|entity| entity.generation == generation);
+        // Two steps, not one `||`: the guard must be checked BEFORE the latch is
+        // touched, and short-circuit order is too quiet a place to keep that. A
+        // stale timer that withdrew a live notice would leave the outage announced
+        // never — silent deafness, which is the failure this whole path prevents.
+        if !current {
+            return;
+        }
+        if !self.announced_giveup.remove(&watch_id) {
+            return;
+        }
+        info!(
+            watch = watch_id.get(),
+            generation = generation.get(),
+            stable_after_ms = self.policy.reset_after.as_millis() as u64,
+            "adapter ran stably after a give-up; withdrawing the give-up notice and publishing recovery"
+        );
+        self.publish_supervisor_event(watch_id, SupervisorEvent::Recovered)
+            .await;
+    }
+
+    /// Withdraw an announced give-up SILENTLY, because the watch is being torn down.
+    ///
+    /// No recovery event: the adapter did not recover, it stopped being wanted, and
+    /// telling subscribers a stopped watch is "being watched again" would be a lie.
+    /// The latch is dropped so that if this entity is watched again later, its next
+    /// outage is a new outage and gets its own notice.
+    fn forget_giveup(&mut self, watch_id: WatchId) {
+        if self.announced_giveup.remove(&watch_id) {
+            debug!(
+                watch = watch_id.get(),
+                "dropped an announced give-up on teardown; a later failure is a new outage"
+            );
+        }
+    }
+
     /// Cancel any pending backoff restart for `watch_id` by advancing its epoch,
     /// so an in-flight scheduled restart is ignored when it fires.
     fn cancel_pending_restart(&mut self, watch_id: WatchId) {
         if let Some(epoch) = self.restart_epoch.get_mut(&watch_id) {
-            *epoch += 1;
+            *epoch = epoch.next();
         }
     }
 
-    /// Publish the give-up error event on the entity's topic (design/01 rule 7:
-    /// surface an error rather than restart forever). Best effort — a failure here
-    /// is logged, not propagated (the watch is already being marked failed).
-    async fn publish_giveup(&self, watch_id: WatchId, failures: u32) {
+    /// Publish one supervisor-authored event on the watch's entity topic.
+    ///
+    /// Best effort throughout — a failure is logged, not propagated: the state change
+    /// the event describes has already happened and is not worth unwinding over a lost
+    /// notification. Every path that cannot surface the event logs at `error`, because
+    /// that is a state change NO signal reaches the session about, which is precisely
+    /// the silent failure these events exist to avoid. A watch that has simply been
+    /// deleted is not one of those — nobody is left to tell — so it returns quietly.
+    async fn publish_supervisor_event(&self, watch_id: WatchId, event: SupervisorEvent) {
+        let event_kind = event.kind();
         let watch = match self.storage.get_watch(watch_id).await {
             Ok(Some(watch)) => watch,
             Ok(None) => return,
             Err(err) => {
-                // Observability: the watch is being marked Failed but no signal
-                // reaches the session, so make it loud.
-                error!(watch = watch_id.get(), error = %err, "could not load watch to publish give-up event; watch marked failed with NO event surfaced");
+                error!(watch = watch_id.get(), event = event_kind, error = %err, "could not load watch to publish a supervisor event; NO event surfaced");
                 return;
             }
         };
         let Some(topic) = topic_for_watch(&watch) else {
             error!(
                 watch = watch_id.get(),
+                event = event_kind,
                 kind = watch.target.kind().as_str(),
                 repo = %watch.target.repo_column(),
                 pr = watch.target.pr_column(),
-                "could not derive topic for give-up event; watch marked failed with NO event surfaced"
+                "could not derive topic for a supervisor event; NO event surfaced"
             );
             return;
         };
-        let body = json!({
-            "source": "mailbox-supervisor",
-            "event": "adapter_gave_up",
-            "repo": watch.target.repo_column(),
-            "pr": watch.target.pr_column(),
-            "consecutive_failures": failures,
-        });
-        // The one event on this topic that is about the mailbox rather than the PR,
-        // so it says so plainly: an agent woken by it should stop expecting news.
-        // `.ok()` because a subject is never worth failing a publish over — least of
-        // all this publish, whose whole job is to surface a failure.
-        let subject = Subject::new(
-            &format!("mailbox stopped watching this: the adapter failed {failures} times in a row"),
-            None,
-        )
-        .ok();
+        // A subject-less wake says nothing but "something happened", which for the
+        // recovery event defeats its whole purpose. Unreachable for both texts as
+        // written, so if it ever fires it is a broken edit, not a bad input — and
+        // the log is the only place that would show it.
+        let subject = event.subject();
+        if subject.is_none() {
+            warn!(
+                watch = watch_id.get(),
+                event = event_kind,
+                "could not build a subject for a supervisor event; publishing it subject-less"
+            );
+        }
         match self
             .bus
             .publish(
                 topic.clone(),
-                AdapterId("mailbox-supervisor".to_string()),
+                AdapterId(SUPERVISOR_ADAPTER_ID.to_string()),
                 Timestamp(now_millis()),
-                body,
+                event.body(&watch),
                 subject,
             )
             .await
         {
             Ok(_) => info!(
                 watch = watch_id.get(),
+                event = event_kind,
                 topic = topic.as_str(),
-                "published adapter give-up error event to entity topic"
+                "published supervisor event to entity topic"
             ),
             Err(err) => {
-                error!(watch = watch_id.get(), error = %err, "failed to publish give-up event; watch marked failed with NO event surfaced")
+                error!(watch = watch_id.get(), event = event_kind, error = %err, "failed to publish supervisor event; NO event surfaced")
             }
         }
     }
@@ -1000,6 +1236,7 @@ impl Actor {
     /// resurrected by a stale scheduled restart) forever.
     async fn stop_watch(&mut self, watch_id: WatchId) -> Result<(), SupervisorError> {
         self.failures.remove(&watch_id);
+        self.forget_giveup(watch_id);
         // Cancel any pending backoff restart so it cannot resurrect this watch.
         self.cancel_pending_restart(watch_id);
         if let Some(entity) = self.running.remove(&watch_id) {
@@ -1197,7 +1434,7 @@ fn ack(reply: Option<Ack>, result: Result<(), SupervisorError>) {
 async fn monitor_adapter(
     transport: SubprocessTransport,
     watch_id: WatchId,
-    generation: u64,
+    generation: Generation,
     pid: u32,
     mut stop_rx: oneshot::Receiver<()>,
     events: mpsc::Sender<Command>,
@@ -1267,5 +1504,69 @@ mod tests {
         // Nowhere to insert the key, so a non-object config is unchanged.
         let injected = inject_baseline(AdapterConfig::new(Value::Null), Some(json!({ "x": 1 })));
         assert_eq!(*injected.value(), Value::Null);
+    }
+
+    fn watch_fixture() -> Watch {
+        Watch {
+            id: WatchId::new(1),
+            target: WatchTarget::GithubPr {
+                repo: "octocat/hello-world".to_string(),
+                pr: 42,
+            },
+            interval: Duration::from_secs(60),
+            state: WatchState::Failed,
+        }
+    }
+
+    /// The give-up body carries the failure count, which is the only thing in it a
+    /// reader could not get from the topic — and the only field the integration
+    /// tests, which match on `event` alone, would not notice the loss of.
+    #[test]
+    fn giveup_body_names_the_entity_and_the_failure_count() {
+        let body = SupervisorEvent::GaveUp { failures: 5 }.body(&watch_fixture());
+        assert_eq!(body["event"], EVENT_ADAPTER_GAVE_UP);
+        assert_eq!(body["consecutive_failures"], 5);
+        assert_eq!(body["repo"], "octocat/hello-world");
+        assert_eq!(body["pr"], 42);
+        assert_eq!(body["source"], SUPERVISOR_ADAPTER_ID);
+    }
+
+    /// Recovery says only that the watch is back — no failure count, because the
+    /// outage it withdraws is over and its size is no longer actionable.
+    #[test]
+    fn recovery_body_names_the_entity_and_nothing_about_failures() {
+        let body = SupervisorEvent::Recovered.body(&watch_fixture());
+        assert_eq!(body["event"], EVENT_ADAPTER_RECOVERED);
+        assert_eq!(body["repo"], "octocat/hello-world");
+        assert_eq!(body["pr"], 42);
+        assert_eq!(
+            body.get("consecutive_failures"),
+            None,
+            "a recovery has no failure count to report"
+        );
+    }
+
+    /// Both subjects must actually parse. They are the only thing a woken agent
+    /// sees (ADR-0022), and `subject()` swallows a parse failure rather than fail a
+    /// publish — so without this, editing either text into something unparseable
+    /// would degrade a live wake to silence with nothing failing first.
+    #[test]
+    fn subjects_are_well_formed() {
+        let giveup = SupervisorEvent::GaveUp { failures: 5 }
+            .subject()
+            .expect("the give-up subject parses");
+        assert!(
+            giveup.text().contains("stopped watching this"),
+            "got {:?}",
+            giveup.text()
+        );
+        let recovered = SupervisorEvent::Recovered
+            .subject()
+            .expect("the recovery subject parses");
+        assert!(
+            recovered.text().contains("watching this again"),
+            "got {:?}",
+            recovered.text()
+        );
     }
 }

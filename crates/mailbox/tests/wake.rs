@@ -247,7 +247,7 @@ fn subscribe_allows_a_session_claude_code_has_never_heard_of() {
 
 // ==== `status` answers "can I be woken?" — the same verdict, from the same read ====
 //
-// ADR-0023. `status` is the command an agent runs to check itself, and it used to
+// ADR-0024. `status` is the command an agent runs to check itself, and it used to
 // report only its inbox TOPIC — a fact about the bus — while `watch` refused on the
 // inbox SOCKET. An agent read the two as contradicting each other, distrusted the
 // refusal, and went back to polling.

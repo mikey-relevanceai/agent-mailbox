@@ -1,4 +1,4 @@
-# ADR-0023: `status` reports the wake verdict, from the same read `watch` refuses on
+# ADR-0024: `status` reports the wake verdict, from the same read `watch` refuses on
 
 - Status: Accepted
 - Date: 2026-08-11

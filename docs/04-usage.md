@@ -273,7 +273,7 @@ Two things to know about that manual path:
 - **Confirm with `mailbox doctor`, not by reading logs.** It reads whether your process
   is alive and whether Claude Code bound you a socket, which is the whole answer.
   `mailbox status`'s `wake:` line is that same verdict for the calling session
-  ([ADR-0023](adr/0023-status-reports-the-wake-verdict.md)), which is why the two lines
+  ([ADR-0024](adr/0024-status-reports-the-wake-verdict.md)), which is why the two lines
   it prints — `wake` and `inbox topic` — are exactly the addressable/wakeable split
   above.
 
@@ -650,7 +650,7 @@ unread:
 - **session** — who this session is.
 - **wake** — whether anything can wake this session, and the load-bearing line of the
   three. It is the SAME verdict `mailbox doctor` reports and `subscribe`/`watch` refuse
-  on ([ADR-0023](adr/0023-status-reports-the-wake-verdict.md)), read from Claude Code's
+  on ([ADR-0024](adr/0024-status-reports-the-wake-verdict.md)), read from Claude Code's
   own registry rather than asked of the bridge:
   - `reachable` — Claude Code bound this session an inbox socket. Mail arrives while it
     is idle.

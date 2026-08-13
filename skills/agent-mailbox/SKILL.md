@@ -69,6 +69,29 @@ publishes only **transitions**: the PR being merged, a merge conflict, a new
 review / review-thread / PR comment, or CI rollup going red. Then **go idle or do
 other work** — do not poll.
 
+#### Two events on a PR topic are about the mailbox, not the PR
+
+If the poller breaks — `gh` auth expired, the repo went away, the machine lost its
+network — the bridge eventually stops trying and tells you so:
+
+```text
+· mailbox stopped watching this: the adapter failed 5 times in a row
+```
+
+Take it at face value: **until further notice, no news about that PR means nothing.**
+Silence is no longer evidence. If you were waiting on the PR, say so to your human
+rather than waiting on a signal that is not coming.
+
+You are told **once**, however long the fault lasts — and you are told when it ends:
+
+```text
+· mailbox is watching this again: the adapter recovered
+```
+
+That is the all-clear; the watch is live and silence means "nothing changed" again.
+You do not re-`watch` for either of them, and you do not need to check in between.
+The bridge keeps retrying in the background on its own.
+
 ### Subscribe to a custom topic
 
 ```bash
