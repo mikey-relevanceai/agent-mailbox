@@ -13,8 +13,14 @@ on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
-# Two tags landing together would race each other pushing the tap. Serialise
-# instead, and never cancel: a half-published release is worse than a slow one.
+# Two tags landing together would race each other pushing the tap, and the loser
+# could leave the formula pinned to the OLDER version. Serialising removes that.
+#
+# Know the edge this does not cover: GitHub keeps at most one run pending per
+# group, so a third tag pushed while one run is in progress and another is already
+# pending CANCELS the pending one — that release is then never published, and a
+# cancelled run is quieter than a failed one. Push tags one at a time; if you ever
+# do land three at once, check Actions for a cancelled run before trusting the tap.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -88,10 +94,20 @@ jobs:
               match($0, /"[^"]+"/); print substr($0, RSTART+1, RLENGTH-2); exit
             }
           ' Cargo.toml)"
+          # That awk keys off an exact `[workspace.package]` line. If the header
+          # ever gains a trailing space or a comment it silently yields nothing,
+          # and the mismatch below would report against a blank version.
+          if [[ -z "${cargo_version}" ]]; then
+            echo "::error::could not read [workspace.package] version from Cargo.toml"
+            exit 1
+          fi
           if [[ "${tag_version}" != "${cargo_version}" ]]; then
             echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
             exit 1
           fi
+          # Say what matched, not just what didn't: the log should show which two
+          # values were compared without having to re-derive them from the tag.
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml version ${cargo_version}"
           echo "version=${tag_version}" >>"${GITHUB_OUTPUT}"
 
       # Only the three shipped binaries. `--bins` would also build the
@@ -100,8 +116,11 @@ jobs:
       # user should have to discover. `--locked` so the release matches Cargo.lock.
       - name: Build
         env:
-          # Without this, a cross-compile defaults to the runner's own macOS
-          # version and produces binaries that refuse to start on anything older.
+          # Pin the floor for BOTH slices. rustc has its own defaults (11.0 for
+          # arm64, 10.12 for x86_64), but the C that `rusqlite`'s `bundled` feature
+          # compiles goes through clang, which with no deployment target set builds
+          # against the runner's own macOS. Setting it makes the floor a decision
+          # rather than a property of whichever image Actions gave us.
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
@@ -153,14 +172,12 @@ jobs:
              README.md LICENSE "${stage}/"
           tar -czf "${RUNNER_TEMP}/${name}.tar.gz" -C "${stage}" \
             mailbox mailbox-stub-adapter mailbox-github-pr-adapter README.md LICENSE
-          # `shasum` on the macOS images, `sha256sum` on the Ubuntu ones; both
-          # emit the "<hash>  <file>" form scripts/render-formula.sh reads.
+          # `shasum` rather than `sha256sum`: it ships with perl, so it is on the
+          # macOS AND the Ubuntu images, and it emits the "<hash>  <file>" form
+          # scripts/render-formula.sh reads. Run it from RUNNER_TEMP so the file
+          # is recorded by bare name, which is what the formula's URLs use.
           cd "${RUNNER_TEMP}"
-          if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "${name}.tar.gz" >"${name}.tar.gz.sha256"
-          else
-            sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256"
-          fi
+          shasum -a 256 "${name}.tar.gz" >"${name}.tar.gz.sha256"
           cat "${name}.tar.gz.sha256"
           echo "name=${name}" >>"${GITHUB_OUTPUT}"
 
@@ -210,23 +227,32 @@ jobs:
             --generate-notes \
             artifacts/*.tar.gz artifacts/SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: checksums
-          path: artifacts/SHA256SUMS
-          if-no-files-found: error
-
   tap:
     name: update the Homebrew tap
     needs: release
     runs-on: ubuntu-latest
+    env:
+      # Named once so the checkout and the error message that explains the
+      # checkout cannot drift apart.
+      TAP_REPO: mikey-relevanceai/homebrew-tap
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: checksums
-          path: sums
+      # Read the checksums back off the published release rather than passing them
+      # as a workflow artifact. Artifacts are immutable per run, so re-running this
+      # job after any artifact upload would 409; the release asset can be fetched
+      # any number of times. That is what makes the "re-run this job once the
+      # secret exists" advice below actually true.
+      - name: Fetch the published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p sums
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS \
+            --dir sums
+          cat sums/SHA256SUMS
 
       # GITHUB_TOKEN is scoped to this repository, so pushing to the tap needs a
       # credential of its own. Without this check the failure surfaces as a 404 on
@@ -236,19 +262,21 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           if [[ -z "${TAP_TOKEN}" ]]; then
-            echo "::error::HOMEBREW_TAP_TOKEN is not set. Create a fine-grained PAT with Contents:write on mikey-relevanceai/homebrew-tap and add it as a repository secret. The release itself is already published; re-run this job once the secret exists."
+            echo "::error::HOMEBREW_TAP_TOKEN is not set. Create a fine-grained PAT with Contents:write on ${TAP_REPO} and add it as a repository secret. The release itself is already published; re-run this job once the secret exists."
             exit 1
           fi
 
       - uses: actions/checkout@v4
         with:
-          repository: mikey-relevanceai/homebrew-tap
+          repository: ${{ env.TAP_REPO }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
       # `mkdir -p` so the very first release can create Formula/ in a tap that has
       # only ever held a README.
       - name: Render the formula
+        env:
+          MAILBOX_RELEASE_REPO: ${{ github.repository }}
         run: |
           mkdir -p tap/Formula
           scripts/render-formula.sh "${{ needs.release.outputs.version }}" sums/SHA256SUMS >tap/Formula/mailbox.rb

@@ -85,17 +85,24 @@ It changes only *which* absolute path a symlinked argument produces.
   idempotent — hooks are matched by shape, not by command string, so a re-run with a
   different binary path replaces ours rather than appending. That safety net is
   unchanged; it is simply no longer load-bearing.
-- Two unit tests now pin this: one asserts a symlinked path survives `abs_bin`, one
-  asserts a relative path is still anchored. The first is a genuine guard — with
+- Three unit tests now pin this: one asserts a symlinked path survives `abs_bin`,
+  one asserts a relative path is still anchored, one asserts an unanchorable path is
+  reported rather than passed through. The first is a genuine guard — with
   `canonicalize` restored it fails, and it fails with the Cellar path in the message.
-  The assumption cannot be expressed in the type system (both functions return an
-  absolute `PathBuf`), which is precisely why it is a test.
-- `abs_bin` no longer touches the filesystem, so it no longer silently falls back to
-  the raw input when the path does not exist yet. Behaviourally this is a small
-  improvement — a typo'd `--mailbox-bin` is now recorded as the absolute form of the
-  typo rather than the relative form, which is easier to read in `settings.json` —
-  but neither form is validated, and `install-hooks` still does not check that the
-  binary exists. Unchanged, and out of scope.
+  The assumption cannot be expressed in the type system (both spellings return an
+  absolute path), which is precisely why it is a test.
+- `abs_bin` returns `io::Result<String>` rather than falling back to its input. The
+  old signature could return a *relative* path from a function whose entire purpose
+  was to produce an absolute one, and the caller could not tell — which would have
+  installed a hook resolved against whatever cwd it fired in. `std::path::absolute`
+  fails only on an empty path, which clap already rejects, so this is unreachable
+  through the CLI today; the guarantee still belongs here rather than in an argument
+  parser one crate away.
+- `abs_bin` no longer touches the filesystem, so it no longer incidentally proves the
+  path exists — `canonicalize` did, as a side effect. Nothing depended on that:
+  `install-hooks` never checked that the binary was there, and still does not. Worth
+  knowing before someone reintroduces `canonicalize` reaching for validation it was
+  never actually providing.
 - We inherit Homebrew's guarantee about `opt_bin`. If that layout ever changes, the
   caveats and `docs/05-release.md` change with it; the code does not.
 - The Linux default path (`current_exe()` → `/proc/self/exe` → Cellar) is **not**

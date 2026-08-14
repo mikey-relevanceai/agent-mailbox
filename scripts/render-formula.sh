@@ -14,8 +14,12 @@
 # line per platform tarball, i.e. the output of `shasum -a 256 *.tar.gz`.
 set -euo pipefail
 
-OWNER="mikey-relevanceai"
-REPO="agent-mailbox"
+# Whose releases the formula's URLs point at. Defaults to this project so the
+# script runs standalone; release.yml passes GITHUB_REPOSITORY, so a rename or a
+# fork does not need a second edit here to publish working URLs.
+SOURCE_REPO="${MAILBOX_RELEASE_REPO:-mikey-relevanceai/agent-mailbox}"
+OWNER="${SOURCE_REPO%%/*}"
+REPO="${SOURCE_REPO#*/}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -47,6 +51,23 @@ url_for() {
 ARM_DARWIN="aarch64-apple-darwin"
 INTEL_DARWIN="x86_64-apple-darwin"
 INTEL_LINUX="x86_64-unknown-linux-gnu"
+
+# Drift guard. release.yml's build matrix and this script each enumerate the
+# shipped targets, and nothing makes them move together. Adding a platform to the
+# matrix without adding it here would publish a tarball the formula has no `url`
+# block for, so `brew install` on that platform would keep failing with no sign
+# that a build for it exists. Refuse to render rather than silently drop it.
+KNOWN=" ${ARM_DARWIN} ${INTEL_DARWIN} ${INTEL_LINUX} "
+while read -r _ file; do
+  [[ -n "${file}" ]] || continue
+  file="${file#\*}"
+  target="${file#"mailbox-${VERSION}-"}"
+  target="${target%.tar.gz}"
+  case "${KNOWN}" in
+    *" ${target} "*) ;;
+    *) die "${SUMS} ships ${target}, which this formula has no url block for — add it to render-formula.sh" ;;
+  esac
+done <"${SUMS}"
 
 # Resolve every checksum BEFORE the heredoc. Inside `$(...)` a `die` would exit
 # only the subshell, so the template would still render — with `sha256 ""` where

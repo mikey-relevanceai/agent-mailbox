@@ -36,6 +36,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # The release path is shell, so `cargo test` cannot reach it. Rendering the
+      # Homebrew formula is a pure transform, and every one of its refusals is
+      # reachable from a fixture — so it gets checked here rather than for the
+      # first time on a tag that is already public and immutable.
+      - name: Formula renderer
+        run: scripts/test-render-formula.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

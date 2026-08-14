@@ -86,7 +86,14 @@ Pushing the tag is the whole trigger. `.github/workflows/release.yml` then:
    and pushes it to `mikey-relevanceai/homebrew-tap`.
 
 The formula and the release read their checksums from one file, so they cannot
-disagree about what was shipped.
+disagree about what was shipped. That file covers all three platforms, so verifying
+a single download needs `shasum -a 256 -c --ignore-missing SHA256SUMS` — without
+`--ignore-missing` the two tarballs you did not download are reported as failures.
+
+**If the `release` job fails partway**, `gh release create` is not idempotent: a
+re-run fails with "release already exists". Delete the release (the tag can stay)
+and re-run, or cut the next patch tag. The `tap` job has no such problem — it reads
+the checksums back off the published release, so it can be re-run freely.
 
 To see the formula without cutting a release:
 

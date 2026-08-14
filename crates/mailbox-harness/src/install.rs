@@ -631,7 +631,19 @@ pub fn default_mailbox_bin(current_exe: std::io::Result<std::path::PathBuf>) -> 
     }
 }
 
-/// The absolute form of a caller-supplied binary path (best-effort).
+/// The absolute form of a caller-supplied binary path.
+///
+/// Returns the failure rather than falling back to the input. The one thing that
+/// makes this path worth computing is that it is absolute — a relative path in
+/// `settings.json` is resolved against whatever cwd the hook happened to fire in —
+/// so quietly writing a hook we know to be unanchored would install exactly the
+/// silent breakage the rest of this function is about.
+///
+/// `std::path::absolute` fails only on an empty path, which clap already rejects
+/// before `--mailbox-bin` reaches here. That makes this unreachable through the
+/// CLI today, and it is still the right signature: the guarantee belongs to this
+/// function, not to an argument parser one crate away that could stop enforcing it
+/// without anything here noticing.
 ///
 /// Absolute but deliberately NOT canonical: `absolute` anchors a relative path to
 /// the cwd without following symlinks, where `canonicalize` would resolve them.
@@ -642,10 +654,8 @@ pub fn default_mailbox_bin(current_exe: std::io::Result<std::path::PathBuf>) -> 
 /// then deletes into `settings.json`, leaving `SessionStart` pointing at a binary
 /// that is gone: the inbox stops being registered, so peers cannot address the
 /// session, while topic wakes keep working and nothing looks broken (ADR-0025).
-pub fn abs_bin(path: &Path) -> String {
-    std::path::absolute(path)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string())
+pub fn abs_bin(path: &Path) -> std::io::Result<String> {
+    std::path::absolute(path).map(|p| p.display().to_string())
 }
 
 #[cfg(test)]
@@ -1282,7 +1292,7 @@ mod tests {
         let via_link = opt.join("mailbox");
 
         assert_eq!(
-            abs_bin(&via_link),
+            abs_bin(&via_link).unwrap(),
             via_link.display().to_string(),
             "the link must survive: resolving it here is what breaks `brew upgrade`"
         );
@@ -1293,12 +1303,23 @@ mod tests {
     /// fire in, which is not ours to predict.
     #[test]
     fn abs_bin_anchors_a_relative_path_to_the_working_directory() {
-        let anchored = abs_bin(Path::new("target/release/mailbox"));
+        let anchored = abs_bin(Path::new("target/release/mailbox")).unwrap();
 
         assert!(
             Path::new(&anchored).is_absolute(),
             "hooks run with an unknown cwd, so a relative path is unusable: {anchored}"
         );
         assert!(anchored.ends_with("target/release/mailbox"), "{anchored}");
+    }
+
+    /// The failure is reported, not papered over. Returning the input unchanged
+    /// would install a hook whose command is a bare relative path — resolved
+    /// against whatever cwd Claude Code happens to run the hook in, which is the
+    /// silent breakage the absolute path exists to prevent.
+    #[test]
+    fn abs_bin_reports_a_path_it_cannot_anchor() {
+        let err = abs_bin(Path::new("")).expect_err("an empty path has no absolute form");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
