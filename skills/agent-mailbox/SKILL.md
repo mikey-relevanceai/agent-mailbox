@@ -41,9 +41,10 @@ commands below. `mailbox status` shows who you are and whether anything can wake
 (and works even if the bridge is down, though those two lines are all it can tell you
 then).
 
-Two commands do not need an identity and so tolerate its absence: `mailbox agents`
-(it only marks which row is you) and `mailbox send` (it only stamps a reply address).
-That is what lets a human run them from a plain terminal — see
+Three commands do not need an identity and so tolerate its absence: `mailbox agents`
+(it only marks which row is you), `mailbox send` (it only stamps a reply address), and
+`mailbox status` (with no session it reports the bridge's watch table and omits your
+half). That is what lets a human run them from a plain terminal — see
 [When a message has no `from`](#when-a-message-has-no-from).
 
 ## Prerequisites (assume already set up; do not do these yourself)

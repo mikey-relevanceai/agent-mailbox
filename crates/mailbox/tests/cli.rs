@@ -388,6 +388,53 @@ fn status_still_answers_who_am_i_when_the_bridge_is_down() {
     assert_eq!(value["wake"], "unknown");
 }
 
+/// Both degradations at once: no session AND no bridge. Neither half is knowable, and
+/// the command must say so twice over rather than fill either in. The one thing it
+/// must NOT do is answer for a session nobody named — the same rule as the success
+/// path, on the path where there is least to check it against.
+#[test]
+fn status_with_no_session_and_no_bridge_invents_neither_half() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("mailbox.db");
+
+    let output = mailbox_command()
+        .args(["--json", "status"])
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run json status with no session and no daemon");
+
+    assert!(
+        !output.status.success(),
+        "the bridge being down is a loud failure even for a caller that is not a session"
+    );
+    let value = parse_json(&stdout(&output));
+    assert_eq!(value["result"], "error");
+    assert_eq!(value["bridge"], "unreachable");
+    for key in ["session", "wake", "inbox_topic"] {
+        assert!(
+            value.get(key).is_none(),
+            "{key} must be absent, not null, when there is no session to describe; got {value}"
+        );
+    }
+
+    let human = mailbox_command()
+        .args(["status"])
+        .env("AGENT_MAILBOX_DB", &db_path)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run status with no session and no daemon");
+    let out = stdout(&human);
+    assert!(
+        out.contains("session: none") && out.contains("UNREACHABLE"),
+        "both missing halves must be named; got: {out}"
+    );
+    assert!(
+        !out.contains("wake:") && !out.contains("inbox topic:"),
+        "no session means no verdict and no address to report; got: {out}"
+    );
+}
+
 #[test]
 fn bridge_down_json_mode_emits_error_object() {
     let dir = TempDir::new().expect("tempdir");
@@ -419,17 +466,20 @@ fn no_session_json_mode_emits_error_object() {
     // contract as a serviced failure — a typed error object on stdout — rather
     // than failing silently before any `fail()`/request call. The bridge is never
     // even contacted (resolution fails first), so no daemon is needed.
+    //
+    // Through `read`, whose whole answer is "my unread": `status` is no longer a
+    // command that needs to know whose.
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("mailbox.db");
 
     let output = mailbox_command()
-        .args(["--json", "status"])
+        .args(["--json", "read"])
         .env("AGENT_MAILBOX_DB", &db_path)
         .env("RUST_LOG", "error")
         // Ensure a real Claude Code session cannot leak in from the test runner.
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .output()
-        .expect("run json status with no session");
+        .expect("run json read with no session");
 
     assert!(!output.status.success(), "must exit non-zero");
     // NOT exit 2 — that is the wake code, and a resolution failure is an error.
@@ -492,6 +542,92 @@ fn ac3_status_shows_watch_with_interest_count() {
     );
     // The daemon's graceful Drop (SIGTERM → supervisor shutdown) reaps the adapter,
     // so no poller is orphaned when the test ends.
+}
+
+/// **`status` answers a human at a terminal.**
+///
+/// The watch table is bridge-global — every caller sees the same rows, with interest
+/// counts summed across all sessions — so `status` has a real answer with no
+/// `CLAUDE_CODE_SESSION_ID` at all. Refusing it made the one question a human most
+/// wants of a bridge daemon ("what is it doing?") require inventing a session id they
+/// are not; the same nonsense `send` and `agents` already avoid.
+#[test]
+fn status_with_no_session_reports_the_bridge_half() {
+    let daemon = Daemon::start_with_env(&[("MAILBOX_GH_ADAPTER_BIN", &stub_bin())]);
+    assert_ok(
+        &daemon.run_as("sess-a", &["watch", "github-pr", "octocat/hello-world#42"]),
+        "watch",
+    );
+
+    // `run` (not `run_as`) exports no session — the human's shell.
+    let status = daemon.run(&["--json", "status"]);
+    assert_ok(&status, "status with no session must succeed");
+    let value = parse_json(&stdout(&status));
+    assert_eq!(value["result"], "status");
+
+    let watches = value["watches"].as_array().expect("watches array");
+    assert_eq!(watches.len(), 1, "the global half answers in full");
+    assert_eq!(watches[0]["repo"], "octocat/hello-world");
+    assert_eq!(
+        watches[0]["interest"], 1,
+        "interest counts every session, so it does not depend on the caller"
+    );
+
+    // The session keys are ABSENT, not null and not zeroed. A `subscription_count`
+    // of 0 here would answer "how many topics am I on?" for a caller who is nobody.
+    for key in [
+        "session",
+        "wake",
+        "inbox",
+        "subscriptions",
+        "subscription_count",
+        "unread",
+    ] {
+        assert!(
+            value.get(key).is_none(),
+            "{key} must be absent for a caller that is not a session; got {value}"
+        );
+    }
+
+    // The human line says why the rest is missing, so nobody reads it as a fault.
+    let human = daemon.run(&["status"]);
+    assert_ok(&human, "human status with no session");
+    let text = stdout(&human);
+    assert!(
+        text.contains("session: none") && text.contains("CLAUDE_CODE_SESSION_ID"),
+        "the missing half must be explained, not silently dropped; got: {text}"
+    );
+    assert!(
+        text.contains("octocat/hello-world#42"),
+        "the watch table is the point of a sessionless status; got: {text}"
+    );
+    assert!(
+        !text.contains("subscriptions:") && !text.contains("unread:"),
+        "no session means no lists to report, not empty ones; got: {text}"
+    );
+}
+
+/// A session caller's document is unchanged by the above: same keys, same places.
+/// A Claude Code status line reads `.subscription_count` off it on every prompt.
+#[test]
+fn status_with_a_session_still_carries_the_session_keys_at_the_top_level() {
+    let daemon = Daemon::start();
+    let session = "sess-still-here";
+    assert_ok(
+        &daemon.run_as(session, &["subscribe", "github.pr.o/r#1"]),
+        "subscribe",
+    );
+
+    let status = daemon.run_as(session, &["--json", "status"]);
+    assert_ok(&status, "status");
+    let value = parse_json(&stdout(&status));
+    assert_eq!(value["result"], "status");
+    assert_eq!(value["session"], session);
+    assert_eq!(value["inbox"], format!("agent.{session}"));
+    assert_eq!(value["subscription_count"], 1);
+    assert!(value["wake"].is_string(), "the verdict is still a word");
+    assert!(value["subscriptions"].is_array());
+    assert!(value["unread"].is_array());
 }
 
 /// Two sessions share one refcounted watch; unwatch reports the sum-typed outcome.
@@ -1024,10 +1160,13 @@ fn the_session_comes_from_the_claude_code_env_var() {
 /// command bound a phantom empty session the agent could never be woken on. With one
 /// env var and no flag, an empty value simply means "no session", which is an error
 /// the agent can see rather than a wrong session it cannot.
+/// Exercised through `read`, one of the commands whose whole content is "whose?".
+/// `status` no longer answers that question — it reports the bridge's global watch
+/// table with no session at all — so it can no longer prove this.
 #[test]
 fn an_empty_session_env_value_is_refused_rather_than_bound() {
     let out = mailbox_command()
-        .args(["--json", "status"])
+        .args(["--json", "read"])
         .env("CLAUDE_CODE_SESSION_ID", "")
         .env("AGENT_MAILBOX_DB", "/nonexistent/mailbox.db")
         .env_remove("RUST_LOG")

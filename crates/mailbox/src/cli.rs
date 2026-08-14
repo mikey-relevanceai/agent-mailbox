@@ -20,8 +20,8 @@ use mailbox_protocol::{AdapterId, GithubPr, Subject, Topic, inbox_topic, stub_to
 
 use crate::client;
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, StatusReport, SubscribeState, TopicStatus,
-    UnwatchResultWire, WatchKindWire, WatchStateWire,
+    AgentSummary, GithubPrTarget, Request, Response, SessionStatus, StatusReport, SubscribeState,
+    TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
 
@@ -146,13 +146,13 @@ fn resolve_session() -> anyhow::Result<SessionId> {
 /// Resolve the calling session if the environment names one, WITHOUT failing when
 /// it does not.
 ///
-/// For the commands where a session is a nicety rather than the point. `send` uses
-/// it to stamp a reply address; `agents` uses it to mark which row is the caller;
-/// `doctor` uses it to warn that the caller cannot measure itself. None of the three
-/// is *about* the caller, so refusing to run without one would refuse the human
-/// manual-poke workflow — look at the fleet, poke an agent — for the sake of a field
-/// that command does not need. Commands that genuinely are about the caller (`read`,
-/// `status`, `subscribe`, `unsubscribe`, `watch`, `unwatch`) use
+/// For the commands where a session buys an extra, not the answer. `send` uses it to
+/// stamp a reply address; `agents` uses it to mark which row is the caller; `status`
+/// uses it to add the caller's own half to a bridge-global watch table.
+/// None of the three is *about* the caller, so refusing to run without one would
+/// refuse the human workflow — look at the bridge, look at the fleet, poke an agent —
+/// for the sake of a field that command does not need. Commands that genuinely are
+/// about the caller (`read`, `subscribe`, `unsubscribe`, `watch`, `unwatch`) use
 /// [`resolve_session_or_fail`] instead, because "whose?" is their whole content.
 fn resolve_session_optional() -> Option<SessionId> {
     session_from_env_value(&std::env::var(ENV_CLAUDE_SESSION).unwrap_or_default())
@@ -661,7 +661,15 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
     request(format, req).await
 }
 
-/// `status`: this session's identity, plus everything the bridge knows about it.
+/// `status`: the bridge's watch table, plus this session's identity and state when a
+/// session ran the command.
+///
+/// **The session is OPTIONAL.** The watch table is bridge-global, so a
+/// caller with no `$CLAUDE_CODE_SESSION_ID` — a human at a terminal — still gets the
+/// answer to "what is this bridge doing?" instead of an error telling them to invent an
+/// identity they do not have. The session half is then ABSENT rather than blanked: a
+/// `subscription_count` of 0 would answer "how many topics am I on?" for a caller who
+/// is nobody.
 ///
 /// **The identity half never depends on the bridge.** A session's id, its inbox topic
 /// and its wake verdict are derivable locally, so when the daemon is down `status`
@@ -675,7 +683,7 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
 /// failure — most of what `status` reports is genuinely missing, and exiting 0 would
 /// report "fine" for a command whose primary content is absent.
 async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
-    let session = resolve_session_or_fail(format)?;
+    let session = resolve_session_optional();
     let request = Request::Status {
         session: session.clone(),
     };
@@ -683,7 +691,13 @@ async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
 
     let response = match client::send(&config.socket_path(), &request).await {
         Ok(response) => response,
-        Err(err) => return Err(status_without_bridge(format, &session, &err.to_string())),
+        Err(err) => {
+            return Err(status_without_bridge(
+                format,
+                session.as_ref(),
+                &err.to_string(),
+            ));
+        }
     };
 
     if let Response::Error { message } = &response {
@@ -699,7 +713,9 @@ async fn run_status(format: OutputFormat) -> anyhow::Result<ExitCode> {
     // Keyed on the session WE resolved, not the one the daemon echoed: `wake_line`'s
     // reasoning ("`Gone` cannot be the caller — it is running this command") is only
     // sound for the caller's own id, and the bridge-down path keys it the same way.
-    let wake = mailbox::doctor::wake_verdict(&session);
+    // `None` when nobody ran this as a session: there is then no "me" to wake, and a
+    // verdict about nobody is not one of the answers `WakeVerdict` can honestly give.
+    let wake = session.as_ref().map(mailbox::doctor::wake_verdict);
 
     if format.is_json() {
         println!(
@@ -745,7 +761,14 @@ struct StatusJson<'a> {
     /// Serialised as its label by [`WakeVerdict`] itself, so the word in the JSON is a
     /// consequence of the verdict rather than of each emission site remembering to ask
     /// for it.
-    wake: WakeVerdict,
+    ///
+    /// **Omitted entirely when no session ran the command**, because `wake` answers
+    /// "can anything wake *me*?" and there is then no me. Emitting `unknown` instead
+    /// would be a specific false claim — that the session registry could not be read —
+    /// and every other label would be a verdict about a session nobody named. A status
+    /// line always runs inside a session, so it always sees the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake: Option<WakeVerdict>,
 }
 
 /// The human `wake:` line: the verdict, and what to do about it when there is anything
@@ -779,6 +802,49 @@ fn wake_line(wake: WakeVerdict) -> String {
     }
 }
 
+/// Everything `status` can derive about its caller WITHOUT the bridge: who they are,
+/// whether anything can wake them, and the address peers would use.
+///
+/// One value rather than three parallel `Option`s, so the "all present or all absent"
+/// rule is the type's rather than a comment's — and `wake` is a plain [`WakeVerdict`]
+/// inside it, which is what makes `"wake": null` unrepresentable on the wire.
+#[derive(serde::Serialize)]
+struct LocalIdentity<'a> {
+    session: &'a str,
+    /// Read locally, so it survives the daemon being the dead thing. A session nothing
+    /// can wake must be told so exactly then — that is when it is most likely to be
+    /// waiting on mail nobody will announce.
+    wake: WakeVerdict,
+    /// `null` keeps its existing meaning here: a session whose id cannot form an inbox
+    /// topic, and which is therefore not addressable at all.
+    inbox_topic: Option<&'a str>,
+}
+
+impl<'a> LocalIdentity<'a> {
+    fn of(session: &'a SessionId, inbox: Option<&'a Topic>) -> Self {
+        LocalIdentity {
+            session: session.as_str(),
+            wake: mailbox::doctor::wake_verdict(session),
+            inbox_topic: inbox.map(Topic::as_str),
+        }
+    }
+}
+
+/// The bridge-down `status` document: the `result: "error"` shape a `--json` consumer
+/// already expects, with the identity keys added when there is an identity.
+///
+/// Derived rather than hand-assembled, and flattened by the same mechanism
+/// [`StatusReport`] uses, so "the session keys appear iff there is a session" is one
+/// rule expressed one way in both documents instead of two that can drift.
+#[derive(serde::Serialize)]
+struct StatusWithoutBridgeJson<'a> {
+    result: &'static str,
+    message: &'a str,
+    bridge: &'static str,
+    #[serde(flatten)]
+    identity: Option<LocalIdentity<'a>>,
+}
+
 /// Render the bridge-down `status`: the identity fields that are always knowable, and
 /// an explicit statement that the bridge could not be reached.
 ///
@@ -787,39 +853,53 @@ fn wake_line(wake: WakeVerdict) -> String {
 /// identity object followed by an error object, which would make stdout two documents.
 fn status_without_bridge(
     format: OutputFormat,
-    session: &SessionId,
+    session: Option<&SessionId>,
     message: &str,
 ) -> anyhow::Error {
-    let inbox = inbox_topic(session).ok();
-    // Wakeability is a local read, so it belongs to the half that survives this. A
-    // session nothing can wake must be told so even when the daemon is the dead thing —
-    // withholding it here would leave the agent that most needs the answer without one.
-    let wake = mailbox::doctor::wake_verdict(session);
+    let inbox = session.and_then(|session| inbox_topic(session).ok());
+    let identity = session.map(|session| LocalIdentity::of(session, inbox.as_ref()));
     if format.is_json() {
-        println!(
-            "{}",
-            serde_json::json!({
-                "result": "error",
-                "message": message,
-                "session": session.as_str(),
-                "wake": wake,
-                "inbox_topic": inbox.as_ref().map(Topic::as_str),
-                "bridge": "unreachable",
-            })
-        );
+        let document = StatusWithoutBridgeJson {
+            result: "error",
+            message,
+            bridge: "unreachable",
+            identity,
+        };
+        match serde_json::to_string(&document) {
+            Ok(json) => println!("{json}"),
+            // A struct of strings and a one-word verdict; unreachable in practice. Said
+            // on stderr rather than panicked on or swallowed: the bridge failure below
+            // is the error worth returning, and stdout must not carry half a document.
+            Err(err) => eprintln!("could not render the status error as JSON: {err}"),
+        }
     } else {
-        println!("session: {}", session.as_str());
-        println!("wake: {}", wake_line(wake));
-        match &inbox {
-            Some(inbox) => println!("inbox topic: {}", inbox.as_str()),
-            None => println!("inbox topic: none (this session id cannot form an inbox topic)"),
+        match &identity {
+            Some(identity) => {
+                println!("session: {}", identity.session);
+                println!("wake: {}", wake_line(identity.wake));
+                match identity.inbox_topic {
+                    Some(topic) => println!("inbox topic: {topic}"),
+                    None => {
+                        println!("inbox topic: none (this session id cannot form an inbox topic)");
+                    }
+                }
+            }
+            // No session, so none of the three lines has a subject. The one line that
+            // replaces them says which they were and why they are missing.
+            None => println!("{NO_SESSION_LINE}"),
         }
         println!(
             "bridge: UNREACHABLE — watches, subscriptions and unread counts are unknown \
              (start it with `mailbox serve`)"
         );
     }
-    anyhow::anyhow!("{message}").context(format!("status for {}", session.as_str()))
+    // Named so stderr says which status failed. With no session there is no "whose" to
+    // name, and inventing one would put a session id in a log line nobody set.
+    let context = match session {
+        Some(session) => format!("status for {}", session.as_str()),
+        None => "status (no session)".to_string(),
+    };
+    anyhow::anyhow!("{message}").context(context)
 }
 
 /// Send one request to the daemon and render the reply.
@@ -965,7 +1045,11 @@ fn request_context(request: &Request) -> String {
         Request::UnwatchStub { session, label } => {
             format!("unwatching stub {label} for {}", session.as_str())
         }
-        Request::Status { session } => format!("status for {}", session.as_str()),
+        // A status without a session is the bridge's half only, so it names no whose.
+        Request::Status { session } => match session {
+            Some(session) => format!("status for {}", session.as_str()),
+            None => "status (no session)".to_string(),
+        },
         // An unattributed send is a real case (a human at a terminal), so it says so
         // rather than printing an empty "sending from  to X".
         Request::Send { from, to, .. } => match from {
@@ -1055,7 +1139,7 @@ fn render_human(response: &Response) {
         // renderer. So it prints the bridge's half and stays a pure formatter of what
         // it was handed, rather than inventing a verdict nobody looked up.
         Response::Status(report) => {
-            println!("session: {}", report.session.as_str());
+            render_session_line(report.session.as_ref());
             render_status_body(report);
         }
         Response::Sent {
@@ -1161,17 +1245,37 @@ fn render_topics(topics: &[TopicStatus]) {
 /// The verdict is a parameter rather than something read in here: this stays a
 /// renderer, and the one derivation lives at the edge that also has to answer for the
 /// bridge being down.
-fn render_status(report: &StatusReport, wake: WakeVerdict) {
-    println!("session: {}", report.session.as_str());
+fn render_status(report: &StatusReport, wake: Option<WakeVerdict>) {
+    render_session_line(report.session.as_ref());
     // Above the inbox topic because it is the more load-bearing fact: an agent that
     // cannot be woken has nothing to gain from being addressable. The two lines answer
     // genuinely different questions — "can anything wake me?" (Claude Code bound this
     // process a socket) versus "can peers reach me?" (this session is subscribed to its
     // own topic on the bus) — and reading the second as the first is what once had an
     // agent distrust a correct `watch` refusal and go back to polling.
-    println!("wake: {}", wake_line(wake));
+    //
+    // Absent exactly when the caller is not a session, since both are read from the one
+    // `resolve_session_optional`: no me, no verdict about me.
+    if let Some(wake) = wake {
+        println!("wake: {}", wake_line(wake));
+    }
     render_status_body(report);
 }
+
+/// Who this snapshot is for — or that it is for nobody, and what that costs.
+fn render_session_line(session: Option<&SessionStatus>) {
+    match session {
+        Some(session) => println!("session: {}", session.session.as_str()),
+        None => println!("{NO_SESSION_LINE}"),
+    }
+}
+
+/// What a caller that is not a session is told instead of an id: which parts of the
+/// report are missing, and that this is normal rather than a failure. A human at a
+/// terminal has no session id and no business inventing one.
+const NO_SESSION_LINE: &str = "session: none (no CLAUDE_CODE_SESSION_ID — wake, inbox, \
+                               subscriptions and unread are per-session, so this is the \
+                               bridge's half only)";
 
 /// Everything in a status snapshot that comes from the bridge, with no wake verdict.
 ///
@@ -1182,16 +1286,18 @@ fn render_status_body(report: &StatusReport) {
     // The inbox-topic line answers "can peers reach me?" — the topic AND whether the
     // session is actually subscribed to it (registration is what makes a `send`
     // deliverable; see ADR-0007).
-    match &report.inbox {
-        Some(inbox) => {
-            let registered = if report.subscriptions.contains(inbox) {
-                "registered"
-            } else {
-                "NOT registered — peers cannot send to this session"
-            };
-            println!("inbox topic: {} ({registered})", inbox.as_str());
+    if let Some(session) = &report.session {
+        match &session.inbox {
+            Some(inbox) => {
+                let registered = if session.subscriptions.contains(inbox) {
+                    "registered"
+                } else {
+                    "NOT registered — peers cannot send to this session"
+                };
+                println!("inbox topic: {} ({registered})", inbox.as_str());
+            }
+            None => println!("inbox topic: none (this session id cannot form an inbox topic)"),
         }
-        None => println!("inbox topic: none (this session id cannot form an inbox topic)"),
     }
     if report.watches.is_empty() {
         println!("watches: none");
@@ -1221,22 +1327,28 @@ fn render_status_body(report: &StatusReport) {
             );
         }
     }
-    if report.subscriptions.is_empty() {
+    // Both lists are the caller's own, so a caller that is not a session gets neither.
+    // "subscriptions: none" there would answer for a session nobody named — the same
+    // false zero the `Option` on the wire exists to prevent.
+    let Some(session) = &report.session else {
+        return;
+    };
+    if session.subscriptions.is_empty() {
         println!("subscriptions: none");
     } else {
         // The count leads the list so the human line carries the same number
         // `--json`'s `subscription_count` does, rather than making a reader tally
         // the rows themselves.
-        println!("subscriptions ({}):", report.subscription_count);
-        for topic in &report.subscriptions {
+        println!("subscriptions ({}):", session.subscription_count);
+        for topic in &session.subscriptions {
             println!("  {}", topic.as_str());
         }
     }
-    if report.unread.is_empty() {
+    if session.unread.is_empty() {
         println!("unread: none");
     } else {
         println!("unread:");
-        for topic in &report.unread {
+        for topic in &session.unread {
             println!("  [{}] {}", topic.topic.as_str(), topic.unread);
         }
     }
@@ -1993,12 +2105,14 @@ mod tests {
     #[test]
     fn a_reply_that_is_not_a_status_snapshot_is_refused() {
         let snapshot = StatusReport {
-            session: SessionId::new("s"),
-            inbox: None,
             watches: Vec::new(),
-            subscriptions: Vec::new(),
-            subscription_count: 0,
-            unread: Vec::new(),
+            session: Some(SessionStatus {
+                session: SessionId::new("s"),
+                inbox: None,
+                subscriptions: Vec::new(),
+                subscription_count: 0,
+                unread: Vec::new(),
+            }),
         };
         assert!(expect_status(&Response::Status(snapshot)).is_ok());
 
@@ -2010,6 +2124,45 @@ mod tests {
         assert_eq!(
             expect_status(&wrong),
             Err("the bridge answered `status` with a different kind of reply")
+        );
+    }
+
+    /// `wake` rides on the document only when there is a session to be a verdict about.
+    /// In process, because this is a serialisation contract: `unknown` would be the
+    /// specific false claim "the registry could not be read", and `null` is a word a
+    /// status line would print.
+    #[test]
+    fn the_wake_key_is_present_for_a_session_and_absent_for_nobody() {
+        let with_session = Response::Status(StatusReport {
+            watches: Vec::new(),
+            session: Some(SessionStatus {
+                session: SessionId::new("s"),
+                inbox: None,
+                subscriptions: Vec::new(),
+                subscription_count: 0,
+                unread: Vec::new(),
+            }),
+        });
+        let value = serde_json::to_value(StatusJson {
+            response: &with_session,
+            wake: Some(WakeVerdict::Known(Reachability::Reachable)),
+        })
+        .unwrap();
+        assert_eq!(value["wake"], "reachable");
+        assert_eq!(value["session"], "s", "and it sits beside the session keys");
+
+        let without_session = Response::Status(StatusReport {
+            watches: Vec::new(),
+            session: None,
+        });
+        let value = serde_json::to_value(StatusJson {
+            response: &without_session,
+            wake: None,
+        })
+        .unwrap();
+        assert!(
+            value.get("wake").is_none(),
+            "a verdict about nobody is not a verdict; got {value}"
         );
     }
 
