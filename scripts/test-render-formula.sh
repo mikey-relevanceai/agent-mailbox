@@ -40,6 +40,8 @@ out="${WORK}/formula.rb"
 check "$(grep -c '^      url ' "${out}")" "3" "renders one url per shipped platform"
 check "$(grep -c '^      sha256 ' "${out}")" "3" "renders one sha256 per shipped platform"
 check "$(grep -c "version \"${VERSION}\"" "${out}")" "1" "renders the version"
+check "$(grep -c 'github.com/mikey-relevanceai/agent-mailbox/releases' "${out}")" "3" \
+  "defaults to this project's releases"
 
 # The pairing is the part worth pinning: a formula that renders three correct
 # checksums against three swapped urls still passes a naive count check, and
@@ -62,6 +64,26 @@ fi
 MAILBOX_RELEASE_REPO="someone/elsewhere" "${RENDER}" "${VERSION}" "${SUMS}" >"${WORK}/forked.rb"
 check "$(grep -c 'github.com/someone/elsewhere/releases' "${WORK}/forked.rb")" "3" \
   "MAILBOX_RELEASE_REPO redirects every url"
+
+# --- input shapes that are valid but not what shasum happens to emit ---------
+# A sums file is external input to this script, and the script is documented as
+# runnable by hand. Two forms it must not choke on:
+
+# CRLF. Every filename would carry an invisible \r, so nothing matches and the
+# script blames a missing platform rather than the line endings.
+sed 's/$/\r/' "${SUMS}" >"${WORK}/crlf"
+if "${RENDER}" "${VERSION}" "${WORK}/crlf" >"${WORK}/crlf.rb" 2>/dev/null; then
+  check "$(grep -c '^      sha256 ' "${WORK}/crlf.rb")" "3" "a CRLF sums file renders every platform"
+else
+  bad "a CRLF sums file renders every platform (refused a valid file)"
+fi
+
+# GNU coreutils binary mode writes "<hash> *<file>". Both the lookup and the
+# drift guard claim to handle it; nothing proved that until now.
+sed 's/  mailbox-/  *mailbox-/' "${SUMS}" >"${WORK}/binary-mode"
+"${RENDER}" "${VERSION}" "${WORK}/binary-mode" >"${WORK}/binary.rb" 2>/dev/null || true
+check "$(grep -c '^      sha256 ' "${WORK}/binary.rb" 2>/dev/null || echo 0)" "3" \
+  "a binary-mode (*file) sums file renders every platform"
 
 # --- every refusal, and each one writes NOTHING -----------------------------
 # A `die` that still emits a partial formula is the dangerous shape: the caller
@@ -96,7 +118,10 @@ refuses "refuses the wrong argument count"        "${RENDER}" "${VERSION}"
 grep -v aarch64 "${SUMS}" >"${WORK}/missing-platform"
 refuses "refuses a sums file missing a platform"  "${RENDER}" "${VERSION}" "${WORK}/missing-platform"
 
-sed 's/^a*/notasha/' "${SUMS}" >"${WORK}/malformed-sha"
+# Corrupt exactly ONE line, so this pins "one bad checksum among good ones".
+# `s/^a*/` would match a zero-width string on every other line too, corrupting all
+# three and passing even if only the first line's check worked.
+sed '1s/^a\{64\}/notasha/' "${SUMS}" >"${WORK}/malformed-sha"
 refuses "refuses a malformed checksum"            "${RENDER}" "${VERSION}" "${WORK}/malformed-sha"
 
 # The drift guard: a platform the build matrix ships but the formula has no url

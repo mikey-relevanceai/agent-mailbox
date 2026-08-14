@@ -103,6 +103,11 @@ scripts/render-formula.sh 0.2.0 SHA256SUMS >Formula/mailbox.rb   # prints to std
 brew style Formula/mailbox.rb                                    # Homebrew's own lint
 ```
 
+The renderer has its own suite in `scripts/test-render-formula.sh` — a pure transform,
+so every refusal is reachable from a fixture. `cargo test` runs it (via
+`crates/mailbox/tests/release_tooling.rs`), so it is covered by the same command as
+everything else; run the script directly when you want its per-case output.
+
 Lint it from a path ending in `Formula/`. `brew style` switches rule sets on the
 directory name, and on a bare `mailbox.rb` it falls back to generic Ruby rules and
 reports three offences (Sorbet sigils, a frozen-string-literal comment) that no

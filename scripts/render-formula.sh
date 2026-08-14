@@ -41,7 +41,11 @@ sha_for() {
   local target="$1"
   local file="mailbox-${VERSION}-${target}.tar.gz"
   local sha
-  sha="$(awk -v f="${file}" '$2 == f || $2 == "*" f { print $1; exit }' "${SUMS}")"
+  # Strip a trailing CR before comparing. Assigning to $0 re-splits the fields, so
+  # a CRLF sums file compares on the same text an LF one does — otherwise every
+  # filename carries an invisible \r, nothing matches, and the script reports a
+  # missing checksum for a file that is plainly right there.
+  sha="$(awk -v f="${file}" '{ sub(/\r$/, "") } $2 == f || $2 == "*" f { print $1; exit }' "${SUMS}")"
   [[ -n "${sha}" ]] || die "no checksum for ${file} in ${SUMS}"
   [[ "${sha}" =~ ^[0-9a-f]{64}$ ]] || die "not a sha256 for ${file}: ${sha}"
   printf '%s' "${sha}"
@@ -63,6 +67,10 @@ INTEL_LINUX="x86_64-unknown-linux-gnu"
 # that a build for it exists. Refuse to render rather than silently drop it.
 KNOWN=" ${ARM_DARWIN} ${INTEL_DARWIN} ${INTEL_LINUX} "
 while read -r _ file; do
+  # Trailing CR first, for the same reason as `sha_for`: with one attached, the
+  # `.tar.gz` strip below silently fails to match, every known target reads as
+  # unknown, and this guard fires on a sums file that is completely valid.
+  file="${file%$'\r'}"
   [[ -n "${file}" ]] || continue
   file="${file#\*}"
   target="${file#"mailbox-${VERSION}-"}"
