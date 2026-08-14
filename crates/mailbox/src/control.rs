@@ -45,7 +45,7 @@ use mailbox_protocol::{
 use mailbox::storage::{
     SessionId, SubscribeKind, SubscribeOutcome, TopicSummary, WatchKind, WatchState,
 };
-use mailbox::watch::{StatusView, UnwatchOutcome, WatchEntry};
+use mailbox::watch::{SessionStatusView, StatusView, UnwatchOutcome, WatchEntry};
 
 /// A one-shot request from a CLI client to the `serve` daemon.
 ///
@@ -113,9 +113,15 @@ pub enum Request {
     },
     /// Drop `session`'s interest in a `stub` watch and unsubscribe it.
     UnwatchStub { session: SessionId, label: String },
-    /// Report watches (interest + child pid), this session's subscriptions, and
-    /// its unread counts.
-    Status { session: SessionId },
+    /// Report watches (interest + child pid), and — when the caller is a session —
+    /// that session's subscriptions and unread counts.
+    ///
+    /// **`session` is OPTIONAL**, because it buys only half the answer. The watch
+    /// table is bridge-global: every caller sees the same rows, so a caller with no
+    /// session still has a question worth answering ("what is the bridge doing?").
+    /// `None` means "report the bridge's half only" — the daemon then omits the
+    /// session fields rather than answering them for nobody.
+    Status { session: Option<SessionId> },
     /// Message a peer agent: publish `body` to the target's inbox topic, stamped
     /// with the sender's id (card 16). `to` is a [`SessionId`], not a `Topic`: the
     /// daemon mints the inbox topic through the one canonical constructor, so a
@@ -332,10 +338,39 @@ impl From<TopicSummary> for TopicStatus {
     }
 }
 
-/// What `status` reports (card 06).
+/// What `status` reports (card 06): the bridge's watch table, plus the caller's own
+/// half when a session ran the command.
+///
+/// **Decoded through [`StatusReportWire`]**, not by the flatten below. `#[serde(flatten)]`
+/// on an `Option` cannot tell "the half is absent" from "the half did not parse" — it
+/// answers `None` to both — so a reply that lost or renamed one session field would
+/// decode as a perfectly plausible sessionless report. The CLI would then print
+/// `session: none (no CLAUDE_CODE_SESSION_ID …)`, which is not merely unhelpful but
+/// FALSE, and a status line would lose `subscription_count` with no error anywhere.
+/// The flatten stays for serialization, where it is exactly right.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "StatusReportWire")]
 pub struct StatusReport {
-    /// The session this snapshot is for (whose unread counts are shown).
+    /// Every watch the bridge knows about, with interest counts + lifecycle.
+    /// Bridge-global, so it is the whole report when no session ran the command.
+    pub watches: Vec<WatchStatus>,
+    /// The caller's own half: absent when no session ran the command.
+    ///
+    /// **Flattened**, so every key keeps the exact top-level place and name it has
+    /// always had for a session caller — a Claude Code status line reads
+    /// `.subscription_count` off this document on every prompt, and nesting it would
+    /// break that consumer silently. `Option` rather than emptied-out fields for the
+    /// same reason `WakeVerdict::Unknown` is a variant: "nobody asked" and "the answer
+    /// is zero" are different claims, and only one of them is true here.
+    #[serde(flatten)]
+    pub session: Option<SessionStatus>,
+}
+
+/// The session-scoped half of a [`StatusReport`] — everything that is true of *this*
+/// caller rather than of the bridge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStatus {
+    /// The session this half is for (whose unread counts are shown).
     pub session: SessionId,
     /// This session's inbox topic (card 16), so an agent can see its own address
     /// without re-deriving it. `None` only if the session id cannot form a topic
@@ -343,8 +378,6 @@ pub struct StatusReport {
     /// addressable at all, which `status` should say plainly rather than hide.
     /// Whether it is REGISTERED is visible in `subscriptions`.
     pub inbox: Option<Topic>,
-    /// Every watch the bridge knows about, with interest counts + lifecycle.
-    pub watches: Vec<WatchStatus>,
     /// The topics `session` is subscribed to (card 11): the read behind
     /// "arm-iff-subscribed", also handy by hand.
     pub subscriptions: Vec<Topic>,
@@ -364,15 +397,26 @@ pub struct StatusReport {
 }
 
 impl StatusReport {
-    /// Assemble the wire report from the domain [`StatusView`] and its session.
+    /// Assemble the wire report from the domain [`StatusView`].
     ///
-    /// The sole constructor, which is what keeps `subscription_count` honest: it
-    /// is derived here from the very list it counts, never passed in.
-    pub fn from_view(session: SessionId, view: StatusView) -> Self {
+    /// The session travels *inside* the view, so there is no second argument that
+    /// could name a different session than the subscriptions belong to.
+    pub fn from_view(view: StatusView) -> Self {
         StatusReport {
-            inbox: inbox_topic(&session).ok(),
-            session,
             watches: view.watches.into_iter().map(WatchStatus::from).collect(),
+            session: view.session.map(SessionStatus::from),
+        }
+    }
+}
+
+/// Domain → wire for the session half, matching the `From` impls the rest of this
+/// module uses. `subscription_count` is derived here from the very list it counts, so
+/// the two cannot be handed in disagreeing.
+impl From<SessionStatusView> for SessionStatus {
+    fn from(view: SessionStatusView) -> Self {
+        SessionStatus {
+            inbox: inbox_topic(&view.session).ok(),
+            session: view.session,
             subscription_count: view.subscriptions.len() as u64,
             subscriptions: view.subscriptions,
             unread: view
@@ -381,6 +425,71 @@ impl StatusReport {
                 .map(|(topic, unread)| TopicUnread { topic, unread })
                 .collect(),
         }
+    }
+}
+
+/// The decode mirror for [`StatusReport`]: every session-half field independently
+/// optional, so a half-decoded reply becomes an ERROR instead of a plausible-looking
+/// sessionless one (see [`StatusReport`]'s note on why the flatten cannot do this).
+///
+/// The realistic way a skewed reply arrives is a long-lived `mailbox serve` from an
+/// older install answering a newer CLI: [`check_version`] rejects only frames NEWER
+/// than ours, so an older daemon's reply is accepted and read.
+///
+/// `subscription_count` is deliberately absent here. Serde ignores unknown keys, so a
+/// wire value is accepted and dropped, and the count is recomputed from the list on
+/// the way in — the two are then structurally incapable of disagreeing, whatever the
+/// sender claimed.
+#[derive(Deserialize)]
+struct StatusReportWire {
+    watches: Vec<WatchStatus>,
+    session: Option<SessionId>,
+    inbox: Option<Topic>,
+    subscriptions: Option<Vec<Topic>>,
+    unread: Option<Vec<TopicUnread>>,
+}
+
+impl TryFrom<StatusReportWire> for StatusReport {
+    type Error = String;
+
+    fn try_from(wire: StatusReportWire) -> Result<Self, Self::Error> {
+        // `session` is the discriminator; `subscriptions` and `unread` must travel with
+        // it. `inbox` is exempt because absent and `null` mean the same thing there — a
+        // session whose id cannot form an inbox topic — so its absence proves nothing.
+        let session = match (wire.session, wire.subscriptions, wire.unread) {
+            (None, None, None) => None,
+            (Some(session), Some(subscriptions), Some(unread)) => Some(SessionStatus {
+                inbox: wire.inbox,
+                session,
+                subscription_count: subscriptions.len() as u64,
+                subscriptions,
+                unread,
+            }),
+            (session, subscriptions, unread) => {
+                return Err(format!(
+                    "a status reply carried an incomplete session half (session: {}, \
+                     subscriptions: {}, unread: {}) — they travel together or not at all, \
+                     so this reply cannot be read as either a session's status or nobody's",
+                    field_state(&session),
+                    field_state(&subscriptions),
+                    field_state(&unread),
+                ));
+            }
+        };
+        Ok(StatusReport {
+            watches: wire.watches,
+            session,
+        })
+    }
+}
+
+/// Name a field's presence for the error above. The values themselves are never
+/// printed: a decode error is read by whoever ran the command, and the report is
+/// theirs to see in full or not at all.
+fn field_state<T>(field: &Option<T>) -> &'static str {
+    match field {
+        Some(_) => "present",
+        None => "missing",
     }
 }
 
@@ -528,6 +637,8 @@ pub fn decode_frame<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, Con
 mod tests {
     use super::*;
 
+    use mailbox::watch::SessionStatusView;
+
     fn round_trip_request(req: Request) {
         let line = encode_frame(&req).unwrap();
         assert!(!line.contains('\n'), "a frame must be one line");
@@ -562,16 +673,16 @@ mod tests {
             interval_secs: 60,
         });
         round_trip_request(Request::Status {
-            session: SessionId::new("s1"),
+            session: Some(SessionId::new("s1")),
         });
     }
 
-    /// The two ops whose caller is optional survive the wire in BOTH shapes. A
+    /// The three ops whose caller is optional survive the wire in BOTH shapes. A
     /// missing caller has to be a real value on the frame, not an encoding that
     /// happens to decode — otherwise "a human sent this" would be indistinguishable
     /// from a truncated frame.
     #[test]
-    fn send_and_agents_round_trip_with_and_without_a_caller() {
+    fn send_agents_and_status_round_trip_with_and_without_a_caller() {
         for from in [Some(SessionId::new("s-a")), None] {
             round_trip_request(Request::Send {
                 from,
@@ -581,7 +692,10 @@ mod tests {
             });
         }
         for session in [Some(SessionId::new("s-a")), None] {
-            round_trip_request(Request::Agents { session });
+            round_trip_request(Request::Agents {
+                session: session.clone(),
+            });
+            round_trip_request(Request::Status { session });
         }
     }
 
@@ -589,7 +703,7 @@ mod tests {
     fn session_is_transparent_on_the_wire() {
         // A branded SessionId serialises as its bare string (no envelope).
         let req = Request::Status {
-            session: SessionId::new("plain-id"),
+            session: Some(SessionId::new("plain-id")),
         };
         let value: serde_json::Value = serde_json::from_str(&encode_frame(&req).unwrap()).unwrap();
         assert_eq!(value["session"], "plain-id");
@@ -628,16 +742,30 @@ mod tests {
         assert_eq!(resp, back);
     }
 
-    /// Build a status view holding just `subscriptions` (the axis under test).
+    /// Build a status view for session `s1` holding just `subscriptions` (the axis
+    /// under test).
     fn view_of(subscriptions: &[&str]) -> StatusView {
         StatusView {
             watches: vec![],
-            subscriptions: subscriptions
-                .iter()
-                .map(|t| Topic::parse(*t).unwrap())
-                .collect(),
-            unread: vec![],
+            session: Some(SessionStatusView {
+                session: SessionId::new("s1"),
+                subscriptions: subscriptions
+                    .iter()
+                    .map(|t| Topic::parse(*t).unwrap())
+                    .collect(),
+                unread: vec![],
+            }),
         }
+    }
+
+    /// The session half of a report built for a session. Panics rather than
+    /// unwrapping at each call site, so a test that loses it fails on the assertion
+    /// it was written for.
+    fn session_half(report: &StatusReport) -> &SessionStatus {
+        report
+            .session
+            .as_ref()
+            .expect("a report built from a view with a session has a session half")
     }
 
     /// `subscription_count` is derived from the list it counts, and reaches the
@@ -646,14 +774,9 @@ mod tests {
     /// that invariant rather than as a hard-coded 2.
     #[test]
     fn status_carries_a_subscription_count_that_matches_its_list() {
-        let report = StatusReport::from_view(
-            SessionId::new("s1"),
-            view_of(&["agent.s1", "github.pr.o/r#1"]),
-        );
-        assert_eq!(
-            report.subscription_count as usize,
-            report.subscriptions.len()
-        );
+        let report = StatusReport::from_view(view_of(&["agent.s1", "github.pr.o/r#1"]));
+        let half = session_half(&report);
+        assert_eq!(half.subscription_count as usize, half.subscriptions.len());
 
         let value = serde_json::to_value(Response::Status(report)).unwrap();
         assert_eq!(value["subscription_count"], 2);
@@ -664,10 +787,121 @@ mod tests {
     /// line must be able to render it without a `// 0` fallback in its `jq`.
     #[test]
     fn a_session_with_no_subscriptions_counts_zero() {
-        let report = StatusReport::from_view(SessionId::new("s1"), view_of(&[]));
-        assert_eq!(report.subscription_count, 0);
+        let report = StatusReport::from_view(view_of(&[]));
+        assert_eq!(session_half(&report).subscription_count, 0);
         let value = serde_json::to_value(Response::Status(report)).unwrap();
         assert_eq!(value["subscription_count"], 0);
+    }
+
+    /// The session half is FLATTENED, so a session caller's document is byte-for-byte
+    /// the shape it has always been — `session` and `subscription_count` at the top
+    /// level, beside `result`. A Claude Code status line reads those keys on every
+    /// prompt, so nesting them would break a live consumer silently.
+    #[test]
+    fn a_session_callers_keys_stay_at_the_top_level() {
+        let value =
+            serde_json::to_value(Response::Status(StatusReport::from_view(view_of(&[])))).unwrap();
+        assert_eq!(value["result"], "status");
+        assert_eq!(value["session"], "s1");
+        assert_eq!(value["inbox"], "agent.s1");
+        assert!(value["watches"].is_array());
+    }
+
+    /// A caller that is not a session gets the bridge's half and NOTHING standing in
+    /// for the rest: the session keys are absent, not null and not zeroed. A `0`
+    /// `subscription_count` there would answer "how many topics am I on?" for a
+    /// caller who never asked, and a status line would print it as fact.
+    #[test]
+    fn a_report_for_no_session_omits_the_session_keys_entirely() {
+        let report = StatusReport::from_view(StatusView {
+            watches: vec![],
+            session: None,
+        });
+        assert!(report.session.is_none());
+
+        let value = serde_json::to_value(Response::Status(report)).unwrap();
+        assert_eq!(value["result"], "status");
+        assert!(value["watches"].is_array(), "the global half still answers");
+        for key in [
+            "session",
+            "inbox",
+            "subscriptions",
+            "subscription_count",
+            "unread",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "{key} must be absent, not null or zero, when no session ran the command"
+            );
+        }
+    }
+
+    /// **A half-decoded session half is an ERROR, not a sessionless report.**
+    ///
+    /// `#[serde(flatten)]` on an `Option` answers `None` to both "absent" and "did not
+    /// parse", so without the [`StatusReportWire`] decode these inputs would each read
+    /// as a perfectly plausible report for nobody — and the CLI would print
+    /// `session: none (no CLAUDE_CODE_SESSION_ID …)` about a session that named itself,
+    /// while a status line lost `subscription_count` with no error anywhere. The lie is
+    /// the point: absence of the half must never be inferred from failure to read it.
+    #[test]
+    fn an_incomplete_session_half_fails_to_decode_rather_than_reading_as_nobody() {
+        for (name, raw) in [
+            (
+                "session with no subscriptions or unread",
+                r#"{"version":1,"result":"status","watches":[],"session":"s1"}"#,
+            ),
+            (
+                "session and subscriptions but no unread",
+                r#"{"version":1,"result":"status","watches":[],"session":"s1","subscriptions":[],"inbox":"agent.s1"}"#,
+            ),
+            (
+                "the half's contents with no session to own them",
+                r#"{"version":1,"result":"status","watches":[],"subscriptions":[],"unread":[]}"#,
+            ),
+        ] {
+            let decoded = decode_frame::<Response>(raw);
+            let err = decoded
+                .err()
+                .unwrap_or_else(|| panic!("{name} must not decode as a valid report"))
+                .to_string();
+            assert!(
+                err.contains("incomplete session half"),
+                "{name}: the error must name what was wrong; got: {err}"
+            );
+        }
+    }
+
+    /// The count is recomputed from the list it counts, so a sender that claims
+    /// otherwise cannot make the two disagree in a reader's hands.
+    #[test]
+    fn a_wire_subscription_count_is_recomputed_rather_than_trusted() {
+        let raw = r#"{"version":1,"result":"status","watches":[],"session":"s1","inbox":"agent.s1","subscriptions":["agent.s1","stub.x"],"subscription_count":99,"unread":[]}"#;
+        let Response::Status(report) = decode_frame::<Response>(raw).expect("a valid report")
+        else {
+            panic!("expected a status reply");
+        };
+        let half = session_half(&report);
+        assert_eq!(half.subscription_count, 2, "the claimed 99 is not believed");
+        assert_eq!(half.subscription_count as usize, half.subscriptions.len());
+    }
+
+    /// Both shapes of the report survive the wire. The sessionless one especially:
+    /// `#[serde(flatten)]` on an `Option` is what keeps the keys top-level, and a
+    /// flatten that serialises but does not decode would break every client.
+    #[test]
+    fn a_status_reply_round_trips_with_and_without_a_session_half() {
+        for view in [
+            view_of(&["agent.s1"]),
+            StatusView {
+                watches: vec![],
+                session: None,
+            },
+        ] {
+            let resp = Response::Status(StatusReport::from_view(view));
+            let line = encode_frame(&resp).unwrap();
+            assert_eq!(decode_frame::<Response>(&line).unwrap(), resp);
+        }
     }
 
     #[test]

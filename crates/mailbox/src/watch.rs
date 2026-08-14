@@ -89,11 +89,23 @@ pub enum UnwatchOutcome {
     NoSuchWatch,
 }
 
-/// A status snapshot: every known watch plus one session's subscriptions and
-/// per-topic unread.
+/// A status snapshot: every known watch, plus the calling session's own half when
+/// a session ran the command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusView {
+    /// Every watch the bridge knows about. Bridge-global — the same table for every
+    /// caller — which is why `status` still has an answer with no session at all.
     pub watches: Vec<WatchEntry>,
+    /// The caller's own half, absent when no session ran the command. Nested rather
+    /// than a pair of empty vecs so "nobody asked" cannot be read as "you are
+    /// subscribed to nothing and have no mail".
+    pub session: Option<SessionStatusView>,
+}
+
+/// The session-scoped half of a [`StatusView`]: what is true of *this* caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionStatusView {
+    pub session: SessionId,
     /// The topics this session is subscribed to (card 11): the read behind
     /// "arm-iff-subscribed", surfaced in `status` so it is observable by hand too.
     pub subscriptions: Vec<Topic>,
@@ -306,9 +318,14 @@ async fn drop_interest_for(
     Ok(WatchDropped { topic, outcome })
 }
 
-/// Snapshot every watch (with interest counts + lifecycle state) and `session`'s
-/// per-topic unread counts. A pure read: it advances no cursor.
-pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView, BusError> {
+/// Snapshot every watch (with interest counts + lifecycle state), and — when the
+/// caller is a session — that session's subscriptions and per-topic unread counts.
+/// A pure read: it advances no cursor.
+///
+/// `session` is optional because only the second half needs one. The watch table is
+/// bridge-global, so a caller with no session (a human at a terminal) still gets the
+/// answer to "what is the bridge doing?" rather than a refusal.
+pub async fn status(storage: &Storage, session: Option<SessionId>) -> Result<StatusView, BusError> {
     let mut watches = Vec::new();
     for watch in storage.list_watches().await? {
         let interest = storage.interest_count(watch.id).await?;
@@ -319,18 +336,31 @@ pub async fn status(storage: &Storage, session: SessionId) -> Result<StatusView,
             interest,
         });
     }
+    let session = match session {
+        Some(session) => Some(session_status(storage, session).await?),
+        None => None,
+    };
+    Ok(StatusView { watches, session })
+}
+
+/// The session-scoped half of [`status`]: what one session is on, and what is waiting
+/// for it.
+async fn session_status(
+    storage: &Storage,
+    session: SessionId,
+) -> Result<SessionStatusView, BusError> {
     let subscriptions = storage.session_subscriptions(session.clone()).await?;
     // Counts, not subjects: `status` answers "is there anything waiting?", and what
     // that mail is about is what `read` is for. It is the same query the wake uses,
     // so the two can never disagree about what "unread" means.
     let unread = storage
-        .unread_digest(session, SubjectBudget::CountsOnly)
+        .unread_digest(session.clone(), SubjectBudget::CountsOnly)
         .await?
         .into_iter()
         .map(|digest| (digest.topic, digest.unread))
         .collect();
-    Ok(StatusView {
-        watches,
+    Ok(SessionStatusView {
+        session,
         subscriptions,
         unread,
     })
@@ -585,7 +615,7 @@ mod tests {
         .await
         .unwrap();
 
-        let view = status(&storage, SessionId::new("s1")).await.unwrap();
+        let view = status(&storage, Some(SessionId::new("s1"))).await.unwrap();
         assert_eq!(view.watches.len(), 1);
         let entry = &view.watches[0];
         assert_eq!(
@@ -601,8 +631,40 @@ mod tests {
             WatchState::Desired,
             "the UnavailableResolver spawns no adapter, so the watch stays desired"
         );
-        assert_eq!(view.subscriptions, vec![recorded.topic.clone()]);
-        assert_eq!(view.unread, vec![(recorded.topic, 1)]);
+        let session = view.session.expect("a status asked for s1 has s1's half");
+        assert_eq!(session.session, SessionId::new("s1"));
+        assert_eq!(session.subscriptions, vec![recorded.topic.clone()]);
+        assert_eq!(session.unread, vec![(recorded.topic, 1)]);
+    }
+
+    /// The watch table is bridge-global, so it is the same table with no session at
+    /// all — and the session half is then absent rather than empty. This is what lets
+    /// a human at a terminal ask "what is the bridge doing?" without inventing an id.
+    #[tokio::test]
+    async fn status_with_no_session_reports_the_watches_and_no_session_half() {
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let watched = pr(1);
+        record(
+            &bus,
+            &storage,
+            &supervisor,
+            &watched,
+            Duration::from_secs(30),
+            SessionId::new("s1"),
+        )
+        .await
+        .unwrap();
+
+        let view = status(&storage, None).await.unwrap();
+        assert_eq!(view.watches.len(), 1, "the global half still answers");
+        assert_eq!(
+            view.watches[0].interest, 1,
+            "interest counts every session, so it does not depend on the caller"
+        );
+        assert!(
+            view.session.is_none(),
+            "no caller means no subscriptions to report, not an empty list"
+        );
     }
 
     #[tokio::test]
@@ -640,8 +702,13 @@ mod tests {
         assert_eq!(ended.adapters_stopped, 0);
 
         // The leaver is gone from status; the shared watch's interest is now 1.
-        let view = status(&storage, SessionId::new("leaver")).await.unwrap();
-        assert!(view.subscriptions.is_empty());
+        let view = status(&storage, Some(SessionId::new("leaver")))
+            .await
+            .unwrap();
+        let session = view
+            .session
+            .expect("a status asked for the leaver has its half");
+        assert!(session.subscriptions.is_empty());
         assert_eq!(view.watches[0].interest, 1);
 
         // The last session leaving empties the watch (drives supervisor teardown).
