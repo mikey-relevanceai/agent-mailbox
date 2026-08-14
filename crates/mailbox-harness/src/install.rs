@@ -632,8 +632,18 @@ pub fn default_mailbox_bin(current_exe: std::io::Result<std::path::PathBuf>) -> 
 }
 
 /// The absolute form of a caller-supplied binary path (best-effort).
+///
+/// Absolute but deliberately NOT canonical: `absolute` anchors a relative path to
+/// the cwd without following symlinks, where `canonicalize` would resolve them.
+/// Under a package manager that distinction decides whether the hook survives an
+/// upgrade. Homebrew installs into a versioned Cellar directory and exposes it via
+/// `opt_bin` — `/opt/homebrew/opt/mailbox/bin/mailbox` — a symlink it re-points on
+/// every upgrade. Canonicalising that would bake the Cellar path `brew upgrade`
+/// then deletes into `settings.json`, leaving `SessionStart` pointing at a binary
+/// that is gone: the inbox stops being registered, so peers cannot address the
+/// session, while topic wakes keep working and nothing looks broken (ADR-0025).
 pub fn abs_bin(path: &Path) -> String {
-    std::fs::canonicalize(path)
+    std::path::absolute(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.display().to_string())
 }
@@ -1246,5 +1256,49 @@ mod tests {
         assert_eq!(start[0], "/home/u/.local/bin/mailbox harness session-start");
         let end = hook_commands(&twice, "SessionEnd");
         assert_eq!(end, vec!["/home/u/.local/bin/mailbox harness cleanup"]);
+    }
+
+    // ==== abs_bin: absolute, never canonical (ADR-0025) =========================
+
+    /// The load-bearing assumption behind the Homebrew install, and one the type
+    /// system cannot hold: `abs_bin` must ANCHOR a path, not RESOLVE it. Homebrew
+    /// hands us `opt_bin` — a stable symlink into a versioned Cellar directory that
+    /// `brew upgrade` deletes and re-points. Swapping `absolute` back to
+    /// `canonicalize` would bake the perishable side into `settings.json`, and the
+    /// resulting breakage is silent (peers can no longer address the session, topic
+    /// wakes carry on), so nothing else in the suite would notice.
+    #[test]
+    fn abs_bin_keeps_the_symlink_it_was_given() {
+        let dir = TempDir::new().unwrap();
+        // Stand in for Homebrew's layout: the versioned directory an upgrade
+        // replaces, and the stable link callers are told to point the hook at.
+        let cellar = dir.path().join("Cellar/mailbox/0.1.0/bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        let real = cellar.join("mailbox");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+
+        let opt = dir.path().join("opt-mailbox-bin");
+        std::os::unix::fs::symlink(&cellar, &opt).unwrap();
+        let via_link = opt.join("mailbox");
+
+        assert_eq!(
+            abs_bin(&via_link),
+            via_link.display().to_string(),
+            "the link must survive: resolving it here is what breaks `brew upgrade`"
+        );
+    }
+
+    /// The other half of the contract — it is still ABSOLUTE. A relative path in
+    /// `settings.json` would be resolved against whatever cwd the hook happened to
+    /// fire in, which is not ours to predict.
+    #[test]
+    fn abs_bin_anchors_a_relative_path_to_the_working_directory() {
+        let anchored = abs_bin(Path::new("target/release/mailbox"));
+
+        assert!(
+            Path::new(&anchored).is_absolute(),
+            "hooks run with an unknown cwd, so a relative path is unusable: {anchored}"
+        );
+        assert!(anchored.ends_with("target/release/mailbox"), "{anchored}");
     }
 }

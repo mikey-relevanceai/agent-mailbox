@@ -1,0 +1,271 @@
+name: Release
+
+# Cut a release from an annotated `vX.Y.Z` tag and nothing else. The tag is the
+# only trigger: a Homebrew formula pins an immutable, checksummed tarball, so a
+# release must correspond to one commit that cannot move afterwards
+# (docs/05-release.md). `scripts/bump-version.sh --tag` produces exactly this tag.
+#
+# That pattern is a GitHub filter pattern, NOT a regex that happens to look like
+# one: `[0-9]` is a range, `+` is one-or-more, and `.` is literal. It matches the
+# whole ref, so `v0.2.0-rc1` deliberately does not fire — a prerelease should not
+# rewrite the tap's only formula.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+# Two tags landing together would race each other pushing the tap. Serialise
+# instead, and never cancel: a half-published release is worse than a slow one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Build every target even after one fails. A release needs all three, so a
+      # failure blocks it either way — seeing all three verdicts at once beats
+      # fixing them one release attempt at a time.
+      fail-fast: false
+      matrix:
+        include:
+          # Both macOS slices are built on the arm64 runner: the x86_64 one is a
+          # cross-compile. Apple's clang carries both slices, and our only C
+          # dependency is the SQLite that `rusqlite`'s `bundled` feature compiles,
+          # so this needs no cross toolchain — and it keeps the matrix off the
+          # Intel runner images, which Actions retires on its own schedule.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            native: true
+            arch_marker: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            native: false
+            arch_marker: x86_64
+          # Built on the OLDEST supported Ubuntu on purpose: a glibc-linked binary
+          # runs on the glibc it was built against or newer, never older, so
+          # building on `ubuntu-latest` would silently exclude older distros.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            native: true
+            arch_marker: x86-64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # crates/mailbox/build.rs bakes the commit into `--version` by shelling
+          # out to git. A shallow clone leaves it printing "(git unknown)" — still
+          # valid, but it throws away the one field that identifies the build.
+          fetch-depth: 0
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # A tag that disagrees with Cargo.toml means someone tagged by hand instead
+      # of via bump-version.sh. Caught here, that is a deleted tag; caught later,
+      # it is a formula whose `version` does not match the binary it installs.
+      - name: Check the tag matches the workspace version
+        id: version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(awk '
+            /^\[/ { in_pkg = ($0 == "[workspace.package]") }
+            in_pkg && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/); print substr($0, RSTART+1, RLENGTH-2); exit
+            }
+          ' Cargo.toml)"
+          if [[ "${tag_version}" != "${cargo_version}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+          echo "version=${tag_version}" >>"${GITHUB_OUTPUT}"
+
+      # Only the three shipped binaries. `--bins` would also build the
+      # `test_adapter` fixture that crates/mailbox declares for its adapter-host
+      # tests, and shipping a test fixture as a public command is not something a
+      # user should have to discover. `--locked` so the release matches Cargo.lock.
+      - name: Build
+        env:
+          # Without this, a cross-compile defaults to the runner's own macOS
+          # version and produces binaries that refuse to start on anything older.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p mailbox --bin mailbox \
+            -p mailbox-stub-adapter --bin mailbox-stub-adapter \
+            -p mailbox-github-pr-adapter --bin mailbox-github-pr-adapter
+
+      # The failure a cross-compile makes easy is shipping the runner's own
+      # architecture under the target's name. `file` is the cheap way to prove we
+      # did not, and it works for the slice we cannot execute here.
+      - name: Check the binaries are built for ${{ matrix.target }}
+        run: |
+          for bin in mailbox mailbox-stub-adapter mailbox-github-pr-adapter; do
+            described="$(file -b "target/${{ matrix.target }}/release/${bin}")"
+            echo "${bin}: ${described}"
+            case "${described}" in
+              *"${{ matrix.arch_marker }}"*) ;;
+              *) echo "::error::${bin} is not ${{ matrix.arch_marker }}: ${described}"; exit 1 ;;
+            esac
+          done
+
+      # Native targets only: an arm64 runner may or may not have Rosetta, and a
+      # smoke test that silently skips is worse than one that is honestly absent.
+      - name: Smoke-test the binary
+        if: matrix.native
+        run: |
+          printed="$(target/${{ matrix.target }}/release/mailbox --version)"
+          echo "${printed}"
+          # The same contract the formula's `test do` block asserts: a bare semver
+          # as an unadorned leading token (docs/05-release.md).
+          case "${printed}" in
+            *"${{ steps.version.outputs.version }}"*) ;;
+            *) echo "::error::--version does not contain ${{ steps.version.outputs.version }}"; exit 1 ;;
+          esac
+
+      # Staged under RUNNER_TEMP, never in the checkout: build.rs stamps `-dirty`
+      # from `git status`, and a release binary must not be able to describe
+      # itself as built from a dirty tree because the packaging step littered.
+      - name: Stage the tarball
+        id: stage
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          name="mailbox-${version}-${{ matrix.target }}"
+          stage="${RUNNER_TEMP}/${name}"
+          mkdir -p "${stage}"
+          cp target/${{ matrix.target }}/release/mailbox \
+             target/${{ matrix.target }}/release/mailbox-stub-adapter \
+             target/${{ matrix.target }}/release/mailbox-github-pr-adapter \
+             README.md LICENSE "${stage}/"
+          tar -czf "${RUNNER_TEMP}/${name}.tar.gz" -C "${stage}" \
+            mailbox mailbox-stub-adapter mailbox-github-pr-adapter README.md LICENSE
+          # `shasum` on the macOS images, `sha256sum` on the Ubuntu ones; both
+          # emit the "<hash>  <file>" form scripts/render-formula.sh reads.
+          cd "${RUNNER_TEMP}"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${name}.tar.gz" >"${name}.tar.gz.sha256"
+          else
+            sha256sum "${name}.tar.gz" >"${name}.tar.gz.sha256"
+          fi
+          cat "${name}.tar.gz.sha256"
+          echo "name=${name}" >>"${GITHUB_OUTPUT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: |
+            ${{ runner.temp }}/${{ steps.stage.outputs.name }}.tar.gz
+            ${{ runner.temp }}/${{ steps.stage.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.collect.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One SHA256SUMS covering every platform: it is what a user verifies a
+      # download against, and what the tap job renders the formula's checksums
+      # from — so the formula and the release cannot disagree by construction.
+      - name: Collect the checksums
+        id: collect
+        run: |
+          cd artifacts
+          cat ./*.tar.gz.sha256 | sort -k2 >SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          cat SHA256SUMS
+          echo "version=${GITHUB_REF_NAME#v}" >>"${GITHUB_OUTPUT}"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --verify-tag: refuse to invent a tag if the ref ever arrives without
+          # one. --generate-notes: the changelog is the commit log; there is no
+          # hand-maintained CHANGELOG.md to fall out of date.
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/SHA256SUMS
+          if-no-files-found: error
+
+  tap:
+    name: update the Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: sums
+
+      # GITHUB_TOKEN is scoped to this repository, so pushing to the tap needs a
+      # credential of its own. Without this check the failure surfaces as a 404 on
+      # checkout, which reads like the tap repo does not exist.
+      - name: Require the tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set. Create a fine-grained PAT with Contents:write on mikey-relevanceai/homebrew-tap and add it as a repository secret. The release itself is already published; re-run this job once the secret exists."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: mikey-relevanceai/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # `mkdir -p` so the very first release can create Formula/ in a tap that has
+      # only ever held a README.
+      - name: Render the formula
+        run: |
+          mkdir -p tap/Formula
+          scripts/render-formula.sh "${{ needs.release.outputs.version }}" sums/SHA256SUMS >tap/Formula/mailbox.rb
+          cat tap/Formula/mailbox.rb
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/mailbox.rb
+          # Re-running the job for a release already in the tap is a no-op, not a
+          # failure: `git commit` exits non-zero with nothing staged, and that is
+          # the expected outcome of a retry, not something to fail the build on.
+          if git diff --cached --quiet; then
+            echo "formula already up to date for ${{ needs.release.outputs.version }}"
+            exit 0
+          fi
+          git commit -m "mailbox ${{ needs.release.outputs.version }}"
+          git push
