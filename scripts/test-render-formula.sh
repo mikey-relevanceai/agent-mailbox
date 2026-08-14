@@ -80,6 +80,15 @@ refuses() {
 }
 
 refuses "refuses a non-semver version"            "${RENDER}" "1.2" "${SUMS}"
+
+# A repo with no `/` would leave OWNER and REPO as the same string, rendering
+# plausible URLs that 404 rather than failing.
+if MAILBOX_RELEASE_REPO="justaname" "${RENDER}" "${VERSION}" "${SUMS}" >/dev/null 2>&1; then
+  bad "refuses a MAILBOX_RELEASE_REPO with no owner"
+else
+  ok "refuses a MAILBOX_RELEASE_REPO with no owner"
+fi
+
 refuses "refuses a version with a v prefix"       "${RENDER}" "v${VERSION}" "${SUMS}"
 refuses "refuses an unreadable sums file"         "${RENDER}" "${VERSION}" "${WORK}/absent"
 refuses "refuses the wrong argument count"        "${RENDER}" "${VERSION}"

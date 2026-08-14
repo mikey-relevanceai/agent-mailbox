@@ -29,6 +29,10 @@ SUMS="$2"
 
 [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "not an X.Y.Z version: ${VERSION}"
 [[ -r "${SUMS}" ]] || die "cannot read sums file: ${SUMS}"
+# Check the shape before trusting the split above: with no `/`, both `%%/*` and
+# `#*/` leave the string untouched, so OWNER and REPO silently become the SAME
+# value and the formula renders plausible-looking URLs that 404.
+[[ "${SOURCE_REPO}" =~ ^[^/]+/[^/]+$ ]] || die "not an OWNER/REPO: ${SOURCE_REPO}"
 
 # Look a checksum up by tarball name. A missing entry is fatal: a formula that
 # ships a blank or stale sha256 fails at `brew install` time on a user's machine,
