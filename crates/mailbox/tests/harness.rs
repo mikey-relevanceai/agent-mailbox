@@ -725,13 +725,15 @@ fn install_hooks_re_run_with_a_different_binary_updates_rather_than_appends() {
         "a re-run must leave exactly ONE session-start hook: {session_start:?}"
     );
     let command = session_start[0]["hooks"][0]["command"].as_str().unwrap();
-    // install-hooks canonicalizes the bin path, so compare against the canonical form
-    // (on macOS /var → /private/var).
-    let canonical = std::fs::canonicalize(&relocated).unwrap();
+    // The path is recorded exactly as GIVEN — absolute, but with symlinks intact
+    // (ADR-0025). The two forms genuinely differ here on macOS, where the tempdir
+    // sits under /var, itself a symlink to /private/var: canonicalizing would write
+    // the resolved form, which under Homebrew is the versioned path `brew upgrade`
+    // deletes.
     assert!(
-        command.starts_with(canonical.to_str().unwrap())
+        command.starts_with(relocated.to_str().unwrap())
             && command.contains("harness session-start"),
-        "the surviving hook points at the relocated binary: {command}"
+        "the surviving hook points at the relocated binary as given: {command}"
     );
     assert_eq!(merged["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
 }

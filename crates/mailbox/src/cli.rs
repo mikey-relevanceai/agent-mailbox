@@ -1632,7 +1632,13 @@ fn run_harness_install(format: OutputFormat, args: InstallHooksArgs) -> anyhow::
     use mailbox_harness::install::{BackupPolicy, SettingsTarget};
 
     let mailbox_bin = match args.mailbox_bin {
-        Some(path) => mailbox_harness::install::abs_bin(&path),
+        Some(path) => mailbox_harness::install::abs_bin(&path).with_context(|| {
+            format!(
+                "--mailbox-bin {} cannot be made absolute, and a hook must not be \
+                 installed with a path that resolves against the hook's own cwd",
+                path.display()
+            )
+        })?,
         None => mailbox_harness::install::default_mailbox_bin(std::env::current_exe()),
     };
     let spec = mailbox_harness::install::HookInstallSpec { mailbox_bin };

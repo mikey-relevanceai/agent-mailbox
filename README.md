@@ -67,18 +67,24 @@ output is in [docs/demo.md](docs/demo.md).
 To actually use it:
 
 ```bash
-# Install mailbox + the two adapters co-located on PATH. Use the helper rather than
-# `cp`/`install`: on Apple Silicon, overwriting a signed binary in place gets the new
-# one SIGKILLed (`Killed: 9`), so it takes a fresh inode and re-signs (docs/05-release.md).
-scripts/install-local.sh              # → ~/.local/bin, or DEST=/usr/local/bin
+# mailbox + the two adapters, co-located on PATH, plus the `gh` the PR adapter needs.
+brew install mikey-relevanceai/tap/mailbox
 
 mailbox serve &                                                   # the bridge daemon
 
 # The two setup commands: hooks make wake infrastructure, the skill teaches the
-# agent the loop it wakes into.
+# agent the loop it wakes into. Neither is run for you by `brew`: both write to
+# ~/.claude, outside Homebrew's prefix.
 mailbox harness install-skills   # skill  -> ~/.claude/skills
-mailbox harness install-hooks    # hooks  -> ~/.claude/settings.json (when it exists)
+mailbox harness install-hooks --mailbox-bin "$(brew --prefix)/opt/mailbox/bin/mailbox"
 ```
+
+Pass `--mailbox-bin` exactly as shown — see the gotcha table below for why. Building
+from source instead? Use `scripts/install-local.sh` (→ `~/.local/bin`, or
+`DEST=/usr/local/bin`) rather than `cp`/`install`: on Apple Silicon, overwriting a
+signed binary in place gets the new one SIGKILLed (`Killed: 9`), so the helper takes
+a fresh inode and re-signs ([docs/05-release.md](docs/05-release.md)). With a
+from-source install, plain `mailbox harness install-hooks` is correct.
 
 Both are idempotent — re-run them after an upgrade to refresh the hooks and the
 skill. Both default under the same home (`AGENT_MAILBOX_HOME`, else `HOME`), and
@@ -185,6 +191,7 @@ Less exotic, but each one fails silently in its own way:
 | Trick | What breaks without it |
 |---|---|
 | Run `install-hooks` from the **installed** binary, not `cargo run` or `target/debug` | The absolute path of whatever binary you ran is baked into `settings.json`. Point it at a build tree and the `SessionStart` hook dies after the next `cargo clean` — your inbox stops being registered, so peers cannot address you, while topic wakes keep working. `--mailbox-bin <abs path>` overrides. |
+| On a Homebrew install, point `install-hooks` at `$(brew --prefix)/opt/mailbox/bin/mailbox` | The path you give it is the path baked into `settings.json`. Give it the versioned Cellar path — which is what `brew --prefix`'s plain `bin/` resolves to on Linux, and what an explicit Cellar path does anywhere — and the next `brew upgrade` deletes it. The `SessionStart` hook then dies exactly as in the row above: your inbox stops being registered, so peers cannot address you, while topic wakes keep working. The `opt` path is the one Homebrew re-points on upgrade ([ADR-0025](docs/adr/0025-hooks-point-at-a-stable-path.md)). |
 | After upgrading the binary: re-run `install-hooks` **and** restart `mailbox serve` | The re-run sweeps every hook name ever shipped, so an upgrade cannot leave a retired hook firing at a subcommand that no longer exists. The running daemon is still the old code and holds the lock. |
 | Start `mailbox serve` with the **same `HOME`** as your Claude sessions | The daemon resolves Claude Code's sessions directory **once, at startup, from its own environment**. Started by launchd/systemd with a different or missing `HOME` — or with `CLAUDE_CONFIG_DIR`/`MAILBOX_CLAUDE_SESSIONS_DIR` changed after it booted — it can wake nobody. Events still store durably; you get one `warn` line. Restart it after any such change. |
 | `gh` on the **daemon's** `PATH`, authenticated as the **daemon's** user | Adapters are spawned by `serve` and inherit its environment, so `gh auth` is checked there, not in your shell. Missing auth is fatal: the adapter exits non-zero and the supervisor gives up on that watch. |

@@ -12,7 +12,36 @@ loop is shaped this way. This doc is the *how*.
 
 ## 1. Install
 
-### Build the binaries
+### Homebrew (the short way)
+
+```bash
+brew install mikey-relevanceai/tap/mailbox
+```
+
+That installs all three binaries co-located in Homebrew's `bin` — the layout
+**Co-location matters** below explains. It also pulls in `gh`, which the
+github-pr adapter shells out to and cannot work without.
+
+Then the two setup commands — `brew` runs neither for you, because both write to
+`~/.claude`, outside Homebrew's prefix:
+
+```bash
+mailbox harness install-skills
+mailbox harness install-hooks --mailbox-bin "$(brew --prefix)/opt/mailbox/bin/mailbox"
+```
+
+**Pass `--mailbox-bin` exactly as shown.** `install-hooks` bakes an absolute path
+into `settings.json`, and `$(brew --prefix)/opt/mailbox/bin` is the one Homebrew
+re-points on upgrade. The versioned path behind it is deleted by `brew upgrade`,
+which would leave the `SessionStart` hook pointing at a binary that is gone — and
+that failure is silent and partial: peers can no longer address the session while
+topic wakes carry on working ([ADR-0025](adr/0025-hooks-point-at-a-stable-path.md)).
+`brew info mailbox` prints the same command back at you.
+
+Upgrades are then just `brew upgrade mailbox` — plus a `mailbox serve` restart,
+since the running daemon is still the old code and holds the lock.
+
+### From source
 
 From the repo root:
 

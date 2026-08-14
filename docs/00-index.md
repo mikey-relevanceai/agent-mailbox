@@ -9,7 +9,7 @@ Notes for the project. **New here and want to *use* it?** Start with
 | Doc | What it covers |
 |---|---|
 | [04-usage](04-usage.md) | **Start here.** Install, hooks, the four-verb agent loop, agent-to-agent messaging, `mailbox status` |
-| [05-release](05-release.md) | Versioning, the `--version` format, the Homebrew-tap distribution route + constraints, macOS `Killed: 9` fix |
+| [05-release](05-release.md) | Versioning, the `--version` format, the Homebrew-tap distribution route + constraints, how to cut a release, why not cargo-dist, macOS `Killed: 9` fix |
 | [demo](demo.md) | Runnable end-to-end demo (`scripts/demo.sh`) + captured output; real-PR steps |
 | [migration-from-agent-ipc](migration-from-agent-ipc.md) | Retire the old `agent-ipc` / `agent-ipc-github` skills; drop-in replacement skill |
 
