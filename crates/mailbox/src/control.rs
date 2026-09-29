@@ -288,6 +288,7 @@ pub enum ResumeState {
         subscriptions_restored: u64,
         interests_restored: u64,
         watches_ensured: u64,
+        watches_failed: u64,
     },
     RefusedSessionRecentlyEnded,
 }
@@ -299,10 +300,12 @@ impl From<SessionResumed> for ResumeState {
                 subscriptions_restored,
                 interests_restored,
                 watches_ensured,
+                watches_failed,
             } => ResumeState::Resumed {
                 subscriptions_restored,
                 interests_restored,
                 watches_ensured,
+                watches_failed,
             },
             SessionResumed::RefusedSessionRecentlyEnded => ResumeState::RefusedSessionRecentlyEnded,
         }
@@ -777,6 +780,40 @@ mod tests {
         assert_eq!(value["version"], serde_json::json!(PROTOCOL_VERSION));
         let back: Response = decode_frame(&line).unwrap();
         assert_eq!(resp, back);
+    }
+
+    /// The resume request and both reply shapes survive the wire, and the domain →
+    /// wire conversion keeps every count (ADR-0026). The `state` tag is what an older
+    /// or newer peer has to agree on.
+    #[test]
+    fn resume_session_round_trips_in_every_shape() {
+        round_trip_request(Request::ResumeSession {
+            session: SessionId::new("s1"),
+        });
+
+        let resumed = ResumeState::from(SessionResumed::Resumed {
+            subscriptions_restored: 1,
+            interests_restored: 2,
+            watches_ensured: 3,
+            watches_failed: 4,
+        });
+        assert_eq!(
+            resumed,
+            ResumeState::Resumed {
+                subscriptions_restored: 1,
+                interests_restored: 2,
+                watches_ensured: 3,
+                watches_failed: 4,
+            }
+        );
+        for outcome in [resumed, ResumeState::RefusedSessionRecentlyEnded] {
+            let resp = Response::SessionResumed { outcome };
+            let line = encode_frame(&resp).unwrap();
+            let back: Response = decode_frame(&line).unwrap();
+            assert_eq!(resp, back);
+        }
+        let refused = serde_json::to_value(ResumeState::RefusedSessionRecentlyEnded).unwrap();
+        assert_eq!(refused["state"], "refused_session_recently_ended");
     }
 
     /// Build a status view for session `s1` holding just `subscriptions` (the axis

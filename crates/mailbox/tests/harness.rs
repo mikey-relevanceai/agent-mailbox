@@ -368,11 +368,13 @@ fn ac3_cleanup_drops_watch_interest_to_zero() {
 /// backdated end.
 #[test]
 fn session_start_resumes_a_watch_the_ttl_sweep_suspended() {
-    // TTL long enough that the resumed interest is observed before the next sweep
-    // suspends it again (nothing in this test is a "running" session).
+    // TTL long enough that the resumed interest is observed well before the next
+    // sweep suspends it again (nothing in this test is a "running" session). The
+    // hook returns only after the daemon has run `ensure_running`, so the check
+    // below is immediate; the TTL is the margin a slow CI runner gets.
     let daemon = Daemon::start_with(&[
         ("MAILBOX_SWEEP_INTERVAL_MS", "100"),
-        ("MAILBOX_INTEREST_TTL_MS", "3000"),
+        ("MAILBOX_INTEREST_TTL_MS", "6000"),
     ]);
     let session = "s-resume";
     assert_ok(
@@ -414,6 +416,42 @@ fn session_start_resumes_a_watch_the_ttl_sweep_suspended() {
         subscriptions(&daemon, session).contains(&"stub.demo".to_string()),
         "the sweep never touched the subscription, and the resume keeps it"
     );
+}
+
+/// ADR-0026's retention window, wired through the real daemon: once a suspension is
+/// older than `MAILBOX_SUSPENSION_RETENTION_MS`, the sweep forgets it and a resume
+/// brings nothing back.
+#[test]
+fn session_start_restores_nothing_once_the_suspension_has_expired() {
+    let daemon = Daemon::start_with(&[
+        ("MAILBOX_SWEEP_INTERVAL_MS", "100"),
+        ("MAILBOX_INTEREST_TTL_MS", "300"),
+        ("MAILBOX_SUSPENSION_RETENTION_MS", "500"),
+    ]);
+    let session = "s-expired";
+    assert_ok(
+        &daemon.run_as(
+            session,
+            &["watch", "stub", "gone", "--interval-ms", "60000"],
+        ),
+        "watch stub",
+    );
+    poll_until(
+        "the sweep suspends the interest",
+        Duration::from_secs(15),
+        || {
+            let (state, interest) = watch_state_interest(&daemon, session)?;
+            (state == "stopped" && interest == 0).then_some(())
+        },
+    );
+    // Waiting out a duration, not a state: the suspended row is not observable
+    // from outside, so the only thing to wait for is the retention to pass plus a
+    // few sweeps.
+    std::thread::sleep(Duration::from_millis(1_500));
+
+    assert_ok(&daemon.session_start(session), "session-start");
+    let (state, interest) = watch_state_interest(&daemon, session).expect("watch row");
+    assert_eq!((state.as_str(), interest), ("stopped", 0));
 }
 
 // ==== install-hooks writes the hook set, and never destroys a settings file =====

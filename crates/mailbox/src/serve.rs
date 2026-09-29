@@ -294,10 +294,14 @@ fn spawn_sweeper(supervisor: Supervisor, storage: Storage) -> tokio::task::JoinH
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
-            let cutoff = mailbox::clock::now_millis().saturating_sub(retention_ms);
+            let cutoff = expiry_cutoff(mailbox::clock::now_millis(), retention);
             if let Err(err) = storage.expire_suspensions(cutoff).await {
-                warn!(error = %err, "could not expire suspended sessions");
+                warn!(
+                    error = %err,
+                    cutoff,
+                    retention_ms = retention.as_millis() as u64,
+                    "could not expire suspended sessions"
+                );
             }
             // ONE `ps` per sweep, not one per interested session. An unreadable
             // process table would look like "every session is dead", so it skips the
@@ -319,6 +323,14 @@ fn spawn_sweeper(supervisor: Supervisor, storage: Storage) -> tokio::task::JoinH
             }
         }
     })
+}
+
+/// The instant before which suspended state is expired: `retention` before `now_ms`.
+/// Saturating, so an absurd retention expires nothing rather than wrapping into the
+/// future and expiring everything.
+fn expiry_cutoff(now_ms: i64, retention: Duration) -> i64 {
+    let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(retention_ms)
 }
 
 /// Accept connections until a shutdown signal. Each connection is served on its
@@ -881,8 +893,8 @@ async fn status(storage: &Storage, session: Option<SessionId>) -> Response {
 }
 
 /// Thin translation over [`mailbox::watch::end_session`] (the harness `SessionEnd`
-/// teardown, card 11): drop the session's subscriptions + interests and stop any
-/// now-orphaned adapters.
+/// teardown, card 11): suspend the session's subscriptions + interests (ADR-0026)
+/// and stop any now-orphaned adapters.
 async fn end_session(storage: &Storage, supervisor: &Supervisor, session: SessionId) -> Response {
     match mailbox::watch::end_session(storage, supervisor, session).await {
         Ok(ended) => Response::SessionEnded {
@@ -988,4 +1000,24 @@ fn bind_socket_owner_only(socket: &Path) -> anyhow::Result<UnixListener> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow::anyhow!("could not set 0600 on socket {}: {e}", socket.display()))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn the_cutoff_is_retention_before_now() {
+        assert_eq!(expiry_cutoff(10_000, Duration::from_millis(3_000)), 7_000);
+        assert_eq!(
+            expiry_cutoff(1_790_000_000_000, DEFAULT_SUSPENSION_RETENTION),
+            1_790_000_000_000 - 30 * 24 * 3600 * 1000
+        );
+    }
+
+    #[test]
+    fn an_absurd_retention_expires_nothing_rather_than_wrapping() {
+        assert_eq!(expiry_cutoff(10_000, Duration::MAX), 10_000 - i64::MAX);
+        assert!(expiry_cutoff(10_000, Duration::MAX) < 0);
+    }
 }

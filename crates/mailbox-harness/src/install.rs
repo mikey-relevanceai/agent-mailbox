@@ -5,9 +5,10 @@
 //! - `SessionStart` (matcher `""` — all sources) runs `mailbox harness session-start`,
 //!   registering the always-on agent inbox so peers can address this session
 //!   (ADR-0007). It fires on `startup` AND on `resume`/`clear`/`compact`, so a resumed
-//!   session (a fresh process) re-establishes it — the gap ADR-0013 closes.
-//! - `SessionEnd` runs `mailbox harness cleanup`: drop interests/subscriptions, so no
-//!   poller outlives the session that wanted it.
+//!   session (a fresh process) re-establishes it — the gap ADR-0013 closes — and
+//!   then resumes the watches its last `SessionEnd` suspended (ADR-0026).
+//! - `SessionEnd` runs `mailbox harness cleanup`: suspend interests/subscriptions, so
+//!   no poller outlives the session that wanted it, while a resume can restore them.
 //!
 //! # What used to be here
 //!
@@ -145,9 +146,10 @@ impl HookInstallSpec {
 /// - `SessionStart` (matcher `""`, all sources) runs `session-start`: register the
 ///   always-on agent inbox so peers can address this session (ADR-0007). Firing on
 ///   every source rather than just `startup` is what re-establishes it on a resume,
-///   which is a fresh process (ADR-0013).
-/// - `SessionEnd` runs `cleanup`: drop subscriptions and interests, so no poller
-///   outlives the session that wanted it.
+///   which is a fresh process (ADR-0013). It then resumes the session's suspended
+///   watches (ADR-0026).
+/// - `SessionEnd` runs `cleanup`: suspend subscriptions and interests, so no poller
+///   outlives the session that wanted it, while a resume can restore them.
 pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
     json!({
         "hooks": {
@@ -163,8 +165,8 @@ pub fn hooks_snippet(spec: &HookInstallSpec) -> Value {
                     "command": spec.session_start_command(),
                 }],
             })],
-            // SessionEnd drops interests/subscriptions, so no poller outlives the
-            // session that wanted it.
+            // SessionEnd suspends interests/subscriptions, so no poller outlives the
+            // session that wanted it (a resume restores them, ADR-0026).
             "SessionEnd": [json!({
                 "matcher": "",
                 "hooks": [{

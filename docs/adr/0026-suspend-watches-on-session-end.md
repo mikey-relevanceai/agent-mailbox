@@ -80,8 +80,17 @@ The live tables have many readers: the interest refcount that keeps an adapter
 running, the wake's subscriber lookup, `agents`, `topics`, `status`, the sweep. With a
 column, every one of them would have to remember to skip suspended rows, and any one
 that forgot would run a poller for a closed session or wake a dead one. A row that is
-not in the live table cannot be counted by mistake. All the new behaviour lives in
-three places: end, sweep, and resume.
+not in the live table cannot be counted by mistake.
+
+The one place a session can hold both is a resume refused by the tombstone guard:
+the session is running again while its suspension waits for the next `SessionStart`.
+So `unwatch` and `unsubscribe` also delete the suspended copy, or the next resume
+would bring back what the agent had just dropped. Beyond that, the new behaviour lives
+in end, sweep, resume and expiry.
+
+A resume that restores its rows but cannot start one of the watches reports that as
+a count (`watches_failed`) rather than an error. The restore has already committed,
+and an error would tell the hook nothing came back.
 
 ### What a restored subscription sees
 

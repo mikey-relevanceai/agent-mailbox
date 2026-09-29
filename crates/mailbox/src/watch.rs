@@ -129,10 +129,13 @@ pub enum SessionResumed {
     Resumed {
         subscriptions_restored: u64,
         interests_restored: u64,
-        /// Watches this session is interested in that were asked to run. Most were
-        /// probably running already — `ensure_running` is idempotent — so this is
-        /// not a count of adapters started.
+        /// Watches asked to run and accepted. `ensure_running` is idempotent, so
+        /// this counts watches asked to run, not adapters started.
         watches_ensured: u64,
+        /// Watches the supervisor could not be asked to run. The rows are restored
+        /// regardless, so this is a partial resume, not a failed one — which is why
+        /// it is a count here rather than an `Err` that would discard the rest.
+        watches_failed: u64,
     },
     /// The session ended moments ago (ADR-0007's tombstone guard); nothing was
     /// restored and the suspended state waits for the next `SessionStart`.
@@ -454,7 +457,9 @@ pub async fn end_session(
 /// (the startup reconcile found no live session), and nothing else would start it.
 ///
 /// Like [`end_session`], one watch failing to start must not stop the rest from
-/// being tried; the first error is surfaced after all have been attempted.
+/// being tried. Unlike it, the failures are reported as a count in the success value:
+/// the restore has already committed, and an `Err` would tell the hook nothing was
+/// resumed when almost everything was.
 pub async fn resume_session(
     storage: &Storage,
     supervisor: &Supervisor,
@@ -479,38 +484,45 @@ pub async fn resume_session(
     };
 
     let mut ensured = 0u64;
-    let mut first_err: Option<SupervisorError> = None;
+    let mut failed = 0u64;
     for watch_id in &watches {
         match supervisor.ensure_running(*watch_id).await {
             Ok(()) => ensured += 1,
             Err(err) => {
+                failed += 1;
                 warn!(
                     session = session.as_str(),
                     watch = watch_id.get(),
                     error = %err,
                     "could not start a resumed session's watch; continuing with the rest"
                 );
-                first_err.get_or_insert(err);
             }
         }
     }
 
-    info!(
-        session = session.as_str(),
-        subscriptions_restored,
-        interests_restored,
-        watches_ensured = ensured,
-        watches_failed = watches.len() as u64 - ensured,
-        "resumed session and ensured its watches are running"
-    );
-
-    if let Some(err) = first_err {
-        return Err(WatchError::Supervisor(err));
+    if failed > 0 {
+        warn!(
+            session = session.as_str(),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured = ensured,
+            watches_failed = failed,
+            "resumed session but some of its watches could not be started"
+        );
+    } else {
+        info!(
+            session = session.as_str(),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured = ensured,
+            "resumed session and ensured its watches are running"
+        );
     }
     Ok(SessionResumed::Resumed {
         subscriptions_restored,
         interests_restored,
         watches_ensured: ensured,
+        watches_failed: failed,
     })
 }
 

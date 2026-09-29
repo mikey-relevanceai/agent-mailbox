@@ -182,10 +182,11 @@ pub struct HarnessArgs {
 #[derive(Subcommand, Debug)]
 pub enum HarnessCommand {
     /// SessionStart hook: register this session's always-on agent inbox so peers can
-    /// address it (ADR-0007). Exits 0 always; it can never wake the session.
+    /// address it (ADR-0007), then resume the watches its last SessionEnd suspended
+    /// (ADR-0026). Exits 0 always; it can never wake the session.
     SessionStart,
-    /// SessionEnd hook: drop this session's interests/subscriptions, so no poller
-    /// outlives the session that wanted it.
+    /// SessionEnd hook: suspend this session's interests/subscriptions, so no poller
+    /// outlives the session that wanted it; a resume of the same id restores them.
     Cleanup,
     /// Merge the hooks into the Claude Code settings.json (and print the snippet).
     InstallHooks(InstallHooksArgs),
@@ -1176,8 +1177,9 @@ fn describe_resume(state: &ResumeState) -> String {
             subscriptions_restored,
             interests_restored,
             watches_ensured,
+            watches_failed,
         } => format!(
-            "resumed session (subscriptions restored={subscriptions_restored}, interests restored={interests_restored}, watches ensured running={watches_ensured})"
+            "resumed session (subscriptions restored={subscriptions_restored}, interests restored={interests_restored}, watches ensured running={watches_ensured}, watches failed to start={watches_failed})"
         ),
         ResumeState::RefusedSessionRecentlyEnded => {
             "refused: session ended moments ago (not resuming it yet)".to_string()
@@ -1449,19 +1451,18 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
 /// its predecessor's inbox registration, and running this on resume re-establishes
 /// it. Idempotent, so re-running on a live session (a `compact`, say) is a no-op.
 ///
-/// # What it no longer does
-///
 /// # It resumes the session's watches (ADR-0026)
 ///
 /// After the inbox, it asks the bridge to restore whatever `cleanup` suspended when
 /// this session last ended, and to make sure each of its watches has a running
-/// adapter. Quitting a desktop harness ends every session it hosts and reopening it
-/// resumes them under the same ids; without this, each came back addressable but
-/// deaf to every PR it had been watching. On a fresh `startup` or a `compact` there
-/// is nothing suspended and every watch is already running, so it is a no-op.
+/// adapter — a resumed session keeps its id, so without this it came back
+/// addressable but deaf. With nothing suspended and every watch running, it changes
+/// nothing.
 ///
 /// The inbox goes first because it clears an aged tombstone the resume would
 /// otherwise have to; both honour the same guard, so they agree either way.
+///
+/// # What it no longer does
 ///
 /// It used to also arm a wake sentinel and print a `watchPaths` registration for it.
 /// Both are gone with the sentinel channel (ADR-0021): a session is woken through the
@@ -1499,9 +1500,35 @@ async fn resume_watches(config: &StorageConfig, session: &SessionId) {
             "did not resume the session's watches: session recently ended (tombstone guard); \
              they stay suspended until the next SessionStart"
         ),
-        Ok(Response::SessionResumed { outcome }) => info!(
+        Ok(Response::SessionResumed {
+            outcome:
+                ResumeState::Resumed {
+                    subscriptions_restored,
+                    interests_restored,
+                    watches_ensured,
+                    watches_failed,
+                },
+        }) if watches_failed > 0 => warn!(
             session = %session.as_str(),
-            outcome = %describe_resume(&outcome),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured,
+            watches_failed,
+            "resumed the session but some of its watches could not be started"
+        ),
+        Ok(Response::SessionResumed {
+            outcome:
+                ResumeState::Resumed {
+                    subscriptions_restored,
+                    interests_restored,
+                    watches_ensured,
+                    ..
+                },
+        }) => info!(
+            session = %session.as_str(),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured,
             "resumed the session's watches"
         ),
         Ok(Response::Error { message }) => warn!(

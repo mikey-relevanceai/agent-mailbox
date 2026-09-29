@@ -455,7 +455,8 @@ fn a_racing_auto_reregistration_after_cleanup_does_not_resurrect_the_inbox() {
     arm_idle(&env, b);
     assert!(agent_row(&env, "s-a", b).is_some(), "B is registered");
 
-    // SessionEnd removes the sentinel, drops the subscription, and tombstones the id.
+    // SessionEnd suspends the subscription (out of the live table, so B is no longer
+    // listed) and tombstones the id.
     let _ = env.cleanup(b);
     assert!(
         agent_row(&env, "s-a", b).is_none(),

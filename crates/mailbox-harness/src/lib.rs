@@ -7,7 +7,8 @@
 //! turn (see `docs/01-wake.md`, ADR-0021). **No hook is involved in waking** — the
 //! sentinel + `FileChanged` + `asyncRewake` mechanism this crate used to wire is
 //! deleted. [`install`](install) now wires just two plain hooks, `SessionStart`
-//! (register the agent inbox) and `SessionEnd` (drop interests), into
+//! (register the agent inbox, resume suspended watches) and `SessionEnd` (suspend
+//! interests), into
 //! `~/.claude/settings.json` when that file exists — else it prints the snippet and
 //! says why — merging rather than clobbering.
 //!
