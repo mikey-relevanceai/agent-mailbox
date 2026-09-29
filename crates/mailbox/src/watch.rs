@@ -38,8 +38,8 @@ use tracing::{info, warn};
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec,
-    WatchState, WatchTarget,
+    ResumeOutcome, SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -120,6 +120,23 @@ pub struct SessionEnded {
     pub interests_dropped: u64,
     /// Adapters stopped because this session's departure took their last interest.
     pub adapters_stopped: u64,
+}
+
+/// The outcome of resuming a session (ADR-0026). Counts only, like
+/// [`SessionEnded`], so it is safe to log verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResumed {
+    Resumed {
+        subscriptions_restored: u64,
+        interests_restored: u64,
+        /// Watches this session is interested in that were asked to run. Most were
+        /// probably running already — `ensure_running` is idempotent — so this is
+        /// not a count of adapters started.
+        watches_ensured: u64,
+    },
+    /// The session ended moments ago (ADR-0007's tombstone guard); nothing was
+    /// restored and the suspended state waits for the next `SessionStart`.
+    RefusedSessionRecentlyEnded,
 }
 
 /// One watch as `status` sees it, including its interest refcount and lifecycle
@@ -419,6 +436,81 @@ pub async fn end_session(
         subscriptions_dropped: outcome.subscriptions_removed,
         interests_dropped: outcome.interests_removed,
         adapters_stopped: stopped,
+    })
+}
+
+/// Resume `session` (ADR-0026): restore the subscriptions and interests it had when
+/// it ended, then make sure every watch it is interested in has a running adapter.
+///
+/// The `SessionStart` hook's second half, after the inbox registration. It is the
+/// inverse of [`end_session`]: that suspended the rows and stopped the adapters
+/// nobody else wanted; this restores the rows and starts them again. A `github-pr`
+/// adapter restarts from its persisted baseline (design/01), so a PR that merged or
+/// failed CI while the session was away is reported as a transition, not missed.
+///
+/// Ensures EVERY interested watch, not just the restored ones, because an interest
+/// can outlive the session's process without being suspended: a daemon restart
+/// while the app was closed leaves the interest in place and the watch `Stopped`
+/// (the startup reconcile found no live session), and nothing else would start it.
+///
+/// Like [`end_session`], one watch failing to start must not stop the rest from
+/// being tried; the first error is surfaced after all have been attempted.
+pub async fn resume_session(
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Result<SessionResumed, WatchError> {
+    let (subscriptions_restored, interests_restored, watches) = match storage
+        .resume_session(session.clone(), now_millis())
+        .await?
+    {
+        ResumeOutcome::Resumed {
+            subscriptions_restored,
+            interests_restored,
+            watches,
+        } => (subscriptions_restored, interests_restored, watches),
+        ResumeOutcome::RefusedSessionRecentlyEnded => {
+            warn!(
+                session = session.as_str(),
+                "did not resume the session's watches: it ended moments ago (tombstone guard)"
+            );
+            return Ok(SessionResumed::RefusedSessionRecentlyEnded);
+        }
+    };
+
+    let mut ensured = 0u64;
+    let mut first_err: Option<SupervisorError> = None;
+    for watch_id in &watches {
+        match supervisor.ensure_running(*watch_id).await {
+            Ok(()) => ensured += 1,
+            Err(err) => {
+                warn!(
+                    session = session.as_str(),
+                    watch = watch_id.get(),
+                    error = %err,
+                    "could not start a resumed session's watch; continuing with the rest"
+                );
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+
+    info!(
+        session = session.as_str(),
+        subscriptions_restored,
+        interests_restored,
+        watches_ensured = ensured,
+        watches_failed = watches.len() as u64 - ensured,
+        "resumed session and ensured its watches are running"
+    );
+
+    if let Some(err) = first_err {
+        return Err(WatchError::Supervisor(err));
+    }
+    Ok(SessionResumed::Resumed {
+        subscriptions_restored,
+        interests_restored,
+        watches_ensured: ensured,
     })
 }
 

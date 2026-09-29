@@ -264,10 +264,14 @@ The snippet wires **two** hooks, and neither can wake the session:
 - **`SessionStart` (matcher `""`) → `mailbox harness session-start`.** Registers this
   session's always-on agent inbox (`agent.<session-id>`), so peer agents can address it
   (§4). The matcher is `""` — every source, not just `startup` — so a **resumed**
-  session, which is a fresh process, re-registers itself. Idempotent, fail-open, and it
-  exits 0 always.
-- **`SessionEnd` → `mailbox harness cleanup`.** Drops this session's subscriptions and
-  interests, so no poller outlives the session that wanted it.
+  session, which is a fresh process, re-registers itself. It then **resumes the
+  session's watches**: whatever `cleanup` suspended when this session id last ended is
+  restored, and every watch it is interested in is started if it is not running
+  ([ADR-0026](adr/0026-suspend-watches-on-session-end.md)). Idempotent, fail-open, and
+  it exits 0 always.
+- **`SessionEnd` → `mailbox harness cleanup`.** Suspends this session's subscriptions
+  and interests, so no poller outlives the session that wanted it — but a resume of the
+  same session id gets them back. Suspended state is forgotten after 30 days.
 
 That is the whole harness surface. Waking is not a hook: the daemon writes the
 session's inbox socket directly, and Claude Code starts a turn on it.

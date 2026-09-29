@@ -20,8 +20,8 @@ use mailbox_protocol::{AdapterId, GithubPr, Subject, Topic, inbox_topic, stub_to
 
 use crate::client;
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, SessionStatus, StatusReport, SubscribeState,
-    TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
+    AgentSummary, GithubPrTarget, Request, Response, ResumeState, SessionStatus, StatusReport,
+    SubscribeState, TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
 
@@ -1062,6 +1062,7 @@ fn request_context(request: &Request) -> String {
             None => "listing topics".to_string(),
         },
         Request::EndSession { session } => format!("ending session {}", session.as_str()),
+        Request::ResumeSession { session } => format!("resuming session {}", session.as_str()),
     }
 }
 
@@ -1163,8 +1164,24 @@ fn render_human(response: &Response) {
         } => println!(
             "ended session (subscriptions dropped={subscriptions_dropped}, interests dropped={interests_dropped}, adapters stopped={adapters_stopped})"
         ),
+        Response::SessionResumed { outcome } => println!("{}", describe_resume(outcome)),
         // Error is handled before rendering; nothing to print here.
         Response::Error { message } => eprintln!("error: {message}"),
+    }
+}
+
+fn describe_resume(state: &ResumeState) -> String {
+    match state {
+        ResumeState::Resumed {
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured,
+        } => format!(
+            "resumed session (subscriptions restored={subscriptions_restored}, interests restored={interests_restored}, watches ensured running={watches_ensured})"
+        ),
+        ResumeState::RefusedSessionRecentlyEnded => {
+            "refused: session ended moments ago (not resuming it yet)".to_string()
+        }
     }
 }
 
@@ -1434,6 +1451,18 @@ async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<
 ///
 /// # What it no longer does
 ///
+/// # It resumes the session's watches (ADR-0026)
+///
+/// After the inbox, it asks the bridge to restore whatever `cleanup` suspended when
+/// this session last ended, and to make sure each of its watches has a running
+/// adapter. Quitting a desktop harness ends every session it hosts and reopening it
+/// resumes them under the same ids; without this, each came back addressable but
+/// deaf to every PR it had been watching. On a fresh `startup` or a `compact` there
+/// is nothing suspended and every watch is already running, so it is a no-op.
+///
+/// The inbox goes first because it clears an aged tombstone the resume would
+/// otherwise have to; both honour the same guard, so they agree either way.
+///
 /// It used to also arm a wake sentinel and print a `watchPaths` registration for it.
 /// Both are gone with the sentinel channel (ADR-0021): a session is woken through the
 /// inbox socket Claude Code binds for it, which needs nothing armed, nothing watched
@@ -1451,7 +1480,46 @@ async fn run_harness_session_start() -> anyhow::Result<ExitCode> {
         .session_id;
 
     register_inbox(&config, &session, "session-start").await;
+    resume_watches(&config, &session).await;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Ask the bridge to resume `session`'s suspended watches (ADR-0026). Best-effort
+/// and fail-open like [`register_inbox`]: a down bridge must not fail the hook.
+/// The suspended rows persist, so the next `SessionStart` tries again.
+async fn resume_watches(config: &StorageConfig, session: &SessionId) {
+    let request = Request::ResumeSession {
+        session: session.clone(),
+    };
+    match client::send(&config.socket_path(), &request).await {
+        Ok(Response::SessionResumed {
+            outcome: ResumeState::RefusedSessionRecentlyEnded,
+        }) => warn!(
+            session = %session.as_str(),
+            "did not resume the session's watches: session recently ended (tombstone guard); \
+             they stay suspended until the next SessionStart"
+        ),
+        Ok(Response::SessionResumed { outcome }) => info!(
+            session = %session.as_str(),
+            outcome = %describe_resume(&outcome),
+            "resumed the session's watches"
+        ),
+        Ok(Response::Error { message }) => warn!(
+            session = %session.as_str(),
+            error = %message,
+            "bridge could not resume the session's watches; continuing"
+        ),
+        Ok(other) => warn!(
+            session = %session.as_str(),
+            reply = ?other,
+            "unexpected bridge reply while resuming the session's watches; continuing"
+        ),
+        Err(err) => warn!(
+            session = %session.as_str(),
+            error = %err,
+            "bridge unreachable while resuming the session's watches; continuing"
+        ),
+    }
 }
 
 /// Ensure `session` is subscribed to its own inbox topic, over the socket
@@ -1542,9 +1610,10 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
     }
 }
 
-/// The `SessionEnd` hook: remove the session's wake sentinel and drop its
-/// subscriptions + interests on the bridge (which stops any adapter whose last
-/// interest this session held). Best-effort: a down bridge must not fail the hook.
+/// The `SessionEnd` hook: suspend the session's subscriptions + interests on the
+/// bridge (which stops any adapter whose last interest this session held). They are
+/// kept, not dropped, so `session-start` can restore them if this session id is
+/// resumed (ADR-0026). Best-effort: a down bridge must not fail the hook.
 ///
 /// It no longer reaps anything. There is no per-session process to reap — the
 /// daemon writes the sentinel itself (ADR-0017) — so teardown is two file/socket
@@ -1593,7 +1662,7 @@ async fn end_session_with_retry(config: &StorageConfig, session: &SessionId) {
                     subscriptions_dropped,
                     interests_dropped,
                     adapters_stopped,
-                    "ended session on the bridge (dropped interests/subscriptions)"
+                    "ended session on the bridge (suspended interests/subscriptions for a resume)"
                 );
                 return;
             }

@@ -182,8 +182,8 @@ does this, and never will: it is a separate decision with a separate consequence
 
 | Hook | Command | What it does |
 |---|---|---|
-| `SessionStart` (matcher `""` — all sources) | `mailbox harness session-start` | Registers the always-on agent inbox (`agent.<session-id>`, ADR-0007) so peers can address this session. Matcher `""` so it re-fires on resume/clear/compact (ADR-0013); idempotent. Fail-open, exits 0. |
-| `SessionEnd` | `mailbox harness cleanup` | Drops this session's subscriptions and interests, so no poller outlives the session that wanted it. |
+| `SessionStart` (matcher `""` — all sources) | `mailbox harness session-start` | Registers the always-on agent inbox (`agent.<session-id>`, ADR-0007) so peers can address this session, then resumes the session's suspended watches (ADR-0026). Matcher `""` so it re-fires on resume/clear/compact (ADR-0013); idempotent. Fail-open, exits 0. |
+| `SessionEnd` | `mailbox harness cleanup` | Suspends this session's subscriptions and interests, so no poller outlives the session that wanted it; a resume of the same id restores them (ADR-0026). |
 
 Plus two setup commands: `install-hooks` (merges the snippet atomically, preserving
 unrelated settings) and `install-inbound` (above, opt-in).

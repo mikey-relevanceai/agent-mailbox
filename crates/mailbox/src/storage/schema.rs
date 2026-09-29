@@ -20,7 +20,9 @@ use super::error::StorageError;
 /// v5 (card 19) stamps the AUTHORING session on an event — see [`SCHEMA_V5`].
 /// v6 drops that column again, along with the one rule that read it — see
 /// [`SCHEMA_V6`]. v7 (ADR-0022) adds the event's subject line — see [`SCHEMA_V7`].
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+/// v8 (ADR-0026) keeps an ended session's watches so a resume can restore them —
+/// see [`SCHEMA_V8`].
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 /// Version 1 of the schema.
 ///
@@ -213,6 +215,37 @@ ALTER TABLE event ADD COLUMN subject TEXT;
 ALTER TABLE event ADD COLUMN subject_link TEXT;
 "#;
 
+/// Version 8 of the schema (ADR-0026): a session's watches outlive the session.
+///
+/// Ending a session used to DELETE its `watch_interest` and `subscription` rows, but
+/// Claude Code resumes a session under the same id, and nothing could put them back.
+/// These tables hold what the session had when it went away, so `session-start` on
+/// the resume can restore it.
+///
+/// Separate tables rather than a `suspended_at` column on the live ones, because the
+/// live tables have many readers — the interest refcount that keeps an adapter alive,
+/// the wake's subscriber lookup, `agents`, `topics`, `status` — and each would need
+/// to learn to skip a suspended row. A column every reader must remember to filter is
+/// the bug waiting to happen; a row that is not in the live table cannot be counted.
+///
+/// `suspended_at_ms` drives expiry: a session that never comes back is forgotten
+/// after the retention window rather than kept forever.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE suspended_interest (
+    watch_id        INTEGER NOT NULL REFERENCES watch(id) ON DELETE CASCADE,
+    session_id      TEXT    NOT NULL,
+    suspended_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (watch_id, session_id)
+);
+
+CREATE TABLE suspended_subscription (
+    session_id      TEXT    NOT NULL,
+    topic           TEXT    NOT NULL,
+    suspended_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, topic)
+);
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -256,6 +289,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 7 {
         sql.push_str(SCHEMA_V7);
+    }
+    if current < 8 {
+        sql.push_str(SCHEMA_V8);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -530,6 +566,45 @@ mod tests {
             .unwrap();
         assert_eq!(subject, "new comment");
         assert_eq!(link, "https://example.com/c/1");
+    }
+
+    /// A v7 database on disk — with sessions mid-watch — migrates forward with
+    /// every live row untouched and nothing suspended: the upgrade must not look
+    /// like every session ended.
+    #[test]
+    fn on_disk_v7_to_v8_migration_keeps_live_rows_and_suspends_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mailbox.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+                 VALUES (1, 'stub', 'lbl', 0, 1000, 0, 'desired', NULL);
+                 INSERT INTO watch_interest (watch_id, session_id, last_seen) VALUES (1, 's', 42);
+                 INSERT INTO subscription (session_id, topic) VALUES ('s', 'stub.lbl');
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM watch_interest"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM subscription"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM suspended_interest"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM suspended_subscription"), 0);
     }
 
     #[test]

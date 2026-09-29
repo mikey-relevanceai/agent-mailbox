@@ -214,9 +214,11 @@ mailbox unwatch github-pr OWNER/REPO#NUMBER
 mailbox unsubscribe TOPIC
 ```
 
-You do not have to clean up on exit — the `SessionEnd` hook drops your
-subscriptions and interests and stops any poller you were the last to watch. Only
-`unwatch`/`unsubscribe` when you want to stop caring *before* the session ends.
+You do not have to clean up on exit — the `SessionEnd` hook suspends your
+subscriptions and interests and stops any poller you were the last to watch. If this
+session is resumed later, they come back on their own: do not re-`watch`. Only
+`unwatch`/`unsubscribe` when you want to stop caring; an `unwatch` is the only thing
+that makes a watch stay gone after a resume.
 
 ## Messaging another agent (peer-to-peer)
 

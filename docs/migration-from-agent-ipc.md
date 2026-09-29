@@ -26,7 +26,7 @@ re-arm. See [01-wake](01-wake.md) and
 | Agent spawns `gh-watch.sh` per PR with `run_in_background`, must remember to kill it | `mailbox watch github-pr OWNER/REPO#N` — the **daemon** owns the poller; one per PR, shared across sessions |
 | Watcher state in `~/.claude/agent-ipc/watchers/*.state` files | Baseline persists centrally in the bridge's SQLite (`adapter_baseline`), round-tripped via the protocol |
 | Durable NDJSON inbox + FIFO kick, per agent | Durable topic log + per-subscriber cursors in the bridge; multi-subscriber topics |
-| Dead session leaks a running `gh-watch.sh` | `SessionEnd` hook drops interest; supervisor stops any now-orphaned poller; TTL sweeper backstops a hard kill |
+| Dead session leaks a running `gh-watch.sh` | `SessionEnd` hook suspends interest (restored if the session is resumed, ADR-0026); supervisor stops any now-orphaned poller; TTL sweeper backstops a hard kill |
 
 ### Command-by-command map
 

@@ -84,11 +84,21 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// Start with extra daemon env — the sweep timing overrides, for a test that
+    /// needs the TTL sweep to run within its lifetime.
+    fn start_with(envs: &[(&str, &str)]) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("mailbox.db");
         let socket_path = socket_for(&db_path);
+        // Present but empty: a readable registry in which no session is running.
+        // A MISSING directory reads as "could not tell", and the sweep then skips.
+        std::fs::create_dir(dir.path().join("claude-sessions")).expect("sessions dir");
         let child = mailbox_command()
             .arg("serve")
+            .envs(envs.iter().copied())
             .env("AGENT_MAILBOX_DB", &db_path)
             // The daemon reads Claude Code's session registry to find each
             // subscriber's inbox socket, so it MUST be pointed at a tempdir — without
@@ -123,6 +133,27 @@ impl Daemon {
             .env("RUST_LOG", "error")
             .output()
             .expect("run mailbox client")
+    }
+
+    /// Run `mailbox harness session-start` for a session, feeding the SessionStart
+    /// payload a resume delivers.
+    fn session_start(&self, session: &str) -> Output {
+        let mut child = mailbox_command()
+            .args(["harness", "session-start"])
+            .env("AGENT_MAILBOX_DB", &self.db_path)
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mailbox harness session-start");
+        let payload = format!(
+            r#"{{"session_id":"{session}","hook_event_name":"SessionStart","source":"resume"}}"#
+        );
+        let mut stdin = child.stdin.take().expect("session-start stdin");
+        stdin.write_all(payload.as_bytes()).expect("write payload");
+        drop(stdin);
+        child.wait_with_output().expect("session-start output")
     }
 
     /// Run `mailbox harness cleanup` for a session (feeding the SessionEnd payload)
@@ -325,6 +356,64 @@ fn ac3_cleanup_drops_watch_interest_to_zero() {
         },
     );
     assert!(subscriptions(&daemon, session).is_empty());
+}
+
+/// ADR-0026 through the real binaries: a session that died without a `SessionEnd`
+/// has its interest swept (suspended) and its adapter stopped; when the same id is
+/// resumed, the `session-start` hook brings the watch back and restarts it.
+///
+/// This drives the sweep path rather than `cleanup`, because a `cleanup` would leave
+/// a tombstone and the hook's resume would be refused for its 10s guard; the
+/// cleanup → resume path is covered in-process in `tests/supervision.rs` with a
+/// backdated end.
+#[test]
+fn session_start_resumes_a_watch_the_ttl_sweep_suspended() {
+    // TTL long enough that the resumed interest is observed before the next sweep
+    // suspends it again (nothing in this test is a "running" session).
+    let daemon = Daemon::start_with(&[
+        ("MAILBOX_SWEEP_INTERVAL_MS", "100"),
+        ("MAILBOX_INTEREST_TTL_MS", "3000"),
+    ]);
+    let session = "s-resume";
+    assert_ok(
+        &daemon.run_as(
+            session,
+            &["watch", "stub", "demo", "--interval-ms", "60000"],
+        ),
+        "watch stub",
+    );
+    poll_until(
+        "watch running with interest 1",
+        Duration::from_secs(10),
+        || {
+            let (state, interest) = watch_state_interest(&daemon, session)?;
+            (state == "running" && interest == 1).then_some(())
+        },
+    );
+
+    poll_until(
+        "the sweep suspends the dead session's interest and stops the adapter",
+        Duration::from_secs(15),
+        || {
+            let (state, interest) = watch_state_interest(&daemon, session)?;
+            (state == "stopped" && interest == 0).then_some(())
+        },
+    );
+
+    assert_ok(&daemon.session_start(session), "session-start");
+    let (state, interest) = poll_until(
+        "the resumed session's watch is running again",
+        Duration::from_secs(2),
+        || {
+            let (state, interest) = watch_state_interest(&daemon, session)?;
+            (state == "running").then_some((state, interest))
+        },
+    );
+    assert_eq!((state.as_str(), interest), ("running", 1));
+    assert!(
+        subscriptions(&daemon, session).contains(&"stub.demo".to_string()),
+        "the sweep never touched the subscription, and the resume keeps it"
+    );
 }
 
 // ==== install-hooks writes the hook set, and never destroys a settings file =====
