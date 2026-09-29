@@ -101,7 +101,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// committed publish gets its ack out) before dropping the runtime.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// How often the TTL sweeper runs, dropping interests whose session hard-died
+/// How often the TTL sweeper runs, suspending interests whose session hard-died
 /// without a `SessionEnd`/`unwatch` (design/01 reconcile row).
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 

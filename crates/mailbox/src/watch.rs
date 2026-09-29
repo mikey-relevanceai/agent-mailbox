@@ -33,7 +33,7 @@
 use std::time::Duration;
 
 use mailbox_protocol::{GithubPr, Topic, TopicError, stub_topic};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
@@ -386,7 +386,8 @@ async fn session_status(
     })
 }
 
-/// End `session`: drop all its subscriptions and interests, and stop the adapter
+/// End `session`: suspend all its subscriptions and interests (kept aside for a
+/// resume, ADR-0026), and stop the adapter
 /// for every watch whose interest thereby reached zero (design/01 rule 5, feeding
 /// the card-08 supervisor). The durable teardown is one atomic storage step; the
 /// adapter stops are driven from its result. This is the bridge half of the
@@ -430,7 +431,7 @@ pub async fn end_session(
         "ended session and stopped its now-orphaned adapters"
     );
 
-    // The session's rows are gone regardless; only surface an error once every
+    // The session's live rows are suspended regardless; only surface an error once every
     // watch has been attempted, so no orphan is skipped by a fail-fast.
     if let Some(err) = first_err {
         return Err(WatchError::Supervisor(err));
@@ -508,6 +509,13 @@ pub async fn resume_session(
             watches_ensured = ensured,
             watches_failed = failed,
             "resumed session but some of its watches could not be started"
+        );
+    } else if subscriptions_restored == 0 && interests_restored == 0 && watches.is_empty() {
+        // The common case: `SessionStart` also fires on startup and compact, where
+        // there is nothing to resume.
+        debug!(
+            session = session.as_str(),
+            "resumed session had nothing suspended and no watches"
         );
     } else {
         info!(

@@ -1428,9 +1428,9 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     Ok(label.to_string())
 }
 
-/// Dispatch a `harness` subcommand. `session-start`, `cleanup`, and `turn-end` are
-/// socket clients (the last two re-register the inbox / end the session); the two
-/// `install-*` setup commands touch no bridge.
+/// Dispatch a `harness` subcommand. `session-start` and `cleanup` are socket clients
+/// (register the inbox and resume the session / end it); the `install-*` setup
+/// commands touch no bridge.
 async fn run_harness(format: OutputFormat, args: HarnessArgs) -> anyhow::Result<ExitCode> {
     match args.command {
         HarnessCommand::SessionStart => run_harness_session_start().await,
@@ -1500,6 +1500,8 @@ async fn resume_watches(config: &StorageConfig, session: &SessionId) {
             "did not resume the session's watches: session recently ended (tombstone guard); \
              they stay suspended until the next SessionStart"
         ),
+        // Every field named, so a count added to `Resumed` is a compile error here
+        // rather than a number this log silently never shows.
         Ok(Response::SessionResumed {
             outcome:
                 ResumeState::Resumed {
@@ -1508,29 +1510,26 @@ async fn resume_watches(config: &StorageConfig, session: &SessionId) {
                     watches_ensured,
                     watches_failed,
                 },
-        }) if watches_failed > 0 => warn!(
-            session = %session.as_str(),
-            subscriptions_restored,
-            interests_restored,
-            watches_ensured,
-            watches_failed,
-            "resumed the session but some of its watches could not be started"
-        ),
-        Ok(Response::SessionResumed {
-            outcome:
-                ResumeState::Resumed {
+        }) => {
+            if watches_failed > 0 {
+                warn!(
+                    session = %session.as_str(),
                     subscriptions_restored,
                     interests_restored,
                     watches_ensured,
-                    ..
-                },
-        }) => info!(
-            session = %session.as_str(),
-            subscriptions_restored,
-            interests_restored,
-            watches_ensured,
-            "resumed the session's watches"
-        ),
+                    watches_failed,
+                    "resumed the session but some of its watches could not be started"
+                );
+            } else {
+                info!(
+                    session = %session.as_str(),
+                    subscriptions_restored,
+                    interests_restored,
+                    watches_ensured,
+                    "resumed the session's watches"
+                );
+            }
+        }
         Ok(Response::Error { message }) => warn!(
             session = %session.as_str(),
             error = %message,
@@ -1641,11 +1640,6 @@ async fn register_inbox(config: &StorageConfig, session: &SessionId, source: &'s
 /// bridge (which stops any adapter whose last interest this session held). They are
 /// kept, not dropped, so `session-start` can restore them if this session id is
 /// resumed (ADR-0026). Best-effort: a down bridge must not fail the hook.
-///
-/// It no longer reaps anything. There is no per-session process to reap — the
-/// daemon writes the sentinel itself (ADR-0017) — so teardown is two file/socket
-/// operations rather than a signal to a detached child that may or may not still
-/// exist.
 ///
 /// A transient bridge failure is RETRIED a few times (brief backoff) so a
 /// momentary blip does not leak the session's interest. If every attempt fails,

@@ -341,8 +341,8 @@ impl Supervisor {
         .await
     }
 
-    /// Run one TTL sweep: refresh the interests of every session in `live`, drop
-    /// the interests left older than `ttl`, and stop any adapter whose interest
+    /// Run one TTL sweep: refresh the interests of every session in `live`, suspend
+    /// the interests left older than `ttl` (ADR-0026), and stop any adapter whose interest
     /// thereby reached zero. Returns the watches that were swept to zero.
     ///
     /// `live` is the set of session ids that currently have a Claude Code process

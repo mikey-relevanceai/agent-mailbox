@@ -704,8 +704,8 @@ async fn a_resume_whose_watch_cannot_start_still_reports_what_it_restored() {
         .end_session(s1.clone(), mailbox::clock::now_millis() - 60_000)
         .await
         .unwrap();
-    // A supervisor that has gone away fails every `ensure_running` — the one
-    // failure `ensure_running` surfaces (an unresolvable adapter is a no-op).
+    // A supervisor that has gone away fails every `ensure_running`: a failure it
+    // surfaces, unlike an unresolvable adapter, which is a no-op.
     supervisor.shutdown().await.unwrap();
 
     let resumed = resume_session(&storage, &supervisor, s1).await.unwrap();

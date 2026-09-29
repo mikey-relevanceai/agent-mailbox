@@ -447,7 +447,7 @@ fn session_start_restores_nothing_once_the_suspension_has_expired() {
     // Waiting out a duration, not a state: the suspended row is not observable
     // from outside, so the only thing to wait for is the retention to pass plus a
     // few sweeps.
-    std::thread::sleep(Duration::from_millis(1_500));
+    std::thread::sleep(Duration::from_millis(2_500));
 
     assert_ok(&daemon.session_start(session), "session-start");
     let (state, interest) = watch_state_interest(&daemon, session).expect("watch row");

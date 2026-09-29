@@ -914,9 +914,10 @@ fn do_session_subscriptions(
 /// rows are what [`do_resume_session`] restores, and what the sweeper expires if
 /// the session never returns.
 ///
-/// The delivery cursors are intentionally left untouched: they are harmless
-/// orphans once the subscriptions are gone (nothing reads them), and preserving
-/// them means a session id that is ever reused does not silently replay history.
+/// The delivery cursors are intentionally left untouched: [`do_resume_session`]
+/// restores a subscription with the cursor it had, so events published while the
+/// session was away are unread rather than skipped — and a reused session id does
+/// not silently replay history.
 ///
 /// # The tombstone (ADR-0007, resurrection guard)
 ///
@@ -2671,26 +2672,31 @@ mod tests {
         );
     }
 
-    /// A session that ends, resumes and ends again counts retention from its LAST
-    /// end — the one it could be resumed from.
+    /// A suspension that survives into a second end — its resume was refused, the
+    /// session re-watched, then ended again — counts retention from the LAST end, and
+    /// is one row, not two.
     #[test]
-    fn a_second_end_restamps_the_suspension() {
+    fn a_second_end_restamps_a_surviving_suspension() {
         let mut conn = migrated();
         let session = SessionId::new("twice");
         let (watch, _) = watched_stub(&mut conn, &session, "t");
         do_end_session(&mut conn, &session, 1_000_000).unwrap();
-        resumed(do_resume_session(&mut conn, &session, 1_060_000).unwrap());
-        do_add_interest(&conn, watch, &session, 1_060_000).unwrap();
+        assert_eq!(
+            do_resume_session(&mut conn, &session, 1_000_500).unwrap(),
+            ResumeOutcome::RefusedSessionRecentlyEnded
+        );
+        do_add_interest(&conn, watch, &session, 1_000_600).unwrap();
         do_end_session(&mut conn, &session, 2_000_000).unwrap();
 
-        let suspended_at: i64 = conn
+        let (rows, suspended_at): (i64, i64) = conn
             .query_row(
-                "SELECT suspended_at_ms FROM suspended_interest WHERE session_id = 'twice'",
+                "SELECT COUNT(*), MAX(suspended_at_ms) FROM suspended_interest
+                 WHERE session_id = 'twice'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(suspended_at, 2_000_000);
+        assert_eq!((rows, suspended_at), (1, 2_000_000));
     }
 
     /// Expiry forgets only what is older than the cutoff.
