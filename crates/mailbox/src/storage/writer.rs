@@ -31,8 +31,9 @@ use mailbox_protocol::{
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
-    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, ExpiredSuspensions, Pid, ReadPage, ResumeOutcome, SessionId, SubjectBudget,
+    SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -151,9 +152,9 @@ pub(crate) enum Command {
         session: SessionId,
         reply: oneshot::Sender<Result<Vec<Topic>, StorageError>>,
     },
-    /// Drop all of a session's subscriptions AND interests in one transaction,
-    /// returning what was removed and which watches reached zero interest (the
-    /// SessionEnd teardown, card 11).
+    /// Suspend all of a session's subscriptions AND interests in one transaction,
+    /// returning what left the live tables and which watches reached zero interest
+    /// (the SessionEnd teardown, card 11; suspended rather than dropped, ADR-0026).
     EndSession {
         session: SessionId,
         /// Wall-clock now (Unix millis), recorded as the session's tombstone
@@ -161,6 +162,20 @@ pub(crate) enum Command {
         /// `SubscribeAndBaseline.now_ms`.
         now_ms: i64,
         reply: oneshot::Sender<Result<EndSessionOutcome, StorageError>>,
+    },
+    /// Restore a session's suspended subscriptions and interests (ADR-0026).
+    ResumeSession {
+        session: SessionId,
+        /// Wall-clock now (Unix millis): the tombstone guard's age check and the
+        /// restored interests' `last_seen`. Caller-stamped like `EndSession.now_ms`.
+        now_ms: i64,
+        reply: oneshot::Sender<Result<ResumeOutcome, StorageError>>,
+    },
+    /// Delete suspended rows older than `cutoff` (Unix millis) — the retention
+    /// window for a session that never came back (ADR-0026).
+    ExpireSuspensions {
+        cutoff: i64,
+        reply: oneshot::Sender<Result<ExpiredSuspensions, StorageError>>,
     },
     UpsertWatch {
         spec: WatchSpec,
@@ -208,7 +223,7 @@ pub(crate) enum Command {
         watch: WatchId,
         reply: oneshot::Sender<Result<Vec<SessionId>, StorageError>>,
     },
-    /// Drop every interest whose `last_seen` is strictly older than `cutoff`,
+    /// Suspend every interest whose `last_seen` is strictly older than `cutoff`,
     /// returning the watches whose interest thereby reached zero (the sweeper
     /// stops those adapters).
     SweepStaleInterests {
@@ -431,6 +446,22 @@ fn handle(conn: &mut Connection, cmd: Command) {
             log_on_err(&result, "read_unread", || {
                 format!("session={}", session.as_str())
             });
+            let _ = reply.send(result);
+        }
+        Command::ResumeSession {
+            session,
+            now_ms,
+            reply,
+        } => {
+            let result = do_resume_session(conn, &session, now_ms);
+            log_on_err(&result, "resume_session", || {
+                format!("session={}", session.as_str())
+            });
+            let _ = reply.send(result);
+        }
+        Command::ExpireSuspensions { cutoff, reply } => {
+            let result = do_expire_suspensions(conn, cutoff);
+            log_on_err(&result, "expire_suspensions", || format!("cutoff={cutoff}"));
             let _ = reply.send(result);
         }
         Command::UpsertWatch { spec, reply } => {
@@ -787,15 +818,25 @@ fn do_read_events(
     Ok(ReadPage { events, next })
 }
 
+/// Unsubscribe `session` from `topic`, live AND suspended (ADR-0026).
+///
+/// The suspended copy goes too, because a session can hold both at once: a resume
+/// refused by the tombstone guard leaves the session running with its suspension
+/// pending. Deleting only the live row would let the next `SessionStart` restore a
+/// subscription the agent had explicitly dropped.
 fn do_unsubscribe(
     conn: &Connection,
     session: &SessionId,
     topic: &Topic,
 ) -> Result<(), StorageError> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    for sql in [
         "DELETE FROM subscription WHERE session_id = ?1 AND topic = ?2",
-        params![session.as_str(), topic.as_str()],
-    )?;
+        "DELETE FROM suspended_subscription WHERE session_id = ?1 AND topic = ?2",
+    ] {
+        tx.execute(sql, params![session.as_str(), topic.as_str()])?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -857,14 +898,26 @@ fn do_session_subscriptions(
     Ok(topics)
 }
 
-/// Drop every subscription and every watch interest held by `session`, and report
-/// which watches thereby reached zero interest — all in ONE transaction so the
-/// "who reached zero" answer is consistent with the deletion that caused it
-/// (mirrors [`do_sweep_stale_interests`], but keyed by session rather than age).
+/// Take every subscription and every watch interest held by `session` out of the
+/// live tables, and report which watches thereby reached zero interest — all in ONE
+/// transaction so the "who reached zero" answer is consistent with the deletion
+/// that caused it (mirrors [`do_sweep_stale_interests`], but keyed by session rather
+/// than age).
 ///
-/// The delivery cursors are intentionally left untouched: they are harmless
-/// orphans once the subscriptions are gone (nothing reads them), and preserving
-/// them means a session id that is ever reused does not silently replay history.
+/// # Suspended, not forgotten (ADR-0026)
+///
+/// Each row is copied into `suspended_interest` / `suspended_subscription` before it
+/// leaves the live table. A `SessionEnd` is not evidence the session is gone for
+/// good: Claude Code resumes a session under the SAME id — quitting a desktop app
+/// ends every session it hosts, and reopening it resumes them — and deleting here
+/// left every resumed agent with its inbox back and its watches gone. The suspended
+/// rows are what [`do_resume_session`] restores, and what the sweeper expires if
+/// the session never returns.
+///
+/// The delivery cursors are intentionally left untouched: [`do_resume_session`]
+/// restores a subscription with the cursor it had, so events published while the
+/// session was away are unread rather than skipped — and a reused session id does
+/// not silently replay history.
 ///
 /// # The tombstone (ADR-0007, resurrection guard)
 ///
@@ -891,6 +944,18 @@ fn do_end_session(
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
+    // `INSERT OR REPLACE` so a session that ends twice keeps its newest end instant,
+    // which is what the retention window should count from.
+    tx.execute(
+        "INSERT OR REPLACE INTO suspended_interest (watch_id, session_id, suspended_at_ms)
+         SELECT watch_id, session_id, ?2 FROM watch_interest WHERE session_id = ?1",
+        params![session.as_str(), now_ms],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO suspended_subscription (session_id, topic, suspended_at_ms)
+         SELECT session_id, topic, ?2 FROM subscription WHERE session_id = ?1",
+        params![session.as_str(), now_ms],
+    )?;
     let interests_removed = tx.execute(
         "DELETE FROM watch_interest WHERE session_id = ?1",
         params![session.as_str()],
@@ -926,7 +991,7 @@ fn do_end_session(
         subscriptions_removed,
         interests_removed,
         emptied = emptied_watches.len(),
-        "ended session (dropped its subscriptions and interests, tombstoned the id)"
+        "ended session (suspended its subscriptions and interests, tombstoned the id)"
     );
     Ok(EndSessionOutcome {
         subscriptions_removed,
@@ -950,6 +1015,129 @@ fn tombstone_ended_at(
         )
         .optional()?;
     Ok(ended_at)
+}
+
+/// The tombstone guard's verdict on an automatic re-registration of `session`.
+enum TombstoneGuard {
+    /// No tombstone, or an aged one (now cleared): go ahead.
+    Proceed,
+    /// The session ended within [`SUBSCRIBE_TOMBSTONE_GUARD_MS`]: write nothing.
+    Refuse,
+}
+
+/// Apply the ADR-0007 tombstone guard inside `tx`: refuse within the window, and
+/// clear an aged tombstone so this and future registrations proceed normally
+/// (self-healing — a real restart well after the end). Shared by the automatic
+/// inbox registration and [`do_resume_session`], the two halves of
+/// `session-start`, so they can never disagree about whether the session is back.
+fn pass_tombstone_guard(
+    tx: &rusqlite::Transaction,
+    session: &SessionId,
+    now_ms: i64,
+) -> Result<TombstoneGuard, StorageError> {
+    let Some(ended_at_ms) = tombstone_ended_at(tx, session)? else {
+        return Ok(TombstoneGuard::Proceed);
+    };
+    if now_ms.saturating_sub(ended_at_ms) < SUBSCRIBE_TOMBSTONE_GUARD_MS {
+        return Ok(TombstoneGuard::Refuse);
+    }
+    tx.execute(
+        "DELETE FROM session_tombstone WHERE session_id = ?1",
+        params![session.as_str()],
+    )?;
+    Ok(TombstoneGuard::Proceed)
+}
+
+/// Put `session`'s suspended subscriptions and interests back in the live tables
+/// (ADR-0026), and list every watch it is now interested in.
+///
+/// A restored subscription keeps the delivery cursor it had — [`do_end_session`]
+/// leaves cursors alone — so an event another session's shared watch published
+/// while this one was away is unread, not skipped. That is deliberately NOT
+/// baseline-on-subscribe: this is the same subscriber coming back, not a new one.
+///
+/// A restored interest is stamped `last_seen = now_ms`, because the session proving
+/// it is back IS a fresh liveness signal; its pre-suspension stamp would let the
+/// next TTL sweep suspend it again at once.
+///
+/// Idempotent. `INSERT OR IGNORE` for subscriptions, so one the session already
+/// holds (its inbox, re-registered moments earlier by the same hook) keeps its
+/// cursor; an upsert for interests.
+fn do_resume_session(
+    conn: &mut Connection,
+    session: &SessionId,
+    now_ms: i64,
+) -> Result<ResumeOutcome, StorageError> {
+    let tx = conn.transaction()?;
+    match pass_tombstone_guard(&tx, session, now_ms)? {
+        TombstoneGuard::Refuse => return Ok(ResumeOutcome::RefusedSessionRecentlyEnded),
+        TombstoneGuard::Proceed => {}
+    }
+
+    let subscriptions_restored = tx.execute(
+        "INSERT OR IGNORE INTO subscription (session_id, topic)
+         SELECT session_id, topic FROM suspended_subscription WHERE session_id = ?1",
+        params![session.as_str()],
+    )? as u64;
+    let interests_restored = tx.execute(
+        "INSERT INTO watch_interest (watch_id, session_id, last_seen)
+         SELECT watch_id, session_id, ?2 FROM suspended_interest WHERE session_id = ?1
+         ON CONFLICT(watch_id, session_id) DO UPDATE SET last_seen = excluded.last_seen",
+        params![session.as_str(), now_ms],
+    )? as u64;
+    tx.execute(
+        "DELETE FROM suspended_subscription WHERE session_id = ?1",
+        params![session.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM suspended_interest WHERE session_id = ?1",
+        params![session.as_str()],
+    )?;
+
+    let watches: Vec<WatchId> = {
+        let mut stmt = tx.prepare(
+            "SELECT watch_id FROM watch_interest WHERE session_id = ?1 ORDER BY watch_id ASC",
+        )?;
+        let rows = stmt.query_map(params![session.as_str()], |row| row.get::<_, i64>(0))?;
+        rows.map(|row| row.map(WatchId::new))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    tx.commit()?;
+
+    // Silent on success: `watch::resume_session` logs the whole resume once, with
+    // what the supervisor did as well.
+    Ok(ResumeOutcome::Resumed {
+        subscriptions_restored,
+        interests_restored,
+        watches,
+    })
+}
+
+/// Forget every suspended row older than `cutoff` (ADR-0026's retention window).
+fn do_expire_suspensions(
+    conn: &mut Connection,
+    cutoff: i64,
+) -> Result<ExpiredSuspensions, StorageError> {
+    let tx = conn.transaction()?;
+    let interests = tx.execute(
+        "DELETE FROM suspended_interest WHERE suspended_at_ms < ?1",
+        params![cutoff],
+    )? as u64;
+    let subscriptions = tx.execute(
+        "DELETE FROM suspended_subscription WHERE suspended_at_ms < ?1",
+        params![cutoff],
+    )? as u64;
+    tx.commit()?;
+    if interests > 0 || subscriptions > 0 {
+        info!(
+            interests,
+            subscriptions, "expired suspended state of sessions that never resumed"
+        );
+    }
+    Ok(ExpiredSuspensions {
+        interests,
+        subscriptions,
+    })
 }
 
 fn topic_head(tx: &rusqlite::Transaction, topic: &Topic) -> Result<Option<i64>, StorageError> {
@@ -1071,18 +1259,11 @@ fn do_subscribe_and_baseline(
         }
         // Auto-inbox re-registration: the guarded path.
         SubscribeKind::AutoInbox => {
-            if let Some(ended_at_ms) = tombstone_ended_at(&tx, session)? {
-                if now_ms.saturating_sub(ended_at_ms) < SUBSCRIBE_TOMBSTONE_GUARD_MS {
-                    // Within the race window: refuse. The tx drops (rolls back) with
-                    // nothing written — no subscription row, tombstone left in place.
-                    return Ok(SubscribeOutcome::RefusedSessionRecentlyEnded);
-                }
-                // Aged tombstone: a real restart well after the end. Clear it so this
-                // and future subscribes proceed normally (self-healing).
-                tx.execute(
-                    "DELETE FROM session_tombstone WHERE session_id = ?1",
-                    params![session.as_str()],
-                )?;
+            match pass_tombstone_guard(&tx, session, now_ms)? {
+                // Within the race window: refuse. The tx drops (rolls back) with
+                // nothing written — no subscription row, tombstone left in place.
+                TombstoneGuard::Refuse => return Ok(SubscribeOutcome::RefusedSessionRecentlyEnded),
+                TombstoneGuard::Proceed => {}
             }
         }
     }
@@ -1797,9 +1978,15 @@ fn do_list_watch_interest_sessions(
         .collect())
 }
 
-/// Drop every interest older than `cutoff`, returning the watches whose interest
-/// thereby fell to zero. One transaction so the "who reached zero" answer is
-/// consistent with the deletion that caused it.
+/// Take every interest older than `cutoff` out of the live table, returning the
+/// watches whose interest thereby fell to zero. One transaction so the "who reached
+/// zero" answer is consistent with the deletion that caused it.
+///
+/// A swept interest is SUSPENDED, not deleted (ADR-0026): the sweep reaps sessions
+/// that died without a `SessionEnd` — a crash, a force-quit — and those are resumed
+/// under the same id just as a cleanly ended one is. It is stamped with its
+/// `last_seen`, the last moment anything proved the session alive, so the retention
+/// window counts from then rather than from when the sweep got round to it.
 fn do_sweep_stale_interests(
     conn: &mut Connection,
     cutoff: i64,
@@ -1815,6 +2002,11 @@ fn do_sweep_stale_interests(
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
+    tx.execute(
+        "INSERT OR REPLACE INTO suspended_interest (watch_id, session_id, suspended_at_ms)
+         SELECT watch_id, session_id, last_seen FROM watch_interest WHERE last_seen < ?1",
+        params![cutoff],
+    )?;
     let removed = tx.execute(
         "DELETE FROM watch_interest WHERE last_seen < ?1",
         params![cutoff],
@@ -1837,21 +2029,27 @@ fn do_sweep_stale_interests(
         info!(
             removed,
             emptied = emptied.len(),
-            "swept stale watch interests"
+            "swept stale watch interests (suspended for a resume)"
         );
     }
     Ok(emptied)
 }
 
+/// Remove `session`'s interest in `watch`, live AND suspended — see
+/// [`do_unsubscribe`] for why the suspended copy must go too (ADR-0026).
 fn do_remove_interest(
     conn: &Connection,
     watch: WatchId,
     session: &SessionId,
 ) -> Result<u64, StorageError> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    for sql in [
         "DELETE FROM watch_interest WHERE watch_id = ?1 AND session_id = ?2",
-        params![watch.get(), session.as_str()],
-    )?;
+        "DELETE FROM suspended_interest WHERE watch_id = ?1 AND session_id = ?2",
+    ] {
+        tx.execute(sql, params![watch.get(), session.as_str()])?;
+    }
+    tx.commit()?;
     let count = interest_count(conn, watch)?;
     if count == 0 {
         // The refcount signal that authorizes teardown; the caller stops the
@@ -2284,6 +2482,254 @@ mod tests {
         let mut conn = migrated();
         let outcome = do_end_session(&mut conn, &SessionId::new("ghost"), 1_000_000).unwrap();
         assert_eq!(outcome, EndSessionOutcome::default());
+    }
+
+    /// A stub watch with `session` interested in it and subscribed to its topic —
+    /// the shape `watch stub` leaves behind.
+    fn watched_stub(conn: &mut Connection, session: &SessionId, label: &str) -> (WatchId, Topic) {
+        let watch = do_upsert_watch(
+            conn,
+            &WatchSpec {
+                target: WatchTarget::Stub {
+                    label: label.to_string(),
+                    count: 0,
+                },
+                interval: std::time::Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        do_add_interest(conn, watch, session, 1_000).unwrap();
+        let topic = Topic::parse(format!("stub.{label}")).unwrap();
+        subscribe_explicit(conn, session, &topic, 1_000).unwrap();
+        (watch, topic)
+    }
+
+    fn resumed(outcome: ResumeOutcome) -> (u64, u64, Vec<WatchId>) {
+        match outcome {
+            ResumeOutcome::Resumed {
+                subscriptions_restored,
+                interests_restored,
+                watches,
+            } => (subscriptions_restored, interests_restored, watches),
+            ResumeOutcome::RefusedSessionRecentlyEnded => panic!("resume was refused"),
+        }
+    }
+
+    /// ADR-0026, the reported bug: quitting the app ends the session, reopening it
+    /// resumes the same id — and the watch must come back with it.
+    #[test]
+    fn a_resumed_session_gets_back_the_watches_it_ended_with() {
+        let mut conn = migrated();
+        let session = SessionId::new("resumed");
+        let (watch, topic) = watched_stub(&mut conn, &session, "pr");
+
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+        assert_eq!(
+            do_interest_count(&conn, watch).unwrap(),
+            0,
+            "not live while ended"
+        );
+        assert!(
+            do_session_subscriptions(&conn, &session)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Well past the tombstone guard: a real resume.
+        let (subscriptions, interests, watches) =
+            resumed(do_resume_session(&mut conn, &session, 1_060_000).unwrap());
+        assert_eq!((subscriptions, interests), (1, 1));
+        assert_eq!(watches, vec![watch]);
+        assert_eq!(do_interest_count(&conn, watch).unwrap(), 1);
+        assert_eq!(
+            do_session_subscriptions(&conn, &session).unwrap(),
+            vec![topic]
+        );
+        assert_eq!(
+            tombstone_row(&conn, "resumed"),
+            None,
+            "an aged tombstone is cleared"
+        );
+
+        // Consumed: a second resume (the next compact, say) restores nothing new.
+        let (subscriptions, interests, watches) =
+            resumed(do_resume_session(&mut conn, &session, 1_070_000).unwrap());
+        assert_eq!((subscriptions, interests), (0, 0));
+        assert_eq!(watches, vec![watch], "still reports what to keep running");
+    }
+
+    /// A restored subscription is the same subscriber coming back, so an event that
+    /// landed while it was away is unread — not skipped by a fresh baseline.
+    #[test]
+    fn a_resume_keeps_the_cursor_so_mail_sent_while_away_is_unread() {
+        let mut conn = migrated();
+        let session = SessionId::new("away");
+        let (_, topic) = watched_stub(&mut conn, &session, "shared");
+        publish_with_subject(&mut conn, &topic, "{}", None);
+        do_read_unread(&mut conn, &session, None).unwrap();
+
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+        publish_with_subject(&mut conn, &topic, "{}", None);
+        resumed(do_resume_session(&mut conn, &session, 1_060_000).unwrap());
+
+        assert_eq!(unread_of(&conn, "away", &topic), 1);
+    }
+
+    /// The resume honours the same guard as the inbox registration beside it in
+    /// `session-start`, and a refusal leaves the suspension for the next try.
+    #[test]
+    fn a_resume_inside_the_tombstone_guard_is_refused_and_keeps_the_suspension() {
+        let mut conn = migrated();
+        let session = SessionId::new("quick");
+        let (watch, _) = watched_stub(&mut conn, &session, "q");
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+
+        let outcome = do_resume_session(&mut conn, &session, 1_000_500).unwrap();
+        assert_eq!(outcome, ResumeOutcome::RefusedSessionRecentlyEnded);
+        assert_eq!(do_interest_count(&conn, watch).unwrap(), 0);
+
+        let (_, interests, _) =
+            resumed(do_resume_session(&mut conn, &session, 1_000_000 + 60_000).unwrap());
+        assert_eq!(interests, 1, "the suspension survived the refusal");
+    }
+
+    /// A session that dies without a `SessionEnd` is reaped by the TTL sweep; that
+    /// must suspend too, or a crashed-then-resumed agent loses its watches.
+    #[test]
+    fn a_swept_interest_is_suspended_and_restored_on_resume() {
+        let mut conn = migrated();
+        let session = SessionId::new("crashed");
+        let (watch, _) = watched_stub(&mut conn, &session, "c");
+
+        let emptied = do_sweep_stale_interests(&mut conn, 2_000).unwrap();
+        assert_eq!(emptied, vec![watch]);
+        let suspended_at: i64 = conn
+            .query_row(
+                "SELECT suspended_at_ms FROM suspended_interest WHERE session_id = 'crashed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(suspended_at, 1_000, "counts from the last proof of life");
+
+        let (_, interests, watches) =
+            resumed(do_resume_session(&mut conn, &session, 5_000).unwrap());
+        assert_eq!(interests, 1);
+        assert_eq!(watches, vec![watch]);
+    }
+
+    /// A resume refused by the tombstone guard leaves the session running with its
+    /// suspension pending. An `unwatch` in that window must remove the suspended
+    /// copy too, or the next `SessionStart` brings back what the agent dropped.
+    #[test]
+    fn an_unwatch_during_a_refused_resume_stays_unwatched() {
+        let mut conn = migrated();
+        let session = SessionId::new("dropper");
+        let (watch, topic) = watched_stub(&mut conn, &session, "d");
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+        assert_eq!(
+            do_resume_session(&mut conn, &session, 1_000_500).unwrap(),
+            ResumeOutcome::RefusedSessionRecentlyEnded
+        );
+
+        do_remove_interest(&conn, watch, &session).unwrap();
+        do_unsubscribe(&conn, &session, &topic).unwrap();
+
+        let (subscriptions, interests, watches) =
+            resumed(do_resume_session(&mut conn, &session, 1_060_000).unwrap());
+        assert_eq!((subscriptions, interests), (0, 0));
+        assert!(watches.is_empty());
+    }
+
+    /// `session-start` registers the inbox first, then resumes. The inbox row then
+    /// already exists: the resume must restore the other topics around it without
+    /// duplicating it or moving its cursor.
+    #[test]
+    fn a_resume_after_the_inbox_re_registers_restores_the_rest_around_it() {
+        let mut conn = migrated();
+        let session = SessionId::new("both");
+        let inbox = inbox_topic(&session).unwrap();
+        subscribe_explicit(&mut conn, &session, &inbox, 1_000).unwrap();
+        let (_, topic) = watched_stub(&mut conn, &session, "b");
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+
+        let registered = subscribe_auto_inbox(&mut conn, &session, &inbox, 1_060_000).unwrap();
+        assert!(matches!(registered, SubscribeOutcome::Subscribed { .. }));
+        let cursor_before = do_get_cursor(&conn, &session, &inbox).unwrap();
+
+        let (subscriptions, _, _) =
+            resumed(do_resume_session(&mut conn, &session, 1_060_000).unwrap());
+        assert_eq!(
+            subscriptions, 1,
+            "only the watch topic; the inbox was already live"
+        );
+        let mut expected = vec![inbox.clone(), topic];
+        expected.sort();
+        assert_eq!(do_session_subscriptions(&conn, &session).unwrap(), expected);
+        assert_eq!(
+            do_get_cursor(&conn, &session, &inbox).unwrap(),
+            cursor_before
+        );
+    }
+
+    /// A suspension that survives into a second end — its resume was refused, the
+    /// session re-watched, then ended again — counts retention from the LAST end, and
+    /// is one row, not two.
+    #[test]
+    fn a_second_end_restamps_a_surviving_suspension() {
+        let mut conn = migrated();
+        let session = SessionId::new("twice");
+        let (watch, _) = watched_stub(&mut conn, &session, "t");
+        do_end_session(&mut conn, &session, 1_000_000).unwrap();
+        assert_eq!(
+            do_resume_session(&mut conn, &session, 1_000_500).unwrap(),
+            ResumeOutcome::RefusedSessionRecentlyEnded
+        );
+        do_add_interest(&conn, watch, &session, 1_000_600).unwrap();
+        do_end_session(&mut conn, &session, 2_000_000).unwrap();
+
+        let (rows, suspended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(suspended_at_ms) FROM suspended_interest
+                 WHERE session_id = 'twice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, suspended_at), (1, 2_000_000));
+    }
+
+    /// Expiry forgets only what is older than the cutoff.
+    #[test]
+    fn expire_suspensions_forgets_only_old_sessions() {
+        let mut conn = migrated();
+        let old = SessionId::new("old");
+        let recent = SessionId::new("recent");
+        let (watch, _) = watched_stub(&mut conn, &old, "shared");
+        do_add_interest(&conn, watch, &recent, 1_000).unwrap();
+        subscribe_explicit(
+            &mut conn,
+            &recent,
+            &Topic::parse("stub.shared").unwrap(),
+            1_000,
+        )
+        .unwrap();
+        do_end_session(&mut conn, &old, 1_000).unwrap();
+        do_end_session(&mut conn, &recent, 9_000).unwrap();
+
+        let expired = do_expire_suspensions(&mut conn, 5_000).unwrap();
+        assert_eq!(
+            expired,
+            ExpiredSuspensions {
+                interests: 1,
+                subscriptions: 1
+            }
+        );
+
+        let (_, interests, _) = resumed(do_resume_session(&mut conn, &old, 100_000).unwrap());
+        assert_eq!(interests, 0, "the expired session comes back to nothing");
+        let (_, interests, _) = resumed(do_resume_session(&mut conn, &recent, 100_000).unwrap());
+        assert_eq!(interests, 1);
     }
 
     /// Raw tombstone read for tests (the helper takes a `Transaction`).

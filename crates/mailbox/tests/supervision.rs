@@ -18,6 +18,8 @@
 //! - AC5 bridge restart: resumed iff an interested session's watcher is alive;
 //!   not resumed (and the stale pid cleared) when none is.
 //! - TTL sweeper drops a stale interest and stops the adapter.
+//! - ADR-0026 an ended session's watch is suspended, and a resume of the same
+//!   session id restarts its adapter.
 //! - ADR-0023 a give-up is announced once per outage however many sweeps retry it,
 //!   withdrawn by one recovery event, and re-armed for the next outage.
 //!
@@ -39,7 +41,7 @@ use mailbox::supervisor::{
     AdapterResolver, EVENT_ADAPTER_GAVE_UP, EVENT_ADAPTER_RECOVERED, ResolveError, ResolvedAdapter,
     RestartPolicy, Supervisor, reconcile_startup, topic_for_watch,
 };
-use mailbox::watch::{drop_interest, record};
+use mailbox::watch::{SessionResumed, drop_interest, record, resume_session};
 use mailbox_protocol::{AdapterId, GithubPr, Topic};
 use serde_json::json;
 use tempfile::TempDir;
@@ -529,6 +531,194 @@ async fn ac2_ac3_child_survives_first_leaver_then_dies_with_last() {
     );
 
     supervisor.shutdown().await.unwrap();
+}
+
+// ---- ADR-0026: an ended session's watches come back when it resumes ------------
+
+/// The reported bug end to end through storage + supervisor: the app quits (every
+/// session ends, the last interest leaves, the adapter stops), the app reopens (the
+/// same session id resumes), and the adapter must run again for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_session_restarts_the_adapter_its_end_stopped() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(26);
+    let s1 = SessionId::new("s1");
+
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let first = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+
+    // SessionEnd — backdated past the tombstone guard, so the resume below reads as
+    // a real reopen rather than the arm-vs-cleanup race the guard refuses.
+    let ended = mailbox::clock::now_millis() - 60_000;
+    let outcome = storage.end_session(s1.clone(), ended).await.unwrap();
+    assert_eq!(outcome.emptied_watches, vec![watch_id]);
+    supervisor.stop_watch(watch_id).await.unwrap();
+    assert_pid_reaped(first).await;
+
+    let resumed = resume_session(&storage, &supervisor, s1.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed,
+        SessionResumed::Resumed {
+            subscriptions_restored: 1,
+            interests_restored: 1,
+            watches_ensured: 1,
+            watches_failed: 0,
+        }
+    );
+    let second = poll_until("adapter running again after resume", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    assert_ne!(second, first, "a fresh adapter, not the reaped one");
+
+    // And the restored subscription delivers what the new adapter publishes.
+    poll_until("resumed session receives events", || {
+        let (bus, s1) = (bus.clone(), s1.clone());
+        async move { (!bus.read(s1, None).await.unwrap().is_empty()).then_some(()) }
+    })
+    .await;
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A daemon restart while the app was closed leaves the interest in place and the
+/// watch stopped (no live session at reconcile). Nothing was suspended, but the
+/// resume must still start the adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_starts_a_watch_the_startup_reconcile_stopped() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(27);
+    let s1 = SessionId::new("s1");
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let first = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    supervisor.stop_watch(watch_id).await.unwrap();
+    assert_pid_reaped(first).await;
+
+    let resumed = resume_session(&storage, &supervisor, s1).await.unwrap();
+    assert_eq!(
+        resumed,
+        SessionResumed::Resumed {
+            subscriptions_restored: 0,
+            interests_restored: 0,
+            watches_ensured: 1,
+            watches_failed: 0,
+        }
+    );
+    poll_until("adapter running after resume", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A resume inside the tombstone guard starts nothing and restores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_moments_after_the_end_is_refused_and_starts_nothing() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(28);
+    let s1 = SessionId::new("s1");
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let pid = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    storage
+        .end_session(s1.clone(), mailbox::clock::now_millis())
+        .await
+        .unwrap();
+    supervisor.stop_watch(watch_id).await.unwrap();
+    assert_pid_reaped(pid).await;
+
+    let resumed = resume_session(&storage, &supervisor, s1).await.unwrap();
+    assert_eq!(resumed, SessionResumed::RefusedSessionRecentlyEnded);
+    assert_eq!(supervisor.running_pid(watch_id).await, None);
+    assert_eq!(storage.interest_count(watch_id).await.unwrap(), 0);
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// When the supervisor cannot be asked to run a watch, the resume still reports
+/// what it restored: the rows are committed, so this is a partial resume counted in
+/// the success value, not an `Err` that would claim nothing came back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_whose_watch_cannot_start_still_reports_what_it_restored() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(29);
+    let s1 = SessionId::new("s1");
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    storage
+        .end_session(s1.clone(), mailbox::clock::now_millis() - 60_000)
+        .await
+        .unwrap();
+    // A supervisor that has gone away fails every `ensure_running`: a failure it
+    // surfaces, unlike an unresolvable adapter, which is a no-op.
+    supervisor.shutdown().await.unwrap();
+
+    let resumed = resume_session(&storage, &supervisor, s1).await.unwrap();
+    assert_eq!(
+        resumed,
+        SessionResumed::Resumed {
+            subscriptions_restored: 1,
+            interests_restored: 1,
+            watches_ensured: 0,
+            watches_failed: 1,
+        }
+    );
+    assert_eq!(storage.interest_count(watch_id).await.unwrap(), 1);
 }
 
 // ---- AC4: crash → restart / give-up -------------------------------------------

@@ -45,7 +45,7 @@ use mailbox_protocol::{
 use mailbox::storage::{
     SessionId, SubscribeKind, SubscribeOutcome, TopicSummary, WatchKind, WatchState,
 };
-use mailbox::watch::{SessionStatusView, StatusView, UnwatchOutcome, WatchEntry};
+use mailbox::watch::{SessionResumed, SessionStatusView, StatusView, UnwatchOutcome, WatchEntry};
 
 /// A one-shot request from a CLI client to the `serve` daemon.
 ///
@@ -158,10 +158,14 @@ pub enum Request {
     /// List known topics with subscriber/event counts, optionally filtered to a
     /// prefix (card-16 discovery).
     Topics { prefix: Option<String> },
-    /// End a session (the harness `SessionEnd` hook, card 11): drop all its
+    /// End a session (the harness `SessionEnd` hook, card 11): suspend all its
     /// subscriptions and interests, stopping any adapter whose last interest it
     /// held. No topic here — it tears down everything for the session at once.
     EndSession { session: SessionId },
+    /// Resume a session (the harness `SessionStart` hook, ADR-0026): restore what
+    /// `EndSession` suspended and ensure its watches are running. A no-op beyond
+    /// the ensure for a session that was never suspended.
+    ResumeSession { session: SessionId },
 }
 
 /// Identity of a GitHub PR to watch/unwatch. Only `github-pr` exists for the MVP;
@@ -224,7 +228,11 @@ pub enum Response {
     Agents { agents: Vec<AgentSummary> },
     /// The known topics (card-16 discovery).
     Topics { topics: Vec<TopicStatus> },
-    /// A session was ended (card 11): counts of what its teardown removed.
+    /// A session was resumed, or refused as having ended moments ago (ADR-0026).
+    SessionResumed { outcome: ResumeState },
+    /// A session was ended (card 11): counts of what its teardown removed from the
+    /// live tables. The `dropped` names predate suspension (ADR-0026) and are kept
+    /// so an older client and a newer daemon still understand each other.
     SessionEnded {
         subscriptions_dropped: u64,
         interests_dropped: u64,
@@ -268,6 +276,38 @@ impl From<SubscribeOutcome> for SubscribeState {
             SubscribeOutcome::RefusedSessionRecentlyEnded => {
                 SubscribeState::RefusedSessionRecentlyEnded
             }
+        }
+    }
+}
+
+/// Wire twin of [`SessionResumed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ResumeState {
+    Resumed {
+        subscriptions_restored: u64,
+        interests_restored: u64,
+        watches_ensured: u64,
+        watches_failed: u64,
+    },
+    RefusedSessionRecentlyEnded,
+}
+
+impl From<SessionResumed> for ResumeState {
+    fn from(resumed: SessionResumed) -> Self {
+        match resumed {
+            SessionResumed::Resumed {
+                subscriptions_restored,
+                interests_restored,
+                watches_ensured,
+                watches_failed,
+            } => ResumeState::Resumed {
+                subscriptions_restored,
+                interests_restored,
+                watches_ensured,
+                watches_failed,
+            },
+            SessionResumed::RefusedSessionRecentlyEnded => ResumeState::RefusedSessionRecentlyEnded,
         }
     }
 }
@@ -740,6 +780,40 @@ mod tests {
         assert_eq!(value["version"], serde_json::json!(PROTOCOL_VERSION));
         let back: Response = decode_frame(&line).unwrap();
         assert_eq!(resp, back);
+    }
+
+    /// The resume request and both reply shapes survive the wire, and the domain →
+    /// wire conversion keeps every count (ADR-0026). The `state` tag is what an older
+    /// or newer peer has to agree on.
+    #[test]
+    fn resume_session_round_trips_in_every_shape() {
+        round_trip_request(Request::ResumeSession {
+            session: SessionId::new("s1"),
+        });
+
+        let resumed = ResumeState::from(SessionResumed::Resumed {
+            subscriptions_restored: 1,
+            interests_restored: 2,
+            watches_ensured: 3,
+            watches_failed: 4,
+        });
+        assert_eq!(
+            resumed,
+            ResumeState::Resumed {
+                subscriptions_restored: 1,
+                interests_restored: 2,
+                watches_ensured: 3,
+                watches_failed: 4,
+            }
+        );
+        for outcome in [resumed, ResumeState::RefusedSessionRecentlyEnded] {
+            let resp = Response::SessionResumed { outcome };
+            let line = encode_frame(&resp).unwrap();
+            let back: Response = decode_frame(&line).unwrap();
+            assert_eq!(resp, back);
+        }
+        let refused = serde_json::to_value(ResumeState::RefusedSessionRecentlyEnded).unwrap();
+        assert_eq!(refused["state"], "refused_session_recently_ended");
     }
 
     /// Build a status view for session `s1` holding just `subscriptions` (the axis

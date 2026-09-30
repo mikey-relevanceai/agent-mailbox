@@ -127,7 +127,9 @@ MVP rules:
    attaches interest and reuses the running adapter.
 5. **Stop only on last interest.** When the last interested session leaves
    (explicit unwatch or SessionEnd), tear down the child and mark the watch
-   stopped.
+   stopped. A SessionEnd *suspends* the session's interest rather than deleting it,
+   and a resume of the same session id restores it and restarts the adapter
+   ([ADR-0026](../adr/0026-suspend-watches-on-session-end.md)).
 6. **Bridge restart.** Resume a watch only if at least one interested session is
    still alive; otherwise mark stopped (fail safe: missed events > zombie API
    load). The session-liveness probe is a **live Claude Code process carrying that

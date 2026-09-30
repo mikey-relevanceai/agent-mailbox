@@ -200,18 +200,19 @@ pub struct Watch {
 
 /// What ending a session removed (the SessionEnd teardown, card 11).
 ///
-/// A session's departure drops both halves of its state in one transaction: its
-/// `subscription` rows (so it is woken about nothing more) and its
-/// `watch_interest` rows (so the card-08 refcount can stop adapters nobody else
-/// wants). `emptied_watches` are exactly the watches whose interest thereby fell
-/// to zero — the ones whose adapter the caller must now stop, mirroring
-/// [`crate::storage::Storage::sweep_stale_interests`]'s return. The counts are
-/// kept for an honest, body-free teardown log.
+/// A session's departure takes both halves of its state out of the live tables in
+/// one transaction: its `subscription` rows (so it is woken about nothing more) and
+/// its `watch_interest` rows (so the card-08 refcount can stop adapters nobody else
+/// wants). They are SUSPENDED, not forgotten — copied aside so a resume of the same
+/// session id can restore them (ADR-0026). `emptied_watches` are exactly the watches
+/// whose interest thereby fell to zero — the ones whose adapter the caller must now
+/// stop, mirroring [`crate::storage::Storage::sweep_stale_interests`]'s return. The
+/// counts are kept for an honest, body-free teardown log.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EndSessionOutcome {
-    /// How many `subscription` rows were removed for the session.
+    /// How many `subscription` rows left the live table (and were suspended).
     pub subscriptions_removed: u64,
-    /// How many `watch_interest` rows were removed for the session.
+    /// How many `watch_interest` rows left the live table (and were suspended).
     pub interests_removed: u64,
     /// Watches whose interest reached zero because this session left — the
     /// caller stops each one's adapter (design/01 rule 5).
@@ -348,4 +349,35 @@ pub enum SubscribeOutcome {
     /// is reported rather than a silent success, so a caller (e.g. the harness
     /// inbox registrar) can log that the session was recently ended.
     RefusedSessionRecentlyEnded,
+}
+
+/// What restoring a session's suspended state did (ADR-0026).
+///
+/// A sum type because the refusal and the success carry different facts: a refused
+/// resume touched nothing, so it has no counts to misread as "restored nothing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The session's suspended rows (if any) are live again.
+    Resumed {
+        /// How many suspended subscriptions were restored.
+        subscriptions_restored: u64,
+        /// How many suspended interests were restored.
+        interests_restored: u64,
+        /// EVERY watch the session now has a live interest in — restored or not —
+        /// for the caller to ensure is running. Not just the restored ones: an
+        /// interest that survived a daemon restart can belong to a watch the
+        /// startup reconcile stopped because the session was not running yet.
+        watches: Vec<WatchId>,
+    },
+    /// Refused: the session ended within the tombstone guard window, the same
+    /// guard the automatic inbox registration honours (ADR-0007). Nothing was
+    /// restored; the suspended rows are left for the next `SessionStart`.
+    RefusedSessionRecentlyEnded,
+}
+
+/// What expiring long-suspended state removed (ADR-0026). Counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExpiredSuspensions {
+    pub interests: u64,
+    pub subscriptions: u64,
 }

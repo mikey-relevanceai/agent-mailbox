@@ -215,8 +215,8 @@ local stack can stand in for.
    mailbox unwatch github-pr OWNER/REPO#N
    ```
 
-   or just end the session — `SessionEnd` drops the interest and stops the poller
-   if no other session is watching that PR.
+   or just end the session — `SessionEnd` suspends the interest and stops the poller
+   if no other session is watching that PR. Resuming the session restarts it.
 
 ### Rehearse the mechanics without a PR
 

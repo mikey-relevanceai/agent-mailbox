@@ -43,8 +43,9 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, Pid, ReadPage, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
-    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, ExpiredSuspensions, Pid, ReadPage, ResumeOutcome, SessionId, SubjectBudget,
+    SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -467,10 +468,12 @@ impl Storage {
             .await
     }
 
-    /// Drop every interest whose `last_seen` is strictly older than `cutoff`
-    /// (Unix millis), returning the watches whose interest thereby reached zero —
-    /// the ones whose adapter the caller should now stop (design/01 reconcile /
-    /// TTL sweep).
+    /// Take every interest whose `last_seen` is strictly older than `cutoff`
+    /// (Unix millis) out of the live table, returning the watches whose interest
+    /// thereby reached zero — the ones whose adapter the caller should now stop
+    /// (design/01 reconcile / TTL sweep). Each is suspended rather than deleted, so
+    /// a session that died without a `SessionEnd` gets its watches back when it is
+    /// resumed (ADR-0026).
     pub async fn sweep_stale_interests(&self, cutoff: i64) -> Result<Vec<WatchId>, StorageError> {
         self.call(|reply| Command::SweepStaleInterests { cutoff, reply })
             .await
@@ -575,13 +578,14 @@ impl Storage {
             .await
     }
 
-    /// Drop every subscription AND every watch interest held by `session`, in one
-    /// transaction, returning what was removed plus the watches whose interest
-    /// thereby reached zero.
+    /// Suspend every subscription AND every watch interest held by `session`, in
+    /// one transaction, returning what left the live tables plus the watches whose
+    /// interest thereby reached zero.
     ///
     /// The durable half of the SessionEnd teardown (card 11): a departing session
-    /// must leave no subscription (so a late publish wakes nobody) and no interest
-    /// (so the card-08 supervisor can stop adapters nobody else wants). The caller
+    /// must leave no live subscription (so a late publish wakes nobody) and no live
+    /// interest (so the card-08 supervisor can stop adapters nobody else wants).
+    /// Both are kept aside for [`Self::resume_session`] (ADR-0026). The caller
     /// stops each [`EndSessionOutcome::emptied_watches`] adapter — the same signal
     /// the TTL sweeper uses, but triggered promptly by an explicit session end
     /// rather than by ageing out.
@@ -600,6 +604,37 @@ impl Storage {
             reply,
         })
         .await
+    }
+
+    /// Restore `session`'s suspended subscriptions and interests (ADR-0026) — the
+    /// durable half of a resumed session's `SessionStart`. Idempotent: a session
+    /// with nothing suspended still gets back the list of watches it is interested
+    /// in, which the caller ensures are running.
+    ///
+    /// Honours the same tombstone guard as the automatic inbox registration, so the
+    /// two halves of `session-start` cannot disagree about whether the session is
+    /// back.
+    pub async fn resume_session(
+        &self,
+        session: SessionId,
+        now_ms: i64,
+    ) -> Result<ResumeOutcome, StorageError> {
+        self.call(|reply| Command::ResumeSession {
+            session,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Forget suspended state older than `cutoff` (Unix millis): a session that was
+    /// never resumed within the retention window (ADR-0026).
+    pub async fn expire_suspensions(
+        &self,
+        cutoff: i64,
+    ) -> Result<ExpiredSuspensions, StorageError> {
+        self.call(|reply| Command::ExpireSuspensions { cutoff, reply })
+            .await
     }
 
     /// The stored adapter baseline for `watch`, or `None` if unset. Opaque JSON

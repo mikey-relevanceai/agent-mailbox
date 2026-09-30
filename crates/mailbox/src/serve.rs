@@ -101,7 +101,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// committed publish gets its ack out) before dropping the runtime.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// How often the TTL sweeper runs, dropping interests whose session hard-died
+/// How often the TTL sweeper runs, suspending interests whose session hard-died
 /// without a `SessionEnd`/`unwatch` (design/01 reconcile row).
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -112,6 +112,12 @@ const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// design: it doubles as the grace period for a momentarily unreadable process
 /// table, and missing a slow cleanup beats dropping a live session's watch.
 const DEFAULT_INTEREST_TTL: Duration = Duration::from_secs(3600);
+
+/// How long an ended session's watches are kept for a resume (ADR-0026). Long,
+/// because a suspended row costs nothing — no adapter runs for it — while losing
+/// one is exactly the bug it exists to fix: an agent resumed after a long weekend
+/// or a holiday should still be watching what it was watching.
+const DEFAULT_SUSPENSION_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// Runtime-tunable daemon limits. Defaults are the constants above; each may be
 /// overridden by an env var, which keeps the safety property (a limit exists)
@@ -235,7 +241,7 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
     //    reconciled and its adapter stopped when its interest hits zero. The
     //    sweep reads the process table for liveness first, so a live-but-silent
     //    session is never swept out from under itself (ADR-0017).
-    let sweeper = spawn_sweeper(supervisor.clone());
+    let sweeper = spawn_sweeper(supervisor.clone(), storage.clone());
 
     // 8. Serve until a shutdown signal, capping concurrent handlers.
     let ctx = Ctx {
@@ -264,22 +270,39 @@ pub async fn run(config: StorageConfig) -> anyhow::Result<()> {
 }
 
 /// Spawn the periodic TTL sweeper. Env overrides (`MAILBOX_SWEEP_INTERVAL_MS`,
-/// `MAILBOX_INTEREST_TTL_MS`) let tests drive it fast; production uses the
-/// generous defaults so a live session's watch is never swept out from under it.
+/// `MAILBOX_INTEREST_TTL_MS`, `MAILBOX_SUSPENSION_RETENTION_MS`) let tests drive it
+/// fast; production uses the generous defaults so a live session's watch is never
+/// swept out from under it.
+///
+/// Each pass also forgets suspended state older than the retention window
+/// (ADR-0026). That needs no process table — a suspended row has no adapter and no
+/// liveness to check — so it runs even when the sweep proper is skipped.
 ///
 /// The interval must stay well below the TTL: the sweep is also the liveness
 /// refresh, so a session needs several probes inside one TTL window for a single
 /// missed probe to be harmless.
-fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
+fn spawn_sweeper(supervisor: Supervisor, storage: Storage) -> tokio::task::JoinHandle<()> {
     let interval = env_var("MAILBOX_SWEEP_INTERVAL_MS")
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_SWEEP_INTERVAL);
     let ttl = env_var("MAILBOX_INTEREST_TTL_MS")
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_INTEREST_TTL);
+    let retention = env_var("MAILBOX_SUSPENSION_RETENTION_MS")
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SUSPENSION_RETENTION);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
+            let cutoff = expiry_cutoff(mailbox::clock::now_millis(), retention);
+            if let Err(err) = storage.expire_suspensions(cutoff).await {
+                warn!(
+                    error = %err,
+                    cutoff,
+                    retention_ms = retention.as_millis() as u64,
+                    "could not expire suspended sessions"
+                );
+            }
             // ONE `ps` per sweep, not one per interested session. An unreadable
             // process table would look like "every session is dead", so it skips the
             // sweep entirely rather than reap live agents' watches on a hiccup — the
@@ -300,6 +323,14 @@ fn spawn_sweeper(supervisor: Supervisor) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// The instant before which suspended state is expired: `retention` before `now_ms`.
+/// Saturating, so an absurd retention expires nothing rather than wrapping into the
+/// future and expiring everything.
+fn expiry_cutoff(now_ms: i64, retention: Duration) -> i64 {
+    let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(retention_ms)
 }
 
 /// Accept connections until a shutdown signal. Each connection is served on its
@@ -506,6 +537,7 @@ fn request_op(request: &Request) -> &'static str {
         Request::Agents { .. } => "agents",
         Request::Topics { .. } => "topics",
         Request::EndSession { .. } => "end_session",
+        Request::ResumeSession { .. } => "resume_session",
     }
 }
 
@@ -522,7 +554,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::Unwatch { session, .. }
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
-        | Request::EndSession { session } => Some(session),
+        | Request::EndSession { session }
+        | Request::ResumeSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
         // logged by the agents module with both ends) — and there may be none, when
         // a human sent it. `agents` marks its caller and otherwise ignores it, so it
@@ -603,6 +636,7 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         Request::Agents { session } => agents(storage, session).await,
         Request::Topics { prefix } => topics(storage, prefix).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
+        Request::ResumeSession { session } => resume_session(storage, supervisor, session).await,
     }
 }
 
@@ -859,14 +893,30 @@ async fn status(storage: &Storage, session: Option<SessionId>) -> Response {
 }
 
 /// Thin translation over [`mailbox::watch::end_session`] (the harness `SessionEnd`
-/// teardown, card 11): drop the session's subscriptions + interests and stop any
-/// now-orphaned adapters.
+/// teardown, card 11): suspend the session's subscriptions + interests (ADR-0026)
+/// and stop any now-orphaned adapters.
 async fn end_session(storage: &Storage, supervisor: &Supervisor, session: SessionId) -> Response {
     match mailbox::watch::end_session(storage, supervisor, session).await {
         Ok(ended) => Response::SessionEnded {
             subscriptions_dropped: ended.subscriptions_dropped,
             interests_dropped: ended.interests_dropped,
             adapters_stopped: ended.adapters_stopped,
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::resume_session`] (the harness
+/// `SessionStart` half of ADR-0026): restore what `end_session` suspended and make
+/// sure the session's watches are running.
+async fn resume_session(
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Response {
+    match mailbox::watch::resume_session(storage, supervisor, session).await {
+        Ok(resumed) => Response::SessionResumed {
+            outcome: resumed.into(),
         },
         Err(err) => Response::error(err.to_string()),
     }
@@ -950,4 +1000,24 @@ fn bind_socket_owner_only(socket: &Path) -> anyhow::Result<UnixListener> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| anyhow::anyhow!("could not set 0600 on socket {}: {e}", socket.display()))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn the_cutoff_is_retention_before_now() {
+        assert_eq!(expiry_cutoff(10_000, Duration::from_millis(3_000)), 7_000);
+        assert_eq!(
+            expiry_cutoff(1_790_000_000_000, DEFAULT_SUSPENSION_RETENTION),
+            1_790_000_000_000 - 30 * 24 * 3600 * 1000
+        );
+    }
+
+    #[test]
+    fn an_absurd_retention_expires_nothing_rather_than_wrapping() {
+        assert_eq!(expiry_cutoff(10_000, Duration::MAX), 10_000 - i64::MAX);
+        assert!(expiry_cutoff(10_000, Duration::MAX) < 0);
+    }
 }

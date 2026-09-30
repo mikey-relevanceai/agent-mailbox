@@ -33,13 +33,13 @@
 use std::time::Duration;
 
 use mailbox_protocol::{GithubPr, Topic, TopicError, stub_topic};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec,
-    WatchState, WatchTarget,
+    ResumeOutcome, SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind,
+    WatchSpec, WatchState, WatchTarget,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -120,6 +120,26 @@ pub struct SessionEnded {
     pub interests_dropped: u64,
     /// Adapters stopped because this session's departure took their last interest.
     pub adapters_stopped: u64,
+}
+
+/// The outcome of resuming a session (ADR-0026). Counts only, like
+/// [`SessionEnded`], so it is safe to log verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResumed {
+    Resumed {
+        subscriptions_restored: u64,
+        interests_restored: u64,
+        /// Watches asked to run and accepted. `ensure_running` is idempotent, so
+        /// this counts watches asked to run, not adapters started.
+        watches_ensured: u64,
+        /// Watches the supervisor could not be asked to run. The rows are restored
+        /// regardless, so this is a partial resume, not a failed one — which is why
+        /// it is a count here rather than an `Err` that would discard the rest.
+        watches_failed: u64,
+    },
+    /// The session ended moments ago (ADR-0007's tombstone guard); nothing was
+    /// restored and the suspended state waits for the next `SessionStart`.
+    RefusedSessionRecentlyEnded,
 }
 
 /// One watch as `status` sees it, including its interest refcount and lifecycle
@@ -366,7 +386,8 @@ async fn session_status(
     })
 }
 
-/// End `session`: drop all its subscriptions and interests, and stop the adapter
+/// End `session`: suspend all its subscriptions and interests (kept aside for a
+/// resume, ADR-0026), and stop the adapter
 /// for every watch whose interest thereby reached zero (design/01 rule 5, feeding
 /// the card-08 supervisor). The durable teardown is one atomic storage step; the
 /// adapter stops are driven from its result. This is the bridge half of the
@@ -410,7 +431,7 @@ pub async fn end_session(
         "ended session and stopped its now-orphaned adapters"
     );
 
-    // The session's rows are gone regardless; only surface an error once every
+    // The session's live rows are suspended regardless; only surface an error once every
     // watch has been attempted, so no orphan is skipped by a fail-fast.
     if let Some(err) = first_err {
         return Err(WatchError::Supervisor(err));
@@ -419,6 +440,97 @@ pub async fn end_session(
         subscriptions_dropped: outcome.subscriptions_removed,
         interests_dropped: outcome.interests_removed,
         adapters_stopped: stopped,
+    })
+}
+
+/// Resume `session` (ADR-0026): restore the subscriptions and interests it had when
+/// it ended, then make sure every watch it is interested in has a running adapter.
+///
+/// The `SessionStart` hook's second half, after the inbox registration. It is the
+/// inverse of [`end_session`]: that suspended the rows and stopped the adapters
+/// nobody else wanted; this restores the rows and starts them again. A `github-pr`
+/// adapter restarts from its persisted baseline (design/01), so a PR that merged or
+/// failed CI while the session was away is reported as a transition, not missed.
+///
+/// Ensures EVERY interested watch, not just the restored ones, because an interest
+/// can outlive the session's process without being suspended: a daemon restart
+/// while the app was closed leaves the interest in place and the watch `Stopped`
+/// (the startup reconcile found no live session), and nothing else would start it.
+///
+/// Like [`end_session`], one watch failing to start must not stop the rest from
+/// being tried. Unlike it, the failures are reported as a count in the success value:
+/// the restore has already committed, and an `Err` would tell the hook nothing was
+/// resumed when almost everything was.
+pub async fn resume_session(
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Result<SessionResumed, WatchError> {
+    let (subscriptions_restored, interests_restored, watches) = match storage
+        .resume_session(session.clone(), now_millis())
+        .await?
+    {
+        ResumeOutcome::Resumed {
+            subscriptions_restored,
+            interests_restored,
+            watches,
+        } => (subscriptions_restored, interests_restored, watches),
+        ResumeOutcome::RefusedSessionRecentlyEnded => {
+            warn!(
+                session = session.as_str(),
+                "did not resume the session's watches: it ended moments ago (tombstone guard)"
+            );
+            return Ok(SessionResumed::RefusedSessionRecentlyEnded);
+        }
+    };
+
+    let mut ensured = 0u64;
+    let mut failed = 0u64;
+    for watch_id in &watches {
+        match supervisor.ensure_running(*watch_id).await {
+            Ok(()) => ensured += 1,
+            Err(err) => {
+                failed += 1;
+                warn!(
+                    session = session.as_str(),
+                    watch = watch_id.get(),
+                    error = %err,
+                    "could not start a resumed session's watch; continuing with the rest"
+                );
+            }
+        }
+    }
+
+    if failed > 0 {
+        warn!(
+            session = session.as_str(),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured = ensured,
+            watches_failed = failed,
+            "resumed session but some of its watches could not be started"
+        );
+    } else if subscriptions_restored == 0 && interests_restored == 0 && watches.is_empty() {
+        // The common case: `SessionStart` also fires on startup and compact, where
+        // there is nothing to resume.
+        debug!(
+            session = session.as_str(),
+            "resumed session had nothing suspended and no watches"
+        );
+    } else {
+        info!(
+            session = session.as_str(),
+            subscriptions_restored,
+            interests_restored,
+            watches_ensured = ensured,
+            "resumed session and ensured its watches are running"
+        );
+    }
+    Ok(SessionResumed::Resumed {
+        subscriptions_restored,
+        interests_restored,
+        watches_ensured: ensured,
+        watches_failed: failed,
     })
 }
 
