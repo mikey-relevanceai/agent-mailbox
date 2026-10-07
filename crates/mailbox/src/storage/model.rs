@@ -114,9 +114,9 @@ pub enum WatchState {
     /// Torn down (last interest gone). A clean stop, distinct from [`Failed`].
     Stopped,
     /// The adapter crashed repeatedly and the supervisor gave up restarting it
-    /// (card 08): it exceeded the restart policy's consecutive-failure budget, so
-    /// an error event was surfaced on the entity's topic and no more restarts are
-    /// attempted. Distinct from [`Stopped`] so `status` can tell "torn down
+    /// (card 08): it exceeded the restart policy's consecutive-failure budget.
+    /// Nothing is published (ADR-0027), and the sweep retries it while an
+    /// interested session is alive (ADR-0011). Distinct from [`Stopped`] so `status` can tell "torn down
     /// because nobody wanted it" from "torn down because it kept dying".
     Failed,
 }

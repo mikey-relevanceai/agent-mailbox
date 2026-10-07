@@ -1327,7 +1327,11 @@ fn render_status_body(report: &StatusReport) {
                 WatchStateWire::Desired => ("desired", "not running".to_string()),
                 WatchStateWire::Running { pid } => ("running", format!("pid {pid}")),
                 WatchStateWire::Stopped => ("stopped", "stopped".to_string()),
-                WatchStateWire::Failed => ("failed", "gave up after repeated crashes".to_string()),
+                WatchStateWire::Failed => (
+                    "failed",
+                    "gave up after repeated crashes; retried each sweep while a session wants it"
+                        .to_string(),
+                ),
             };
             // The github entity is `repo#pr`; a stub is just its label (pr is an
             // unused 0 sentinel there, so showing `#0` would be noise).
