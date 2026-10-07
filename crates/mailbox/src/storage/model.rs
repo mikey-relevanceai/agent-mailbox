@@ -156,7 +156,7 @@ impl WatchTarget {
         match self {
             WatchTarget::GithubPr { .. } => WatchKind::GithubPr,
             WatchTarget::Stub { .. } => WatchKind::Stub,
-            WatchTarget::Slack(SlackWatch::Channel(_)) => WatchKind::SlackChannel,
+            WatchTarget::Slack(SlackWatch::Channel { .. }) => WatchKind::SlackChannel,
             WatchTarget::Slack(SlackWatch::Thread { .. }) => WatchKind::SlackThread,
         }
     }

@@ -64,9 +64,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use mailbox_protocol::{
-    AdapterId, GithubPr, SlackChannelId, SlackTs, SlackWatch, Subject, Timestamp, Topic,
-};
+use mailbox_protocol::{AdapterId, GithubPr, SlackWatch, Subject, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
@@ -75,8 +73,8 @@ use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, SlackTarget, StatusReport, TopicStatus,
-    decode_frame, encode_frame,
+    AgentSummary, GithubPrTarget, Request, Response, StatusReport, TopicStatus, decode_frame,
+    encode_frame,
 };
 
 /// Hard cap on a single control frame (request line). Sized for the largest
@@ -904,18 +902,14 @@ async fn watch_slack(
     storage: &Storage,
     supervisor: &Supervisor,
     session: SessionId,
-    target: SlackTarget,
+    target: SlackWatch,
     interval_secs: u64,
 ) -> Response {
-    let slack = match slack_watch(&target) {
-        Ok(slack) => slack,
-        Err(message) => return Response::error(message),
-    };
     match mailbox::watch::record_slack(
         bus,
         storage,
         supervisor,
-        &slack,
+        &target,
         Duration::from_secs(interval_secs),
         session,
     )
@@ -936,13 +930,9 @@ async fn unwatch_slack(
     storage: &Storage,
     supervisor: &Supervisor,
     session: SessionId,
-    target: SlackTarget,
+    target: SlackWatch,
 ) -> Response {
-    let slack = match slack_watch(&target) {
-        Ok(slack) => slack,
-        Err(message) => return Response::error(message),
-    };
-    match mailbox::watch::drop_interest_slack(bus, storage, supervisor, &slack, session).await {
+    match mailbox::watch::drop_interest_slack(bus, storage, supervisor, &target, session).await {
         Ok(dropped) => Response::Unwatched {
             topic: dropped.topic,
             outcome: dropped.outcome.into(),
@@ -994,18 +984,6 @@ async fn resume_session(
 fn github_pr(target: &GithubPrTarget) -> Result<GithubPr, String> {
     GithubPr::new(&target.owner, &target.repo, target.number)
         .map_err(|err| format!("invalid github-pr target: {err}"))
-}
-
-/// Validate a wire [`SlackTarget`] into a domain [`SlackWatch`] at the daemon edge.
-fn slack_watch(target: &SlackTarget) -> Result<SlackWatch, String> {
-    let channel = SlackChannelId::parse(&target.channel)
-        .map_err(|err| format!("invalid slack target: {err}"))?;
-    match &target.thread_ts {
-        None => Ok(SlackWatch::Channel(channel)),
-        Some(ts) => SlackTs::parse(ts)
-            .map(|thread_ts| SlackWatch::Thread { channel, thread_ts })
-            .map_err(|err| format!("invalid slack target: {err}")),
-    }
 }
 
 /// Create the daemon directory `0700`, fatal on failure (B4: refuse to serve

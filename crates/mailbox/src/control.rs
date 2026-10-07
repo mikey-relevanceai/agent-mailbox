@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mailbox_protocol::{
-    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, Subject, Topic,
-    check_version, inbox_topic,
+    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, SlackWatch, Subject,
+    Topic, check_version, inbox_topic,
 };
 
 use mailbox::storage::{
@@ -116,15 +116,18 @@ pub enum Request {
     /// Declare `session`'s interest in a Slack channel or thread watch and
     /// subscribe it to that watch's topic (design/02). One variant covers both
     /// Slack kinds: they share every parameter, and the target says which.
+    ///
+    /// The target travels as a parsed [`SlackWatch`]: decoding the frame is what
+    /// validates it, so there is no stringly twin to re-check at the daemon.
     WatchSlack {
         session: SessionId,
-        target: SlackTarget,
+        target: SlackWatch,
         interval_secs: u64,
     },
     /// Drop `session`'s interest in a Slack watch and unsubscribe it.
     UnwatchSlack {
         session: SessionId,
-        target: SlackTarget,
+        target: SlackWatch,
     },
     /// Report watches (interest + child pid), and — when the caller is a session —
     /// that session's subscriptions and unread counts.
@@ -190,16 +193,6 @@ pub struct GithubPrTarget {
     pub owner: String,
     pub repo: String,
     pub number: u64,
-}
-
-/// Identity of a Slack channel or thread to watch/unwatch, as plain strings on
-/// the wire. The daemon parses it into a [`SlackWatch`](mailbox_protocol::SlackWatch)
-/// at the edge; `thread_ts` absent means the channel's top level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlackTarget {
-    pub channel: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread_ts: Option<String>,
 }
 
 /// The daemon's reply to a [`Request`]. Internally tagged by `"result"`.

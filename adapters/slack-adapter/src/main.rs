@@ -39,6 +39,7 @@
 //! - Offline or a Slack 5xx → skip the poll; only a long streak exits non-zero.
 
 mod api;
+mod message;
 mod token;
 mod watcher;
 
@@ -51,7 +52,7 @@ use serde_json::Value;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use mailbox_protocol::{
     AdapterId, Baseline as BaselineMsg, Message, Publish, SlackChannelId, SlackTargetError,
@@ -134,7 +135,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            error!(error = %err, "slack adapter exiting with an error");
+            error!(error = %err, "slack adapter exited with an error");
             ExitCode::FAILURE
         }
     }
@@ -144,6 +145,13 @@ async fn run() -> Result<(), AdapterError> {
     let config = read_config(std::io::stdin().lock())?;
     let watch = watch_of(&config)?;
     let topic = watch.topic();
+    // Every line from here on carries the watch's topic, so a warning in the
+    // bridge's log (where several adapters' stderr meet) names its watch.
+    let span = info_span!("slack_watch", topic = topic.as_str());
+    watch_loop(config, watch, topic).instrument(span).await
+}
+
+async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(), AdapterError> {
     let interval = Duration::from_millis(if config.interval_ms == 0 {
         DEFAULT_INTERVAL_MS
     } else {
@@ -164,7 +172,6 @@ async fn run() -> Result<(), AdapterError> {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     info!(
-        topic = topic.as_str(),
         interval_ms = interval.as_millis() as u64,
         resuming = baseline.is_some(),
         max_polls = config.max_polls,
@@ -207,6 +214,11 @@ async fn run() -> Result<(), AdapterError> {
                     "skipped a poll on a transient Slack failure; cursor unchanged"
                 );
                 if consecutive_transient >= limits.max_transient {
+                    error!(
+                        consecutive_transient,
+                        polls,
+                        "persistent transient Slack failures; exiting so the supervisor surfaces it"
+                    );
                     return Err(err.into());
                 }
                 continue;
@@ -314,7 +326,15 @@ async fn step_with_backoff<A: SlackApi>(
             Ok(step) => return Outcome::Done(step),
             Err(SlackError::RateLimited { retry_after }) => retry_after,
             Err(err @ SlackError::Transient(_)) => return Outcome::Transient(err),
-            Err(err) => return Outcome::Fatal(err),
+            // Listed, not wildcarded: a new error class must decide here whether
+            // it is retried, skipped or fatal.
+            Err(
+                err @ (SlackError::Auth(_)
+                | SlackError::NotInChannel
+                | SlackError::Access(_)
+                | SlackError::Failed(_)
+                | SlackError::Spawn { .. }),
+            ) => return Outcome::Fatal(err),
         };
         retries += 1;
         if retries > limits.max_rate_limit_retries {
@@ -360,7 +380,7 @@ fn injected_baseline(value: Value) -> Option<Baseline> {
 fn watch_of(config: &Config) -> Result<SlackWatch, AdapterError> {
     let channel = SlackChannelId::parse(&config.channel)?;
     let watch = match &config.thread_ts {
-        None => SlackWatch::Channel(channel),
+        None => SlackWatch::Channel { channel },
         Some(ts) => SlackWatch::Thread {
             channel,
             thread_ts: SlackTs::parse(ts)?,
@@ -414,10 +434,9 @@ async fn publish(
     write_message(stdout, &line).await?;
     info!(
         ts = %message.ts,
-        user = message.user.as_deref().unwrap_or(""),
+        user = message.user.as_ref().map_or("", |user| user.as_str()),
         bot_id = message.bot_id.as_deref().unwrap_or(""),
-        subtype = message.subtype.as_deref().unwrap_or(""),
-        topic = topic.as_str(),
+        subtype = message.subtype.as_ref().map_or("", |subtype| subtype.as_str()),
         "published a new Slack message"
     );
     Ok(())
@@ -469,7 +488,7 @@ mod tests {
             r#"{"topic":"slack.channel.C0C83CXLUL8","channel":"C0C83CXLUL8"}"#,
         ))
         .unwrap();
-        assert!(matches!(watch, SlackWatch::Channel(_)));
+        assert!(matches!(watch, SlackWatch::Channel { .. }));
     }
 
     #[test]

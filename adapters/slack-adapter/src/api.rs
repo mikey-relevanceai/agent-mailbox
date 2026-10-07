@@ -115,8 +115,9 @@ impl SlackApi for CurlSlack {
             .map_err(|err| SlackError::Transient(format!("curl did not finish: {err}")))?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
-            // curl's own failures (DNS, connect, timeout) are the laptop being
-            // offline far more often than anything wrong with the watch.
+            // A curl-level failure (DNS, connect, timeout) means Slack could not
+            // be reached, which says nothing about the watch itself; the run
+            // loop's skipped-poll budget escalates it if it persists.
             return Err(SlackError::Transient(first_line(&stderr)));
         }
         let (status, retry_after) = parse_status(&stderr)

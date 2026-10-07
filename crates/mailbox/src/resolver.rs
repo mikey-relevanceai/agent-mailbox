@@ -252,7 +252,7 @@ impl AdapterResolver for SlackResolver {
         let config = json!({
             "topic": slack.topic().as_str(),
             "channel": slack.channel().as_str(),
-            "thread_ts": slack.thread_ts().map(|ts| ts.as_str()),
+            "thread_ts": slack.thread_ts().map(|ts| ts.to_string()),
             "interval_ms": interval_ms(watch),
         });
         let (program, env_override) = SlackResolver::program();
@@ -311,6 +311,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use mailbox_protocol::SlackWatch;
+
     use crate::storage::{WatchId, WatchKind, WatchState};
 
     fn stub_watch(label: &str, interval: Duration, count: u64) -> Watch {
@@ -334,6 +336,64 @@ mod tests {
             },
             interval: Duration::from_secs(60),
             state: WatchState::Desired,
+        }
+    }
+
+    fn slack_watch(key: &str) -> Watch {
+        let slack = if key.contains('/') {
+            SlackWatch::parse_thread_key(key)
+        } else {
+            SlackWatch::parse_channel_key(key)
+        };
+        Watch {
+            id: WatchId::new(3),
+            target: WatchTarget::Slack(slack.unwrap()),
+            interval: Duration::from_secs(60),
+            state: WatchState::Desired,
+        }
+    }
+
+    /// The adapter reads exactly these keys; `thread_ts` is present and `null`
+    /// for a channel, because that is how the adapter tells the two apart.
+    #[test]
+    fn slack_resolver_builds_the_adapter_config_for_both_kinds() {
+        let channel = SlackResolver.resolve(&slack_watch("C0C83CXLUL8")).unwrap();
+        assert_eq!(
+            channel.config.value(),
+            &json!({"topic": "slack.channel.C0C83CXLUL8", "channel": "C0C83CXLUL8",
+                "thread_ts": null, "interval_ms": 60_000})
+        );
+        let thread = SlackResolver
+            .resolve(&slack_watch("C0C83CXLUL8/1791349480.652779"))
+            .unwrap();
+        assert_eq!(
+            thread.config.value(),
+            &json!({"topic": "slack.thread.C0C83CXLUL8/1791349480.652779",
+                "channel": "C0C83CXLUL8", "thread_ts": "1791349480.652779",
+                "interval_ms": 60_000})
+        );
+    }
+
+    #[test]
+    fn each_resolver_refuses_the_kinds_that_are_not_its_own() {
+        let stub = stub_watch("demo", Duration::from_millis(250), 0);
+        assert!(matches!(
+            SlackResolver.resolve(&stub),
+            Err(ResolveError::NoAdapter {
+                kind: WatchKind::Stub
+            })
+        ));
+        let slack = slack_watch("C0C83CXLUL8");
+        for err in [
+            StubResolver.resolve(&slack).unwrap_err(),
+            GithubPrResolver.resolve(&slack).unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                ResolveError::NoAdapter {
+                    kind: WatchKind::SlackChannel
+                }
+            ));
         }
     }
 
@@ -387,6 +447,11 @@ mod tests {
             github.config.value()["topic"],
             "github.pr.octocat/hello-world#42"
         );
+        // ...and both Slack kinds via the Slack resolver.
+        for key in ["C0C83CXLUL8", "C0C83CXLUL8/1791349480.652779"] {
+            let slack = resolver.resolve(&slack_watch(key)).unwrap();
+            assert_eq!(slack.config.value()["channel"], "C0C83CXLUL8", "{key}");
+        }
     }
 
     #[test]

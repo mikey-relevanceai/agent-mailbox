@@ -20,8 +20,8 @@ use mailbox_protocol::{AdapterId, GithubPr, SlackWatch, Subject, Topic, inbox_to
 
 use crate::client;
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, ResumeState, SessionStatus, SlackTarget,
-    StatusReport, SubscribeState, TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
+    AgentSummary, GithubPrTarget, Request, Response, ResumeState, SessionStatus, StatusReport,
+    SubscribeState, TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
 
@@ -1105,16 +1105,10 @@ fn request_context(request: &Request) -> String {
         }
         Request::WatchSlack {
             session, target, ..
-        } => format!(
-            "watching slack {} for {}",
-            slack_target_key(target),
-            session.as_str()
-        ),
-        Request::UnwatchSlack { session, target } => format!(
-            "unwatching slack {} for {}",
-            slack_target_key(target),
-            session.as_str()
-        ),
+        } => format!("watching slack {} for {}", target.key(), session.as_str()),
+        Request::UnwatchSlack { session, target } => {
+            format!("unwatching slack {} for {}", target.key(), session.as_str())
+        }
         // A status without a session is the bridge's half only, so it names no whose.
         Request::Status { session } => match session {
             Some(session) => format!("status for {}", session.as_str()),
@@ -1504,7 +1498,7 @@ fn parse_stub_label(label: &str) -> anyhow::Result<String> {
 /// Parse a `watch slack-channel` argument: a channel id, or a Slack link to the
 /// channel. A link to a message inside it is refused rather than quietly widened
 /// to the whole channel, since the caller probably meant that message's thread.
-fn parse_slack_channel(raw: &str) -> anyhow::Result<SlackTarget> {
+fn parse_slack_channel(raw: &str) -> anyhow::Result<SlackWatch> {
     let slack = if raw.starts_with("https://") {
         SlackWatch::parse_link(raw)
     } else {
@@ -1512,10 +1506,7 @@ fn parse_slack_channel(raw: &str) -> anyhow::Result<SlackTarget> {
     }
     .with_context(|| format!("invalid slack channel {raw:?}"))?;
     match slack {
-        SlackWatch::Channel(channel) => Ok(SlackTarget {
-            channel: channel.to_string(),
-            thread_ts: None,
-        }),
+        SlackWatch::Channel { .. } => Ok(slack),
         SlackWatch::Thread { .. } => anyhow::bail!(
             "{raw:?} links to a message, not a channel; use `watch slack-thread` to follow its thread"
         ),
@@ -1524,7 +1515,7 @@ fn parse_slack_channel(raw: &str) -> anyhow::Result<SlackTarget> {
 
 /// Parse a `watch slack-thread` argument: `<channel-id>/<parent-ts>`, or a Slack
 /// link to any message in the thread.
-fn parse_slack_thread(raw: &str) -> anyhow::Result<SlackTarget> {
+fn parse_slack_thread(raw: &str) -> anyhow::Result<SlackWatch> {
     let slack = if raw.starts_with("https://") {
         SlackWatch::parse_link(raw)
     } else {
@@ -1532,21 +1523,10 @@ fn parse_slack_thread(raw: &str) -> anyhow::Result<SlackTarget> {
     }
     .with_context(|| format!("invalid slack thread {raw:?}"))?;
     match slack {
-        SlackWatch::Thread { channel, thread_ts } => Ok(SlackTarget {
-            channel: channel.to_string(),
-            thread_ts: Some(thread_ts.to_string()),
-        }),
-        SlackWatch::Channel(_) => anyhow::bail!(
+        SlackWatch::Thread { .. } => Ok(slack),
+        SlackWatch::Channel { .. } => anyhow::bail!(
             "{raw:?} links to a channel, not a thread; use `watch slack-channel` to watch it"
         ),
-    }
-}
-
-/// The watch key a [`SlackTarget`] names, for messages.
-fn slack_target_key(target: &SlackTarget) -> String {
-    match &target.thread_ts {
-        Some(ts) => format!("{}/{ts}", target.channel),
-        None => target.channel.clone(),
     }
 }
 
@@ -2276,14 +2256,8 @@ mod tests {
     #[test]
     fn slack_watch_arguments_accept_ids_and_links_and_refuse_the_wrong_kind() {
         let base = "https://tryrelevance.slack.com/archives/C0C83CXLUL8";
-        let channel = SlackTarget {
-            channel: "C0C83CXLUL8".to_string(),
-            thread_ts: None,
-        };
-        let thread = SlackTarget {
-            channel: "C0C83CXLUL8".to_string(),
-            thread_ts: Some("1791349480.652779".to_string()),
-        };
+        let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
+        let thread = SlackWatch::parse_thread_key("C0C83CXLUL8/1791349480.652779").unwrap();
         assert_eq!(parse_slack_channel("C0C83CXLUL8").unwrap(), channel);
         assert_eq!(parse_slack_channel(base).unwrap(), channel);
         assert_eq!(

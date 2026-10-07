@@ -12,7 +12,8 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -27,7 +28,8 @@ fn adapter_bin() -> &'static str {
 /// A fake `curl`: reads the `-K -` config from stdin, refuses a wrong token the
 /// way Slack does, logs the method and form data (never the header), and answers
 /// from `$FAKE_SLACK_DIR/<method>.<n>`, clamping to the last fixture. A fixture
-/// whose first line is `@429` answers with HTTP 429 and a `Retry-After: 0`.
+/// whose first line is `@429` answers with HTTP 429 and a `Retry-After: 0`;
+/// `@503` answers with an HTTP 503.
 const FAKE_CURL: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 dir="${FAKE_SLACK_DIR:?}"
@@ -58,6 +60,10 @@ f="$dir/$method.$use"
 if [ "$(head -n1 "$f")" = "@429" ]; then
   printf '{"ok":false,"error":"ratelimited"}'
   printf '\n@@mailbox-slack-status 429 0\n' >&2
+  exit 0
+fi
+if [ "$(head -n1 "$f")" = "@503" ]; then
+  printf '\n@@mailbox-slack-status 503 \n' >&2
   exit 0
 fi
 cat "$f"
@@ -126,6 +132,21 @@ impl FakeSlack {
 
     /// Run the adapter with `config`, the Keychain holding `keychain_token`.
     fn run(&self, config: Value, keychain_token: Option<&str>) -> Output {
+        self.run_with(config, keychain_token, &[])
+    }
+
+    fn run_with(
+        &self,
+        config: Value,
+        keychain_token: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Output {
+        self.spawn(config, keychain_token, env)
+            .wait_with_output()
+            .unwrap()
+    }
+
+    fn spawn(&self, config: Value, keychain_token: Option<&str>, env: &[(&str, &str)]) -> Child {
         let mut command = Command::new(adapter_bin());
         command
             .env("MAILBOX_SLACK_CURL_BIN", &self.curl)
@@ -141,11 +162,12 @@ impl FakeSlack {
             Some(token) => command.env("FAKE_KEYCHAIN_TOKEN", token),
             None => command.env_remove("FAKE_KEYCHAIN_TOKEN"),
         };
+        command.envs(env.iter().copied());
         let mut child = command.spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         writeln!(stdin, "{config}").unwrap();
         drop(stdin);
-        child.wait_with_output().unwrap()
+        child
     }
 }
 
@@ -240,11 +262,14 @@ fn baselines_then_publishes_each_new_message_once() {
     );
 
     // The second poll asked for messages after the baseline, not the whole channel.
-    assert!(
-        slack.log("calls.log").contains(
-            "conversations.history channel=C0C83CXLUL8&limit=200&oldest=1791349480.652779"
-        )
-    );
+    let polls: Vec<String> = slack
+        .log("calls.log")
+        .lines()
+        .filter(|call| call.starts_with("conversations.history"))
+        .map(str::to_string)
+        .collect();
+    assert!(polls[1].contains("oldest=1791349480.652779"), "{polls:?}");
+    assert!(polls[1].contains("limit=200"), "{polls:?}");
 }
 
 #[test]
@@ -364,5 +389,81 @@ fn a_rate_limit_waits_and_retries_instead_of_failing() {
             .count(),
         2,
         "one rate-limited call, one retry"
+    );
+}
+
+#[test]
+fn a_persistent_outage_skips_polls_then_exits_non_zero() {
+    let slack = FakeSlack::new();
+    slack.raw_fixture("conversations.history", 0, "@503");
+    let output = slack.run_with(
+        channel_config(Value::Null, 0),
+        Some(TOKEN),
+        &[("MAILBOX_SLACK_MAX_TRANSIENT_FAILURES", "3")],
+    );
+    assert!(
+        !output.status.success(),
+        "an outage that never ends must surface"
+    );
+    assert!(
+        of_type(&lines(&output), "baseline").is_empty(),
+        "the cursor never moved"
+    );
+    assert_eq!(
+        slack
+            .log("calls.log")
+            .matches("conversations.history")
+            .count(),
+        3,
+        "one skipped poll per tick, up to the budget"
+    );
+}
+
+#[test]
+fn a_rate_limit_that_never_lifts_exits_non_zero() {
+    let slack = FakeSlack::new();
+    slack.raw_fixture("conversations.history", 0, "@429");
+    let output = slack.run_with(
+        channel_config(Value::Null, 0),
+        Some(TOKEN),
+        &[("MAILBOX_SLACK_MAX_RATE_LIMIT_RETRIES", "2")],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        slack
+            .log("calls.log")
+            .matches("conversations.history")
+            .count(),
+        3,
+        "the first call and two retries"
+    );
+}
+
+#[test]
+fn sigterm_exits_cleanly_mid_watch() {
+    let slack = FakeSlack::new();
+    slack.fixture("conversations.history", 0, history(json!([])));
+    let mut config = channel_config(Value::Null, 0);
+    config["interval_ms"] = json!(60_000);
+    let child = slack.spawn(config, Some(TOKEN), &[]);
+    // Wait until it has baselined, so the signal lands in the idle wait.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !slack.log("calls.log").contains("conversations.history") {
+        assert!(Instant::now() < deadline, "the adapter never polled");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = i32::try_from(child.id()).unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -14,8 +14,9 @@
 //! Channels are addressed by **id**, never by name: a channel can be renamed, and
 //! a watch keyed by a name would silently start watching nothing.
 
-use std::cmp::Ordering;
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 use crate::topic::Topic;
 
@@ -57,7 +58,11 @@ pub enum SlackTargetError {
 /// A Slack conversation id for a public or private channel (`C…`, or the legacy
 /// `G…` private-channel prefix). Direct messages (`D…`) are not watchable: the
 /// bot is granted no `im:history` scope.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Deserialization parses (`#[serde(try_from)]`), so a channel id decoded from a
+/// control frame or a Slack reply is as valid as one built by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct SlackChannelId(String);
 
 impl SlackChannelId {
@@ -85,6 +90,20 @@ impl SlackChannelId {
     }
 }
 
+impl TryFrom<String> for SlackChannelId {
+    type Error = SlackTargetError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<SlackChannelId> for String {
+    fn from(id: SlackChannelId) -> Self {
+        id.0
+    }
+}
+
 impl fmt::Display for SlackChannelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -94,11 +113,14 @@ impl fmt::Display for SlackChannelId {
 /// A Slack message timestamp, which is also a message's id within its channel
 /// and a thread's id (its parent's `ts`).
 ///
-/// Ordered numerically rather than as a string so "newer than the cursor" cannot
-/// go wrong on a seconds field that changes width.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Held as numbers, not the string it was parsed from, so equality and order
+/// agree: `01791349480.652779` and `1791349480.652779` are the same message, and
+/// "newer than the cursor" cannot go wrong on a seconds field that changes width.
+/// It always renders in Slack's canonical form. Field order is `seconds` then
+/// `micros`, which is what the derived `Ord` compares.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct SlackTs {
-    raw: String,
     seconds: u64,
     micros: u32,
 }
@@ -108,7 +130,6 @@ impl SlackTs {
     /// here, so its first message is new.
     pub fn zero() -> Self {
         Self {
-            raw: "0.000000".to_string(),
             seconds: 0,
             micros: 0,
         }
@@ -124,7 +145,6 @@ impl SlackTs {
             return Err(invalid());
         }
         Ok(Self {
-            raw: raw.to_string(),
             seconds: seconds.parse().map_err(|_| invalid())?,
             micros: micros.parse().map_err(|_| invalid())?,
         })
@@ -144,39 +164,41 @@ impl SlackTs {
         Self::parse(&format!("{seconds}.{micros}"))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.raw
-    }
-
     /// The permalink form: the timestamp with its dot removed.
     pub fn permalink_digits(&self) -> String {
-        self.raw.replace('.', "")
-    }
-}
-
-impl Ord for SlackTs {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.seconds, self.micros).cmp(&(other.seconds, other.micros))
-    }
-}
-
-impl PartialOrd for SlackTs {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        format!("{}{:06}", self.seconds, self.micros)
     }
 }
 
 impl fmt::Display for SlackTs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.raw)
+        write!(f, "{}.{:06}", self.seconds, self.micros)
+    }
+}
+
+impl TryFrom<String> for SlackTs {
+    type Error = SlackTargetError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<SlackTs> for String {
+    fn from(ts: SlackTs) -> Self {
+        ts.to_string()
     }
 }
 
 /// What a Slack watch is for.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// It crosses the control socket as itself, tagged by `kind`, so the daemon
+/// decodes a parsed value rather than strings it must remember to check.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SlackWatch {
     /// New top-level messages in a channel.
-    Channel(SlackChannelId),
+    Channel { channel: SlackChannelId },
     /// New replies in one thread, named by its parent message's `ts`.
     Thread {
         channel: SlackChannelId,
@@ -187,30 +209,31 @@ pub enum SlackWatch {
 impl SlackWatch {
     pub fn channel(&self) -> &SlackChannelId {
         match self {
-            SlackWatch::Channel(channel) | SlackWatch::Thread { channel, .. } => channel,
+            SlackWatch::Channel { channel } | SlackWatch::Thread { channel, .. } => channel,
         }
     }
 
     pub fn thread_ts(&self) -> Option<&SlackTs> {
         match self {
-            SlackWatch::Channel(_) => None,
+            SlackWatch::Channel { .. } => None,
             SlackWatch::Thread { thread_ts, .. } => Some(thread_ts),
         }
     }
 
     /// The watch's identity as one string: `<channel>` or `<channel>/<thread-ts>`.
     /// This is what the CLI accepts, what `status` shows, and what storage keys
-    /// the watch row by; [`SlackWatch::parse_key`] is its inverse.
+    /// the watch row by. [`SlackWatch::parse_channel_key`] and
+    /// [`SlackWatch::parse_thread_key`] are its inverse.
     pub fn key(&self) -> String {
         match self {
-            SlackWatch::Channel(channel) => channel.to_string(),
+            SlackWatch::Channel { channel } => channel.to_string(),
             SlackWatch::Thread { channel, thread_ts } => format!("{channel}/{thread_ts}"),
         }
     }
 
     /// Parse a channel key (`<channel>`).
     pub fn parse_channel_key(raw: &str) -> Result<Self, SlackTargetError> {
-        SlackChannelId::parse(raw).map(SlackWatch::Channel)
+        SlackChannelId::parse(raw).map(|channel| SlackWatch::Channel { channel })
     }
 
     /// Parse a thread key (`<channel>/<thread-ts>`).
@@ -243,7 +266,7 @@ impl SlackWatch {
             return Err(SlackTargetError::NotPermalink);
         }
         let Some(message) = message else {
-            return Ok(SlackWatch::Channel(channel));
+            return Ok(SlackWatch::Channel { channel });
         };
         let parent = query
             .split('&')
@@ -258,7 +281,7 @@ impl SlackWatch {
     /// The canonical topic this watch publishes on.
     pub fn topic(&self) -> Topic {
         let raw = match self {
-            SlackWatch::Channel(channel) => format!("{SLACK_CHANNEL_PREFIX}{channel}"),
+            SlackWatch::Channel { channel } => format!("{SLACK_CHANNEL_PREFIX}{channel}"),
             SlackWatch::Thread { channel, thread_ts } => {
                 format!("{SLACK_THREAD_PREFIX}{channel}/{thread_ts}")
             }
@@ -318,9 +341,45 @@ mod tests {
     }
 
     #[test]
+    fn equal_times_are_equal_however_they_were_written() {
+        let padded = SlackTs::parse("01791349480.652779").unwrap();
+        let plain = SlackTs::parse("1791349480.652779").unwrap();
+        assert_eq!(padded, plain);
+        assert_eq!(
+            padded.to_string(),
+            "1791349480.652779",
+            "renders canonically"
+        );
+        assert_eq!(
+            SlackWatch::parse_thread_key("C0C83CXLUL8/01791349480.652779")
+                .unwrap()
+                .key(),
+            "C0C83CXLUL8/1791349480.652779",
+            "so it cannot mint a second watch for the same thread"
+        );
+    }
+
+    #[test]
+    fn a_watch_crosses_the_wire_tagged_and_parsed() {
+        let thread = SlackWatch::parse_thread_key("C0C83CXLUL8/1791349480.652779").unwrap();
+        let wire = serde_json::to_value(&thread).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"kind": "thread", "channel": "C0C83CXLUL8",
+                "thread_ts": "1791349480.652779"})
+        );
+        assert_eq!(serde_json::from_value::<SlackWatch>(wire).unwrap(), thread);
+        let bad = serde_json::json!({"kind": "channel", "channel": "general"});
+        assert!(
+            serde_json::from_value::<SlackWatch>(bad).is_err(),
+            "decoding parses"
+        );
+    }
+
+    #[test]
     fn permalink_segment_round_trips() {
         let ts = SlackTs::from_permalink_segment("p1791349480652779").unwrap();
-        assert_eq!(ts.as_str(), "1791349480.652779");
+        assert_eq!(ts.to_string(), "1791349480.652779");
         assert_eq!(ts.permalink_digits(), "1791349480652779");
         assert!(SlackTs::from_permalink_segment("1791349480652779").is_err());
         assert!(SlackTs::from_permalink_segment("p123").is_err());

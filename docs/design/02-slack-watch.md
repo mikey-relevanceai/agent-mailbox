@@ -73,7 +73,11 @@ mailbox watch slack-thread <link>
 - **Targets and topics** (`mailbox-protocol::slack`). `SlackWatch` is
   `Channel(SlackChannelId)` or `Thread { channel, thread_ts: SlackTs }`. Topics are
   `slack.channel.<C>` and `slack.thread.<C>/<ts>`. A channel is named by id because
-  names can change. `SlackTs` orders numerically.
+  names can change. `SlackTs` is held as numbers and renders canonically, so two
+  spellings of one timestamp are one watch. All three types parse on deserialize,
+  and `SlackWatch` crosses the control socket as a tagged value
+  (`{"kind": "thread", "channel": …, "thread_ts": …}`), so the daemon decodes a
+  parsed target rather than re-checking strings.
 - **Storage.** Two watch kinds, `slack-channel` and `slack-thread`, on the existing
   flat row: the watch key (`<C>` or `<C>/<ts>`) in `repo`, `0` in `pr` and
   `publish_count`, the same way a stub stores its label. No migration.
@@ -92,10 +96,13 @@ mailbox watch slack-thread <link>
 | `channel_join`, `channel_leave`, topic/purpose/name changes | skipped | skipped |
 | `message_changed`, `message_deleted`, `hidden` | skipped | skipped |
 
-**Authorship is not filtered.** Every agent on Mikey's machine posts as the same Slack
-user, so a session's own post is indistinguishable from a peer's, and filtering on
-author would silence the peers. A session is woken by its own post, the trade
-[ADR-0014](../adr/0014-self-authored-events-wake-their-author.md) made for `publish`.
+**Authorship is not filtered.** The setup this was built for has every agent posting
+through one person's claude.ai Slack connector, so they all post as that person's
+Slack user. Then a session's own post is indistinguishable from a peer's, and
+filtering on author would silence the peers too. A session is woken by its own post,
+the trade [ADR-0014](../adr/0014-self-authored-events-wake-their-author.md) made for
+`publish`. If agents ever post under distinct identities, an opt-in author filter
+becomes possible; nothing needs it yet.
 
 ### Cursor and baseline
 
@@ -115,6 +122,10 @@ The subject is `new message from <name> in #<channel>` or `new reply from <name>
 thread in #<channel>`, linked to the message's permalink, built locally from
 `auth.test`'s workspace URL. Names come from `bot_profile.name` or `users.info`,
 cached per process; a failed lookup falls back to the id.
+
+Each message is parsed once, where it leaves the API, into a typed `SlackMessage`; a
+message whose `ts` or `thread_ts` is malformed is dropped with a warning rather than
+read as if the field were absent. The text is never deserialized.
 
 The body is `{kind, channel, ts, thread_ts?, user?, bot_id?, subtype?, permalink}`.
 **It never carries the text.** The woken agent reads the message through its own Slack
@@ -145,12 +156,17 @@ retries a failed watch while someone still wants it.
 ## Test plan
 
 - **Protocol:** id, ts and link parsing; numeric ts order; key and topic round trip.
-- **Adapter unit tests:** an in-memory fake Slack with history newest-first and
-  replies parent-first, covering the wake table, the cursor, join-then-read, a
-  reply ts used as a thread, and name caching.
+- **Adapter unit tests:** the wake table, row by row, over typed messages; and an
+  in-memory fake Slack (history newest-first, replies parent-first, both paged by
+  `limit` and `cursor`) covering the cursor, an empty channel, pagination, the page
+  cap's documented loss, a malformed message dropped rather than misread,
+  join-then-read, a reply ts used as a thread, and name caching.
 - **Adapter e2e:** the real binary against a fake `curl` and a fake `security`:
   baseline then one publish, the token never in argv or logs, resume from an injected
-  cursor, thread links, no token, a rejected token, a rate limit.
+  cursor, thread links, no token, a rejected token, a rate limit that lifts, one
+  that never does, an outage that outlasts the skipped-poll budget, and SIGTERM.
+- **Resolver:** the config each Slack kind gets, and that every resolver refuses
+  the kinds that are not its own.
 - **Bridge e2e:** `watch slack-thread <link>` through the daemon; a reply reaches
   `mailbox read`; `unwatch` stops the adapter.
 - **Storage:** channel and thread watches are distinct rows that round-trip; a bad

@@ -1606,25 +1606,18 @@ fn build_watch(
             }
             WatchTarget::Stub { label: repo, count }
         }
-        WatchKind::SlackChannel | WatchKind::SlackThread => {
-            if pr != 0 || count != 0 {
-                return Err(StorageError::Corrupt {
-                    detail: format!(
-                        "slack watch {} carries a non-zero pr {pr} or publish count {count}",
-                        id.get()
-                    ),
-                });
-            }
-            let parsed = if kind == WatchKind::SlackChannel {
-                SlackWatch::parse_channel_key(&repo)
-            } else {
-                SlackWatch::parse_thread_key(&repo)
-            };
-            let slack = parsed.map_err(|err| StorageError::Corrupt {
-                detail: format!("slack watch {} has an invalid key: {err}", id.get()),
-            })?;
-            WatchTarget::Slack(slack)
-        }
+        WatchKind::SlackChannel => WatchTarget::Slack(slack_watch(
+            id,
+            pr,
+            count,
+            SlackWatch::parse_channel_key(&repo),
+        )?),
+        WatchKind::SlackThread => WatchTarget::Slack(slack_watch(
+            id,
+            pr,
+            count,
+            SlackWatch::parse_thread_key(&repo),
+        )?),
     };
     let state = reconstruct_state(state, child_pid, id)?;
 
@@ -1633,6 +1626,27 @@ fn build_watch(
         target,
         interval: std::time::Duration::from_millis(interval_ms),
         state,
+    })
+}
+
+/// The Slack half of [`build_watch`]: a Slack row uses only its key column, and a
+/// key that does not parse is corrupt.
+fn slack_watch(
+    id: WatchId,
+    pr: u64,
+    count: u64,
+    parsed: Result<SlackWatch, mailbox_protocol::SlackTargetError>,
+) -> Result<SlackWatch, StorageError> {
+    if pr != 0 || count != 0 {
+        return Err(StorageError::Corrupt {
+            detail: format!(
+                "slack watch {} carries a non-zero pr {pr} or publish count {count}",
+                id.get()
+            ),
+        });
+    }
+    parsed.map_err(|err| StorageError::Corrupt {
+        detail: format!("slack watch {} has an invalid key: {err}", id.get()),
     })
 }
 

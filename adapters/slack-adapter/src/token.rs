@@ -4,8 +4,9 @@
 //! The token is never passed in through the bridge, in this adapter's config, or
 //! in an environment variable. The daemon's environment is inherited by EVERY
 //! adapter it spawns, so a token there would reach the stub and `gh` adapters
-//! too. The Keychain item is readable by `security` without a prompt because
-//! `security add-generic-password` created it.
+//! too. When this was built, `security` read an item that `security
+//! add-generic-password` had created without prompting; if it ever prompts, the
+//! item's access control list is the thing to check.
 
 use std::fmt;
 
