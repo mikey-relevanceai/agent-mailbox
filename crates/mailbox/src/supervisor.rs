@@ -521,6 +521,7 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
             GithubPr::new(owner, repo, *pr).ok().map(|pr| pr.topic())
         }
         WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
+        WatchTarget::Slack(slack) => Some(slack.topic()),
     }
 }
 

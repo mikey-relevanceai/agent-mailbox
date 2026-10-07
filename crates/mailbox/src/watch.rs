@@ -32,7 +32,7 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{GithubPr, Topic, TopicError, stub_topic};
+use mailbox_protocol::{GithubPr, SlackWatch, Topic, TopicError, stub_topic};
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
@@ -207,6 +207,24 @@ pub async fn record_stub(
     record_watch(bus, storage, supervisor, spec, topic, session).await
 }
 
+/// Record (or reuse) the Slack channel or thread watch for `slack`, attach
+/// `session`'s interest, and subscribe it to the watch's topic. The Slack analogue
+/// of [`record`], keyed by `(kind, key, pr=0)`.
+pub async fn record_slack(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    slack: &SlackWatch,
+    interval: Duration,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    let spec = WatchSpec {
+        target: WatchTarget::Slack(slack.clone()),
+        interval,
+    };
+    record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
+}
+
 /// Shared body of [`record`]/[`record_stub`]: upsert the watch, attach interest,
 /// align the subscription, and ask the supervisor to run the adapter. Kind-
 /// agnostic — it speaks only in the already-built [`WatchSpec`] and topic — so
@@ -289,6 +307,29 @@ pub async fn drop_interest_stub(
         label,
         0,
         topic,
+        session,
+    )
+    .await
+}
+
+/// Drop `session`'s interest in the Slack watch for `slack` and unsubscribe it
+/// from the watch's topic. The Slack analogue of [`drop_interest`].
+pub async fn drop_interest_slack(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    slack: &SlackWatch,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    let target = WatchTarget::Slack(slack.clone());
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        target.kind(),
+        &target.repo_column(),
+        0,
+        slack.topic(),
         session,
     )
     .await

@@ -113,6 +113,19 @@ pub enum Request {
     },
     /// Drop `session`'s interest in a `stub` watch and unsubscribe it.
     UnwatchStub { session: SessionId, label: String },
+    /// Declare `session`'s interest in a Slack channel or thread watch and
+    /// subscribe it to that watch's topic (design/02). One variant covers both
+    /// Slack kinds: they share every parameter, and the target says which.
+    WatchSlack {
+        session: SessionId,
+        target: SlackTarget,
+        interval_secs: u64,
+    },
+    /// Drop `session`'s interest in a Slack watch and unsubscribe it.
+    UnwatchSlack {
+        session: SessionId,
+        target: SlackTarget,
+    },
     /// Report watches (interest + child pid), and — when the caller is a session —
     /// that session's subscriptions and unread counts.
     ///
@@ -177,6 +190,16 @@ pub struct GithubPrTarget {
     pub owner: String,
     pub repo: String,
     pub number: u64,
+}
+
+/// Identity of a Slack channel or thread to watch/unwatch, as plain strings on
+/// the wire. The daemon parses it into a [`SlackWatch`](mailbox_protocol::SlackWatch)
+/// at the edge; `thread_ts` absent means the channel's top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackTarget {
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
 }
 
 /// The daemon's reply to a [`Request`]. Internally tagged by `"result"`.
@@ -543,6 +566,10 @@ pub enum WatchKindWire {
     GithubPr,
     #[serde(rename = "stub")]
     Stub,
+    #[serde(rename = "slack-channel")]
+    SlackChannel,
+    #[serde(rename = "slack-thread")]
+    SlackThread,
 }
 
 impl From<WatchKind> for WatchKindWire {
@@ -550,6 +577,8 @@ impl From<WatchKind> for WatchKindWire {
         match kind {
             WatchKind::GithubPr => WatchKindWire::GithubPr,
             WatchKind::Stub => WatchKindWire::Stub,
+            WatchKind::SlackChannel => WatchKindWire::SlackChannel,
+            WatchKind::SlackThread => WatchKindWire::SlackThread,
         }
     }
 }
@@ -589,9 +618,10 @@ impl From<WatchState> for WatchStateWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchStatus {
     pub kind: WatchKindWire,
-    /// The flat `repo` column: `owner/repo` for github, the label for stub.
+    /// The flat `repo` column: `owner/repo` for github, the label for stub, the
+    /// watch key (`<channel>` or `<channel>/<thread-ts>`) for Slack.
     pub repo: String,
-    /// The flat `pr` column: the PR number for github, `0` for stub.
+    /// The flat `pr` column: the PR number for github, `0` for stub and Slack.
     pub pr: u64,
     /// Desired poll interval, **milliseconds** — carried at millisecond precision
     /// so a sub-second stub interval (`--interval-ms 200`) is not flattened to
@@ -611,7 +641,7 @@ impl From<WatchEntry> for WatchStatus {
         // mirrors the flat storage row): kind + repo/label + pr.
         WatchStatus {
             kind: entry.target.kind().into(),
-            repo: entry.target.repo_column().to_string(),
+            repo: entry.target.repo_column(),
             pr: entry.target.pr_column(),
             interval_ms: u64::try_from(entry.interval.as_millis()).unwrap_or(u64::MAX),
             interest: entry.interest,

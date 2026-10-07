@@ -83,9 +83,9 @@ impl StubResolver {
 impl AdapterResolver for StubResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
-            // github-pr is GithubPrResolver's job; DefaultResolver never routes a
-            // github watch here.
-            WatchTarget::GithubPr { .. } => Err(ResolveError::NoAdapter {
+            // Other kinds have their own resolvers; DefaultResolver never routes
+            // them here.
+            WatchTarget::GithubPr { .. } | WatchTarget::Slack(_) => Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             }),
             WatchTarget::Stub { label, count } => {
@@ -166,7 +166,7 @@ impl GithubPrResolver {
 impl AdapterResolver for GithubPrResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
-            WatchTarget::Stub { .. } => Err(ResolveError::NoAdapter {
+            WatchTarget::Stub { .. } | WatchTarget::Slack(_) => Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             }),
             WatchTarget::GithubPr { repo, pr } => {
@@ -201,13 +201,83 @@ impl AdapterResolver for GithubPrResolver {
     }
 }
 
+/// Env override for the Slack adapter binary path (tests/dev). When unset, the
+/// resolver falls back to the co-located binary, then [`DEFAULT_SLACK_ADAPTER_BIN`]
+/// on `PATH`.
+pub const ENV_SLACK_ADAPTER_BIN: &str = "MAILBOX_SLACK_ADAPTER_BIN";
+
+/// Default Slack adapter program name, found on `PATH` for a normal install.
+const DEFAULT_SLACK_ADAPTER_BIN: &str = "mailbox-slack-adapter";
+
+/// Provenance the Slack adapter's events are stamped with (the host stamps this,
+/// not the child).
+const SLACK_ADAPTER_ID: &str = "slack-adapter";
+
+/// The `serve` resolver for `slack-channel` and `slack-thread` watches (design/02).
+/// One adapter program serves both kinds; the config says which. Like
+/// [`GithubPrResolver`] it is storage-free: the supervisor injects the baseline.
+///
+/// The config carries no credential. The adapter reads its Slack token from the
+/// macOS Keychain itself (ADR-0027), so the token never passes through the bridge.
+pub struct SlackResolver;
+
+impl SlackResolver {
+    /// Same precedence as [`StubResolver::program`]: env override → co-located
+    /// beside the bridge binary → bare name on `PATH`.
+    fn program() -> (String, bool) {
+        if let Ok(value) = std::env::var(ENV_SLACK_ADAPTER_BIN)
+            && !value.is_empty()
+        {
+            return (value, true);
+        }
+        let colocated = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(DEFAULT_SLACK_ADAPTER_BIN)))
+            .filter(|path| path.exists())
+            .and_then(|path| path.to_str().map(str::to_string));
+        (
+            colocated.unwrap_or_else(|| DEFAULT_SLACK_ADAPTER_BIN.to_string()),
+            false,
+        )
+    }
+}
+
+impl AdapterResolver for SlackResolver {
+    fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
+        let WatchTarget::Slack(slack) = &watch.target else {
+            return Err(ResolveError::NoAdapter {
+                kind: watch.target.kind(),
+            });
+        };
+        let config = json!({
+            "topic": slack.topic().as_str(),
+            "channel": slack.channel().as_str(),
+            "thread_ts": slack.thread_ts().map(|ts| ts.as_str()),
+            "interval_ms": interval_ms(watch),
+        });
+        let (program, env_override) = SlackResolver::program();
+        debug!(
+            watch = watch.id.get(),
+            program = %program,
+            env_override,
+            "resolved slack adapter binary"
+        );
+        Ok(ResolvedAdapter {
+            spec: AdapterSpec::new(program, AdapterId(SLACK_ADAPTER_ID.to_string())),
+            config: AdapterConfig::new(config),
+        })
+    }
+}
+
 /// The production `serve` resolver: routes each watch kind to its adapter —
-/// `stub` to [`StubResolver`], `github-pr` to [`GithubPrResolver`]. Matching on
-/// the kind (rather than one resolver knowing every kind) keeps each resolver
-/// focused and makes adding a kind a matter of adding an arm here.
+/// `stub` to [`StubResolver`], `github-pr` to [`GithubPrResolver`], both Slack
+/// kinds to [`SlackResolver`]. Matching on the kind (rather than one resolver
+/// knowing every kind) keeps each resolver focused and makes adding a kind a
+/// matter of adding an arm here.
 pub struct DefaultResolver {
     stub: StubResolver,
     github: GithubPrResolver,
+    slack: SlackResolver,
 }
 
 impl Default for DefaultResolver {
@@ -215,6 +285,7 @@ impl Default for DefaultResolver {
         Self {
             stub: StubResolver,
             github: GithubPrResolver,
+            slack: SlackResolver,
         }
     }
 }
@@ -224,6 +295,7 @@ impl AdapterResolver for DefaultResolver {
         match watch.target.kind() {
             WatchKind::Stub => self.stub.resolve(watch),
             WatchKind::GithubPr => self.github.resolve(watch),
+            WatchKind::SlackChannel | WatchKind::SlackThread => self.slack.resolve(watch),
         }
     }
 }

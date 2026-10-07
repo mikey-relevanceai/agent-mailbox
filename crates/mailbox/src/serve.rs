@@ -64,7 +64,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, GithubPr, Subject, Timestamp, Topic};
+use mailbox_protocol::{
+    AdapterId, GithubPr, SlackChannelId, SlackTs, SlackWatch, Subject, Timestamp, Topic,
+};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
@@ -73,8 +75,8 @@ use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, StatusReport, TopicStatus, decode_frame,
-    encode_frame,
+    AgentSummary, GithubPrTarget, Request, Response, SlackTarget, StatusReport, TopicStatus,
+    decode_frame, encode_frame,
 };
 
 /// Hard cap on a single control frame (request line). Sized for the largest
@@ -532,6 +534,8 @@ fn request_op(request: &Request) -> &'static str {
         Request::Unwatch { .. } => "unwatch",
         Request::WatchStub { .. } => "watch_stub",
         Request::UnwatchStub { .. } => "unwatch_stub",
+        Request::WatchSlack { .. } => "watch_slack",
+        Request::UnwatchSlack { .. } => "unwatch_slack",
         Request::Status { .. } => "status",
         Request::Send { .. } => "send",
         Request::Agents { .. } => "agents",
@@ -554,6 +558,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::Unwatch { session, .. }
         | Request::WatchStub { session, .. }
         | Request::UnwatchStub { session, .. }
+        | Request::WatchSlack { session, .. }
+        | Request::UnwatchSlack { session, .. }
         | Request::EndSession { session }
         | Request::ResumeSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
@@ -625,6 +631,14 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         } => watch_stub(bus, storage, supervisor, session, label, interval_ms, count).await,
         Request::UnwatchStub { session, label } => {
             unwatch_stub(bus, storage, supervisor, session, label).await
+        }
+        Request::WatchSlack {
+            session,
+            target,
+            interval_secs,
+        } => watch_slack(bus, storage, supervisor, session, target, interval_secs).await,
+        Request::UnwatchSlack { session, target } => {
+            unwatch_slack(bus, storage, supervisor, session, target).await
         }
         Request::Status { session } => status(storage, session).await,
         Request::Send {
@@ -884,6 +898,59 @@ async fn unwatch_stub(
     }
 }
 
+/// Thin translation over [`mailbox::watch::record_slack`].
+async fn watch_slack(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    target: SlackTarget,
+    interval_secs: u64,
+) -> Response {
+    let slack = match slack_watch(&target) {
+        Ok(slack) => slack,
+        Err(message) => return Response::error(message),
+    };
+    match mailbox::watch::record_slack(
+        bus,
+        storage,
+        supervisor,
+        &slack,
+        Duration::from_secs(interval_secs),
+        session,
+    )
+    .await
+    {
+        Ok(recorded) => Response::Watched {
+            topic: recorded.topic,
+            interest: recorded.interest,
+            subscribe: recorded.subscribe.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::drop_interest_slack`].
+async fn unwatch_slack(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    target: SlackTarget,
+) -> Response {
+    let slack = match slack_watch(&target) {
+        Ok(slack) => slack,
+        Err(message) => return Response::error(message),
+    };
+    match mailbox::watch::drop_interest_slack(bus, storage, supervisor, &slack, session).await {
+        Ok(dropped) => Response::Unwatched {
+            topic: dropped.topic,
+            outcome: dropped.outcome.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
 /// Thin translation over [`mailbox::watch::status`].
 async fn status(storage: &Storage, session: Option<SessionId>) -> Response {
     match mailbox::watch::status(storage, session).await {
@@ -927,6 +994,18 @@ async fn resume_session(
 fn github_pr(target: &GithubPrTarget) -> Result<GithubPr, String> {
     GithubPr::new(&target.owner, &target.repo, target.number)
         .map_err(|err| format!("invalid github-pr target: {err}"))
+}
+
+/// Validate a wire [`SlackTarget`] into a domain [`SlackWatch`] at the daemon edge.
+fn slack_watch(target: &SlackTarget) -> Result<SlackWatch, String> {
+    let channel = SlackChannelId::parse(&target.channel)
+        .map_err(|err| format!("invalid slack target: {err}"))?;
+    match &target.thread_ts {
+        None => Ok(SlackWatch::Channel(channel)),
+        Some(ts) => SlackTs::parse(ts)
+            .map(|thread_ts| SlackWatch::Thread { channel, thread_ts })
+            .map_err(|err| format!("invalid slack target: {err}")),
+    }
 }
 
 /// Create the daemon directory `0700`, fatal on failure (B4: refuse to serve

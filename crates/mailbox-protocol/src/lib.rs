@@ -44,6 +44,7 @@ mod framing;
 mod ids;
 mod message;
 mod session;
+mod slack;
 mod subject;
 mod topic;
 
@@ -59,5 +60,6 @@ pub use message::{
     Subscribe, Unsubscribe,
 };
 pub use session::SessionId;
+pub use slack::{SlackChannelId, SlackTargetError, SlackTs, SlackWatch};
 pub use subject::{MAX_LINK_BYTES, MAX_TEXT_CHARS, Subject, SubjectError};
 pub use topic::{GithubPr, Topic, inbox_topic, stub_topic};

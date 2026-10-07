@@ -49,23 +49,25 @@ From the repo root:
 cargo build --release
 ```
 
-That produces three binaries in `target/release/`:
+That produces four binaries in `target/release/`:
 
 | Binary | Role |
 |---|---|
 | `mailbox` | the bridge CLI + daemon (the one entry point) |
 | `mailbox-stub-adapter` | reference adapter (synthetic edges; for the demo/tests) |
 | `mailbox-github-pr-adapter` | the real GitHub PR poller |
+| `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) |
 
 ### Put them on your PATH (co-located)
 
-Install the three binaries **into the same directory** — e.g. `~/.local/bin` or
+Install the four binaries **into the same directory** — e.g. `~/.local/bin` or
 `/usr/local/bin`:
 
 ```bash
 install -m755 target/release/mailbox \
               target/release/mailbox-stub-adapter \
               target/release/mailbox-github-pr-adapter \
+              target/release/mailbox-slack-adapter \
               ~/.local/bin/
 ```
 
@@ -435,12 +437,35 @@ Add global `--json` for machine-readable stdout.
 | `mailbox read [--limit <n>]` | Return unread events, advance the cursor. |
 | `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>]` | Watch a PR: record interest, subscribe to the PR topic, and (via the daemon) spawn the shared edge-triggered `github-pr` poller. Default interval 60s. |
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
+| `mailbox watch slack-channel <channel> [--interval <secs>]` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
+| `mailbox watch slack-thread <channel>/<ts> [--interval <secs>]` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
+| `mailbox unwatch slack-channel <channel>` / `unwatch slack-thread <channel>/<ts>` | Stop watching. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
 | `mailbox publish <topic> [--body <json>] [--adapter <id>] [--subject <s>] [--link <url>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). `--subject` is the one line subscribers see on WAKE. |
 | `mailbox send <target> [--text <s>] [--body <json>] [--subject <s>] [--link <url>]` | Message a peer agent (see below). Works with no session; the message then carries no `from`. |
 | `mailbox agents [--json]` | List the agents you can `send` to. Works with no session; no row is then marked as you. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
+
+### Slack watches
+
+A Slack watch polls with a bot token from a Slack app installed in your workspace
+([design/02](design/02-slack-watch.md)). Once per machine:
+
+1. Create an app at <https://api.slack.com/apps> with bot scopes `channels:history`,
+   `channels:read`, `channels:join` and `users:read`, and install it (your workspace
+   may need an admin to approve it).
+2. Store its **Bot User OAuth Token** (`xoxb-…`) in the Keychain. The command prompts
+   for it, so it never lands in shell history:
+
+   ```bash
+   security add-generic-password -s agent-mailbox.slack -a "$USER" -w
+   ```
+
+The adapter reads the token itself; the bridge, its database and its environment
+never hold it ([ADR-0027](adr/0027-adapter-secrets-live-in-the-keychain.md)). The bot
+joins a public channel by itself the first time it is watched; a private channel needs
+an `/invite`. macOS only for now.
 
 ### Publishing: one rule
 
