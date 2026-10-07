@@ -29,6 +29,7 @@ Also:
 | [adr/](adr/README.md) | Architecture Decision Records |
 | [design/](design/README.md) | Major system / subsystem designs |
 | [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md) | MVP: GitHub PR watch lifecycle (**Implemented**) |
+| [design/02-slack-watch.md](design/02-slack-watch.md) | Slack channel and thread watches; how Slack is reached and why (**Implemented**) |
 
 ## Mental model
 

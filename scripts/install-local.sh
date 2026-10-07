@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEST="${DEST:-${HOME}/.local/bin}"
-BINS=(mailbox mailbox-stub-adapter mailbox-github-pr-adapter)
+BINS=(mailbox mailbox-stub-adapter mailbox-github-pr-adapter mailbox-slack-adapter)
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   echo "==> cargo build --release (set SKIP_BUILD=1 to skip)"

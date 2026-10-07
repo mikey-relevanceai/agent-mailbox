@@ -35,7 +35,7 @@
 //! session is still alive (ADR-0011), so a give-up caused by a transient upstream
 //! outage self-heals rather than needing a manual re-`watch`.
 //!
-//! # Adapter failure wakes nobody (ADR-0027)
+//! # Adapter failure wakes nobody (ADR-0028)
 //!
 //! None of this is published. A give-up is not terminal — the sweep keeps retrying
 //! while a session wants the watch — so there is no moment at which "this watch is
@@ -433,6 +433,7 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
             GithubPr::new(owner, repo, *pr).ok().map(|pr| pr.topic())
         }
         WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
+        WatchTarget::Slack(slack) => Some(slack.topic()),
     }
 }
 
@@ -862,7 +863,7 @@ impl Actor {
         // (e.g. a `stub --count N`) that published its batch and returned. Even
         // with interest still held, restarting it would republish the batch
         // forever (or, for short runs, exhaust the budget and falsely mark a
-        // healthy adapter Failed with a bogus give-up event). So a clean exit is
+        // healthy adapter Failed with a bogus give-up). So a clean exit is
         // TERMINAL: mark the watch Stopped and do not restart. Only a crash — a
         // non-zero code or a signal — takes the backoff-restart path below.
         if matches!(exit, AdapterExit::Exited { code: 0 }) {
@@ -922,7 +923,7 @@ impl Actor {
             self.failures.remove(&watch_id);
             self.cancel_pending_restart(watch_id);
             let failures = attempt - 1;
-            // Publishes nothing (ADR-0027): the sweep retries a `Failed` watch, so
+            // Publishes nothing (ADR-0028): the sweep retries a `Failed` watch, so
             // this is not the end of trying, and a wake saying it was would be
             // contradicted by the next retry.
             self.storage

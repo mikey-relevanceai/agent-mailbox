@@ -20,7 +20,7 @@
 //! - TTL sweeper drops a stale interest and stops the adapter.
 //! - ADR-0026 an ended session's watch is suspended, and a resume of the same
 //!   session id restarts its adapter.
-//! - ADR-0027 adapter failure publishes nothing — not on give-up, not on the
+//! - ADR-0028 adapter failure publishes nothing — not on give-up, not on the
 //!   sweep's retries, not on recovery — so it never wakes a subscriber.
 //!
 //! Flakiness discipline: poll with bounded timeouts (never fixed sleeps waiting
@@ -783,7 +783,7 @@ async fn ac4_crash_with_interest_restarts_once() {
 
 /// An adapter that keeps crashing exhausts the restart budget: the supervisor
 /// gives up and marks the watch Failed — and publishes nothing, because the sweep
-/// will retry it and a give-up is therefore not news worth a turn (ADR-0027).
+/// will retry it and a give-up is therefore not news worth a turn (ADR-0028).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ac4_repeated_crash_gives_up_and_wakes_nobody() {
     let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::crash()).await;
@@ -824,7 +824,7 @@ async fn ac4_repeated_crash_gives_up_and_wakes_nobody() {
     assert_eq!(
         durable_count(&storage, &topic).await,
         0,
-        "a give-up must not publish: the sweep retries it, so it is not final (ADR-0027)"
+        "a give-up must not publish: the sweep retries it, so it is not final (ADR-0028)"
     );
 }
 
@@ -1475,7 +1475,7 @@ async fn repeated_start_failures_give_up() {
     assert_eq!(
         durable_count(&storage, &topic).await,
         0,
-        "a start-failure give-up publishes nothing (ADR-0027)"
+        "a start-failure give-up publishes nothing (ADR-0028)"
     );
 }
 
@@ -1516,7 +1516,7 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
     assert_eq!(
         durable_count(&storage, &watched.topic()).await,
         0,
-        "the outage published nothing (ADR-0027)"
+        "the outage published nothing (ADR-0028)"
     );
 
     // Upstream recovers, and s1's Claude Code process is still running — the
@@ -1590,7 +1590,7 @@ async fn sweep_does_not_retry_a_failed_watch_of_a_dead_session() {
     supervisor.shutdown().await.unwrap();
 }
 
-// ---- ADR-0027: adapter failure wakes nobody ------------------------------------
+// ---- ADR-0028: adapter failure wakes nobody ------------------------------------
 
 /// The wake-storm regression. A watch that keeps failing is retried by every sweep
 /// (ADR-0011), and neither its give-up nor any retry's give-up publishes — so no
@@ -1753,7 +1753,7 @@ async fn a_flapping_watch_publishes_nothing_about_failing_or_recovering() {
         .collect();
     assert!(
         foreign.is_empty(),
-        "only the adapter may publish on its topic; failing and recovering must wake nobody (ADR-0027); got {foreign:?}"
+        "only the adapter may publish on its topic; failing and recovering must wake nobody (ADR-0028); got {foreign:?}"
     );
 }
 

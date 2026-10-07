@@ -53,17 +53,17 @@ alive.
 ### Why a hand-rolled workflow and not cargo-dist
 
 cargo-dist is the obvious tool here and was the original plan. It does not fit,
-for one structural reason: **it maps one "App" to one Cargo package.** Our three
-shipped binaries live in three packages (`crates/mailbox`, `adapters/stub-adapter`,
-`adapters/github-pr-adapter`), so cargo-dist would emit three tarballs and three
-formulae, and a user would have to know to `brew install` all three to get a working
-watch. There is no supported way to merge packages into one artifact. It would also
+for one structural reason: **it maps one "App" to one Cargo package.** Our four
+shipped binaries live in four packages (`crates/mailbox`, `adapters/stub-adapter`,
+`adapters/github-pr-adapter`, `adapters/slack-adapter`), so cargo-dist would emit four
+tarballs and four formulae, and a user would have to know to `brew install` all four to
+get a working watch. There is no supported way to merge packages into one artifact. It would also
 ship `crates/mailbox`'s `test_adapter` fixture, which is a second bin target in the
 same package and therefore inseparable from `mailbox` in its model.
 
 Co-location is not a preference we could give up to make the tool fit — the bridge
 resolves an adapter by looking beside its own executable
-([04-usage](04-usage.md#from-source)), so one tarball holding all three is the
+([04-usage](04-usage.md#from-source)), so one tarball holding all of them is the
 artifact this project actually needs.
 
 Reconsider cargo-dist if the binaries ever collapse into one package.

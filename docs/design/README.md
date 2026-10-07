@@ -11,6 +11,7 @@ ADRs ([`../adr/`](../adr/)) record the durable *choice*. Designs record the
 | Design | Status | Notes |
 |---|---|---|
 | [01-mvp-github-watch](01-mvp-github-watch.md) | Implemented | GitHub PR watch (conflicts, reviews, CI); refcounted multi-session interest; no zombie pollers |
+| [02-slack-watch](02-slack-watch.md) | Implemented | Slack channel and thread watches: polling with an internal app's bot token, what wakes, the cursor |
 
 Likely next designs:
 

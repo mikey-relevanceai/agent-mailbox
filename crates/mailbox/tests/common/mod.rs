@@ -165,6 +165,10 @@ pub fn github_pr_adapter_bin() -> String {
     sibling_adapter_bin("mailbox-github-pr-adapter", "mailbox-github-pr-adapter")
 }
 
+pub fn slack_adapter_bin() -> String {
+    sibling_adapter_bin("mailbox-slack-adapter", "mailbox-slack-adapter")
+}
+
 // ---- the fake `gh` (recorded-fixture emitter, card 10's seam) -----------------
 
 /// A fake `gh` that dispatches on the subcommand (`pr` vs `api`, and for `api` on

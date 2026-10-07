@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use mailbox_protocol::{Cursor, Event, Offset};
+use mailbox_protocol::{Cursor, Event, Offset, SlackWatch};
 // The session identity is shared with the harness, so it lives in the protocol
 // crate (see `mailbox_protocol::session`). Re-exported here so the many existing
 // `mailbox::storage::SessionId` call sites keep working unchanged.
@@ -76,6 +76,10 @@ pub enum WatchKind {
     /// The reference stub publisher (`stub`), keyed by its `(kind, repo=label, pr=0)`
     /// identity — a synthetic edge emitter for tests and experiments.
     Stub,
+    /// New top-level messages in a Slack channel (`slack-channel`, design/02).
+    SlackChannel,
+    /// New replies in one Slack thread (`slack-thread`, design/02).
+    SlackThread,
 }
 
 impl WatchKind {
@@ -86,6 +90,8 @@ impl WatchKind {
         match self {
             WatchKind::GithubPr => "github-pr",
             WatchKind::Stub => "stub",
+            WatchKind::SlackChannel => "slack-channel",
+            WatchKind::SlackThread => "slack-thread",
         }
     }
 
@@ -94,6 +100,8 @@ impl WatchKind {
         match raw {
             "github-pr" => Some(WatchKind::GithubPr),
             "stub" => Some(WatchKind::Stub),
+            "slack-channel" => Some(WatchKind::SlackChannel),
+            "slack-thread" => Some(WatchKind::SlackThread),
             _ => None,
         }
     }
@@ -115,7 +123,7 @@ pub enum WatchState {
     Stopped,
     /// The adapter crashed repeatedly and the supervisor gave up restarting it
     /// (card 08): it exceeded the restart policy's consecutive-failure budget.
-    /// Nothing is published (ADR-0027), and the sweep retries it while an
+    /// Nothing is published (ADR-0028), and the sweep retries it while an
     /// interested session is alive (ADR-0011). Distinct from [`Stopped`] so `status` can tell "torn down
     /// because nobody wanted it" from "torn down because it kept dying".
     Failed,
@@ -137,6 +145,9 @@ pub enum WatchTarget {
     GithubPr { repo: String, pr: u64 },
     /// A stub publisher: a label + how many events to publish (`0` = unbounded).
     Stub { label: String, count: u64 },
+    /// A Slack channel or thread. Stored with its [`SlackWatch::key`] in the
+    /// `repo` column and `0` in the others, the same way a stub stores its label.
+    Slack(SlackWatch),
 }
 
 impl WatchTarget {
@@ -145,14 +156,18 @@ impl WatchTarget {
         match self {
             WatchTarget::GithubPr { .. } => WatchKind::GithubPr,
             WatchTarget::Stub { .. } => WatchKind::Stub,
+            WatchTarget::Slack(SlackWatch::Channel { .. }) => WatchKind::SlackChannel,
+            WatchTarget::Slack(SlackWatch::Thread { .. }) => WatchKind::SlackThread,
         }
     }
 
-    /// The flat `repo` column: `owner/repo` for github, the label for stub.
-    pub fn repo_column(&self) -> &str {
+    /// The flat `repo` column: `owner/repo` for github, the label for stub, the
+    /// watch key (`<channel>` or `<channel>/<thread-ts>`) for Slack.
+    pub fn repo_column(&self) -> String {
         match self {
-            WatchTarget::GithubPr { repo, .. } => repo,
-            WatchTarget::Stub { label, .. } => label,
+            WatchTarget::GithubPr { repo, .. } => repo.clone(),
+            WatchTarget::Stub { label, .. } => label.clone(),
+            WatchTarget::Slack(slack) => slack.key(),
         }
     }
 
@@ -160,14 +175,14 @@ impl WatchTarget {
     pub fn pr_column(&self) -> u64 {
         match self {
             WatchTarget::GithubPr { pr, .. } => *pr,
-            WatchTarget::Stub { .. } => 0,
+            WatchTarget::Stub { .. } | WatchTarget::Slack(_) => 0,
         }
     }
 
     /// The flat `publish_count` column: `0` (unused) for github, the count for stub.
     pub fn count_column(&self) -> u64 {
         match self {
-            WatchTarget::GithubPr { .. } => 0,
+            WatchTarget::GithubPr { .. } | WatchTarget::Slack(_) => 0,
             WatchTarget::Stub { count, .. } => *count,
         }
     }

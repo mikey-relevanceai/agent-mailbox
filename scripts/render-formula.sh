@@ -128,9 +128,10 @@ class Mailbox < Formula
   end
 
   def install
-    # All three side by side. The bridge finds an adapter by looking next to its
+    # All of them side by side. The bridge finds an adapter by looking next to its
     # own executable first, so co-location is the contract, not a convenience.
-    bin.install "mailbox", "mailbox-stub-adapter", "mailbox-github-pr-adapter"
+    bin.install "mailbox", "mailbox-stub-adapter", "mailbox-github-pr-adapter",
+                "mailbox-slack-adapter"
     doc.install "README.md"
   end
 
@@ -166,6 +167,7 @@ class Mailbox < Formula
     # above and still fail the first time anyone ran \`mailbox watch\`.
     assert_path_exists bin/"mailbox-stub-adapter"
     assert_path_exists bin/"mailbox-github-pr-adapter"
+    assert_path_exists bin/"mailbox-slack-adapter"
   end
 end
 FORMULA

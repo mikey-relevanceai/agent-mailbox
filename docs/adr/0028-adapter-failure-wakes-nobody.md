@@ -1,4 +1,4 @@
-# ADR-0027: Adapter failure wakes nobody
+# ADR-0028: Adapter failure wakes nobody
 
 - Status: **Accepted**
 - Date: 2026-10-07

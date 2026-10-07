@@ -145,7 +145,7 @@ MVP rules:
    ([ADR-0011](../adr/0011-retry-failed-watches-on-sweep.md)), so a give-up caused
    by a transient upstream outage self-heals instead of needing a manual re-`watch`.
    None of this is published, so it wakes no agent
-   ([ADR-0027](../adr/0027-adapter-failure-wakes-nobody.md), superseding
+   ([ADR-0028](../adr/0028-adapter-failure-wakes-nobody.md), superseding
    [ADR-0023](../adr/0023-one-give-up-notice-per-outage.md)'s once-per-outage
    notice). A give-up is never terminal, and the persisted baseline means an
    outage delays news rather than dropping it. `mailbox status` shows `failed`.

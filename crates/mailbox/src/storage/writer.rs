@@ -26,7 +26,7 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use mailbox_protocol::{
-    AdapterId, Cursor, Event, EventId, Offset, Subject, Timestamp, Topic, inbox_topic,
+    AdapterId, Cursor, Event, EventId, Offset, SlackWatch, Subject, Timestamp, Topic, inbox_topic,
 };
 
 use super::error::StorageError;
@@ -1606,6 +1606,18 @@ fn build_watch(
             }
             WatchTarget::Stub { label: repo, count }
         }
+        WatchKind::SlackChannel => WatchTarget::Slack(slack_watch(
+            id,
+            pr,
+            count,
+            SlackWatch::parse_channel_key(&repo),
+        )?),
+        WatchKind::SlackThread => WatchTarget::Slack(slack_watch(
+            id,
+            pr,
+            count,
+            SlackWatch::parse_thread_key(&repo),
+        )?),
     };
     let state = reconstruct_state(state, child_pid, id)?;
 
@@ -1614,6 +1626,27 @@ fn build_watch(
         target,
         interval: std::time::Duration::from_millis(interval_ms),
         state,
+    })
+}
+
+/// The Slack half of [`build_watch`]: a Slack row uses only its key column, and a
+/// key that does not parse is corrupt.
+fn slack_watch(
+    id: WatchId,
+    pr: u64,
+    count: u64,
+    parsed: Result<SlackWatch, mailbox_protocol::SlackTargetError>,
+) -> Result<SlackWatch, StorageError> {
+    if pr != 0 || count != 0 {
+        return Err(StorageError::Corrupt {
+            detail: format!(
+                "slack watch {} carries a non-zero pr {pr} or publish count {count}",
+                id.get()
+            ),
+        });
+    }
+    parsed.map_err(|err| StorageError::Corrupt {
+        detail: format!("slack watch {} has an invalid key: {err}", id.get()),
     })
 }
 
@@ -2177,6 +2210,46 @@ mod tests {
         conn.execute(
             "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
              VALUES (1, 'bogus-kind', 'o/r', 1, 60000, 0, 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        let err = do_get_watch(&conn, WatchId::new(1)).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn slack_channel_and_thread_watches_are_distinct_entities_that_round_trip() {
+        let conn = migrated();
+        let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
+        let thread = SlackWatch::parse_thread_key("C0C83CXLUL8/1791349480.652779").unwrap();
+        let spec = |slack: &SlackWatch| WatchSpec {
+            target: WatchTarget::Slack(slack.clone()),
+            interval: std::time::Duration::from_secs(60),
+        };
+        let channel_id = do_upsert_watch(&conn, &spec(&channel)).unwrap();
+        let thread_id = do_upsert_watch(&conn, &spec(&thread)).unwrap();
+        assert_ne!(channel_id, thread_id, "a thread is not its channel");
+        assert_eq!(
+            do_upsert_watch(&conn, &spec(&thread)).unwrap(),
+            thread_id,
+            "re-watching a thread reuses its row"
+        );
+        assert_eq!(
+            do_get_watch(&conn, channel_id).unwrap().unwrap().target,
+            WatchTarget::Slack(channel)
+        );
+        assert_eq!(
+            do_get_watch(&conn, thread_id).unwrap().unwrap().target,
+            WatchTarget::Slack(thread)
+        );
+    }
+
+    #[test]
+    fn slack_watch_with_an_unparseable_key_is_corrupt() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'slack-thread', 'C0C83CXLUL8', 0, 60000, 0, 'desired', NULL)",
             [],
         )
         .unwrap();
