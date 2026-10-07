@@ -52,7 +52,7 @@ use serde_json::Value;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::MissedTickBehavior;
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, error, error_span, info, warn};
 
 use mailbox_protocol::{
     AdapterId, Baseline as BaselineMsg, Message, Publish, SlackChannelId, SlackTargetError,
@@ -132,33 +132,38 @@ enum AdapterError {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     init_tracing();
-    // `run` logs its own failure, inside the watch's span where it has one.
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(()) => ExitCode::FAILURE,
-    }
+    run().await
 }
 
-async fn run() -> Result<(), ()> {
+/// Run the watch and log how it ended: once, and inside the watch's span when
+/// the watch is known.
+async fn run() -> ExitCode {
     let (config, watch) = match read_config(std::io::stdin().lock())
         .and_then(|config| watch_of(&config).map(|watch| (config, watch)))
     {
         Ok(parsed) => parsed,
         Err(err) => {
             error!(error = %err, "slack adapter exited with an error before it knew its watch");
-            return Err(());
+            return ExitCode::FAILURE;
         }
     };
     let topic = watch.topic();
     // Every line from here on carries the watch's topic, so a line in the
-    // bridge's log (where several adapters' stderr meet) names its watch.
-    let span = info_span!("slack_watch", topic = topic.as_str());
-    let result = watch_loop(config, watch, topic)
+    // bridge's log (where several adapters' stderr meet) names its watch. An
+    // error-level span, because adapters run with tracing's default ERROR
+    // filter unless RUST_LOG says otherwise, and an info span would be filtered
+    // out from under the one line that most needs it.
+    let span = error_span!("slack_watch", topic = topic.as_str());
+    match watch_loop(config, watch, topic)
         .instrument(span.clone())
-        .await;
-    result.map_err(|err| {
-        span.in_scope(|| error!(error = %err, "slack adapter exited with an error"));
-    })
+        .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            span.in_scope(|| error!(error = %err, "slack adapter exited with an error"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(), AdapterError> {
