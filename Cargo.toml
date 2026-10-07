@@ -6,6 +6,7 @@ members = [
     "crates/mailbox-harness",
     "adapters/stub-adapter",
     "adapters/github-pr-adapter",
+    "adapters/slack-adapter",
 ]
 
 [workspace.package]

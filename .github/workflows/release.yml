@@ -126,14 +126,15 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }} \
             -p mailbox --bin mailbox \
             -p mailbox-stub-adapter --bin mailbox-stub-adapter \
-            -p mailbox-github-pr-adapter --bin mailbox-github-pr-adapter
+            -p mailbox-github-pr-adapter --bin mailbox-github-pr-adapter \
+            -p mailbox-slack-adapter --bin mailbox-slack-adapter
 
       # The failure a cross-compile makes easy is shipping the runner's own
       # architecture under the target's name. `file` is the cheap way to prove we
       # did not, and it works for the slice we cannot execute here.
       - name: Check the binaries are built for ${{ matrix.target }}
         run: |
-          for bin in mailbox mailbox-stub-adapter mailbox-github-pr-adapter; do
+          for bin in mailbox mailbox-stub-adapter mailbox-github-pr-adapter mailbox-slack-adapter; do
             described="$(file -b "target/${{ matrix.target }}/release/${bin}")"
             echo "${bin}: ${described}"
             case "${described}" in
@@ -169,9 +170,10 @@ jobs:
           cp target/${{ matrix.target }}/release/mailbox \
              target/${{ matrix.target }}/release/mailbox-stub-adapter \
              target/${{ matrix.target }}/release/mailbox-github-pr-adapter \
+             target/${{ matrix.target }}/release/mailbox-slack-adapter \
              README.md LICENSE "${stage}/"
           tar -czf "${RUNNER_TEMP}/${name}.tar.gz" -C "${stage}" \
-            mailbox mailbox-stub-adapter mailbox-github-pr-adapter README.md LICENSE
+            mailbox mailbox-stub-adapter mailbox-github-pr-adapter mailbox-slack-adapter README.md LICENSE
           # `shasum` rather than `sha256sum`: it ships with perl, so it is on the
           # macOS AND the Ubuntu images, and it emits the "<hash>  <file>" form
           # scripts/render-formula.sh reads. Run it from RUNNER_TEMP so the file

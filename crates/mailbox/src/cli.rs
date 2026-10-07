@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use mailbox::doctor::{Reachability, WakeVerdict};
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox_harness::hook::HookInput;
-use mailbox_protocol::{AdapterId, GithubPr, Subject, Topic, inbox_topic, stub_topic};
+use mailbox_protocol::{AdapterId, GithubPr, SlackWatch, Subject, Topic, inbox_topic, stub_topic};
 
 use crate::client;
 use crate::control::{
@@ -376,6 +376,29 @@ pub enum WatchTargetCmd {
     /// Watch a stub publisher (a built-in test adapter). Publishes a synthetic
     /// event on an interval to prove the whole path end to end.
     Stub(StubWatchArgs),
+    /// Watch a Slack channel: wakes on each new top-level message. Thread replies
+    /// do not wake a channel watch; watch the thread for those.
+    SlackChannel(SlackChannelWatchArgs),
+    /// Watch a Slack thread: wakes on each new reply in it.
+    SlackThread(SlackThreadWatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SlackChannelWatchArgs {
+    /// The channel: its id (`C0C83CXLUL8`, not its name) or a Slack link to it.
+    pub channel: String,
+    /// Poll interval in seconds.
+    #[arg(long, default_value_t = 60)]
+    pub interval: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct SlackThreadWatchArgs {
+    /// The thread: `<channel-id>/<parent-ts>`, or a Slack link to any message in it.
+    pub thread: String,
+    /// Poll interval in seconds.
+    #[arg(long, default_value_t = 60)]
+    pub interval: u64,
 }
 
 #[derive(Args, Debug)]
@@ -411,6 +434,22 @@ pub enum UnwatchTargetCmd {
     GithubPr(GithubPrUnwatchArgs),
     /// Stop watching a stub publisher.
     Stub(StubUnwatchArgs),
+    /// Stop watching a Slack channel.
+    SlackChannel(SlackChannelUnwatchArgs),
+    /// Stop watching a Slack thread.
+    SlackThread(SlackThreadUnwatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SlackChannelUnwatchArgs {
+    /// The channel, as given to `watch slack-channel`.
+    pub channel: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SlackThreadUnwatchArgs {
+    /// The thread, as given to `watch slack-thread`.
+    pub thread: String,
 }
 
 #[derive(Args, Debug)]
@@ -644,6 +683,16 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<Exit
             interval_ms: stub.interval_ms,
             count: stub.count,
         },
+        WatchTargetCmd::SlackChannel(args) => Request::WatchSlack {
+            session: resolve_wakeable_session_or_fail(format)?,
+            target: parse_slack_channel(&args.channel)?,
+            interval_secs: args.interval,
+        },
+        WatchTargetCmd::SlackThread(args) => Request::WatchSlack {
+            session: resolve_wakeable_session_or_fail(format)?,
+            target: parse_slack_thread(&args.thread)?,
+            interval_secs: args.interval,
+        },
     };
     request(format, req).await
 }
@@ -657,6 +706,14 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
         UnwatchTargetCmd::Stub(stub) => Request::UnwatchStub {
             session: resolve_session_or_fail(format)?,
             label: parse_stub_label(&stub.label)?,
+        },
+        UnwatchTargetCmd::SlackChannel(args) => Request::UnwatchSlack {
+            session: resolve_session_or_fail(format)?,
+            target: parse_slack_channel(&args.channel)?,
+        },
+        UnwatchTargetCmd::SlackThread(args) => Request::UnwatchSlack {
+            session: resolve_session_or_fail(format)?,
+            target: parse_slack_thread(&args.thread)?,
         },
     };
     request(format, req).await
@@ -1046,6 +1103,12 @@ fn request_context(request: &Request) -> String {
         Request::UnwatchStub { session, label } => {
             format!("unwatching stub {label} for {}", session.as_str())
         }
+        Request::WatchSlack {
+            session, target, ..
+        } => format!("watching slack {} for {}", target.key(), session.as_str()),
+        Request::UnwatchSlack { session, target } => {
+            format!("unwatching slack {} for {}", target.key(), session.as_str())
+        }
         // A status without a session is the bridge's half only, so it names no whose.
         Request::Status { session } => match session {
             Some(session) => format!("status for {}", session.as_str()),
@@ -1333,7 +1396,9 @@ fn render_status_body(report: &StatusReport) {
             // unused 0 sentinel there, so showing `#0` would be noise).
             let entity = match watch.kind {
                 WatchKindWire::GithubPr => format!("{}#{}", watch.repo, watch.pr),
-                WatchKindWire::Stub => watch.repo.clone(),
+                WatchKindWire::Stub | WatchKindWire::SlackChannel | WatchKindWire::SlackThread => {
+                    watch.repo.clone()
+                }
             };
             println!(
                 "  {} {}  state={} interest={} interval={} child={}",
@@ -1377,6 +1442,8 @@ fn kind_label(kind: WatchKindWire) -> &'static str {
     match kind {
         WatchKindWire::GithubPr => "github-pr",
         WatchKindWire::Stub => "stub",
+        WatchKindWire::SlackChannel => "slack-channel",
+        WatchKindWire::SlackThread => "slack-thread",
     }
 }
 
@@ -1426,6 +1493,41 @@ fn parse_pr_spec(spec: &str) -> anyhow::Result<GithubPrTarget> {
 fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     stub_topic(label).with_context(|| format!("invalid stub label {label:?}"))?;
     Ok(label.to_string())
+}
+
+/// Parse a `watch slack-channel` argument: a channel id, or a Slack link to the
+/// channel. A link to a message inside it is refused rather than quietly widened
+/// to the whole channel, since the caller probably meant that message's thread.
+fn parse_slack_channel(raw: &str) -> anyhow::Result<SlackWatch> {
+    let slack = if raw.starts_with("https://") {
+        SlackWatch::parse_link(raw)
+    } else {
+        SlackWatch::parse_channel_key(raw)
+    }
+    .with_context(|| format!("invalid slack channel {raw:?}"))?;
+    match slack {
+        SlackWatch::Channel { .. } => Ok(slack),
+        SlackWatch::Thread { .. } => anyhow::bail!(
+            "{raw:?} links to a message, not a channel; use `watch slack-thread` to follow its thread"
+        ),
+    }
+}
+
+/// Parse a `watch slack-thread` argument: `<channel-id>/<parent-ts>`, or a Slack
+/// link to any message in the thread.
+fn parse_slack_thread(raw: &str) -> anyhow::Result<SlackWatch> {
+    let slack = if raw.starts_with("https://") {
+        SlackWatch::parse_link(raw)
+    } else {
+        SlackWatch::parse_thread_key(raw)
+    }
+    .with_context(|| format!("invalid slack thread {raw:?}"))?;
+    match slack {
+        SlackWatch::Thread { .. } => Ok(slack),
+        SlackWatch::Channel { .. } => anyhow::bail!(
+            "{raw:?} links to a channel, not a thread; use `watch slack-channel` to watch it"
+        ),
+    }
 }
 
 /// Dispatch a `harness` subcommand. `session-start` and `cleanup` are socket clients
@@ -2148,6 +2250,28 @@ pub fn output_format(json: bool) -> OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agents mostly have a Slack link in hand, so both commands take one; each
+    /// refuses the other's kind of link rather than guessing what was meant.
+    #[test]
+    fn slack_watch_arguments_accept_ids_and_links_and_refuse_the_wrong_kind() {
+        let base = "https://tryrelevance.slack.com/archives/C0C83CXLUL8";
+        let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
+        let thread = SlackWatch::parse_thread_key("C0C83CXLUL8/1791349480.652779").unwrap();
+        assert_eq!(parse_slack_channel("C0C83CXLUL8").unwrap(), channel);
+        assert_eq!(parse_slack_channel(base).unwrap(), channel);
+        assert_eq!(
+            parse_slack_thread("C0C83CXLUL8/1791349480.652779").unwrap(),
+            thread
+        );
+        assert_eq!(
+            parse_slack_thread(&format!("{base}/p1791349480652779")).unwrap(),
+            thread
+        );
+        assert!(parse_slack_channel(&format!("{base}/p1791349480652779")).is_err());
+        assert!(parse_slack_thread(base).is_err());
+        assert!(parse_slack_channel("#team-arg-agent-watercooler").is_err());
+    }
 
     /// Every state of knowledge gets its own words, and the two that no integration
     /// test can reach — a caller cannot be `Gone`, and `Unregistered` needs a registry

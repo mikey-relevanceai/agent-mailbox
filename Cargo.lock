@@ -836,6 +836,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailbox-slack-adapter"
+version = "0.1.1"
+dependencies = [
+ "mailbox-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mailbox-stub-adapter"
 version = "0.1.1"
 dependencies = [
