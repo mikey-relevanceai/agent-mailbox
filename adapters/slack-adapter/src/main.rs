@@ -75,9 +75,9 @@ const ENV_RATE_LIMIT_BACKOFF_MS: &str = "MAILBOX_SLACK_RATE_LIMIT_BACKOFF_MS";
 const DEFAULT_MAX_RATE_LIMIT_RETRIES: u64 = 12;
 const ENV_MAX_RATE_LIMIT_RETRIES: &str = "MAILBOX_SLACK_MAX_RATE_LIMIT_RETRIES";
 
-/// Consecutive skipped polls before exiting non-zero. Ten minutes offline at the
-/// default interval is a lid closed on a train, not a broken watch; longer than
-/// that and the supervisor's give-up notice is the more useful signal.
+/// Consecutive skipped polls before exiting non-zero: a chosen budget, ten
+/// minutes at the default interval, not one derived from measured outages. Past
+/// it, the supervisor's give-up notice is the more useful signal.
 const DEFAULT_MAX_TRANSIENT_FAILURES: u64 = 10;
 const ENV_MAX_TRANSIENT_FAILURES: &str = "MAILBOX_SLACK_MAX_TRANSIENT_FAILURES";
 
@@ -132,23 +132,33 @@ enum AdapterError {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     init_tracing();
+    // `run` logs its own failure, inside the watch's span where it has one.
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!(error = %err, "slack adapter exited with an error");
-            ExitCode::FAILURE
-        }
+        Err(()) => ExitCode::FAILURE,
     }
 }
 
-async fn run() -> Result<(), AdapterError> {
-    let config = read_config(std::io::stdin().lock())?;
-    let watch = watch_of(&config)?;
+async fn run() -> Result<(), ()> {
+    let (config, watch) = match read_config(std::io::stdin().lock())
+        .and_then(|config| watch_of(&config).map(|watch| (config, watch)))
+    {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            error!(error = %err, "slack adapter exited with an error before it knew its watch");
+            return Err(());
+        }
+    };
     let topic = watch.topic();
-    // Every line from here on carries the watch's topic, so a warning in the
+    // Every line from here on carries the watch's topic, so a line in the
     // bridge's log (where several adapters' stderr meet) names its watch.
     let span = info_span!("slack_watch", topic = topic.as_str());
-    watch_loop(config, watch, topic).instrument(span).await
+    let result = watch_loop(config, watch, topic)
+        .instrument(span.clone())
+        .await;
+    result.map_err(|err| {
+        span.in_scope(|| error!(error = %err, "slack adapter exited with an error"));
+    })
 }
 
 async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(), AdapterError> {
@@ -214,11 +224,6 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
                     "skipped a poll on a transient Slack failure; cursor unchanged"
                 );
                 if consecutive_transient >= limits.max_transient {
-                    error!(
-                        consecutive_transient,
-                        polls,
-                        "persistent transient Slack failures; exiting so the supervisor surfaces it"
-                    );
                     return Err(err.into());
                 }
                 continue;

@@ -32,12 +32,13 @@ use crate::api::{SlackApi, SlackError};
 use crate::message::{SlackMessage, SlackUserId, Subtype};
 
 /// Messages per page. Slack's cap for an internal app is 1,000; 200 keeps each
-/// reply small while making a second page rare at one poll a minute.
+/// reply small, and a second page is only needed when more than 200 messages
+/// arrive between polls.
 const PAGE_SIZE: usize = 200;
 
-/// Pages read per poll before giving up on the rest. Only a channel taking more
-/// than 2,000 messages between polls reaches it, and then the oldest are skipped
-/// with a warning rather than stalling the watch.
+/// Pages read per poll before stopping. Only more than 2,000 new messages between
+/// polls reach it. History pages newest first, so a channel watch then skips the
+/// oldest; replies page oldest first, so a thread watch reads the rest next poll.
 const MAX_PAGES: usize = 10;
 
 /// The newest `ts` this watch has seen, persisted through the bridge.
@@ -125,13 +126,13 @@ pub(crate) enum Disposition {
     Skip(SkipReason),
 }
 
-/// Why a message does not wake. Closed, so a log line about a skip can only
-/// ever carry one of these and never anything read from the message's content.
+/// Why a message does not wake. A log line about a skip carries one of these and
+/// nothing from the message's content: `NotSpoken` holds the parsed subtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     Hidden,
     /// A change to the channel or a message, named by its Slack subtype.
-    NotSpoken(String),
+    NotSpoken(Subtype),
     /// A plain reply seen by a channel watch; it belongs to a thread watch.
     ThreadReply,
     /// The parent, which `conversations.replies` always returns first.
@@ -145,8 +146,8 @@ pub(crate) fn disposition(watch: &SlackWatch, message: &SlackMessage) -> Disposi
     let broadcast = match &message.subtype {
         None | Some(Subtype::BotMessage | Subtype::FileShare | Subtype::MeMessage) => false,
         Some(Subtype::ThreadBroadcast) => true,
-        Some(Subtype::Other(name)) => {
-            return Disposition::Skip(SkipReason::NotSpoken(name.clone()));
+        Some(other @ Subtype::Other(_)) => {
+            return Disposition::Skip(SkipReason::NotSpoken(other.clone()));
         }
     };
     match watch {
@@ -247,8 +248,12 @@ struct ResponseMetadata {
 
 /// Parse a reply into `T`; a shape Slack does not normally send skips the poll.
 fn parse<T: serde::de::DeserializeOwned>(method: &str, reply: Value) -> Result<T, SlackError> {
+    // The serde error itself is not included: it can quote the value it choked on.
     serde_json::from_value(reply).map_err(|err| {
-        SlackError::Transient(format!("{method} reply had an unexpected shape: {err}"))
+        SlackError::Transient(format!(
+            "{method} reply had an unexpected shape ({:?})",
+            err.classify()
+        ))
     })
 }
 
@@ -371,11 +376,18 @@ impl<A: SlackApi> Watcher<A> {
         let context = self.context().await?;
         let pages = self.read(Read::Since(&prior.last_ts)).await?;
         if pages.truncated {
-            warn!(
-                max_pages = self.max_pages,
-                page_size = self.page_size,
-                "more new messages than one poll reads; the oldest were skipped"
-            );
+            match &self.watch {
+                SlackWatch::Channel { .. } => warn!(
+                    max_pages = self.max_pages,
+                    page_size = self.page_size,
+                    "more new messages than one poll reads; the oldest were skipped"
+                ),
+                SlackWatch::Thread { .. } => info!(
+                    max_pages = self.max_pages,
+                    page_size = self.page_size,
+                    "more new replies than one poll reads; the rest are read next poll"
+                ),
+            }
         }
 
         let mut newer: Vec<SlackMessage> = pages
@@ -469,12 +481,33 @@ impl<A: SlackApi> Watcher<A> {
         let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
         match self.api.call(method, &borrowed).await {
             Err(SlackError::NotInChannel) if !self.tried_join => {
-                self.tried_join = true;
                 let channel = self.watch.channel().to_string();
-                self.api
+                match self
+                    .api
                     .call("conversations.join", &[("channel", &channel)])
                     .await
-                    .map_err(|err| not_a_member(&channel, &err.to_string()))?;
+                {
+                    Ok(_) => {}
+                    // The join itself was refused: that is the membership problem.
+                    Err(
+                        err @ (SlackError::Access(_)
+                        | SlackError::Failed(_)
+                        | SlackError::NotInChannel),
+                    ) => {
+                        self.tried_join = true;
+                        return Err(not_a_member(&channel, &err.to_string()));
+                    }
+                    // Anything else keeps its own class, so a rate limit backs off,
+                    // a blip skips the poll and the join is tried again, and a bad
+                    // token is reported as a bad token.
+                    Err(
+                        err @ (SlackError::RateLimited { .. }
+                        | SlackError::Transient(_)
+                        | SlackError::Auth(_)
+                        | SlackError::Spawn { .. }),
+                    ) => return Err(err),
+                }
+                self.tried_join = true;
                 info!(channel = %channel, "joined the channel to read it");
                 self.api
                     .call(method, &borrowed)
@@ -601,6 +634,8 @@ mod tests {
         replies: RefCell<Vec<Value>>,
         member: RefCell<bool>,
         joinable: bool,
+        /// The next join fails transiently, once.
+        join_blip: RefCell<bool>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -617,6 +652,7 @@ mod tests {
                     "thread_ts": PARENT})]),
                 member: RefCell::new(true),
                 joinable: true,
+                join_blip: RefCell::new(false),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -673,6 +709,9 @@ mod tests {
                 }
                 "users.info" => Ok(json!({"ok": true, "user": {"name": "ben", "profile":
                     {"display_name": format!("Name of {}", param(params, "user").unwrap())}}})),
+                "conversations.join" if self.join_blip.replace(false) => {
+                    Err(SlackError::Transient("blip".into()))
+                }
                 "conversations.join" if self.joinable => {
                     *self.member.borrow_mut() = true;
                     Ok(json!({"ok": true}))
@@ -806,6 +845,33 @@ mod tests {
         assert_eq!(next.last_ts, ts("1791349500.000005"));
     }
 
+    /// Replies page oldest first, so the page cap loses nothing on a thread: the
+    /// cursor stops at the newest reply read and the next poll carries on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_thread_past_the_page_cap_reads_the_rest_next_poll() {
+        let slack = FakeSlack::new();
+        let mut watcher = Watcher::new(&slack, thread_watch()).with_paging(2, 2);
+        let baseline = watcher.baseline().await.unwrap();
+        for i in 1..=5 {
+            slack.reply(json!({"ts": format!("1791349600.00000{i}"), "user": "U2",
+                "thread_ts": PARENT}));
+        }
+        let (next, first) = watcher.poll(&baseline).await.unwrap();
+        let (_, second) = watcher.poll(&next).await.unwrap();
+        let all: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|m| m.ts.to_string())
+            .collect();
+        assert_eq!(
+            all,
+            (1..=5)
+                .map(|i| format!("1791349600.00000{i}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!first.is_empty() && !second.is_empty(), "it took two polls");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn replies_wake_the_thread_watch_not_the_channel_watch() {
         let slack = FakeSlack::new();
@@ -865,6 +931,33 @@ mod tests {
         let mut watcher = Watcher::new(&slack, channel_watch());
         watcher.baseline().await.unwrap();
         assert_eq!(slack.calls_to("conversations.join"), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_that_blips_keeps_its_class_and_is_tried_again() {
+        let slack = FakeSlack::new();
+        *slack.member.borrow_mut() = false;
+        *slack.join_blip.borrow_mut() = true;
+        let mut watcher = Watcher::new(&slack, channel_watch());
+        assert!(matches!(
+            watcher.baseline().await,
+            Err(SlackError::Transient(_))
+        ));
+        watcher.baseline().await.unwrap();
+        assert_eq!(slack.calls_to("conversations.join"), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bot_removed_mid_watch_and_refused_rejoin_is_fatal() {
+        let mut slack = FakeSlack::new();
+        slack.joinable = false;
+        let mut watcher = Watcher::new(&slack, channel_watch());
+        let baseline = watcher.baseline().await.unwrap();
+        *slack.member.borrow_mut() = false;
+        assert!(matches!(
+            watcher.poll(&baseline).await,
+            Err(SlackError::Access(_))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -949,19 +1042,25 @@ mod tests {
                 "channel_join",
                 channel_watch(),
                 json!({"ts": "1.000001", "subtype": "channel_join"}),
-                Skip(SkipReason::NotSpoken("channel_join".to_string())),
+                Skip(SkipReason::NotSpoken(Subtype::from(
+                    "channel_join".to_string(),
+                ))),
             ),
             (
                 "message_changed",
                 channel_watch(),
                 json!({"ts": "1.000001", "subtype": "message_changed"}),
-                Skip(SkipReason::NotSpoken("message_changed".to_string())),
+                Skip(SkipReason::NotSpoken(Subtype::from(
+                    "message_changed".to_string(),
+                ))),
             ),
             (
                 "message_deleted",
                 thread_watch(),
                 json!({"ts": "1.000001", "subtype": "message_deleted"}),
-                Skip(SkipReason::NotSpoken("message_deleted".to_string())),
+                Skip(SkipReason::NotSpoken(Subtype::from(
+                    "message_deleted".to_string(),
+                ))),
             ),
             (
                 "hidden",

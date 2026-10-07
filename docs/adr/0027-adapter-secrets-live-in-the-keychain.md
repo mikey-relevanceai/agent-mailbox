@@ -48,15 +48,17 @@ A future adapter that needs a secret follows the same pattern under its own
 
 - The posture matches `github-pr`'s where `gh` keeps its token in the system
   keyring, as `gh auth status` reported `(keyring)` on the machine this was built
-  on. `gh` can fall back to a plaintext config file where no keyring is available;
-  that is `gh`'s choice, outside this repo either way. In both cases the bridge only
+  on. Where no keyring is available `gh` may store it in plaintext instead (from
+  `gh`'s documented `--insecure-storage` option, not checked here); that is `gh`'s
+  choice, outside this repo either way. In both cases the bridge only
   starts a process that knows where its credential is.
 - **macOS only, for now.** `security` does not exist on Linux, and there the
   adapter fails at start with "no Slack token in the Keychain". A Linux user would
   need a `secret-tool` (libsecret) equivalent; nobody has asked for one yet.
 - The Keychain must be unlocked when the adapter starts; it was in the logged-in
-  session this was tested in. A daemon started before login would fail its Slack watches until the supervisor's retry runs after
-  login.
+  session this was tested in. We expect a daemon started before login to fail its
+  Slack watches until the supervisor's sweep retries them after login; that was
+  not tested.
 - `curl` becomes a runtime dependency of the Slack adapter. It ships with macOS.
 - Rotating the token means re-running `add-generic-password` (with `-U`) and
   waiting for the adapter's next restart; it reads the token once per process.

@@ -98,7 +98,8 @@ mailbox watch slack-thread <link>
 
 **Authorship is not filtered.** The setup this was built for has every agent posting
 through one person's claude.ai Slack connector, so they all post as that person's
-Slack user. Then a session's own post is indistinguishable from a peer's, and
+Slack user (inferred from how the connector authenticates; attribution was not
+checked message by message). Then a session's own post is indistinguishable from a peer's, and
 filtering on author would silence the peers too. A session is woken by its own post,
 the trade [ADR-0014](../adr/0014-self-authored-events-wake-their-author.md) made for
 `publish`. If agents ever post under distinct identities, an opt-in author filter
@@ -113,8 +114,9 @@ cursor, oldest first; publishes the ones that wake; then emits the cursor advanc
 everything it read, including skipped messages. Publishing before emitting the cursor
 means a crash re-fires a message rather than dropping one.
 
-A poll reads at most 10 pages of 200. A channel taking more than 2,000 messages between
-polls loses the oldest, with a warning.
+A poll reads at most 10 pages of 200. History pages newest first, so a channel taking
+more than 2,000 messages between polls loses the oldest, with a warning. Replies page
+oldest first, so a thread past the cap loses nothing: the next poll reads the rest.
 
 ### Subject and body
 

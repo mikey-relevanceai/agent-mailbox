@@ -1,4 +1,5 @@
-//! A Slack message, parsed once where it leaves the API.
+//! A Slack message, parsed once in the watcher's read step, before any rule
+//! sees it.
 //!
 //! Slack's reply is untrusted input. Everything the wake rules look at is parsed
 //! here into typed fields, so the rules never read raw JSON, and a message whose
