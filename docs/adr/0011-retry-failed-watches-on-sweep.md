@@ -2,7 +2,9 @@
 
 - Status: **Accepted — but the liveness probe below is amended by
   [ADR-0017](0017-daemon-bumps-the-sentinel.md), and the give-up event rate in
-  Consequences by [ADR-0023](0023-one-give-up-notice-per-outage.md).** The decision
+  Consequences by [ADR-0023](0023-one-give-up-notice-per-outage.md), itself superseded
+  by [ADR-0028](0028-adapter-failure-wakes-nobody.md): a give-up now publishes
+  nothing at all.** The decision
   (retry a `Failed` watch once per sweep while an interested session lives) is in
   force. Every
   reference below to "the watcher-pidfile liveness probe (ADR-0009)" now reads the
@@ -20,7 +22,8 @@
 
 design/01 rule 7: after N consecutive failed runs the supervisor gives up — it
 publishes an `adapter_gave_up` error event on the entity's topic and marks the
-watch `Failed`. Rule 7 exists so a genuinely broken adapter (a deleted PR, revoked
+watch `Failed`. (It no longer publishes anything; see
+[ADR-0028](0028-adapter-failure-wakes-nobody.md).) Rule 7 exists so a genuinely broken adapter (a deleted PR, revoked
 `gh` auth, a bad binary) does not restart-loop forever burning API quota.
 
 But give-up does not distinguish a **permanent** fault from a **transient** one.

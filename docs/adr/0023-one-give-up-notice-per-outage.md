@@ -1,6 +1,9 @@
 # ADR-0023: One give-up notice per outage, withdrawn by a recovery event
 
-- Status: **Accepted**
+- Status: **Superseded by [ADR-0028](0028-adapter-failure-wakes-nobody.md).** The
+  supervisor no longer publishes `adapter_gave_up` or `adapter_recovered` at all.
+  Announce-once survived a network that stayed down, but not one that flapped:
+  every 60-second survivor counted as recovered, so the notices alternated.
 - Date: 2026-08-12
 - Amends: [ADR-0011](0011-retry-failed-watches-on-sweep.md) — its retry decision
   stands unchanged; the consequence it flagged for revisit ("re-publishing an

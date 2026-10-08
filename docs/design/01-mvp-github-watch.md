@@ -139,14 +139,16 @@ MVP rules:
    that default stopped being fail-safe once ADR-0008 made an idle session take
    zero turns, because the re-`watch` it assumed can never happen.
 7. **Adapter crash.** Bridge restarts with backoff **only while interest count
-   > 0**; give up and surface an error event after N failures. Give-up is not
+   > 0**; give up after N failures and mark the watch `Failed`. Give-up is not
    permanent: the periodic sweep retries a `Failed` watch once per interval while
    an interested session is still alive
    ([ADR-0011](../adr/0011-retry-failed-watches-on-sweep.md)), so a give-up caused
    by a transient upstream outage self-heals instead of needing a manual re-`watch`.
-   The error event is surfaced **once per outage**, not once per retry, and is
-   withdrawn by an `adapter_recovered` event when the adapter stays up again
-   ([ADR-0023](../adr/0023-one-give-up-notice-per-outage.md)).
+   None of this is published, so it wakes no agent
+   ([ADR-0028](../adr/0028-adapter-failure-wakes-nobody.md), superseding
+   [ADR-0023](../adr/0023-one-give-up-notice-per-outage.md)'s once-per-outage
+   notice). A give-up is never terminal, and the persisted baseline means an
+   outage delays news rather than dropping it. `mailbox status` shows `failed`.
 8. **No agent-owned infinite bash.** Agents declare intent; they do not hold the
    poll loop in a tool background task.
 

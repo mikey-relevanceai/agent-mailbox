@@ -71,28 +71,17 @@ publishes only **transitions**: the PR being merged, a merge conflict, a new
 review / review-thread / PR comment, or CI rollup going red. Then **go idle or do
 other work** — do not poll.
 
-#### Two events on a PR topic are about the mailbox, not the PR
+#### If the poller breaks, you are not told — and do not need to be
 
-If the poller breaks — `gh` auth expired, the repo went away, the machine lost its
-network — the bridge eventually stops trying and tells you so:
+If the poller breaks (`gh` auth expired, the machine lost its network), the bridge
+keeps retrying in the background and wakes nobody about it. You do not re-`watch`,
+and you do not check in. When the poller comes back it diffs against the last state
+it saw, so a merge, conflict, review or CI failure from the outage still reaches
+you, just late. (A change that reverted before the next successful poll is never
+seen.) To see whether a watch is currently failing, run `mailbox status`.
 
-```text
-· mailbox stopped watching this: the adapter failed 5 times in a row
-```
-
-Take it at face value: **until further notice, no news about that PR means nothing.**
-Silence is no longer evidence. If you were waiting on the PR, say so to your human
-rather than waiting on a signal that is not coming.
-
-You are told **once**, however long the fault lasts — and you are told when it ends:
-
-```text
-· mailbox is watching this again: the adapter recovered
-```
-
-That is the all-clear; the watch is live and silence means "nothing changed" again.
-You do not re-`watch` for either of them, and you do not need to check in between.
-The bridge keeps retrying in the background on its own.
+You may still find old `mailbox stopped watching this` or `mailbox is watching this
+again` events in a topic's history. Current bridges no longer send them.
 
 ### Watch a Slack channel or thread
 

@@ -14,14 +14,14 @@
 //! - AC2 first session ends → child still running; second still gets edges.
 //! - AC3 last session leaves → child gone; zero further activity.
 //! - AC4 kill the adapter with interest > 0 → exactly one restart; N crashes →
-//!   give up + error event; interest 0 → stays stopped.
+//!   give up (marked failed, nothing published); interest 0 → stays stopped.
 //! - AC5 bridge restart: resumed iff an interested session's watcher is alive;
 //!   not resumed (and the stale pid cleared) when none is.
 //! - TTL sweeper drops a stale interest and stops the adapter.
 //! - ADR-0026 an ended session's watch is suspended, and a resume of the same
 //!   session id restarts its adapter.
-//! - ADR-0023 a give-up is announced once per outage however many sweeps retry it,
-//!   withdrawn by one recovery event, and re-armed for the next outage.
+//! - ADR-0028 adapter failure publishes nothing — not on give-up, not on the
+//!   sweep's retries, not on recovery — so it never wakes a subscriber.
 //!
 //! Flakiness discipline: poll with bounded timeouts (never fixed sleeps waiting
 //! for a state), use a fast restart policy + short sweep windows, and assert no
@@ -38,8 +38,8 @@ use mailbox::host::AdapterConfig;
 use mailbox::host::subprocess::AdapterSpec;
 use mailbox::storage::{Cursor, SessionId, Storage, StorageConfig, Watch, WatchId, WatchState};
 use mailbox::supervisor::{
-    AdapterResolver, EVENT_ADAPTER_GAVE_UP, EVENT_ADAPTER_RECOVERED, ResolveError, ResolvedAdapter,
-    RestartPolicy, Supervisor, reconcile_startup, topic_for_watch,
+    AdapterResolver, ResolveError, ResolvedAdapter, RestartPolicy, Supervisor, reconcile_startup,
+    topic_for_watch,
 };
 use mailbox::watch::{SessionResumed, drop_interest, record, resume_session};
 use mailbox_protocol::{AdapterId, GithubPr, Topic};
@@ -245,8 +245,8 @@ impl AdapterResolver for StubResolverFixture {
 /// the spawn attempts made through it.
 ///
 /// The count is what lets a test tell "the sweep retried and gave up again" apart
-/// from "the sweep did nothing", which is the difference between proving
-/// announce-once and asserting it vacuously.
+/// from "the sweep did nothing", which is the difference between proving a retry
+/// publishes nothing and asserting it vacuously.
 struct CountingBrokenResolver {
     attempts: Arc<AtomicUsize>,
 }
@@ -319,20 +319,10 @@ async fn watch_state(storage: &Storage, id: WatchId) -> WatchState {
     storage.get_watch(id).await.unwrap().unwrap().state
 }
 
-/// How many supervisor-authored events of `kind` (`adapter_gave_up` /
-/// `adapter_recovered`) are durably on `topic`. Counting — not merely finding one —
-/// is the point for ADR-0023: the bug being guarded against was a *repeat*.
-async fn supervisor_events(storage: &Storage, topic: &Topic, kind: &str) -> usize {
-    storage
-        .read_events(topic.clone(), Cursor::Oldest, None)
-        .await
-        .unwrap()
-        .events
-        .iter()
-        .filter(|e| e.body.get("event").and_then(|v| v.as_str()) == Some(kind))
-        .count()
-}
-
+/// Every event durably on `topic`. A fixture that never spawns (or crashes before
+/// publishing) can author none, so for those this being 0 proves the supervisor
+/// published nothing either — without naming an event the supervisor no longer
+/// has, which would make "found none" pass vacuously.
 async fn durable_count(storage: &Storage, topic: &Topic) -> usize {
     storage
         .read_events(topic.clone(), Cursor::Oldest, None)
@@ -792,9 +782,10 @@ async fn ac4_crash_with_interest_restarts_once() {
 }
 
 /// An adapter that keeps crashing exhausts the restart budget: the supervisor
-/// gives up, marks the watch Failed, and publishes an error event on the topic.
+/// gives up and marks the watch Failed — and publishes nothing, because the sweep
+/// will retry it and a give-up is therefore not news worth a turn (ADR-0028).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ac4_repeated_crash_gives_up_and_publishes_error() {
+async fn ac4_repeated_crash_gives_up_and_wakes_nobody() {
     let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::crash()).await;
     let watched = pr(4);
     let topic = watched.topic();
@@ -825,29 +816,23 @@ async fn ac4_repeated_crash_gives_up_and_publishes_error() {
         "a given-up watch has no running adapter"
     );
 
-    // A give-up error event was published on the entity topic by the supervisor.
-    let events = storage
-        .read_events(topic.clone(), Cursor::Oldest, None)
-        .await
-        .unwrap()
-        .events;
-    let giveup = events
-        .iter()
-        .find(|e| e.body.get("event").and_then(|v| v.as_str()) == Some(EVENT_ADAPTER_GAVE_UP));
-    assert!(
-        giveup.is_some(),
-        "the supervisor must publish a give-up error event; got {events:?}"
-    );
-
+    // Shut down first: the actor drains every command queued before it, so a
+    // publish made after the watch was marked failed would be on the topic now.
     supervisor.shutdown().await.unwrap();
+    // The crash fixture publishes nothing itself, so anything here is the
+    // supervisor's — and every event on the topic wakes its subscribers.
+    assert_eq!(
+        durable_count(&storage, &topic).await,
+        0,
+        "a give-up must not publish: the sweep retries it, so it is not final (ADR-0028)"
+    );
 }
 
 // ---- clean exit-0 is terminal, NOT a crash-restart (card-09 review, item A) ----
 
 /// A supervised FINITE adapter (`stub --count N`) that publishes its batch and
 /// exits 0 while interest is still held is DONE, not crashed: the batch is
-/// published EXACTLY ONCE, the watch ends `Stopped` (never `Failed`), and no
-/// `adapter_gave_up` event is surfaced. Paired with `ac4_crash_with_interest_
+/// published EXACTLY ONCE and the watch ends `Stopped` (never `Failed`). Paired with `ac4_crash_with_interest_
 /// restarts_once` (a crash — signal death — DOES restart), this pins the
 /// clean-exit-vs-crash distinction so it cannot silently regress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -890,19 +875,8 @@ async fn clean_finite_exit_is_terminal_not_restarted() {
         "a completed finite adapter must not be restarted and republish its batch"
     );
 
-    // It must NOT have been marked Failed, and no give-up event was surfaced.
+    // It must NOT have been marked Failed.
     assert_eq!(watch_state(&storage, watch_id).await, WatchState::Stopped);
-    let events = storage
-        .read_events(topic.clone(), Cursor::Oldest, None)
-        .await
-        .unwrap()
-        .events;
-    assert!(
-        !events
-            .iter()
-            .any(|e| e.body.get("event").and_then(|v| v.as_str()) == Some(EVENT_ADAPTER_GAVE_UP)),
-        "a healthy finite adapter must not produce a give-up event; got {events:?}"
-    );
 
     supervisor.shutdown().await.unwrap();
 }
@@ -1465,8 +1439,8 @@ async fn unwatch_during_backoff_ends_stopped_no_restart() {
 // ---- regression: repeated START failures give up (proves B) -------------------
 
 /// An adapter whose program never spawns (every `start` fails) must accumulate
-/// consecutive failures and give up within budget — reaching `Failed` and
-/// publishing the give-up event — rather than hammering spawn forever.
+/// consecutive failures and give up within budget — reaching `Failed`, silently —
+/// rather than hammering spawn forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_start_failures_give_up() {
     let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::nonexistent()).await;
@@ -1495,20 +1469,14 @@ async fn repeated_start_failures_give_up() {
     .await;
     assert_eq!(supervisor.running_pid(watch_id).await, None);
 
-    // The give-up error event was surfaced on the entity topic.
-    let events = storage
-        .read_events(topic.clone(), Cursor::Oldest, None)
-        .await
-        .unwrap()
-        .events;
-    assert!(
-        events
-            .iter()
-            .any(|e| e.body.get("event").and_then(|v| v.as_str()) == Some(EVENT_ADAPTER_GAVE_UP)),
-        "a repeated start-failure must still publish the give-up event"
-    );
-
+    // Shut down first: the actor drains every command queued before it, so a
+    // publish made after the watch was marked failed would be on the topic now.
     supervisor.shutdown().await.unwrap();
+    assert_eq!(
+        durable_count(&storage, &topic).await,
+        0,
+        "a start-failure give-up publishes nothing (ADR-0028)"
+    );
 }
 
 // ---- ADR-0011: slow retry of failed watches -----------------------------------
@@ -1545,6 +1513,11 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
         async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
     })
     .await;
+    assert_eq!(
+        durable_count(&storage, &watched.topic()).await,
+        0,
+        "the outage published nothing (ADR-0028)"
+    );
 
     // Upstream recovers, and s1's Claude Code process is still running — the
     // sweep's liveness signal (ADR-0017's probe).
@@ -1567,11 +1540,6 @@ async fn sweep_retries_a_failed_watch_whose_session_is_alive() {
             pid: mailbox::storage::Pid::new(pid)
         },
         "a sweep retries a Failed watch whose interested session is alive"
-    );
-    assert_eq!(
-        supervisor_events(&storage, &watched.topic(), EVENT_ADAPTER_GAVE_UP).await,
-        1,
-        "the outage announced itself once; the retry that healed it added nothing (ADR-0023)"
     );
 
     supervisor.shutdown().await.unwrap();
@@ -1622,22 +1590,16 @@ async fn sweep_does_not_retry_a_failed_watch_of_a_dead_session() {
     supervisor.shutdown().await.unwrap();
 }
 
-// ---- ADR-0023: one give-up notice per outage ----------------------------------
+// ---- ADR-0028: adapter failure wakes nobody ------------------------------------
 
-/// The wake-storm regression. A watch that keeps failing is still retried by every
-/// sweep (ADR-0011), but its give-up is announced ONCE — the retries that give up
-/// again publish nothing.
+/// The wake-storm regression. A watch that keeps failing is retried by every sweep
+/// (ADR-0011), and neither its give-up nor any retry's give-up publishes — so no
+/// subscriber is woken however long the fault lasts.
 ///
-/// Observed in production (2026-08-12): a laptop lost its network, every `gh` poll
-/// failed, and all eight watched PRs gave up. ADR-0011 then retried each of them
-/// every 300s, each retry re-published `adapter_gave_up`, and each publish woke
-/// every subscribed agent — thirteen identical give-up events per topic, five
-/// minutes apart, for as long as the network was down.
-///
-/// Note the assertion is a COUNT. The pre-existing give-up tests use `.any()`, so
-/// they stayed green throughout the storm: only counting catches a repeat.
+/// The topic is checked after EVERY round, and each round is proved to have run a
+/// full restart burst, so "nothing published" cannot pass because nothing ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_repeated_give_up_is_announced_only_once() {
+async fn a_watch_that_keeps_failing_wakes_nobody_however_often_the_sweep_retries_it() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let (bus, storage, supervisor, _dir) = fresh(CountingBrokenResolver {
         attempts: attempts.clone(),
@@ -1664,9 +1626,9 @@ async fn a_repeated_give_up_is_announced_only_once() {
     })
     .await;
     assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        1,
-        "the first give-up of an outage is announced"
+        durable_count(&storage, &topic).await,
+        0,
+        "the first give-up publishes nothing"
     );
 
     // One full restart burst is every attempt within the budget plus the one that
@@ -1690,29 +1652,33 @@ async fn a_repeated_give_up_is_announced_only_once() {
         })
         .await;
         assert_eq!(
-            supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-            1,
-            "sweep {round} retried and gave up again; the outage is unchanged, so it must not re-announce"
+            durable_count(&storage, &topic).await,
+            0,
+            "sweep {round} retried and gave up again; that must wake nobody"
         );
     }
 
+    // Shut down first: the actor drains every command queued before it, so a
+    // publish made after the watch was marked failed would be on the topic now.
     supervisor.shutdown().await.unwrap();
+    assert_eq!(durable_count(&storage, &topic).await, 0);
 }
 
-/// The other half of announce-once: it must not become announce-never. A watch that
-/// comes back and STAYS back publishes exactly one recovery event, and the notice
-/// re-arms so the NEXT outage is announced too.
+/// The production pattern that ADR-0023's announce-once did not survive: a flaky
+/// network. The watch gives up, heals and runs well past `reset_after`, then fails
+/// and gives up again. ADR-0023 published gave-up, recovered, gave-up for that —
+/// three wakes per topic per flap. Now the only events on the topic are the
+/// adapter's own.
 ///
-/// Without the recovery event, announce-once would be a silent black hole — an
-/// agent told "mailbox stopped watching this" and nothing after has no way to learn
-/// its watch came back, which is the ADR-0008 deafness this bus exists to prevent.
+/// "Only the adapter's own" rather than "no supervisor event", because the
+/// supervisor no longer has an event name to search for, and searching for a
+/// retyped one would pass whatever was published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_recovered_watch_announces_once_and_re_arms_for_the_next_outage() {
+async fn a_flapping_watch_publishes_nothing_about_failing_or_recovering() {
     let healthy = Arc::new(AtomicBool::new(false));
-    // `fast_policy`'s hour-long `reset_after` exists to stop a crash streak being
-    // read as stable; here the stability timer is the thing under test, so it has
-    // to be short enough to fire. Start-failures never reset the streak whatever
-    // this is set to, so the give-up still accumulates as fast as ever.
+    // Short, so the healthy run below outlives it: that is the run ADR-0023 read as
+    // a recovery and announced. Start failures never reset the streak whatever this
+    // is set to, so the give-ups still accumulate as fast as ever.
     let policy = RestartPolicy {
         reset_after: Duration::from_millis(150),
         ..fast_policy()
@@ -1734,25 +1700,15 @@ async fn a_recovered_watch_announces_once_and_re_arms_for_the_next_outage() {
     .await
     .unwrap();
     let watch_id = only_watch_id(&storage).await;
-
-    // The outage: the watch gives up and says so once.
     poll_until("watch failed during the outage", || {
         let storage = storage.clone();
         async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
     })
     .await;
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        1
-    );
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        0,
-        "nothing has recovered yet"
-    );
 
-    // Upstream comes back; the sweep retries the failed watch (ADR-0011) and the
-    // adapter this time stays up past `reset_after`.
+    // Upstream comes back; the sweep retries, and the adapter stays up well past
+    // `reset_after`. A fixed sleep is right here: part of the assertion is that
+    // nothing besides the stub publishes during it.
     healthy.store(true, Ordering::SeqCst);
     supervisor
         .sweep(Duration::from_secs(3600), BTreeSet::from([s1.clone()]))
@@ -1763,265 +1719,42 @@ async fn a_recovered_watch_announces_once_and_re_arms_for_the_next_outage() {
         async move { s.running_pid(watch_id).await }
     })
     .await;
-    poll_until("recovery announced once the run proved stable", || {
-        let storage = storage.clone();
-        let topic = topic.clone();
-        async move {
-            (supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await == 1).then_some(())
-        }
-    })
-    .await;
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        1,
-        "recovering does not re-announce the give-up it withdraws"
-    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // The recovery must carry a subject (ADR-0022): the wake wire shows only that
-    // line, so an event without one wakes the agent saying nothing — the exact
-    // silence the recovery exists to break.
-    let recovery = storage
-        .read_events(topic.clone(), Cursor::Oldest, None)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .find(|e| e.body.get("event").and_then(|v| v.as_str()) == Some(EVENT_ADAPTER_RECOVERED))
-        .expect("a recovery event");
-    let subject = recovery.subject.expect("the recovery carries a subject");
-    assert!(
-        subject.text().contains("watching this again"),
-        "the subject must say the watch is live again, not merely that something happened; got {:?}",
-        subject.text()
-    );
-
-    // A second, separate outage: kill the healthy adapter with upstream broken
-    // again. The withdrawn notice must re-arm, or this outage would be silent.
+    // And breaks again: kill the healthy adapter with upstream broken, so the
+    // restarts fail and the watch gives up a second time.
     healthy.store(false, Ordering::SeqCst);
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGKILL,
     )
     .expect("kill the recovered adapter");
-    poll_until("the next outage is announced in its own right", || {
-        let storage = storage.clone();
-        let topic = topic.clone();
-        async move {
-            (supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await == 2).then_some(())
-        }
-    })
-    .await;
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        1,
-        "the second outage has not recovered"
-    );
-
-    supervisor.shutdown().await.unwrap();
-}
-
-/// A healthy watch that never gave up publishes no recovery event, however long it
-/// runs. The stability timer fires for every spawn, so the latch — not the timer —
-/// has to be what decides: only an agent that was told the watch went dark is told
-/// it came back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_watch_that_never_gave_up_announces_no_recovery() {
-    let policy = RestartPolicy {
-        reset_after: Duration::from_millis(100),
-        ..fast_policy()
-    };
-    let (bus, storage, supervisor, _dir) =
-        fresh_with(StubResolverFixture::interval(20), policy).await;
-    let watched = pr(13);
-    let topic = watched.topic();
-
-    record(
-        &bus,
-        &storage,
-        &supervisor,
-        &watched,
-        Duration::from_secs(60),
-        SessionId::new("s1"),
-    )
-    .await
-    .unwrap();
-    let watch_id = only_watch_id(&storage).await;
-    poll_until("adapter running", || {
-        let s = supervisor.clone();
-        async move { s.running_pid(watch_id).await }
-    })
-    .await;
-
-    // Well past `reset_after`, so the stability timer has certainly fired. A fixed
-    // sleep is right here: the assertion is that nothing happens.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        0,
-        "a watch that never announced a give-up has nothing to withdraw"
-    );
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        0
-    );
-
-    supervisor.shutdown().await.unwrap();
-}
-
-/// A start is not a recovery. While the fault persists, every sweep retry spawns an
-/// adapter that dies moments later — so if the stability timer withdrew the notice
-/// on the mere fact of a spawn, it would publish one bogus "recovered" per interval
-/// and rebuild the storm inverted.
-///
-/// This is the guard the generation check in `on_stable` exists for. The crash
-/// fixture spawns REAL children that die in milliseconds, so every armed timer is
-/// stale by the time it fires — deterministically, with no race to lose.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn adapters_that_start_and_die_never_count_as_recovered() {
-    // `reset_after` has to sit in a window, and the window is why this is spelled
-    // out rather than tuned to taste. It is BOTH the stable-run threshold that
-    // resets the crash streak and the delay before a stability timer fires, so:
-    //
-    //   crash lifetime  <<  reset_after  <<  the poll_until budget (6s)
-    //
-    // Too LOW and a crash that outlived it counts as a stable run, the streak
-    // resets every time, the watch never reaches `Failed`, and this hangs — which
-    // is exactly how a 120ms value passed locally (the fixture aborts in ~1ms) and
-    // then timed out on a loaded CI runner, where spawning a process and aborting
-    // it took longer than that. Too HIGH and the timers never fire inside the test,
-    // which would pass for the wrong reason. 1.5s is ~1000x the fixture's lifetime
-    // and a quarter of the budget.
-    let policy = RestartPolicy {
-        reset_after: Duration::from_millis(1500),
-        ..fast_policy()
-    };
-    let (bus, storage, supervisor, _dir) = fresh_with(FixtureResolver::crash(), policy).await;
-    let watched = pr(14);
-    let topic = watched.topic();
-    let s1 = SessionId::new("s1");
-
-    record(
-        &bus,
-        &storage,
-        &supervisor,
-        &watched,
-        Duration::from_secs(60),
-        s1.clone(),
-    )
-    .await
-    .unwrap();
-    let watch_id = only_watch_id(&storage).await;
-    poll_until("watch failed after a crash streak", || {
+    poll_until("the watch gave up again", || {
         let storage = storage.clone();
         async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
     })
     .await;
-
-    // Retry it twice more, so several generations of short-lived adapter have been
-    // spawned and several stale timers are in flight.
-    for _ in 0..2 {
-        supervisor
-            .sweep(Duration::from_secs(3600), BTreeSet::from([s1.clone()]))
-            .await
-            .unwrap();
-        poll_until("the retry crashed back to failed", || {
-            let storage = storage.clone();
-            async move {
-                (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(())
-            }
-        })
-        .await;
-    }
-    // Well past `reset_after` measured from the LAST spawn above, so every timer
-    // armed during this test has certainly fired and declined.
-    tokio::time::sleep(Duration::from_millis(1800)).await;
-
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        0,
-        "adapters that started and immediately died have recovered nothing"
-    );
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        1,
-        "and the outage is still the same outage"
-    );
-
+    // Shut down first: the actor drains every command queued before it, so a
+    // publish made after the watch was marked failed would be on the topic now.
     supervisor.shutdown().await.unwrap();
-}
 
-/// Teardown withdraws the notice SILENTLY, and the next watch of the same entity is
-/// a new outage that announces in its own right.
-///
-/// Silently, because the adapter did not recover — it stopped being wanted, and
-/// telling subscribers a stopped watch is "being watched again" would be a lie. But
-/// the latch must still be dropped: a re-watched entity that failed again to silence
-/// would be the announce-never failure, one unwatch later.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unwatching_withdraws_the_notice_silently_and_the_next_watch_re_announces() {
-    let (bus, storage, supervisor, _dir) = fresh(FixtureResolver::nonexistent()).await;
-    let watched = pr(15);
-    let topic = watched.topic();
-    let s1 = SessionId::new("s1");
-
-    record(
-        &bus,
-        &storage,
-        &supervisor,
-        &watched,
-        Duration::from_secs(60),
-        s1.clone(),
-    )
-    .await
-    .unwrap();
-    let watch_id = only_watch_id(&storage).await;
-    poll_until("watch failed", || {
-        let storage = storage.clone();
-        async move { (watch_state(&storage, watch_id).await == WatchState::Failed).then_some(()) }
-    })
-    .await;
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await,
-        1
-    );
-
-    // The last interested session leaves while the watch is still failed.
-    drop_interest(&bus, &storage, &supervisor, &watched, s1.clone())
+    let events = storage
+        .read_events(topic.clone(), Cursor::Oldest, None)
         .await
-        .unwrap();
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        0,
-        "unwatching a failed watch is not a recovery, and must not be announced as one"
+        .unwrap()
+        .events;
+    assert!(
+        !events.is_empty(),
+        "the healthy stub published during its run; without that this test reads an empty topic and proves nothing"
     );
-
-    // Watched again, still broken: a new outage, announced in its own right.
-    record(
-        &bus,
-        &storage,
-        &supervisor,
-        &watched,
-        Duration::from_secs(60),
-        s1,
-    )
-    .await
-    .unwrap();
-    poll_until("the re-watched entity failed again", || {
-        let storage = storage.clone();
-        let topic = topic.clone();
-        async move {
-            (supervisor_events(&storage, &topic, EVENT_ADAPTER_GAVE_UP).await == 2).then_some(())
-        }
-    })
-    .await;
-    assert_eq!(
-        supervisor_events(&storage, &topic, EVENT_ADAPTER_RECOVERED).await,
-        0,
-        "nothing recovered at any point"
+    let foreign: Vec<_> = events
+        .iter()
+        .filter(|e| e.body.get("source").and_then(|v| v.as_str()) != Some("stub"))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "only the adapter may publish on its topic; failing and recovering must wake nobody (ADR-0028); got {foreign:?}"
     );
-
-    supervisor.shutdown().await.unwrap();
 }
 
 // ---- invariant: running_pid==None ⟹ state is never Running ---------------------
