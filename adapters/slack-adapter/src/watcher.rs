@@ -13,23 +13,27 @@
 //! than the cursor" is "posted since we last looked". The cursor advances past
 //! skipped messages too, so a join is read once rather than on every poll.
 //!
-//! # Authorship is not filtered
+//! # Filters are opt-in
 //!
-//! This assumes the watching agents share one Slack identity, as they do when
-//! they all post through one person's connector. Then a session's own post is
-//! indistinguishable from a peer's, and filtering on author would silence the
-//! peers along with the self. So nothing is filtered, and a session is woken by
-//! its own post too: the trade ADR-0014 made for `publish` (design/02).
+//! By default nothing is filtered on author, and a session is woken by its own
+//! post too: the trade ADR-0014 made for `publish` (design/02). Agents posting
+//! through one person's connector all post as that person, so a session's own
+//! post is indistinguishable from a peer's by author alone. A watch can carry
+//! `--skip` filters (ADR-0029), and a message they match is skipped like a join:
+//! read, past the cursor, never published. It is skipped only after the wake
+//! rules would have woken for it, so a skip's logged reason is the real one.
 
 use std::collections::HashMap;
 
-use mailbox_protocol::{SlackTs, SlackWatch, Subject};
+use mailbox_protocol::{
+    Poster, SlackAppId, SlackFilter, SlackFilters, SlackTs, SlackUserId, SlackWatch, Subject,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::api::{SlackApi, SlackError};
-use crate::message::{SlackMessage, SlackUserId, Subtype};
+use crate::message::{SlackMessage, Subtype};
 
 /// Messages per page. Slack's cap for an internal app is 1,000; 200 keeps each
 /// reply small, and a second page is only needed when more than 200 messages
@@ -66,6 +70,7 @@ pub struct NewMessage {
     pub author: String,
     pub user: Option<SlackUserId>,
     pub bot_id: Option<String>,
+    pub app_id: Option<SlackAppId>,
     pub subtype: Option<Subtype>,
     pub permalink: String,
 }
@@ -106,6 +111,10 @@ impl NewMessage {
             ("user", self.user.as_ref().map(|u| u.as_str().to_string())),
             ("bot_id", self.bot_id.clone()),
             (
+                "app_id",
+                self.app_id.as_ref().map(|a| a.as_str().to_string()),
+            ),
+            (
                 "subtype",
                 self.subtype.as_ref().map(|s| s.as_str().to_string()),
             ),
@@ -137,9 +146,32 @@ pub(crate) enum SkipReason {
     ThreadReply,
     /// The parent, which `conversations.replies` always returns first.
     ThreadParent,
+    /// One of the watch's `--skip` filters matched (ADR-0029). Carries the
+    /// filter, which is ids the operator chose, never message content.
+    Filtered(SlackFilter),
 }
 
-pub(crate) fn disposition(watch: &SlackWatch, message: &SlackMessage) -> Disposition {
+pub(crate) fn disposition(
+    watch: &SlackWatch,
+    skip: &SlackFilters,
+    message: &SlackMessage,
+) -> Disposition {
+    match wake_rule(watch, message) {
+        Disposition::Wake => {}
+        skipped @ Disposition::Skip(_) => return skipped,
+    }
+    let poster = Poster {
+        user: message.user.as_ref(),
+        app: message.app_id.as_ref(),
+    };
+    match skip.matching(poster) {
+        Some(filter) => Disposition::Skip(SkipReason::Filtered(filter.clone())),
+        None => Disposition::Wake,
+    }
+}
+
+/// The design/02 wake table, before any filter.
+fn wake_rule(watch: &SlackWatch, message: &SlackMessage) -> Disposition {
     if message.hidden {
         return Disposition::Skip(SkipReason::Hidden);
     }
@@ -266,15 +298,17 @@ pub(crate) struct Watcher<A> {
     /// successful join means something else is wrong.
     tried_join: bool,
     names: HashMap<SlackUserId, String>,
+    skip: SlackFilters,
     page_size: usize,
     max_pages: usize,
 }
 
 impl<A: SlackApi> Watcher<A> {
-    pub fn new(api: A, watch: SlackWatch) -> Self {
+    pub fn new(api: A, watch: SlackWatch, skip: SlackFilters) -> Self {
         Self {
             api,
             watch,
+            skip,
             context: None,
             tried_join: false,
             names: HashMap::new(),
@@ -402,8 +436,13 @@ impl<A: SlackApi> Watcher<A> {
             .map_or_else(|| prior.last_ts.clone(), |message| message.ts.clone());
         let mut woken = Vec::new();
         for message in &newer {
-            match disposition(&self.watch, message) {
+            match disposition(&self.watch, &self.skip, message) {
                 Disposition::Wake => woken.push(self.new_message(&context, message).await),
+                // Info rather than debug: a filter is an operator's choice, and
+                // "why didn't that wake me?" is answered here.
+                Disposition::Skip(SkipReason::Filtered(filter)) => {
+                    info!(ts = %message.ts, filter = %filter, "skipped a message a --skip filter matched");
+                }
                 Disposition::Skip(reason) => {
                     debug!(ts = %message.ts, reason = ?reason, "skipped a message that does not wake");
                 }
@@ -545,6 +584,7 @@ impl<A: SlackApi> Watcher<A> {
             author,
             user: message.user.clone(),
             bot_id: message.bot_id.clone(),
+            app_id: message.app_id.clone(),
             subtype: message.subtype.clone(),
             permalink: self.permalink(context, &message.ts),
         }
@@ -738,7 +778,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn channel_baseline_is_the_newest_message_and_wakes_nobody() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let baseline = watcher.baseline().await.unwrap();
         assert_eq!(baseline.last_ts, ts(PARENT));
         let (next, woken) = watcher.poll(&baseline).await.unwrap();
@@ -749,7 +789,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_empty_channel_baselines_before_everything_so_its_first_message_wakes() {
         let slack = FakeSlack::with_top_level(Vec::new());
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let baseline = watcher.baseline().await.unwrap();
         assert_eq!(baseline.last_ts, SlackTs::zero());
         slack.post(json!({"ts": "1791349500.000001", "user": "U1"}));
@@ -760,7 +800,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_new_top_level_message_wakes_once_and_noise_does_not() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let baseline = watcher.baseline().await.unwrap();
 
         slack.post(json!({"ts": "1791349500.000001", "subtype": "channel_join", "user": "U3"}));
@@ -791,7 +831,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_message_in_an_unexpected_shape_is_dropped_not_misread() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let baseline = watcher.baseline().await.unwrap();
         slack.post(json!({"ts": "1791349500.000001", "user": "U1", "thread_ts": "garbage"}));
         slack.post(json!({"ts": "1791349500.000002", "user": "U1"}));
@@ -803,7 +843,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_poll_follows_every_page_in_order() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch()).with_paging(2, 10);
+        let mut watcher =
+            Watcher::new(&slack, channel_watch(), SlackFilters::default()).with_paging(2, 10);
         let baseline = watcher.baseline().await.unwrap();
         for i in 1..=5 {
             slack.post(json!({"ts": format!("1791349500.00000{i}"), "user": "U1"}));
@@ -829,7 +870,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn past_the_page_cap_the_oldest_new_messages_are_skipped() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch()).with_paging(2, 2);
+        let mut watcher =
+            Watcher::new(&slack, channel_watch(), SlackFilters::default()).with_paging(2, 2);
         let baseline = watcher.baseline().await.unwrap();
         for i in 1..=5 {
             slack.post(json!({"ts": format!("1791349500.00000{i}"), "user": "U1"}));
@@ -850,7 +892,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_thread_past_the_page_cap_reads_the_rest_next_poll() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, thread_watch()).with_paging(2, 2);
+        let mut watcher =
+            Watcher::new(&slack, thread_watch(), SlackFilters::default()).with_paging(2, 2);
         let baseline = watcher.baseline().await.unwrap();
         for i in 1..=5 {
             slack.reply(json!({"ts": format!("1791349600.00000{i}"), "user": "U2",
@@ -875,8 +918,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn replies_wake_the_thread_watch_not_the_channel_watch() {
         let slack = FakeSlack::new();
-        let mut channel = Watcher::new(&slack, channel_watch());
-        let mut thread = Watcher::new(&slack, thread_watch());
+        let mut channel = Watcher::new(&slack, channel_watch(), SlackFilters::default());
+        let mut thread = Watcher::new(&slack, thread_watch(), SlackFilters::default());
         let channel_base = channel.baseline().await.unwrap();
         let thread_base = thread.baseline().await.unwrap();
         assert_eq!(
@@ -909,7 +952,7 @@ mod tests {
     async fn a_thread_with_no_replies_baselines_on_its_parent() {
         let slack = FakeSlack::with_top_level(vec![json!({"ts": PARENT, "user": "U1"})]);
         slack.replies.borrow_mut().clear();
-        let mut watcher = Watcher::new(&slack, thread_watch());
+        let mut watcher = Watcher::new(&slack, thread_watch(), SlackFilters::default());
         assert_eq!(watcher.baseline().await.unwrap().last_ts, ts(PARENT));
     }
 
@@ -917,7 +960,7 @@ mod tests {
     async fn a_reply_ts_is_not_a_thread() {
         let slack = FakeSlack::new();
         let reply = SlackWatch::parse_thread_key(&format!("{CHANNEL}/1791349481.000001")).unwrap();
-        let mut watcher = Watcher::new(&slack, reply);
+        let mut watcher = Watcher::new(&slack, reply, SlackFilters::default());
         assert!(matches!(
             watcher.baseline().await,
             Err(SlackError::Access(_))
@@ -928,7 +971,7 @@ mod tests {
     async fn a_bot_outside_the_channel_joins_once_then_reads() {
         let slack = FakeSlack::new();
         *slack.member.borrow_mut() = false;
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         watcher.baseline().await.unwrap();
         assert_eq!(slack.calls_to("conversations.join"), 1);
     }
@@ -938,7 +981,7 @@ mod tests {
         let slack = FakeSlack::new();
         *slack.member.borrow_mut() = false;
         *slack.join_blip.borrow_mut() = true;
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         assert!(matches!(
             watcher.baseline().await,
             Err(SlackError::Transient(_))
@@ -951,7 +994,7 @@ mod tests {
     async fn a_bot_removed_mid_watch_and_refused_rejoin_is_fatal() {
         let mut slack = FakeSlack::new();
         slack.joinable = false;
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let baseline = watcher.baseline().await.unwrap();
         *slack.member.borrow_mut() = false;
         assert!(matches!(
@@ -965,7 +1008,7 @@ mod tests {
         let mut slack = FakeSlack::new();
         slack.joinable = false;
         *slack.member.borrow_mut() = false;
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         match watcher.baseline().await {
             Err(SlackError::Access(detail)) => assert!(detail.contains("/invite"), "{detail}"),
             other => panic!("expected an access error, got {other:?}"),
@@ -975,7 +1018,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn user_names_are_looked_up_once() {
         let slack = FakeSlack::new();
-        let mut watcher = Watcher::new(&slack, channel_watch());
+        let mut watcher = Watcher::new(&slack, channel_watch(), SlackFilters::default());
         let base = watcher.baseline().await.unwrap();
         slack.post(json!({"ts": "1791349800.000001", "user": "U9"}));
         slack.post(json!({"ts": "1791349800.000002", "user": "U9"}));
@@ -1070,8 +1113,93 @@ mod tests {
             ),
         ];
         for (name, watch, raw, expected) in cases {
-            assert_eq!(disposition(&watch, &message(raw)), expected, "{name}");
+            assert_eq!(
+                disposition(&watch, &SlackFilters::default(), &message(raw)),
+                expected,
+                "{name}"
+            );
         }
+    }
+
+    const MIKEY: &str = "U0AB7RJSQBE";
+    const CLAUDE_APP: &str = "A08SF47R6P4";
+
+    fn app_posts_by_mikey() -> SlackFilters {
+        SlackFilters::new(vec![
+            SlackFilter::parse(&format!("user={MIKEY},app={CLAUDE_APP}")).unwrap(),
+        ])
+    }
+
+    /// The shapes of a real connector post and a real typed post by the same user
+    /// (ADR-0029), with text and blocks removed and the incidental ids replaced.
+    fn connector_post(ts: &str) -> Value {
+        json!({"ts": ts, "type": "message", "user": MIKEY, "app_id": CLAUDE_APP,
+            "thread_ts": PARENT, "parent_user_id": MIKEY, "team": "T0000000001"})
+    }
+
+    fn typed_post(ts: &str) -> Value {
+        json!({"ts": ts, "type": "message", "user": MIKEY,
+            "client_msg_id": "00000000-0000-0000-0000-000000000001",
+            "thread_ts": PARENT, "parent_user_id": MIKEY, "team": "T0000000001"})
+    }
+
+    #[test]
+    fn a_filter_skips_the_connector_post_and_wakes_for_the_typed_one() {
+        let skip = app_posts_by_mikey();
+        assert_eq!(
+            disposition(
+                &thread_watch(),
+                &skip,
+                &message(connector_post("1791502779.408819"))
+            ),
+            Disposition::Skip(SkipReason::Filtered(
+                SlackFilter::parse(&format!("user={MIKEY},app={CLAUDE_APP}")).unwrap()
+            ))
+        );
+        assert_eq!(
+            disposition(
+                &thread_watch(),
+                &skip,
+                &message(typed_post("1791502873.184069"))
+            ),
+            Disposition::Wake
+        );
+    }
+
+    #[test]
+    fn a_message_the_wake_rules_skip_keeps_its_own_reason_under_a_filter() {
+        let skip = SlackFilters::new(vec![SlackFilter::parse(&format!("user={MIKEY}")).unwrap()]);
+        assert_eq!(
+            disposition(
+                &channel_watch(),
+                &skip,
+                &message(json!({"ts": "1.000001", "user": MIKEY, "subtype": "channel_join"}))
+            ),
+            Disposition::Skip(SkipReason::NotSpoken(Subtype::from(
+                "channel_join".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_filtered_reply_moves_the_cursor_but_publishes_nothing() {
+        let slack = FakeSlack::new();
+        let mut watcher = Watcher::new(&slack, thread_watch(), app_posts_by_mikey());
+        let baseline = watcher.baseline().await.unwrap();
+        slack.reply(connector_post("1791349490.000001"));
+        slack.reply(typed_post("1791349491.000001"));
+        slack.reply(connector_post("1791349492.000001"));
+        let (next, woken) = watcher.poll(&baseline).await.unwrap();
+        assert_eq!(
+            woken.iter().map(|m| m.ts.to_string()).collect::<Vec<_>>(),
+            vec!["1791349491.000001"],
+            "only the typed reply wakes"
+        );
+        assert_eq!(
+            next.last_ts,
+            ts("1791349492.000001"),
+            "the cursor passes the filtered posts, so they are not re-read"
+        );
     }
 
     #[test]
@@ -1081,6 +1209,7 @@ mod tests {
             author: "Ben".to_string(),
             user: message(json!({"ts": "1.000001", "user": "U1"})).user,
             bot_id: None,
+            app_id: Some(SlackAppId::parse(CLAUDE_APP).unwrap()),
             subtype: None,
             permalink: "https://x.slack.com/archives/C1/p1791349900000001".to_string(),
         };
@@ -1088,6 +1217,10 @@ mod tests {
         assert_eq!(body["kind"], "slack_message");
         assert_eq!(body["ts"], "1791349900.000001");
         assert_eq!(body["user"], "U1");
+        assert_eq!(
+            body["app_id"], CLAUDE_APP,
+            "so an agent can tell a connector post"
+        );
         assert!(body.get("text").is_none());
         assert!(
             body.get("bot_id").is_none(),

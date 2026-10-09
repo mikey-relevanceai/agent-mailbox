@@ -243,6 +243,18 @@ impl Supervisor {
         .await
     }
 
+    /// Restart the adapter for `watch_id` so it picks up the watch's current
+    /// config, waiting for the old one to finish stopping before the new one
+    /// starts (ADR-0029). Called when a watch's filters change: a running adapter
+    /// read its filters once, at spawn. Starts the adapter if none was running.
+    pub async fn respawn(&self, watch_id: WatchId) -> Result<(), SupervisorError> {
+        self.request(|reply| Command::Respawn {
+            watch_id,
+            reply: Some(reply),
+        })
+        .await
+    }
+
     /// Stop the adapter for `watch_id` (called by `watch::drop_interest` on the
     /// last interest removal). A no-op if nothing is running.
     pub async fn stop_watch(&self, watch_id: WatchId) -> Result<(), SupervisorError> {
@@ -433,7 +445,7 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
             GithubPr::new(owner, repo, *pr).ok().map(|pr| pr.topic())
         }
         WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
-        WatchTarget::Slack(slack) => Some(slack.topic()),
+        WatchTarget::Slack { watch, .. } => Some(watch.topic()),
     }
 }
 
@@ -489,6 +501,10 @@ enum Command {
         reply: Option<Ack>,
     },
     StopWatch {
+        watch_id: WatchId,
+        reply: Option<Ack>,
+    },
+    Respawn {
         watch_id: WatchId,
         reply: Option<Ack>,
     },
@@ -610,6 +626,10 @@ impl Actor {
                 }
                 Command::StopWatch { watch_id, reply } => {
                     let result = self.stop_watch(watch_id).await;
+                    ack(reply, result);
+                }
+                Command::Respawn { watch_id, reply } => {
+                    let result = self.respawn(watch_id).await;
                     ack(reply, result);
                 }
                 Command::Restart { watch_id, epoch } => {
@@ -974,6 +994,42 @@ impl Actor {
         if let Some(epoch) = self.restart_epoch.get_mut(&watch_id) {
             *epoch = epoch.next();
         }
+    }
+
+    /// Stop the running adapter, wait until it has exited, then start a fresh one.
+    ///
+    /// The wait is the point. Starting the new adapter while the old one is still
+    /// in its SIGTERM grace would leave two pollers on one topic for a moment, and
+    /// the old one's final baseline could land after the new one read its own,
+    /// re-firing what the old one had already published. Awaiting the monitor is
+    /// the same graceful teardown [`Self::shutdown_all`] relies on to flush the
+    /// final baseline. It blocks the actor for at most `stop_grace`, which is
+    /// acceptable for an operation a person runs by hand.
+    async fn respawn(&mut self, watch_id: WatchId) -> Result<(), SupervisorError> {
+        self.failures.remove(&watch_id);
+        self.cancel_pending_restart(watch_id);
+        let stopped = self.running.remove(&watch_id);
+        let had_running = stopped.is_some();
+        if let Some(entity) = stopped {
+            let _ = entity.stop_tx.send(());
+            let _ = entity.monitor.await;
+            info!(
+                watch = watch_id.get(),
+                kind = entity.kind.as_str(),
+                repo = %entity.repo,
+                pr = entity.pr,
+                pid = entity.pid,
+                "stopped adapter ahead of a config-change restart"
+            );
+        }
+        let result = self.ensure_running(watch_id).await;
+        info!(
+            watch = watch_id.get(),
+            had_running,
+            pid = ?self.running.get(&watch_id).map(|e| e.pid),
+            "respawned adapter with the watch's current config"
+        );
+        result
     }
 
     /// Stop the adapter for `watch_id` and mark the watch `Stopped`, authoritatively.

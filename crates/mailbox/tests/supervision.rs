@@ -20,6 +20,8 @@
 //! - TTL sweeper drops a stale interest and stops the adapter.
 //! - ADR-0026 an ended session's watch is suspended, and a resume of the same
 //!   session id restarts its adapter.
+//! - ADR-0029 a respawn (a watch's filters changed) stops the old adapter fully
+//!   before the new one starts, so two never poll one entity at once.
 //! - ADR-0028 adapter failure publishes nothing — not on give-up, not on the
 //!   sweep's retries, not on recovery — so it never wakes a subscriber.
 //!
@@ -41,8 +43,8 @@ use mailbox::supervisor::{
     AdapterResolver, ResolveError, ResolvedAdapter, RestartPolicy, Supervisor, reconcile_startup,
     topic_for_watch,
 };
-use mailbox::watch::{SessionResumed, drop_interest, record, resume_session};
-use mailbox_protocol::{AdapterId, GithubPr, Topic};
+use mailbox::watch::{SessionResumed, drop_interest, record, record_slack, resume_session};
+use mailbox_protocol::{AdapterId, GithubPr, SlackFilter, SlackFilters, SlackWatch, Topic};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -778,6 +780,128 @@ async fn ac4_crash_with_interest_restarts_once() {
         "with no interest the adapter stays stopped"
     );
 
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A respawn hands back only once the old adapter is gone and the new one is
+/// running (ADR-0029). Two adapters on one entity, even briefly, could publish
+/// one message twice, and the old one's final baseline could land after the new
+/// one read its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn respawn_stops_the_old_adapter_before_starting_the_new_one() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &pr(7),
+        Duration::from_secs(60),
+        SessionId::new("s1"),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let old = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+
+    supervisor.respawn(watch_id).await.unwrap();
+
+    assert!(
+        !pid_alive(old),
+        "the old adapter was reaped before respawn returned"
+    );
+    let new = supervisor
+        .running_pid(watch_id)
+        .await
+        .expect("a new adapter is running");
+    assert_ne!(new, old);
+    assert_eq!(
+        watch_state(&storage, watch_id).await,
+        WatchState::Running {
+            pid: mailbox::storage::Pid::new(new)
+        }
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A respawn of a watch with no adapter running just starts one, so a filter
+/// change still takes effect when nothing is running. Covered here with a
+/// stopped adapter; a watch backing off or marked failed takes the same branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn respawn_with_nothing_running_starts_the_adapter() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let watched = pr(8);
+    let s1 = SessionId::new("s1");
+    record(
+        &bus,
+        &storage,
+        &supervisor,
+        &watched,
+        Duration::from_secs(60),
+        s1.clone(),
+    )
+    .await
+    .unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let old = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+    // Interest stays, but stop the adapter out from under it.
+    supervisor.stop_watch(watch_id).await.unwrap();
+    assert_pid_reaped(old).await;
+
+    supervisor.respawn(watch_id).await.unwrap();
+    assert!(supervisor.running_pid(watch_id).await.is_some());
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Through the watch layer: a sole session changing its Slack watch's filters
+/// restarts the adapter (so the new filters apply now), and the same filters
+/// again do not (ADR-0029).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changing_a_slack_watchs_filters_restarts_its_adapter_and_repeating_them_does_not() {
+    let (bus, storage, supervisor, _dir) = fresh(StubResolverFixture::interval(20)).await;
+    let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
+    let skip = SlackFilters::new(vec![
+        SlackFilter::parse("user=U0AB7RJSQBE,app=A08SF47R6P4").unwrap(),
+    ]);
+    let s1 = SessionId::new("s1");
+    let watch = |skip: SlackFilters| {
+        record_slack(
+            &bus,
+            &storage,
+            &supervisor,
+            &channel,
+            skip,
+            Duration::from_secs(60),
+            s1.clone(),
+        )
+    };
+
+    watch(SlackFilters::default()).await.unwrap();
+    let watch_id = only_watch_id(&storage).await;
+    let first = poll_until("adapter running", || {
+        let s = supervisor.clone();
+        async move { s.running_pid(watch_id).await }
+    })
+    .await;
+
+    watch(skip.clone()).await.unwrap();
+    let second = supervisor.running_pid(watch_id).await.expect("respawned");
+    assert_ne!(second, first, "a filter change restarts the adapter");
+    assert!(!pid_alive(first));
+
+    watch(skip).await.unwrap();
+    assert_eq!(
+        supervisor.running_pid(watch_id).await,
+        Some(second),
+        "the same filters again leave the adapter alone"
+    );
     supervisor.shutdown().await.unwrap();
 }
 

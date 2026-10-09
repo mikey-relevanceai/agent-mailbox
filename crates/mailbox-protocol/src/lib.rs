@@ -45,6 +45,7 @@ mod ids;
 mod message;
 mod session;
 mod slack;
+mod slack_filter;
 mod subject;
 mod topic;
 
@@ -61,5 +62,8 @@ pub use message::{
 };
 pub use session::SessionId;
 pub use slack::{SlackChannelId, SlackTargetError, SlackTs, SlackWatch};
+pub use slack_filter::{
+    Poster, SlackAppId, SlackFilter, SlackFilterError, SlackFilters, SlackUserId,
+};
 pub use subject::{MAX_LINK_BYTES, MAX_TEXT_CHARS, Subject, SubjectError};
 pub use topic::{GithubPr, Topic, inbox_topic, stub_topic};

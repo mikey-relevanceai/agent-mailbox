@@ -43,9 +43,9 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, ExpiredSuspensions, Pid, ReadPage, ResumeOutcome, SessionId, SubjectBudget,
-    SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId, WatchKind,
-    WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
+    ResumeOutcome, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget, slack_kind,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -375,9 +375,32 @@ impl Storage {
 
     /// Create the watch for this entity, or return the existing one's id if a
     /// watch for the same `(kind, repo, pr)` already exists (idempotent start).
+    /// An existing watch keeps its filters: other sessions share them, so only
+    /// [`Self::record_interest`] may change them (ADR-0029). Production records
+    /// watches through that; this remains for callers that only need the row.
     pub async fn upsert_watch(&self, spec: WatchSpec) -> Result<WatchId, StorageError> {
         self.call(|reply| Command::UpsertWatch { spec, reply })
             .await
+    }
+
+    /// Create or reuse the watch for `spec` and attach `session`'s interest to it,
+    /// in one transaction, unless that would change the filters of a watch other
+    /// sessions are interested in (ADR-0029). One transaction so two sessions
+    /// racing to watch the same entity with different filters cannot both pass
+    /// the check.
+    pub async fn record_interest(
+        &self,
+        spec: WatchSpec,
+        session: SessionId,
+        last_seen: i64,
+    ) -> Result<RecordInterestOutcome, StorageError> {
+        self.call(|reply| Command::RecordInterest {
+            spec,
+            session,
+            last_seen,
+            reply,
+        })
+        .await
     }
 
     /// Set a watch's lifecycle [`WatchState`] (and, for `Running`, its pid).

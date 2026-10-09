@@ -26,14 +26,15 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use mailbox_protocol::{
-    AdapterId, Cursor, Event, EventId, Offset, SlackWatch, Subject, Timestamp, Topic, inbox_topic,
+    AdapterId, Cursor, Event, EventId, Offset, SlackFilters, SlackWatch, Subject, Timestamp, Topic,
+    inbox_topic,
 };
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, ExpiredSuspensions, Pid, ReadPage, ResumeOutcome, SessionId, SubjectBudget,
-    SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId, WatchKind,
-    WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
+    ResumeOutcome, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -180,6 +181,12 @@ pub(crate) enum Command {
     UpsertWatch {
         spec: WatchSpec,
         reply: oneshot::Sender<Result<WatchId, StorageError>>,
+    },
+    RecordInterest {
+        spec: WatchSpec,
+        session: SessionId,
+        last_seen: i64,
+        reply: oneshot::Sender<Result<RecordInterestOutcome, StorageError>>,
     },
     SetWatchState {
         id: WatchId,
@@ -472,6 +479,24 @@ fn handle(conn: &mut Connection, cmd: Command) {
                     spec.target.kind().as_str(),
                     spec.target.repo_column(),
                     spec.target.pr_column()
+                )
+            });
+            let _ = reply.send(result);
+        }
+        Command::RecordInterest {
+            spec,
+            session,
+            last_seen,
+            reply,
+        } => {
+            let result = do_record_interest(conn, &spec, &session, last_seen);
+            log_on_err(&result, "record_interest", || {
+                format!(
+                    "kind={} repo={} pr={} session={}",
+                    spec.target.kind().as_str(),
+                    spec.target.repo_column(),
+                    spec.target.pr_column(),
+                    session.as_str()
                 )
             });
             let _ = reply.send(result);
@@ -1427,26 +1452,30 @@ fn read_topic_unread(
 fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, StorageError> {
     // Idempotent by (kind, repo, pr): a second session watching the same entity
     // reuses the row and its (possibly running) state. The interval and the
-    // (stub) publish count are non-identity fields refreshed on a re-watch;
-    // lifecycle state is owned by SetWatchState, never reset here. Saturate rather
-    // than wrap on the (practically impossible) overflow of an interval, PR
-    // number, or count that exceeds i64 — a wrapped negative would be silently
-    // wrong, whereas a clamp is at worst a harmless over-large value.
+    // (stub) publish count are non-identity fields refreshed on a re-watch. The
+    // (Slack) filters are written on insert only: changing them on an existing
+    // watch is `do_record_interest`'s job, because other sessions share them
+    // (ADR-0029). Lifecycle state is owned by SetWatchState, never reset here.
+    // Saturate rather than wrap on the (practically impossible) overflow of an
+    // interval, PR number, or count that exceeds i64 — a wrapped negative would be
+    // silently wrong, whereas a clamp is at worst a harmless over-large value.
     let interval_ms = i64::try_from(spec.interval.as_millis()).unwrap_or(i64::MAX);
     let pr = i64::try_from(spec.target.pr_column()).unwrap_or(i64::MAX);
     let count = i64::try_from(spec.target.count_column()).unwrap_or(i64::MAX);
     let id: i64 = conn.query_row(
-        "INSERT INTO watch (kind, repo, pr, interval_ms, publish_count, state, child_pid)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'desired', NULL)
+        "INSERT INTO watch (kind, repo, pr, interval_ms, publish_count, filters, state, child_pid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'desired', NULL)
          ON CONFLICT(kind, repo, pr)
-         DO UPDATE SET interval_ms = excluded.interval_ms, publish_count = excluded.publish_count
+         DO UPDATE SET interval_ms = excluded.interval_ms,
+                       publish_count = excluded.publish_count
          RETURNING id",
         params![
             spec.target.kind().as_str(),
             spec.target.repo_column(),
             pr,
             interval_ms,
-            count
+            count,
+            spec.target.filters_column()
         ],
         |row| row.get(0),
     )?;
@@ -1458,6 +1487,98 @@ fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, Stora
         "upserted watch (created or reused existing entity)"
     );
     Ok(WatchId::new(id))
+}
+
+/// Upsert the watch and attach `session`'s interest, refusing a filter change
+/// other sessions would hear (ADR-0029). See [`crate::storage::Storage::record_interest`].
+///
+/// The refusal is decided here, inside the writer's transaction, rather than by
+/// the caller from facts this returned: a decision made outside it would be made
+/// on a read another session's `watch` could invalidate before the write landed.
+///
+/// Stored and requested filters are compared as parsed sets, so "different"
+/// means a different set, never a different spelling of the same one.
+fn do_record_interest(
+    conn: &mut Connection,
+    spec: &WatchSpec,
+    session: &SessionId,
+    last_seen: i64,
+) -> Result<RecordInterestOutcome, StorageError> {
+    let tx = conn.transaction()?;
+    let pr = i64::try_from(spec.target.pr_column()).unwrap_or(i64::MAX);
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, filters FROM watch WHERE kind = ?1 AND repo = ?2 AND pr = ?3",
+            params![spec.target.kind().as_str(), spec.target.repo_column(), pr],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let wanted = spec.target.skip().cloned().unwrap_or_default();
+    let existing = match existing {
+        Some((id, stored)) => {
+            let id = WatchId::new(id);
+            Some((id, slack_filters(id, &stored)?))
+        }
+        None => None,
+    };
+    let filters = match &existing {
+        Some((_, stored)) if *stored != wanted => FilterChange::Replaced,
+        _ => FilterChange::Unchanged,
+    };
+    if let (Some((id, stored)), FilterChange::Replaced) = (&existing, filters) {
+        let other_sessions: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM watch_interest WHERE watch_id = ?1 AND session_id != ?2",
+            params![id.get(), session.as_str()],
+            |row| row.get(0),
+        )?;
+        if other_sessions > 0 {
+            info!(
+                watch = id.get(),
+                session = session.as_str(),
+                other_sessions,
+                current = %stored,
+                wanted = %wanted,
+                "refused a filter change other sessions are relying on"
+            );
+            // Dropping `tx` rolls back; nothing was written.
+            return Ok(RecordInterestOutcome::FiltersInUse {
+                current: stored.clone(),
+                other_sessions: other_sessions.max(0) as u64,
+            });
+        }
+    }
+    let watch = do_upsert_watch(&tx, spec)?;
+    // `do_upsert_watch` never changes an existing row's filters, so a public
+    // upsert cannot skip the check above; this is the one place that does.
+    if filters == FilterChange::Replaced {
+        tx.execute(
+            "UPDATE watch SET filters = ?1 WHERE id = ?2",
+            params![spec.target.filters_column(), watch.get()],
+        )?;
+    }
+    let interest = do_add_interest(&tx, watch, session, last_seen)?;
+    // Read back rather than echo the request, so the caller reports what is stored.
+    let recorded = do_get_watch(&tx, watch)?
+        .ok_or_else(|| StorageError::Corrupt {
+            detail: format!("watch {} vanished inside its own transaction", watch.get()),
+        })?
+        .target;
+    tx.commit()?;
+    if let (FilterChange::Replaced, Some((_, previous))) = (filters, &existing) {
+        info!(
+            watch = watch.get(),
+            session = session.as_str(),
+            previous = %previous,
+            filters = %wanted,
+            "replaced the watch's filters (no other session was interested)"
+        );
+    }
+    Ok(RecordInterestOutcome::Recorded {
+        watch,
+        interest,
+        filter_change: filters,
+        skip: recorded.skip().cloned(),
+    })
 }
 
 fn do_set_watch_state(
@@ -1484,7 +1605,7 @@ fn do_set_watch_state(
 fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, StorageError> {
     let row = conn
         .query_row(
-            "SELECT kind, repo, pr, interval_ms, state, child_pid, publish_count
+            "SELECT kind, repo, pr, interval_ms, state, child_pid, publish_count, filters
              FROM watch WHERE id = ?1",
             params![id.get()],
             |row| {
@@ -1495,12 +1616,22 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
                 let state: String = row.get(4)?;
                 let child_pid: Option<i64> = row.get(5)?;
                 let count: i64 = row.get(6)?;
-                Ok((kind, repo, pr, interval_ms, state, child_pid, count))
+                let filters: String = row.get(7)?;
+                Ok((
+                    kind,
+                    repo,
+                    pr,
+                    interval_ms,
+                    state,
+                    child_pid,
+                    count,
+                    filters,
+                ))
             },
         )
         .optional()?;
 
-    let Some((kind, repo, pr, interval_ms, state, child_pid, count)) = row else {
+    let Some((kind, repo, pr, interval_ms, state, child_pid, count, filters)) = row else {
         return Ok(None);
     };
 
@@ -1513,6 +1644,7 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
         &state,
         child_pid,
         count,
+        &filters,
     )?))
 }
 
@@ -1522,7 +1654,7 @@ fn do_get_watch(conn: &Connection, id: WatchId) -> Result<Option<Watch>, Storage
 /// [`do_get_watch`] apply to every listed row.
 fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, repo, pr, interval_ms, state, child_pid, publish_count
+        "SELECT id, kind, repo, pr, interval_ms, state, child_pid, publish_count, filters
          FROM watch ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -1534,12 +1666,23 @@ fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
         let state: String = row.get(5)?;
         let child_pid: Option<i64> = row.get(6)?;
         let count: i64 = row.get(7)?;
-        Ok((id, kind, repo, pr, interval_ms, state, child_pid, count))
+        let filters: String = row.get(8)?;
+        Ok((
+            id,
+            kind,
+            repo,
+            pr,
+            interval_ms,
+            state,
+            child_pid,
+            count,
+            filters,
+        ))
     })?;
 
     let mut watches = Vec::new();
     for row in rows {
-        let (id, kind, repo, pr, interval_ms, state, child_pid, count) = row?;
+        let (id, kind, repo, pr, interval_ms, state, child_pid, count, filters) = row?;
         watches.push(build_watch(
             WatchId::new(id),
             kind,
@@ -1549,6 +1692,7 @@ fn do_list_watches(conn: &Connection) -> Result<Vec<Watch>, StorageError> {
             &state,
             child_pid,
             count,
+            &filters,
         )?);
     }
     Ok(watches)
@@ -1567,6 +1711,7 @@ fn build_watch(
     state: &str,
     child_pid: Option<i64>,
     count: i64,
+    filters: &str,
 ) -> Result<Watch, StorageError> {
     let kind = WatchKind::parse(&kind).ok_or_else(|| StorageError::Corrupt {
         detail: format!("unknown watch kind {kind:?} for watch {}", id.get()),
@@ -1585,7 +1730,19 @@ fn build_watch(
     // Parse the flat columns into the sum type here, at the corruption-checking
     // boundary, so "a github watch with a publish count" or "a stub watch with a
     // PR number" are rejected as corrupt and unrepresentable downstream. Only
-    // this store writes these rows, and it always writes the unused column as 0.
+    // this store writes these rows, and it always writes the unused column as 0
+    // (and an unused `filters` as `[]`).
+    if !matches!(kind, WatchKind::SlackChannel | WatchKind::SlackThread)
+        && !slack_filters(id, filters)?.is_empty()
+    {
+        return Err(StorageError::Corrupt {
+            detail: format!(
+                "{} watch {} carries filters {filters:?}",
+                kind.as_str(),
+                id.get()
+            ),
+        });
+    }
     let target = match kind {
         WatchKind::GithubPr => {
             if count != 0 {
@@ -1606,18 +1763,14 @@ fn build_watch(
             }
             WatchTarget::Stub { label: repo, count }
         }
-        WatchKind::SlackChannel => WatchTarget::Slack(slack_watch(
-            id,
-            pr,
-            count,
-            SlackWatch::parse_channel_key(&repo),
-        )?),
-        WatchKind::SlackThread => WatchTarget::Slack(slack_watch(
-            id,
-            pr,
-            count,
-            SlackWatch::parse_thread_key(&repo),
-        )?),
+        WatchKind::SlackChannel => WatchTarget::Slack {
+            watch: slack_watch(id, pr, count, SlackWatch::parse_channel_key(&repo))?,
+            skip: slack_filters(id, filters)?,
+        },
+        WatchKind::SlackThread => WatchTarget::Slack {
+            watch: slack_watch(id, pr, count, SlackWatch::parse_thread_key(&repo))?,
+            skip: slack_filters(id, filters)?,
+        },
     };
     let state = reconstruct_state(state, child_pid, id)?;
 
@@ -1647,6 +1800,14 @@ fn slack_watch(
     }
     parsed.map_err(|err| StorageError::Corrupt {
         detail: format!("slack watch {} has an invalid key: {err}", id.get()),
+    })
+}
+
+/// A Slack row's `filters` column. Only parsed filters are ever written, so one
+/// that does not parse now is corrupt, never a reason to run the watch unfiltered.
+fn slack_filters(id: WatchId, filters: &str) -> Result<SlackFilters, StorageError> {
+    serde_json::from_str(filters).map_err(|err| StorageError::Corrupt {
+        detail: format!("slack watch {} has invalid filters: {err}", id.get()),
     })
 }
 
@@ -2223,7 +2384,7 @@ mod tests {
         let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
         let thread = SlackWatch::parse_thread_key("C0C83CXLUL8/1791349480.652779").unwrap();
         let spec = |slack: &SlackWatch| WatchSpec {
-            target: WatchTarget::Slack(slack.clone()),
+            target: slack_target(slack, &[]),
             interval: std::time::Duration::from_secs(60),
         };
         let channel_id = do_upsert_watch(&conn, &spec(&channel)).unwrap();
@@ -2236,12 +2397,165 @@ mod tests {
         );
         assert_eq!(
             do_get_watch(&conn, channel_id).unwrap().unwrap().target,
-            WatchTarget::Slack(channel)
+            slack_target(&channel, &[])
         );
         assert_eq!(
             do_get_watch(&conn, thread_id).unwrap().unwrap().target,
-            WatchTarget::Slack(thread)
+            slack_target(&thread, &[])
         );
+    }
+
+    fn slack_target(watch: &SlackWatch, skip: &[&str]) -> WatchTarget {
+        WatchTarget::Slack {
+            watch: watch.clone(),
+            skip: SlackFilters::new(
+                skip.iter()
+                    .map(|raw| mailbox_protocol::SlackFilter::parse(raw).unwrap())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn slack_spec(skip: &[&str]) -> WatchSpec {
+        WatchSpec {
+            target: slack_target(&SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap(), skip),
+            interval: std::time::Duration::from_secs(60),
+        }
+    }
+
+    const APP_POSTS: &str = "user=U0AB7RJSQBE,app=A08SF47R6P4";
+
+    fn recorded(outcome: RecordInterestOutcome) -> (WatchId, u64, FilterChange) {
+        match outcome {
+            RecordInterestOutcome::Recorded {
+                watch,
+                interest,
+                filter_change,
+                ..
+            } => (watch, interest, filter_change),
+            other => panic!("expected Recorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slack_filters_round_trip_through_the_watch_row() {
+        let mut conn = migrated();
+        let a = SessionId::new("s-a");
+        let (id, interest, change) =
+            recorded(do_record_interest(&mut conn, &slack_spec(&[APP_POSTS]), &a, 1).unwrap());
+        assert_eq!(
+            (interest, change),
+            (1, FilterChange::Unchanged),
+            "a new watch"
+        );
+        assert_eq!(
+            do_get_watch(&conn, id).unwrap().unwrap().target,
+            slack_spec(&[APP_POSTS]).target
+        );
+    }
+
+    #[test]
+    fn a_session_alone_on_a_watch_can_change_its_filters() {
+        let mut conn = migrated();
+        let a = SessionId::new("s-a");
+        recorded(do_record_interest(&mut conn, &slack_spec(&[]), &a, 1).unwrap());
+        let (id, interest, change) =
+            recorded(do_record_interest(&mut conn, &slack_spec(&[APP_POSTS]), &a, 2).unwrap());
+        assert_eq!((interest, change), (1, FilterChange::Replaced));
+        assert_eq!(
+            do_get_watch(&conn, id).unwrap().unwrap().target,
+            slack_spec(&[APP_POSTS]).target
+        );
+        // The same filters again is not a change, so nothing would restart.
+        let (_, _, again) =
+            recorded(do_record_interest(&mut conn, &slack_spec(&[APP_POSTS]), &a, 3).unwrap());
+        assert_eq!(again, FilterChange::Unchanged);
+    }
+
+    #[test]
+    fn a_filter_change_another_session_relies_on_is_refused_and_writes_nothing() {
+        let mut conn = migrated();
+        let a = SessionId::new("s-a");
+        let b = SessionId::new("s-b");
+        let (id, ..) =
+            recorded(do_record_interest(&mut conn, &slack_spec(&[APP_POSTS]), &a, 1).unwrap());
+
+        // B asks for the same channel unfiltered: refused, because A's filter
+        // would silently disappear.
+        let refused = do_record_interest(&mut conn, &slack_spec(&[]), &b, 2).unwrap();
+        assert_eq!(
+            refused,
+            RecordInterestOutcome::FiltersInUse {
+                current: slack_spec(&[APP_POSTS]).target.skip().cloned().unwrap(),
+                other_sessions: 1,
+            }
+        );
+        assert_eq!(interest_count(&conn, id).unwrap(), 1, "B was not attached");
+        assert_eq!(
+            do_get_watch(&conn, id).unwrap().unwrap().target,
+            slack_spec(&[APP_POSTS]).target,
+            "A's filters are intact"
+        );
+
+        // Asking for the filters the watch already has shares it.
+        let (_, interest, change) =
+            recorded(do_record_interest(&mut conn, &slack_spec(&[APP_POSTS]), &b, 3).unwrap());
+        assert_eq!((interest, change), (2, FilterChange::Unchanged));
+    }
+
+    #[test]
+    fn the_outcome_reports_the_filters_as_stored() {
+        let mut conn = migrated();
+        let outcome = do_record_interest(
+            &mut conn,
+            &slack_spec(&[APP_POSTS]),
+            &SessionId::new("s"),
+            1,
+        )
+        .unwrap();
+        let RecordInterestOutcome::Recorded { skip, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        assert_eq!(skip, slack_spec(&[APP_POSTS]).target.skip().cloned());
+    }
+
+    /// A plain upsert must not be a second way to change filters other sessions
+    /// rely on; only the checked path may.
+    #[test]
+    fn a_plain_upsert_never_changes_an_existing_watchs_filters() {
+        let conn = migrated();
+        let id = do_upsert_watch(&conn, &slack_spec(&[APP_POSTS])).unwrap();
+        do_upsert_watch(&conn, &slack_spec(&[])).unwrap();
+        assert_eq!(
+            do_get_watch(&conn, id).unwrap().unwrap().target,
+            slack_spec(&[APP_POSTS]).target
+        );
+    }
+
+    #[test]
+    fn filters_on_a_non_slack_watch_are_corrupt() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, filters, state, child_pid)
+             VALUES (1, 'stub', 'lbl', 0, 1000, 0, '[{\"user\":\"U1X\"}]', 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        let err = do_get_watch(&conn, WatchId::new(1)).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn slack_watch_with_unparseable_filters_is_corrupt_not_unfiltered() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, filters, state, child_pid)
+             VALUES (1, 'slack-channel', 'C0C83CXLUL8', 0, 60000, 0, '[{}]', 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        let err = do_get_watch(&conn, WatchId::new(1)).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt { .. }));
     }
 
     #[test]

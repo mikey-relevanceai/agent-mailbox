@@ -32,14 +32,14 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{GithubPr, SlackWatch, Topic, TopicError, stub_topic};
+use mailbox_protocol::{GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic};
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    ResumeOutcome, SessionId, Storage, StorageError, SubjectBudget, SubscribeOutcome, WatchKind,
-    WatchSpec, WatchState, WatchTarget,
+    FilterChange, RecordInterestOutcome, ResumeOutcome, SessionId, Storage, StorageError,
+    SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget, slack_kind,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -57,6 +57,29 @@ pub enum WatchError {
     /// The stub label did not form a valid `stub.<label>` topic.
     #[error("invalid stub label: {0}")]
     Topic(#[from] TopicError),
+    /// The watch already exists with other filters, and other sessions are
+    /// interested in it (ADR-0029). Nothing was recorded.
+    #[error(
+        "{topic} is already watched by {other_sessions} other session(s) with {}; one adapter \
+         serves every session on a watch, so its filters are shared. Watch it with the same \
+         filters to share it, or ask the other session(s) to change them",
+        describe_filters(current)
+    )]
+    FiltersInUse {
+        topic: Topic,
+        current: SlackFilters,
+        other_sessions: u64,
+    },
+}
+
+/// How a refusal names a watch's filters: their CLI form, or that there are none.
+fn describe_filters(filters: &SlackFilters) -> String {
+    if filters.is_empty() {
+        "no --skip filters".to_string()
+    } else {
+        let flags: Vec<String> = filters.iter().map(|f| format!("--skip {f}")).collect();
+        flags.join(" ")
+    }
 }
 
 /// The outcome of recording a watch: the PR topic, this session's interest
@@ -66,6 +89,9 @@ pub struct WatchRecorded {
     pub topic: Topic,
     pub interest: u64,
     pub subscribe: SubscribeOutcome,
+    /// The filters stored on the watch after this call (ADR-0029); `None` for a
+    /// kind that has none.
+    pub skip: Option<SlackFilters>,
 }
 
 /// The outcome of dropping a watch: always unsubscribes the session from the PR
@@ -210,16 +236,25 @@ pub async fn record_stub(
 /// Record (or reuse) the Slack channel or thread watch for `slack`, attach
 /// `session`'s interest, and subscribe it to the watch's topic. The Slack analogue
 /// of [`record`], keyed by `(kind, key, pr=0)`.
+///
+/// `skip` is the whole filter set the caller wants, not an addition: a re-watch
+/// with none clears them. That matches how every other watch parameter behaves,
+/// and the refusal in [`record_watch`] is what stops it clearing another
+/// session's filters (ADR-0029).
 pub async fn record_slack(
     bus: &Bus,
     storage: &Storage,
     supervisor: &Supervisor,
     slack: &SlackWatch,
+    skip: SlackFilters,
     interval: Duration,
     session: SessionId,
 ) -> Result<WatchRecorded, WatchError> {
     let spec = WatchSpec {
-        target: WatchTarget::Slack(slack.clone()),
+        target: WatchTarget::Slack {
+            watch: slack.clone(),
+            skip,
+        },
         interval,
     };
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
@@ -237,27 +272,51 @@ async fn record_watch(
     topic: Topic,
     session: SessionId,
 ) -> Result<WatchRecorded, WatchError> {
-    let watch_id = storage.upsert_watch(spec).await?;
     // Stamp the interest's last-seen now so the TTL sweeper (card 08) has a fresh
     // liveness baseline; a re-watch refreshes it.
-    let interest = storage
-        .add_interest(watch_id, session.clone(), now_millis())
-        .await?;
+    let (watch_id, interest, filter_change, skip) = match storage
+        .record_interest(spec, session.clone(), now_millis())
+        .await?
+    {
+        RecordInterestOutcome::Recorded {
+            watch,
+            interest,
+            filter_change,
+            skip,
+        } => (watch, interest, filter_change, skip),
+        RecordInterestOutcome::FiltersInUse {
+            current,
+            other_sessions,
+        } => {
+            return Err(WatchError::FiltersInUse {
+                topic,
+                current,
+                other_sessions,
+            });
+        }
+    };
     info!(
         topic = topic.as_str(),
-        interest, "attached session interest to watch"
+        interest,
+        filter_change = ?filter_change,
+        "attached session interest to watch"
     );
     let subscribe = subscribe_one(bus, session, &topic).await?;
 
     // Now that interest is attached, ask the supervisor to run the adapter. It is
     // idempotent (one adapter per entity), so a second session watching the same
-    // entity reuses the running adapter rather than spawning another.
-    supervisor.ensure_running(watch_id).await?;
+    // entity reuses the running adapter rather than spawning another. A running
+    // adapter read its filters at spawn, so a filter change restarts it.
+    match filter_change {
+        FilterChange::Unchanged => supervisor.ensure_running(watch_id).await?,
+        FilterChange::Replaced => supervisor.respawn(watch_id).await?,
+    }
 
     Ok(WatchRecorded {
         topic,
         interest,
         subscribe,
+        skip,
     })
 }
 
@@ -321,13 +380,12 @@ pub async fn drop_interest_slack(
     slack: &SlackWatch,
     session: SessionId,
 ) -> Result<WatchDropped, WatchError> {
-    let target = WatchTarget::Slack(slack.clone());
     drop_interest_for(
         bus,
         storage,
         supervisor,
-        target.kind(),
-        &target.repo_column(),
+        slack_kind(slack),
+        &slack.key(),
         0,
         slack.topic(),
         session,
@@ -604,6 +662,91 @@ mod tests {
     use crate::supervisor::{RestartPolicy, UnavailableResolver};
     use mailbox_protocol::{AdapterId, Timestamp};
     use std::sync::Arc;
+
+    #[test]
+    fn a_refusal_names_the_filters_in_force_as_flags() {
+        let filter = |raw: &str| mailbox_protocol::SlackFilter::parse(raw).unwrap();
+        assert_eq!(
+            describe_filters(&SlackFilters::default()),
+            "no --skip filters"
+        );
+        assert_eq!(
+            describe_filters(&SlackFilters::new(vec![
+                filter("app=A1"),
+                filter("user=U1")
+            ])),
+            "--skip app=A1 --skip user=U1",
+            "one flag per filter, in the canonical order, so it can be pasted back"
+        );
+    }
+
+    /// The refusal reaches the caller as `FiltersInUse` and records nothing; the
+    /// sole session's change is recorded and echoed. No adapter resolves here, so
+    /// the respawn itself is covered in `tests/supervision.rs`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn record_slack_refuses_a_shared_change_and_records_a_sole_one() {
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();
+        let skip = SlackFilters::new(vec![
+            mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE,app=A08SF47R6P4").unwrap(),
+        ]);
+        let a = SessionId::new("s-a");
+        let b = SessionId::new("s-b");
+        let interval = Duration::from_secs(60);
+
+        let recorded = record_slack(
+            &bus,
+            &storage,
+            &supervisor,
+            &channel,
+            skip.clone(),
+            interval,
+            a.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.skip, Some(skip.clone()));
+
+        let refused = record_slack(
+            &bus,
+            &storage,
+            &supervisor,
+            &channel,
+            SlackFilters::default(),
+            interval,
+            b.clone(),
+        )
+        .await
+        .unwrap_err();
+        match refused {
+            WatchError::FiltersInUse {
+                current,
+                other_sessions,
+                ..
+            } => {
+                assert_eq!((current, other_sessions), (skip.clone(), 1));
+            }
+            other => panic!("expected FiltersInUse, got {other:?}"),
+        }
+        assert!(
+            storage.session_subscriptions(b).await.unwrap().is_empty(),
+            "the refused session was not subscribed either"
+        );
+
+        let cleared = record_slack(
+            &bus,
+            &storage,
+            &supervisor,
+            &channel,
+            SlackFilters::default(),
+            interval,
+            a,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.skip, Some(SlackFilters::default()));
+        supervisor.shutdown().await.unwrap();
+    }
 
     // These unit tests use the `UnavailableResolver`, so `record` records intent
     // and drives the supervisor but no adapter is spawned (the watch stays

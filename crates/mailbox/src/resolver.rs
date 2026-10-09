@@ -85,9 +85,11 @@ impl AdapterResolver for StubResolver {
         match &watch.target {
             // Other kinds have their own resolvers; DefaultResolver never routes
             // them here.
-            WatchTarget::GithubPr { .. } | WatchTarget::Slack(_) => Err(ResolveError::NoAdapter {
-                kind: watch.target.kind(),
-            }),
+            WatchTarget::GithubPr { .. } | WatchTarget::Slack { .. } => {
+                Err(ResolveError::NoAdapter {
+                    kind: watch.target.kind(),
+                })
+            }
             WatchTarget::Stub { label, count } => {
                 // Derive the whole config (topic/interval/count) from the watch row
                 // so a re-watch's updated interval/count take effect on respawn.
@@ -166,7 +168,7 @@ impl GithubPrResolver {
 impl AdapterResolver for GithubPrResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
-            WatchTarget::Stub { .. } | WatchTarget::Slack(_) => Err(ResolveError::NoAdapter {
+            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } => Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             }),
             WatchTarget::GithubPr { repo, pr } => {
@@ -219,6 +221,8 @@ const SLACK_ADAPTER_ID: &str = "slack-adapter";
 ///
 /// The config carries no credential. The adapter reads its Slack token from the
 /// macOS Keychain itself (ADR-0027), so the token never passes through the bridge.
+/// It does carry the watch's filters, which the adapter applies before it
+/// publishes (ADR-0029).
 pub struct SlackResolver;
 
 impl SlackResolver {
@@ -244,7 +248,7 @@ impl SlackResolver {
 
 impl AdapterResolver for SlackResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
-        let WatchTarget::Slack(slack) = &watch.target else {
+        let WatchTarget::Slack { watch: slack, skip } = &watch.target else {
             return Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             });
@@ -254,12 +258,14 @@ impl AdapterResolver for SlackResolver {
             "channel": slack.channel().as_str(),
             "thread_ts": slack.thread_ts().map(|ts| ts.to_string()),
             "interval_ms": interval_ms(watch),
+            "skip": skip,
         });
         let (program, env_override) = SlackResolver::program();
         debug!(
             watch = watch.id.get(),
             program = %program,
             env_override,
+            skip = %skip,
             "resolved slack adapter binary"
         );
         Ok(ResolvedAdapter {
@@ -311,7 +317,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use mailbox_protocol::SlackWatch;
+    use mailbox_protocol::{SlackFilter, SlackFilters, SlackWatch};
 
     use crate::storage::{WatchId, WatchKind, WatchState};
 
@@ -340,6 +346,10 @@ mod tests {
     }
 
     fn slack_watch(key: &str) -> Watch {
+        slack_watch_skipping(key, &[])
+    }
+
+    fn slack_watch_skipping(key: &str, skip: &[&str]) -> Watch {
         let slack = if key.contains('/') {
             SlackWatch::parse_thread_key(key)
         } else {
@@ -347,7 +357,14 @@ mod tests {
         };
         Watch {
             id: WatchId::new(3),
-            target: WatchTarget::Slack(slack.unwrap()),
+            target: WatchTarget::Slack {
+                watch: slack.unwrap(),
+                skip: SlackFilters::new(
+                    skip.iter()
+                        .map(|raw| SlackFilter::parse(raw).unwrap())
+                        .collect(),
+                ),
+            },
             interval: Duration::from_secs(60),
             state: WatchState::Desired,
         }
@@ -361,7 +378,7 @@ mod tests {
         assert_eq!(
             channel.config.value(),
             &json!({"topic": "slack.channel.C0C83CXLUL8", "channel": "C0C83CXLUL8",
-                "thread_ts": null, "interval_ms": 60_000})
+                "thread_ts": null, "interval_ms": 60_000, "skip": []})
         );
         let thread = SlackResolver
             .resolve(&slack_watch("C0C83CXLUL8/1791349480.652779"))
@@ -370,7 +387,22 @@ mod tests {
             thread.config.value(),
             &json!({"topic": "slack.thread.C0C83CXLUL8/1791349480.652779",
                 "channel": "C0C83CXLUL8", "thread_ts": "1791349480.652779",
-                "interval_ms": 60_000})
+                "interval_ms": 60_000, "skip": []})
+        );
+    }
+
+    /// The filters reach the adapter in the shape it decodes them from.
+    #[test]
+    fn slack_resolver_hands_the_adapter_its_filters() {
+        let resolved = SlackResolver
+            .resolve(&slack_watch_skipping(
+                "C0C83CXLUL8",
+                &["user=U0AB7RJSQBE,app=A08SF47R6P4"],
+            ))
+            .unwrap();
+        assert_eq!(
+            resolved.config.value()["skip"],
+            json!([{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}])
         );
     }
 

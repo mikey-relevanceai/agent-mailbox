@@ -5,7 +5,8 @@
   [0005](../adr/0005-baseline-via-protocol.md),
   [0014](../adr/0014-self-authored-events-wake-their-author.md),
   [0022](../adr/0022-the-wake-carries-a-subject.md),
-  [0027](../adr/0027-adapter-secrets-live-in-the-keychain.md)
+  [0027](../adr/0027-adapter-secrets-live-in-the-keychain.md),
+  [0029](../adr/0029-watch-filters-run-in-the-adapter.md)
 
 ## Goal
 
@@ -19,6 +20,7 @@ them when someone else posted.
 mailbox watch slack-channel C0C83CXLUL8
 mailbox watch slack-thread  C0C83CXLUL8/1791349480.652779
 mailbox watch slack-thread  https://tryrelevance.slack.com/archives/C0C83CXLUL8/p1791349480652779
+mailbox watch slack-channel C0C83CXLUL8 --skip user=U0AB7RJSQBE,app=A08SF47R6P4
 ```
 
 ## Non-goals
@@ -65,7 +67,7 @@ mailbox watch slack-thread <link>
   → CLI parses the link into SlackTarget{channel, thread_ts}
   → daemon parses it into SlackWatch, records the watch + interest, subscribes
   → supervisor → SlackResolver → mailbox-slack-adapter
-       config {topic, channel, thread_ts, interval_ms, baseline}
+       config {topic, channel, thread_ts, interval_ms, skip, baseline}
   → adapter: token from Keychain → curl → Slack → Publish / Baseline lines
   → host relays; the bridge wakes subscribers
 ```
@@ -80,8 +82,10 @@ mailbox watch slack-thread <link>
   parsed target rather than re-checking strings.
 - **Storage.** Two watch kinds, `slack-channel` and `slack-thread`, on the existing
   flat row: the watch key (`<C>` or `<C>/<ts>`) in `repo`, `0` in `pr` and
-  `publish_count`, the same way a stub stores its label. No migration.
-  `build_watch` parses the key back, and an unparseable one is corrupt.
+  `publish_count`, the same way a stub stores its label. `build_watch` parses the
+  key back, and an unparseable one is corrupt. The watch's `--skip` filters are
+  canonical JSON in `filters` (schema v9, [ADR-0029](../adr/0029-watch-filters-run-in-the-adapter.md)),
+  parsed back the same way.
 - **One adapter for both kinds**, `adapters/slack-adapter`, resolved like the others:
   `MAILBOX_SLACK_ADAPTER_BIN`, else beside the bridge binary, else `PATH`.
 
@@ -95,15 +99,28 @@ mailbox watch slack-thread <link>
 | The thread's parent | — | skipped |
 | `channel_join`, `channel_leave`, topic/purpose/name changes | skipped | skipped |
 | `message_changed`, `message_deleted`, `hidden` | skipped | skipped |
+| Anything above that wakes, but matches a `--skip` filter | skipped | skipped |
 
-**Authorship is not filtered.** The setup this was built for has every agent posting
-through one person's claude.ai Slack connector, so they all post as that person's
-Slack user (inferred from how the connector authenticates; attribution was not
-checked message by message). Then a session's own post is indistinguishable from a peer's, and
-filtering on author would silence the peers too. A session is woken by its own post,
-the trade [ADR-0014](../adr/0014-self-authored-events-wake-their-author.md) made for
-`publish`. If agents ever post under distinct identities, an opt-in author filter
-becomes possible; nothing needs it yet.
+**Authorship is not filtered by default.** The setup this was built for has agents
+posting through one person's claude.ai Slack connector, so they post as that
+person's Slack user. Then a session's own post is indistinguishable from a peer's by
+author, and a session is woken by its own post: the trade
+[ADR-0014](../adr/0014-self-authored-events-wake-their-author.md) made for `publish`.
+
+**A watch can opt in to filters** ([ADR-0029](../adr/0029-watch-filters-run-in-the-adapter.md)).
+`--skip key=value[,key=value]` (repeatable) skips a message that meets every
+condition of any filter. The keys are `user=<U…>` and `app=<A…>`. A connector post
+carries the connector's `app_id`, and the typed messages measured carried none
+(ADR-0029 has the measurement and its limits). So `--skip user=U0AB7RJSQBE,app=A08SF47R6P4`
+skips that person's agent posts in the tryrelevance workspace and keeps what they
+type. It also skips any peer agent posting through the same connector as that person.
+
+The adapter applies filters after the rows above, so a join is still logged as a
+join. A filtered message advances the cursor and is logged at `info` with its `ts` and
+the filter; it is never published, so the bridge stores nothing for it. The filters
+are the watch's, shared by every session on it: a `watch` whose `--skip` set differs
+from the stored one is refused while another session is interested, and otherwise
+replaces it and respawns the adapter.
 
 ### Cursor and baseline
 
@@ -129,7 +146,7 @@ Each message is parsed once, where it leaves the API, into a typed `SlackMessage
 message whose `ts` or `thread_ts` is malformed is dropped with a warning rather than
 read as if the field were absent. The text is never deserialized.
 
-The body is `{kind, channel, ts, thread_ts?, user?, bot_id?, subtype?, permalink}`.
+The body is `{kind, channel, ts, thread_ts?, user?, bot_id?, app_id?, subtype?, permalink}`.
 **It never carries the text.** The woken agent reads the message through its own Slack
 access. That keeps third-party text, which is a prompt-injection surface, out of the
 bridge's log and out of `mailbox read`.
@@ -158,6 +175,11 @@ retries a failed watch while someone still wants it.
 ## Test plan
 
 - **Protocol:** id, ts and link parsing; numeric ts order; key and topic round trip.
+- **Filters:** grammar, matching and the canonical set (protocol); the stored
+  column, the refusal and the replace (storage); the respawn waiting for the old
+  adapter (supervisor); a connector post skipped and a typed one woken (adapter
+  unit and e2e); and through the bridge, `--skip` reaching the adapter, another
+  session refused, and a change respawning it.
 - **Adapter unit tests:** the wake table, row by row, over typed messages; and an
   in-memory fake Slack (history newest-first, replies parent-first, both paged by
   `limit` and `cursor`) covering the cursor, an empty channel, pagination, the page

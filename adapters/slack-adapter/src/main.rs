@@ -22,12 +22,15 @@
 //!   "channel": "C0C83CXLUL8",
 //!   "thread_ts": "1791349480.652779",
 //!   "interval_ms": 60000,
+//!   "skip": [{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}],
 //!   "baseline": null,
 //!   "max_polls": 0
 //! }
 //! ```
 //!
 //! - `thread_ts` absent or `null` ⇒ a channel watch.
+//! - `skip` absent ⇒ no filters. A filter that does not parse fails the config,
+//!   rather than running the watch unfiltered (ADR-0029).
 //! - `interval_ms` absent or `0` ⇒ [`DEFAULT_INTERVAL_MS`].
 //! - `max_polls` stops cleanly after that many polls; `0` ⇒ until SIGTERM.
 //!
@@ -55,8 +58,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, error_span, info, warn};
 
 use mailbox_protocol::{
-    AdapterId, Baseline as BaselineMsg, Message, Publish, SlackChannelId, SlackTargetError,
-    SlackTs, SlackWatch, Topic, encode_line,
+    AdapterId, Baseline as BaselineMsg, Message, Publish, SlackChannelId, SlackFilters,
+    SlackTargetError, SlackTs, SlackWatch, Topic, encode_line,
 };
 
 use api::{CurlSlack, SlackApi, SlackError};
@@ -95,6 +98,8 @@ struct Config {
     thread_ts: Option<String>,
     #[serde(default)]
     interval_ms: u64,
+    #[serde(default)]
+    skip: SlackFilters,
     #[serde(default)]
     baseline: Value,
     #[serde(default)]
@@ -181,7 +186,9 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
     let mut stdout = tokio::io::stdout();
 
     let token = token::load().await?;
-    let mut watcher = Watcher::new(CurlSlack::new(token), watch);
+    let skip = config.skip.to_string();
+    let skip_count = config.skip.iter().count();
+    let mut watcher = Watcher::new(CurlSlack::new(token), watch, config.skip);
     let mut baseline = injected_baseline(config.baseline);
 
     let mut ticker = tokio::time::interval(interval);
@@ -190,6 +197,8 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
         interval_ms = interval.as_millis() as u64,
         resuming = baseline.is_some(),
         max_polls = config.max_polls,
+        skip_count,
+        skip = %skip,
         "slack adapter started"
     );
 
