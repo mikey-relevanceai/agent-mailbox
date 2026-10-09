@@ -64,7 +64,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, GithubPr, SlackWatch, Subject, Timestamp, Topic};
+use mailbox_protocol::{AdapterId, GithubPr, SlackFilters, SlackWatch, Subject, Timestamp, Topic};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
@@ -634,7 +634,19 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
             session,
             target,
             interval_secs,
-        } => watch_slack(bus, storage, supervisor, session, target, interval_secs).await,
+            skip,
+        } => {
+            watch_slack(
+                bus,
+                storage,
+                supervisor,
+                session,
+                target,
+                skip,
+                interval_secs,
+            )
+            .await
+        }
         Request::UnwatchSlack { session, target } => {
             unwatch_slack(bus, storage, supervisor, session, target).await
         }
@@ -821,6 +833,7 @@ async fn watch(
             topic: recorded.topic,
             interest: recorded.interest,
             subscribe: recorded.subscribe.into(),
+            skip: recorded.skip,
         },
         Err(err) => Response::error(err.to_string()),
     }
@@ -874,6 +887,7 @@ async fn watch_stub(
             topic: recorded.topic,
             interest: recorded.interest,
             subscribe: recorded.subscribe.into(),
+            skip: recorded.skip,
         },
         Err(err) => Response::error(err.to_string()),
     }
@@ -903,6 +917,7 @@ async fn watch_slack(
     supervisor: &Supervisor,
     session: SessionId,
     target: SlackWatch,
+    skip: SlackFilters,
     interval_secs: u64,
 ) -> Response {
     match mailbox::watch::record_slack(
@@ -910,6 +925,7 @@ async fn watch_slack(
         storage,
         supervisor,
         &target,
+        skip,
         Duration::from_secs(interval_secs),
         session,
     )
@@ -919,6 +935,7 @@ async fn watch_slack(
             topic: recorded.topic,
             interest: recorded.interest,
             subscribe: recorded.subscribe.into(),
+            skip: recorded.skip,
         },
         Err(err) => Response::error(err.to_string()),
     }

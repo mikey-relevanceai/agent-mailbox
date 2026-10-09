@@ -437,8 +437,8 @@ Add global `--json` for machine-readable stdout.
 | `mailbox read [--limit <n>]` | Return unread events, advance the cursor. |
 | `mailbox watch github-pr <owner>/<repo>#<n> [--interval <secs>]` | Watch a PR: record interest, subscribe to the PR topic, and (via the daemon) spawn the shared edge-triggered `github-pr` poller. Default interval 60s. |
 | `mailbox unwatch github-pr <owner>/<repo>#<n>` | Drop this session's interest + unsubscribe; the poller stops only when the last interested session leaves. |
-| `mailbox watch slack-channel <channel> [--interval <secs>]` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
-| `mailbox watch slack-thread <channel>/<ts> [--interval <secs>]` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
+| `mailbox watch slack-channel <channel> [--interval <secs>] [--skip <filter>]…` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
+| `mailbox watch slack-thread <channel>/<ts> [--interval <secs>] [--skip <filter>]…` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
 | `mailbox unwatch slack-channel <channel>` / `unwatch slack-thread <channel>/<ts>` | Stop watching. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
@@ -466,6 +466,29 @@ The adapter reads the token itself; the bridge, its database and its environment
 never hold it ([ADR-0027](adr/0027-adapter-secrets-live-in-the-keychain.md)). The bot
 joins a public channel by itself the first time it is watched; a private channel needs
 an `/invite`. macOS only for now.
+
+**Filters.** `--skip` stops matching messages from waking you
+([ADR-0029](adr/0029-watch-filters-run-in-the-adapter.md)). A filter is
+`key=value[,key=value]`, and every condition must hold; repeat `--skip` for more
+filters. The keys are `user=<U…>` and `app=<A…>`. In the workspace this was
+measured in, an agent posting through the claude.ai Slack connector posted as the
+person's own user, through the connector's app. A
+filter on both skips those posts and still wakes you for what you type yourself:
+
+```bash
+mailbox watch slack-channel <CHANNEL_ID> --skip user=<YOUR_USER_ID>,app=<CONNECTOR_APP_ID>
+```
+
+In the tryrelevance workspace the connector's app id measured as `A08SF47R6P4`
+([ADR-0029](adr/0029-watch-filters-run-in-the-adapter.md)). Elsewhere, check the
+`app_id` on one of your agent's posts (`conversations.history` returns it) before
+relying on it.
+
+A skipped message is never published, so it is not in `mailbox read` either. It is
+still in Slack. The flag states the whole set: watching again without `--skip` clears
+the filters. One adapter serves everyone watching a channel, so the filters are
+shared. Changing them is refused while another session watches it, and otherwise
+restarts the adapter. `mailbox status` shows each watch's `skip=[…]`.
 
 ### Publishing: one rule
 

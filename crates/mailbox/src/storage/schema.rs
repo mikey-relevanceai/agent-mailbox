@@ -21,8 +21,8 @@ use super::error::StorageError;
 /// v6 drops that column again, along with the one rule that read it — see
 /// [`SCHEMA_V6`]. v7 (ADR-0022) adds the event's subject line — see [`SCHEMA_V7`].
 /// v8 (ADR-0026) keeps an ended session's watches so a resume can restore them —
-/// see [`SCHEMA_V8`].
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+/// see [`SCHEMA_V8`]. v9 (ADR-0029) gives a watch its filters — see [`SCHEMA_V9`].
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Version 1 of the schema.
 ///
@@ -246,6 +246,20 @@ CREATE TABLE suspended_subscription (
 );
 "#;
 
+/// Version 9 of the schema (ADR-0029): a watch's filters.
+///
+/// A JSON array of the filters the watch's adapter applies before publishing,
+/// `[]` for none. Only Slack watches have any today; every other kind stores
+/// `[]`, which `build_watch` enforces. A non-identity column, like
+/// `publish_count`: a watch is still one row per `(kind, repo, pr)`, and two
+/// sessions with different filters are a conflict the writer refuses, not two
+/// watches.
+///
+/// `DEFAULT '[]'` gives every existing watch no filters, which is what it had.
+const SCHEMA_V9: &str = r#"
+ALTER TABLE watch ADD COLUMN filters TEXT NOT NULL DEFAULT '[]';
+"#;
+
 /// Bring an open connection up to [`SCHEMA_VERSION`], creating the schema on a
 /// fresh DB and no-op'ing on an up-to-date one. Idempotent: safe to call on
 /// every open.
@@ -292,6 +306,9 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     }
     if current < 8 {
         sql.push_str(SCHEMA_V8);
+    }
+    if current < 9 {
+        sql.push_str(SCHEMA_V9);
     }
     sql.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
@@ -605,6 +622,50 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM subscription"), 1);
         assert_eq!(count("SELECT COUNT(*) FROM suspended_interest"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM suspended_subscription"), 0);
+    }
+
+    /// A v8 database on disk with a running Slack watch migrates forward with the
+    /// watch intact and filterless: the upgrade must not change what wakes anyone.
+    #[test]
+    fn on_disk_v8_to_v9_migration_gives_every_watch_no_filters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mailbox.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+                 VALUES (1, 'slack-channel', 'C0C83CXLUL8', 0, 60000, 0, 'running', 4242);
+                 INSERT INTO watch_interest (watch_id, session_id, last_seen) VALUES (1, 's', 42);
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let (repo, state, filters): (String, String, String) = conn
+            .query_row(
+                "SELECT repo, state, filters FROM watch WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (repo.as_str(), state.as_str(), filters.as_str()),
+            ("C0C83CXLUL8", "running", "[]")
+        );
     }
 
     #[test]

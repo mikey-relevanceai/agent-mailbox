@@ -7,8 +7,8 @@
 //! the field were absent (which would let a reply pass for a top-level message).
 //! Fields the adapter does not use, `text` above all, are never deserialized.
 
-use mailbox_protocol::SlackTs;
-use serde::Deserialize;
+use mailbox_protocol::{SlackAppId, SlackTs, SlackUserId};
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SlackMessage {
@@ -22,10 +22,15 @@ pub struct SlackMessage {
     pub subtype: Option<Subtype>,
     #[serde(default)]
     pub hidden: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub user: Option<SlackUserId>,
     #[serde(default)]
     pub bot_id: Option<String>,
+    /// The app a message was posted through, e.g. the claude.ai connector posting
+    /// as a person's own user. Absent on a message typed in a Slack client
+    /// (ADR-0029 has the measurement).
+    #[serde(default, deserialize_with = "lenient")]
+    pub app_id: Option<SlackAppId>,
     /// The name a bot or integration posted under.
     #[serde(default)]
     pub username: Option<String>,
@@ -39,16 +44,17 @@ pub struct BotProfile {
     pub name: Option<String>,
 }
 
-/// A Slack user id (`U…`/`W…`). Distinct from a bot id so a bot's id cannot be
-/// sent to `users.info`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-#[serde(transparent)]
-pub struct SlackUserId(String);
-
-impl SlackUserId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// An id field that reads as absent when it is not a valid id, rather than
+/// failing the whole message. Unlike `ts`, these only decorate a message or feed
+/// a `--skip` filter, and an absent id is the safe reading for both: no `user=` or
+/// `app=` condition can match it, so a malformed id wakes rather than silences.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: TryFrom<String>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| T::try_from(raw).ok()))
 }
 
 /// A message subtype. The four named ones are someone saying something; every
@@ -98,12 +104,13 @@ mod tests {
     fn parses_the_fields_the_rules_use_and_ignores_the_text() {
         let message: SlackMessage = serde_json::from_value(json!({
             "ts": "1791349500.000002", "thread_ts": "1791349480.652779",
-            "subtype": "thread_broadcast", "user": "U1", "text": "anything at all",
-            "blocks": [{"type": "rich_text"}]
+            "subtype": "thread_broadcast", "user": "U0AB7RJSQBE", "text": "anything at all",
+            "blocks": [{"type": "rich_text"}], "app_id": "A08SF47R6P4"
         }))
         .unwrap();
         assert_eq!(message.subtype, Some(Subtype::ThreadBroadcast));
-        assert_eq!(message.user.unwrap().as_str(), "U1");
+        assert_eq!(message.user.unwrap().as_str(), "U0AB7RJSQBE");
+        assert_eq!(message.app_id.unwrap().as_str(), "A08SF47R6P4");
         assert!(!message.hidden);
     }
 
@@ -113,6 +120,16 @@ mod tests {
             "ts": "1791349500.000002", "thread_ts": "not-a-ts"
         }));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn a_malformed_user_or_app_id_reads_as_absent_and_keeps_the_message() {
+        let message: SlackMessage = serde_json::from_value(json!({
+            "ts": "1791349500.000002", "user": "not a user", "app_id": "Claude"
+        }))
+        .unwrap();
+        assert_eq!(message.user, None);
+        assert_eq!(message.app_id, None);
     }
 
     #[test]

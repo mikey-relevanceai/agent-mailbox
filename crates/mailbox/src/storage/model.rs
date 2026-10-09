@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use mailbox_protocol::{Cursor, Event, Offset, SlackWatch};
+use mailbox_protocol::{Cursor, Event, Offset, SlackFilters, SlackWatch};
 // The session identity is shared with the harness, so it lives in the protocol
 // crate (see `mailbox_protocol::session`). Re-exported here so the many existing
 // `mailbox::storage::SessionId` call sites keep working unchanged.
@@ -147,7 +147,13 @@ pub enum WatchTarget {
     Stub { label: String, count: u64 },
     /// A Slack channel or thread. Stored with its [`SlackWatch::key`] in the
     /// `repo` column and `0` in the others, the same way a stub stores its label.
-    Slack(SlackWatch),
+    ///
+    /// `skip` is the watch's filters (ADR-0029): like a stub's count, part of what
+    /// the adapter is told to do, not part of the watch's identity.
+    Slack {
+        watch: SlackWatch,
+        skip: SlackFilters,
+    },
 }
 
 impl WatchTarget {
@@ -156,8 +162,7 @@ impl WatchTarget {
         match self {
             WatchTarget::GithubPr { .. } => WatchKind::GithubPr,
             WatchTarget::Stub { .. } => WatchKind::Stub,
-            WatchTarget::Slack(SlackWatch::Channel { .. }) => WatchKind::SlackChannel,
-            WatchTarget::Slack(SlackWatch::Thread { .. }) => WatchKind::SlackThread,
+            WatchTarget::Slack { watch, .. } => slack_kind(watch),
         }
     }
 
@@ -167,7 +172,7 @@ impl WatchTarget {
         match self {
             WatchTarget::GithubPr { repo, .. } => repo.clone(),
             WatchTarget::Stub { label, .. } => label.clone(),
-            WatchTarget::Slack(slack) => slack.key(),
+            WatchTarget::Slack { watch, .. } => watch.key(),
         }
     }
 
@@ -175,16 +180,45 @@ impl WatchTarget {
     pub fn pr_column(&self) -> u64 {
         match self {
             WatchTarget::GithubPr { pr, .. } => *pr,
-            WatchTarget::Stub { .. } | WatchTarget::Slack(_) => 0,
+            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } => 0,
         }
     }
 
     /// The flat `publish_count` column: `0` (unused) for github, the count for stub.
     pub fn count_column(&self) -> u64 {
         match self {
-            WatchTarget::GithubPr { .. } | WatchTarget::Slack(_) => 0,
+            WatchTarget::GithubPr { .. } | WatchTarget::Slack { .. } => 0,
             WatchTarget::Stub { count, .. } => *count,
         }
+    }
+
+    /// The watch's filters, for the kinds that have any.
+    pub fn skip(&self) -> Option<&SlackFilters> {
+        match self {
+            WatchTarget::Slack { skip, .. } => Some(skip),
+            WatchTarget::GithubPr { .. } | WatchTarget::Stub { .. } => None,
+        }
+    }
+
+    /// The `filters` column: the Slack filters as a JSON array, `[]` for the
+    /// kinds that have none. This is `SlackFilters`' serde form, so that form is
+    /// now persisted: changing it is a schema migration, and a row an older
+    /// reader cannot parse fails as corrupt rather than running unfiltered.
+    pub fn filters_column(&self) -> String {
+        match self {
+            WatchTarget::GithubPr { .. } | WatchTarget::Stub { .. } => "[]".to_string(),
+            WatchTarget::Slack { skip, .. } => {
+                serde_json::to_string(skip).expect("Slack filters always serialize")
+            }
+        }
+    }
+}
+
+/// The watch kind of a Slack target, which its shape alone decides.
+pub fn slack_kind(watch: &SlackWatch) -> WatchKind {
+    match watch {
+        SlackWatch::Channel { .. } => WatchKind::SlackChannel,
+        SlackWatch::Thread { .. } => WatchKind::SlackThread,
     }
 }
 
@@ -201,6 +235,42 @@ pub struct WatchSpec {
     /// Desired poll interval. Stored with millisecond precision so a sub-second
     /// stub interval survives the round trip.
     pub interval: Duration,
+}
+
+/// What recording a session's interest in a watch did (ADR-0029).
+///
+/// A watch's filters belong to every session watching it, because one adapter
+/// serves them all. So a re-watch asking for different filters is refused while
+/// another session holds interest, rather than changing what that session hears
+/// without telling it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordInterestOutcome {
+    /// The watch exists (created or reused) and this session's interest is on it.
+    Recorded {
+        watch: WatchId,
+        /// Interested sessions, this one included.
+        interest: u64,
+        filter_change: FilterChange,
+        /// The filters now stored on the watch, read back after the write;
+        /// `None` for a kind that has none.
+        skip: Option<SlackFilters>,
+    },
+    /// Nothing was written: the watch has different filters and other sessions
+    /// are interested in it. `current` is the filter set it has.
+    FiltersInUse {
+        current: SlackFilters,
+        other_sessions: u64,
+    },
+}
+
+/// Whether recording a watch changed its filters. A named pair rather than a
+/// bool so the caller that must restart the adapter on a change reads as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterChange {
+    /// A new watch, or the same filters it already had.
+    Unchanged,
+    /// The stored filters were replaced; a running adapter still has the old ones.
+    Replaced,
 }
 
 /// A watch as stored — the read model returned from queries.

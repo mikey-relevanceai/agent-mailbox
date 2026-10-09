@@ -16,7 +16,10 @@ use tracing::{error, info, warn};
 use mailbox::doctor::{Reachability, WakeVerdict};
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox_harness::hook::HookInput;
-use mailbox_protocol::{AdapterId, GithubPr, SlackWatch, Subject, Topic, inbox_topic, stub_topic};
+use mailbox_protocol::{
+    AdapterId, GithubPr, SlackFilter, SlackFilters, SlackWatch, Subject, Topic, inbox_topic,
+    stub_topic,
+};
 
 use crate::client;
 use crate::control::{
@@ -390,6 +393,8 @@ pub struct SlackChannelWatchArgs {
     /// Poll interval in seconds.
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
+    #[command(flatten)]
+    pub skip: SlackSkipArgs,
 }
 
 #[derive(Args, Debug)]
@@ -399,6 +404,26 @@ pub struct SlackThreadWatchArgs {
     /// Poll interval in seconds.
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
+    #[command(flatten)]
+    pub skip: SlackSkipArgs,
+}
+
+/// The filters both Slack watch kinds take (ADR-0029).
+#[derive(Args, Debug)]
+pub struct SlackSkipArgs {
+    /// Do not wake for messages matching this filter: `key=value[,key=value]`, every
+    /// condition must hold. Keys: `user=<U…>`, `app=<A…>`. Repeat for more filters.
+    /// E.g. `--skip user=<USER_ID>,app=<APP_ID>` skips that user's posts made through
+    /// that app (an agent posting as them) but not what they type. The set replaces
+    /// the watch's filters: a re-watch without `--skip` clears them.
+    #[arg(long = "skip", value_name = "FILTER", value_parser = parse_slack_filter)]
+    pub filters: Vec<SlackFilter>,
+}
+
+impl SlackSkipArgs {
+    fn into_filters(self) -> SlackFilters {
+        SlackFilters::new(self.filters)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -687,11 +712,13 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<Exit
             session: resolve_wakeable_session_or_fail(format)?,
             target: parse_slack_channel(&args.channel)?,
             interval_secs: args.interval,
+            skip: args.skip.into_filters(),
         },
         WatchTargetCmd::SlackThread(args) => Request::WatchSlack {
             session: resolve_wakeable_session_or_fail(format)?,
             target: parse_slack_thread(&args.thread)?,
             interval_secs: args.interval,
+            skip: args.skip.into_filters(),
         },
     };
     request(format, req).await
@@ -984,6 +1011,9 @@ async fn request(format: OutputFormat, request: Request) -> anyhow::Result<ExitC
     if let Response::Error { message } = &response {
         return Err(fail(format, message));
     }
+    if let Some(message) = unapplied_filters(&request, &response) {
+        return Err(fail(format, &message));
+    }
 
     if format.is_json() {
         // The typed response is already the machine-readable contract.
@@ -992,6 +1022,29 @@ async fn request(format: OutputFormat, request: Request) -> anyhow::Result<ExitC
         render_human(&response);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Why a watch reply does not confirm the filters asked for, if it does not.
+///
+/// A daemon built before filters (ADR-0029) decodes `watch_slack` without
+/// complaint and records the watch unfiltered, because serde ignores the unknown
+/// `skip` field. Reporting success then would leave the agent believing it will
+/// not be woken by messages that will wake it. The daemon echoes what it
+/// recorded, and an old one echoes nothing.
+fn unapplied_filters(request: &Request, response: &Response) -> Option<String> {
+    let (Request::WatchSlack { skip: asked, .. }, Response::Watched { topic, skip, .. }) =
+        (request, response)
+    else {
+        return None;
+    };
+    // An old daemon replying to a request with no filters did what was asked.
+    (!asked.is_empty() && skip.as_ref() != Some(asked)).then(|| {
+        format!(
+            "the running daemon recorded {} WITHOUT the --skip filters: it predates them. \
+             Restart `mailbox serve` with this version, then watch again",
+            topic.as_str()
+        )
+    })
 }
 
 /// Build the edge error. In JSON mode it first prints the TYPED
@@ -1178,9 +1231,14 @@ fn render_human(response: &Response) {
             topic,
             interest,
             subscribe,
+            skip,
         } => {
+            let skipping = match skip {
+                Some(skip) if !skip.is_empty() => format!(", skipping: {skip}"),
+                _ => String::new(),
+            };
             println!(
-                "watching {} (interest={}, subscription: {})",
+                "watching {} (interest={}, subscription: {}{skipping})",
                 topic.as_str(),
                 interest,
                 describe_sub(subscribe)
@@ -1404,8 +1462,12 @@ fn render_status_body(report: &StatusReport) {
                     watch.repo.clone()
                 }
             };
+            let skipping = match &watch.skip {
+                Some(skip) if !skip.is_empty() => format!(" skip=[{skip}]"),
+                _ => String::new(),
+            };
             println!(
-                "  {} {}  state={} interest={} interval={} child={}",
+                "  {} {}  state={} interest={} interval={} child={}{skipping}",
                 kind_label(watch.kind),
                 entity,
                 state,
@@ -1497,6 +1559,12 @@ fn parse_pr_spec(spec: &str) -> anyhow::Result<GithubPrTarget> {
 fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     stub_topic(label).with_context(|| format!("invalid stub label {label:?}"))?;
     Ok(label.to_string())
+}
+
+/// Clap value parser for `--skip`, so a bad filter is a usage error before any
+/// request is sent.
+fn parse_slack_filter(raw: &str) -> Result<SlackFilter, String> {
+    SlackFilter::parse(raw).map_err(|err| err.to_string())
 }
 
 /// Parse a `watch slack-channel` argument: a channel id, or a Slack link to the
@@ -2254,6 +2322,95 @@ pub fn output_format(json: bool) -> OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_posts() -> SlackFilters {
+        SlackFilters::new(vec![
+            SlackFilter::parse("user=U0AB7RJSQBE,app=A08SF47R6P4").unwrap(),
+        ])
+    }
+
+    fn watch_slack(skip: SlackFilters) -> Request {
+        Request::WatchSlack {
+            session: SessionId::new("s"),
+            target: SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap(),
+            interval_secs: 60,
+            skip,
+        }
+    }
+
+    fn watched(skip: Option<SlackFilters>) -> Response {
+        Response::Watched {
+            topic: Topic::parse("slack.channel.C0C83CXLUL8").unwrap(),
+            interest: 1,
+            subscribe: SubscribeState::AlreadySubscribed,
+            skip,
+        }
+    }
+
+    /// A daemon that predates filters records the watch and replies with no
+    /// `skip`. Calling that success would promise quiet the agent will not get.
+    #[test]
+    fn a_reply_without_the_filters_asked_for_is_a_failure() {
+        let message = unapplied_filters(&watch_slack(app_posts()), &watched(None))
+            .expect("an old daemon's reply must not pass");
+        assert!(message.contains("WITHOUT the --skip filters"), "{message}");
+        assert!(message.contains("mailbox serve"), "{message}");
+        assert!(
+            unapplied_filters(
+                &watch_slack(app_posts()),
+                &watched(Some(SlackFilters::default()))
+            )
+            .is_some(),
+            "a reply recording other filters must not pass either"
+        );
+
+        assert_eq!(
+            unapplied_filters(&watch_slack(app_posts()), &watched(Some(app_posts()))),
+            None
+        );
+        assert_eq!(
+            unapplied_filters(&watch_slack(SlackFilters::default()), &watched(None)),
+            None,
+            "no filters asked, none needed"
+        );
+    }
+
+    #[test]
+    fn skip_flags_parse_into_a_filter_set_and_a_bad_one_is_a_usage_error() {
+        let cli = Cli::try_parse_from([
+            "mailbox",
+            "watch",
+            "slack-channel",
+            "C0C83CXLUL8",
+            "--skip",
+            "app=A08SF47R6P4,user=U0AB7RJSQBE",
+            "--skip",
+            "user=U0AB7RJSQBE,app=A08SF47R6P4",
+        ])
+        .unwrap();
+        let Command::Watch(WatchArgs {
+            target: WatchTargetCmd::SlackChannel(args),
+        }) = cli.command
+        else {
+            panic!("expected watch slack-channel");
+        };
+        assert_eq!(
+            args.skip.into_filters(),
+            app_posts(),
+            "one filter, said twice"
+        );
+
+        let err = Cli::try_parse_from([
+            "mailbox",
+            "watch",
+            "slack-thread",
+            "C0C83CXLUL8/1791349480.652779",
+            "--skip",
+            "text=lol",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err}");
+    }
 
     /// Agents mostly have a Slack link in hand, so both commands take one; each
     /// refuses the other's kind of link rather than guessing what was meant.

@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mailbox_protocol::{
-    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, SlackWatch, Subject,
-    Topic, check_version, inbox_topic,
+    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, SlackFilters,
+    SlackWatch, Subject, Topic, check_version, inbox_topic,
 };
 
 use mailbox::storage::{
@@ -123,6 +123,11 @@ pub enum Request {
         session: SessionId,
         target: SlackWatch,
         interval_secs: u64,
+        /// The messages that must not wake (ADR-0029). The whole set: none clears
+        /// the watch's filters. Defaulted so a frame from a CLI that predates
+        /// filters still decodes, as a watch with none.
+        #[serde(default, skip_serializing_if = "SlackFilters::is_empty")]
+        skip: SlackFilters,
     },
     /// Drop `session`'s interest in a Slack watch and unsubscribe it.
     UnwatchSlack {
@@ -222,6 +227,12 @@ pub enum Response {
         topic: Topic,
         interest: u64,
         subscribe: SubscribeState,
+        /// The filters stored on the watch, so the CLI can tell a daemon that
+        /// applied them from one too old to know the field (ADR-0029): that one
+        /// drops `skip` from the request without a word, and its reply decodes
+        /// with `None` here. `None` too for a kind that has no filters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skip: Option<SlackFilters>,
     },
     /// A watch interest op completed; `outcome` distinguishes "dropped" from
     /// "no such watch". The topic was unsubscribed either way.
@@ -626,12 +637,17 @@ pub struct WatchStatus {
     /// with no pid; adapter supervision that sets `running` is card 08.
     #[serde(flatten)]
     pub state: WatchStateWire,
+    /// The watch's filters (ADR-0029): `[]` for a Slack watch with none, and
+    /// omitted for a kind that has no filters at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<SlackFilters>,
 }
 
 impl From<WatchEntry> for WatchStatus {
     fn from(entry: WatchEntry) -> Self {
         // Project the sum-typed target back onto the flat wire fields (the wire
         // mirrors the flat storage row): kind + repo/label + pr.
+        let skip = entry.target.skip().cloned();
         WatchStatus {
             kind: entry.target.kind().into(),
             repo: entry.target.repo_column(),
@@ -639,6 +655,7 @@ impl From<WatchEntry> for WatchStatus {
             interval_ms: u64::try_from(entry.interval.as_millis()).unwrap_or(u64::MAX),
             interest: entry.interest,
             state: entry.state.into(),
+            skip,
         }
     }
 }
@@ -782,11 +799,77 @@ mod tests {
             interval_ms: 30_000,
             interest: 1,
             state: WatchStateWire::Desired,
+            skip: None,
         };
         let value: serde_json::Value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["state"], "desired");
         assert_eq!(value["kind"], "github-pr");
         assert!(value.get("pid").is_none(), "desired watch carries no pid");
+        assert!(value.get("skip").is_none(), "no filters, no key");
+    }
+
+    fn app_posts() -> SlackFilters {
+        SlackFilters::new(vec![
+            mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE,app=A08SF47R6P4").unwrap(),
+        ])
+    }
+
+    /// A Slack watch's filters reach `status`, including an explicit `[]` for
+    /// none, so "no filters" is distinguishable from "a kind without filters".
+    #[test]
+    fn a_slack_status_row_carries_its_filters() {
+        let entry = |skip: SlackFilters| WatchEntry {
+            target: mailbox::storage::WatchTarget::Slack {
+                watch: SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap(),
+                skip,
+            },
+            interval: std::time::Duration::from_secs(60),
+            state: WatchState::Desired,
+            interest: 1,
+        };
+        let filtered = serde_json::to_value(WatchStatus::from(entry(app_posts()))).unwrap();
+        assert_eq!(
+            filtered["skip"],
+            serde_json::json!([{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}])
+        );
+        let plain =
+            serde_json::to_value(WatchStatus::from(entry(SlackFilters::default()))).unwrap();
+        assert_eq!(plain["skip"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_slack_watch_carries_its_filters_and_an_old_frame_has_none() {
+        let req = Request::WatchSlack {
+            session: SessionId::new("s"),
+            target: SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap(),
+            interval_secs: 60,
+            skip: app_posts(),
+        };
+        let line = encode_frame(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            value["skip"],
+            serde_json::json!([{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}])
+        );
+        assert_eq!(decode_frame::<Request>(&line).unwrap(), req);
+
+        // A CLI that predates filters sends no `skip`: a watch with none.
+        let old = r#"{"version":1,"op":"watch_slack","session":"s",
+            "target":{"kind":"channel","channel":"C0C83CXLUL8"},"interval_secs":60}"#;
+        match decode_frame::<Request>(old).unwrap() {
+            Request::WatchSlack { skip, .. } => assert!(skip.is_empty()),
+            other => panic!("expected WatchSlack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_from_a_daemon_that_predates_filters_echoes_none() {
+        let old = r#"{"version":1,"result":"watched","topic":"slack.channel.C0C83CXLUL8",
+            "interest":1,"subscribe":{"state":"already_subscribed"}}"#;
+        match decode_frame::<Response>(old).unwrap() {
+            Response::Watched { skip, .. } => assert_eq!(skip, None),
+            other => panic!("expected Watched, got {other:?}"),
+        }
     }
 
     #[test]
@@ -797,6 +880,7 @@ mod tests {
             subscribe: SubscribeState::Subscribed {
                 baseline: Some(Offset(4)),
             },
+            skip: None,
         };
         let line = encode_frame(&resp).unwrap();
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();

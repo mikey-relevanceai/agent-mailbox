@@ -6,7 +6,9 @@
 //!
 //! Which messages wake is covered by the adapter's own tests; this proves the
 //! plumbing between them: CLI parsing, the control request, storage, the
-//! resolver's config, the injected baseline and the host relay.
+//! resolver's config, the injected baseline and the host relay. The same goes
+//! for `--skip` filters (ADR-0029): that one reaches the adapter, that another
+//! session cannot silently drop it, and that changing it restarts the adapter.
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -25,10 +27,11 @@ const SESSION: &str = "slack-e2e-session";
 const CHANNEL: &str = "C0C83CXLUL8";
 const PARENT: &str = "1791349480.652779";
 const TOKEN: &str = "xoxb-e2e";
+const MIKEY: &str = "U0AB7RJSQBE";
+const CLAUDE_APP: &str = "A08SF47R6P4";
 
-/// A fake `curl` serving `$FAKE_SLACK_DIR/<method>`. `conversations.replies`
-/// answers from `replies.later` once that file exists, so the test decides when
-/// the reply is "posted".
+/// A fake `curl` serving `$FAKE_SLACK_DIR/<method>`, or `<method>.later` once
+/// that file exists, so the test decides when a message is "posted".
 const FAKE_CURL: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 dir="${FAKE_SLACK_DIR:?}"
@@ -36,7 +39,7 @@ config="$(cat)"
 url="$(printf '%s\n' "$config" | sed -n 's/^url = "\(.*\)"$/\1/p')"
 method="${url##*/}"
 f="$dir/$method"
-if [ "$method" = "conversations.replies" ] && [ -f "$dir/replies.later" ]; then f="$dir/replies.later"; fi
+if [ -f "$dir/$method.later" ]; then f="$dir/$method.later"; fi
 cat "$f"
 printf '\n@@mailbox-slack-status 200 \n' >&2
 "#;
@@ -73,6 +76,11 @@ impl Bridge {
             json!({"ok": true, "has_more": false, "messages": [
                 {"ts": PARENT, "thread_ts": PARENT, "user": "U1"}]}),
         );
+        fixture(
+            "conversations.history",
+            json!({"ok": true, "has_more": false, "messages": [
+                {"ts": PARENT, "user": "U1"}]}),
+        );
         let curl = script(dir.path(), "fake-curl.sh", FAKE_CURL);
         let security = script(dir.path(), "fake-security.sh", FAKE_SECURITY);
 
@@ -103,19 +111,24 @@ impl Bridge {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let output = mailbox_command()
-            .args(args)
-            .env("AGENT_MAILBOX_DB", self.dir.path().join("mailbox.db"))
-            .env("CLAUDE_CODE_SESSION_ID", SESSION)
-            .env("RUST_LOG", "error")
-            .output()
-            .unwrap();
+        let output = self.run_as(SESSION, args);
         assert!(
             output.status.success(),
             "mailbox {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    /// Run as `session`, success or not.
+    fn run_as(&self, session: &str, args: &[&str]) -> Output {
+        mailbox_command()
+            .args(args)
+            .env("AGENT_MAILBOX_DB", self.dir.path().join("mailbox.db"))
+            .env("CLAUDE_CODE_SESSION_ID", session)
+            .env("RUST_LOG", "error")
+            .output()
+            .unwrap()
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -126,10 +139,26 @@ impl Bridge {
 
     fn post_reply(&self) {
         std::fs::write(
-            self.dir.path().join("slack/replies.later"),
+            self.dir.path().join("slack/conversations.replies.later"),
             json!({"ok": true, "has_more": false, "messages": [
                 {"ts": PARENT, "thread_ts": PARENT, "user": "U1"},
                 {"ts": "1791349600.000001", "thread_ts": PARENT, "user": "U2", "text": "on it"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Post two messages by one user to the channel: one through the claude.ai
+    /// connector (`app_id`), one typed (`client_msg_id`). The connector post is
+    /// the newer of the two, so the cursor reaching it proves it was read.
+    fn post_connector_and_typed(&self) {
+        std::fs::write(
+            self.dir.path().join("slack/conversations.history.later"),
+            json!({"ok": true, "has_more": false, "messages": [
+                {"ts": "1791349600.000002", "user": MIKEY, "app_id": CLAUDE_APP},
+                {"ts": "1791349600.000001", "user": MIKEY, "client_msg_id": "typed"},
+                {"ts": PARENT, "user": "U1"}
             ]})
             .to_string(),
         )
@@ -195,5 +224,75 @@ fn a_reply_in_a_watched_thread_reaches_the_session() {
     poll_until("the adapter stops", Duration::from_secs(10), || {
         let status = bridge.json(&["status"]);
         (status["watches"][0]["state"] == "stopped").then_some(())
+    });
+}
+
+fn running_pid(watch: &Value) -> Option<u64> {
+    (watch["state"] == "running").then(|| watch["pid"].as_u64())?
+}
+
+#[test]
+fn a_skip_filter_reaches_the_adapter_and_only_its_owner_can_change_it() {
+    let bridge = Bridge::start();
+    let filter = format!("app={CLAUDE_APP},user={MIKEY}");
+    let watched = bridge.json(&[
+        "watch",
+        "slack-channel",
+        CHANNEL,
+        "--interval",
+        "1",
+        "--skip",
+        &filter,
+    ]);
+    let skip = json!([{"user": MIKEY, "app": CLAUDE_APP}]);
+    assert_eq!(watched["skip"], skip, "the daemon echoes what it recorded");
+    let topic = format!("slack.channel.{CHANNEL}");
+
+    poll_until("the adapter baselines", Duration::from_secs(15), || {
+        bridge.baseline()
+    });
+    let watch = bridge.json(&["status"])["watches"][0].clone();
+    assert_eq!(watch["skip"], skip);
+    let first_pid = running_pid(&watch).expect("running");
+
+    // Another session asking for the channel unfiltered would silently drop the
+    // filter for this one, so it is refused and told what the filter is.
+    let refused = bridge.run_as("another-session", &["watch", "slack-channel", CHANNEL]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("--skip user={MIKEY},app={CLAUDE_APP}")),
+        "{stderr}"
+    );
+    assert_eq!(bridge.json(&["status"])["watches"][0]["interest"], 1);
+
+    bridge.post_connector_and_typed();
+    poll_until(
+        "the poll passes both posts",
+        Duration::from_secs(15),
+        || {
+            bridge
+                .baseline()
+                .filter(|b| b.contains("1791349600.000002"))
+        },
+    );
+    let events: Vec<Value> = bridge.json(&["read"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["topic"] == topic)
+        .cloned()
+        .collect();
+    assert_eq!(events.len(), 1, "the connector post never reached the bus");
+    assert_eq!(events[0]["body"]["ts"], "1791349600.000001");
+
+    // Alone on the watch, this session can drop the filter, and the adapter is
+    // restarted so the change takes effect now rather than at its next crash.
+    let rewatched = bridge.json(&["watch", "slack-channel", CHANNEL, "--interval", "1"]);
+    assert_eq!(rewatched["skip"], json!([]), "{rewatched}");
+    poll_until("the adapter restarts", Duration::from_secs(15), || {
+        let watch = bridge.json(&["status"])["watches"][0].clone();
+        let pid = running_pid(&watch)?;
+        (pid != first_pid && watch["skip"] == json!([])).then_some(())
     });
 }

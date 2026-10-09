@@ -467,3 +467,69 @@ fn sigterm_exits_cleanly_mid_watch() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A `--skip` filter (ADR-0029) reaches the binary through its config: a post by
+/// the user through the app is read and passed by the cursor but never published,
+/// while the same user's typed message still is.
+#[test]
+fn a_skip_filter_drops_app_posts_and_keeps_typed_ones() {
+    let slack = FakeSlack::new();
+    slack.fixture(
+        "conversations.history",
+        0,
+        history(json!([{"ts": "1791349480.652779", "user": "U1"}])),
+    );
+    slack.fixture(
+        "conversations.history",
+        1,
+        history(json!([
+            {"ts": "1791349500.000003", "user": "U0AB7RJSQBE", "app_id": "A08SF47R6P4"},
+            {"ts": "1791349500.000002", "user": "U0AB7RJSQBE", "client_msg_id": "x"},
+            {"ts": "1791349500.000001", "user": "U0AB7RJSQBE", "app_id": "A08SF47R6P4"},
+        ])),
+    );
+    let mut config = channel_config(Value::Null, 2);
+    config["skip"] = json!([{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}]);
+
+    let output = slack.run(config, Some(TOKEN));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    let lines = lines(&output);
+    let published: Vec<&Value> = of_type(&lines, "publish")
+        .into_iter()
+        .map(|p| &p["body"]["ts"])
+        .collect();
+    assert_eq!(
+        published,
+        [&json!("1791349500.000002")],
+        "only the typed one"
+    );
+    let last = of_type(&lines, "baseline").last().unwrap()["value"]["last_ts"].clone();
+    assert_eq!(
+        last, "1791349500.000003",
+        "the cursor passes the skipped posts"
+    );
+    assert_eq!(
+        stderr
+            .matches("skipped a message a --skip filter matched")
+            .count(),
+        2,
+        "each skip is logged: {stderr}"
+    );
+}
+
+/// A filter the adapter cannot parse stops it at start: running unfiltered
+/// would wake the session for exactly what it asked not to hear.
+#[test]
+fn an_unparseable_skip_filter_fails_the_config() {
+    let slack = FakeSlack::new();
+    let mut config = channel_config(Value::Null, 1);
+    config["skip"] = json!([{}]);
+    let output = slack.run(config, Some(TOKEN));
+    assert!(!output.status.success());
+    assert!(
+        slack.log("calls.log").is_empty(),
+        "nothing was polled with a broken filter"
+    );
+}
