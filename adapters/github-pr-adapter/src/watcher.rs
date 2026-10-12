@@ -8,9 +8,11 @@ use mailbox_protocol::Subject;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::{debug, info};
 
 use crate::gh::{GhClient, GhError};
 use crate::review_requests;
+use crate::review_search;
 use crate::snapshot;
 
 /// One mode of the adapter. Every method but [`Watcher::observe`] is pure.
@@ -20,8 +22,6 @@ pub trait Watcher {
     type Baseline: Serialize + DeserializeOwned + PartialEq;
     type Edge;
 
-    /// What this process watches, for its logs.
-    fn label(&self) -> String;
     fn observe(&self) -> impl Future<Output = Result<Self::Observation, GhError>>;
     /// The first poll's baseline. Nothing fires on it.
     fn first_baseline(&self, obs: &Self::Observation) -> Self::Baseline;
@@ -36,22 +36,21 @@ pub trait Watcher {
     fn subject(&self, edge: &Self::Edge, obs: &Self::Observation) -> Option<Subject>;
 }
 
-/// The `github-pr` mode: one pull request's transitions (card 10).
+/// The `github-pr` mode: one pull request's transitions (card 10). The client
+/// is the one record of which PR, so what is polled and what is published about
+/// cannot disagree.
 pub struct PrWatcher {
     client: GhClient,
-    /// `owner/repo`.
-    repo: String,
-    number: u64,
 }
 
 impl PrWatcher {
-    pub fn new(client: GhClient, owner: String, repo: String) -> Self {
-        let number = client.number();
-        Self {
-            client,
-            repo: format!("{owner}/{repo}"),
-            number,
-        }
+    pub fn new(client: GhClient) -> Self {
+        Self { client }
+    }
+
+    /// `owner/repo`.
+    pub fn repo(&self) -> String {
+        self.client.slug()
     }
 }
 
@@ -59,10 +58,6 @@ impl Watcher for PrWatcher {
     type Observation = snapshot::Observation;
     type Baseline = snapshot::Baseline;
     type Edge = snapshot::Edge;
-
-    fn label(&self) -> String {
-        format!("{}#{}", self.repo, self.number)
-    }
 
     fn observe(&self) -> impl Future<Output = Result<Self::Observation, GhError>> {
         self.client.observe()
@@ -89,7 +84,7 @@ impl Watcher for PrWatcher {
     }
 
     fn body(&self, edge: &Self::Edge) -> Value {
-        edge.body(&self.repo, self.number)
+        edge.body(&self.repo(), self.client.number())
     }
 
     fn subject(&self, edge: &Self::Edge, obs: &Self::Observation) -> Option<Subject> {
@@ -100,11 +95,11 @@ impl Watcher for PrWatcher {
 /// The `github-review-requests` mode: PRs newly asking one login for a review
 /// (design/03).
 pub struct ReviewRequestsWatcher {
-    client: review_requests::Client,
+    client: review_search::Client,
 }
 
 impl ReviewRequestsWatcher {
-    pub fn new(client: review_requests::Client) -> Self {
+    pub fn new(client: review_search::Client) -> Self {
         Self { client }
     }
 }
@@ -114,24 +109,46 @@ impl Watcher for ReviewRequestsWatcher {
     type Baseline = review_requests::Baseline;
     type Edge = review_requests::Edge;
 
-    fn label(&self) -> String {
-        format!("review requests for {}", self.client.login())
-    }
-
     fn observe(&self) -> impl Future<Output = Result<Self::Observation, GhError>> {
         self.client.observe()
     }
 
     fn first_baseline(&self, obs: &Self::Observation) -> Self::Baseline {
+        info!(
+            pending = obs.requested.len(),
+            "recorded the review requests already pending; none of them will wake"
+        );
         review_requests::Baseline::from_observation(obs)
     }
 
+    /// Logs the counts behind the diff, so "why did this request not wake me?"
+    /// can be told apart: never seen, already known, or held as leaving.
     fn apply(
         &self,
         prior: &Self::Baseline,
         obs: &Self::Observation,
     ) -> (Self::Baseline, Vec<Self::Edge>) {
-        review_requests::apply(prior, obs)
+        let (next, edges) = review_requests::apply(prior, obs);
+        let already_known = obs
+            .requested
+            .iter()
+            .filter(|pr| prior.knows(&pr.key()))
+            .count();
+        let back_from_leaving = obs
+            .requested
+            .iter()
+            .filter(|pr| prior.leaving.contains(&pr.key()))
+            .count();
+        debug!(
+            observed = obs.requested.len(),
+            entered = edges.len(),
+            already_known,
+            back_from_leaving,
+            now_leaving = next.leaving.len(),
+            forgotten = prior.leaving.len() - back_from_leaving,
+            "diffed the review-request set"
+        );
+        (next, edges)
     }
 
     fn edge_kind(&self, edge: &Self::Edge) -> &'static str {

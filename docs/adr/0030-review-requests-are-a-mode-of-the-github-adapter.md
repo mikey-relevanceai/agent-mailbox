@@ -61,8 +61,13 @@ same user shares the 30.
 2. **Wake on entry into the set, never on exit.** The first poll records what is
    already pending and publishes nothing. A PR that appears in a later poll publishes
    one `review_requested` event. A PR that leaves (reviewed, closed, request
-   withdrawn) publishes nothing. GitHub removes a reviewer from the pending set when
-   they review, so a re-request is a fresh entry and wakes. The set is the baseline,
+   withdrawn) publishes nothing. A re-request after a review is a fresh entry and
+   wakes. That rests on GitHub's REST docs ("Review requests"): "Once a requested
+   reviewer submits a review, they are no longer considered a requested reviewer."
+   Mikey's data agrees: 13 open PRs he has reviewed were all absent from his
+   `review-requested:` search, and 0 matched both (measured 2026-10-12). No open PR
+   had been re-requested at the time, so a re-request reappearing in search has not
+   been observed. The set is the baseline,
    persisted through the bridge as every adapter's is ([ADR-0005](0005-baseline-via-protocol.md)).
 3. **One watch per person, named by login.** `mailbox watch github-review-requests
    <login>`, topic `github.review-requests.<login>`. The login is lowercased, because

@@ -75,6 +75,19 @@ pub enum GhError {
     /// keeps the baseline (never fail-open to zeros — review item A).
     #[error("gh returned an unexpected/incomplete response: {0}")]
     Parse(String),
+    /// A review-request search reported more pending requests than GitHub search
+    /// will return (1,000), so the set cannot be seen whole and entries cannot be
+    /// told from churn. Fatal, so the watch shows `failed` (ADR-0030).
+    #[error(
+        "{total_count} open review requests; GitHub search returns at most 1,000, so the set cannot be watched"
+    )]
+    SearchTruncated { total_count: u64 },
+    /// The review-request set changed between the pages of one poll, so the pages
+    /// do not describe one set. TRANSIENT: skip the poll and keep the baseline.
+    #[error(
+        "the review-request set changed while paging: {seen} PRs seen, search reported {total_count}"
+    )]
+    SetChangedWhilePaging { seen: u64, total_count: u64 },
 }
 
 /// The `gh` binary, shared by both of the adapter's modes.
@@ -137,7 +150,7 @@ impl GhClient {
     }
 
     /// `owner/repo`, the slug `gh --repo` wants.
-    fn slug(&self) -> String {
+    pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
     }
 

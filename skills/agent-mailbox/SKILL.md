@@ -94,7 +94,8 @@ Wakes you when an open PR **newly** asks that user for a review, directly or thr
 a team they are on. Requests already pending when you start the watch do not wake
 you: run `gh search prs --review-requested=GITHUB_LOGIN --state=open` for those. A
 PR leaving the set (reviewed, closed, withdrawn) wakes nobody. A re-request after a
-review wakes you again. `@me` is refused; name the login.
+review should wake you again (it is a new entry once your review cleared the old
+one). `@me` is refused; name the login.
 
 The wake says `review requested: OWNER/REPO#N` with the PR's link, and nothing about
 its content. Read the PR with `gh`. What you do about the request is whatever your

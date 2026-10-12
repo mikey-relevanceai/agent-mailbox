@@ -65,6 +65,7 @@
 
 mod gh;
 mod review_requests;
+mod review_search;
 mod snapshot;
 mod watcher;
 
@@ -79,7 +80,7 @@ use serde_json::Value;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use mailbox_protocol::{
     AdapterId, Baseline as BaselineMsg, GithubLogin, Message, Publish, Topic, encode_line,
@@ -174,6 +175,22 @@ enum Target {
     GithubReviewRequests { login: GithubLogin },
 }
 
+/// The config's `kind`, spelt as the bridge's `WatchKind::as_str` spells it.
+/// The two cannot share a type: an adapter never links the bridge (ADR-0001).
+#[derive(Debug, Deserialize)]
+enum ConfigKind {
+    #[serde(rename = "github-pr")]
+    GithubPr,
+    #[serde(rename = "github-review-requests")]
+    GithubReviewRequests,
+}
+
+#[derive(Deserialize)]
+struct KindField {
+    #[serde(default)]
+    kind: Option<ConfigKind>,
+}
+
 #[derive(Deserialize)]
 struct PrFields {
     owner: String,
@@ -199,8 +216,8 @@ enum AdapterError {
     ConfigTooLarge(u64),
     #[error("could not parse the config line as JSON: {0}")]
     ParseConfig(#[source] serde_json::Error),
-    #[error("config kind {0:?} is not one this adapter serves")]
-    UnknownKind(String),
+    #[error("config kind is not one this adapter serves: {0}")]
+    UnknownKind(#[source] serde_json::Error),
     #[error("config topic {topic:?} is not a valid topic: {source}")]
     InvalidTopic {
         topic: String,
@@ -240,19 +257,37 @@ async fn run() -> Result<(), AdapterError> {
     let topic = topic_of(&config)?;
     let interval = interval_of(&config);
     let gh = Gh::from_env();
+    // Every line this process logs carries the watch it serves, as discrete
+    // fields: one program runs both kinds, and the host interleaves many adapters.
     match config.target {
         Target::GithubPr {
             owner,
             repo,
             number,
         } => {
-            let watcher = PrWatcher::new(GhClient::new(gh, &owner, &repo, number), owner, repo);
-            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls).await
+            let watcher = PrWatcher::new(GhClient::new(gh, owner, repo, number));
+            let span = info_span!(
+                "github_watch",
+                kind = "github-pr",
+                repo = %watcher.repo(),
+                pr = number,
+                topic = topic.as_str()
+            );
+            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls)
+                .instrument(span)
+                .await
         }
         Target::GithubReviewRequests { login } => {
-            let watcher =
-                ReviewRequestsWatcher::new(review_requests::Client::new(gh, login.as_str()));
-            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls).await
+            let span = info_span!(
+                "github_watch",
+                kind = "github-review-requests",
+                login = %login,
+                topic = topic.as_str()
+            );
+            let watcher = ReviewRequestsWatcher::new(review_search::Client::new(gh, login));
+            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls)
+                .instrument(span)
+                .await
         }
     }
 }
@@ -270,7 +305,6 @@ async fn poll_loop<W: Watcher>(
     let max_rate_limit_retries =
         env_u64(ENV_MAX_RATE_LIMIT_RETRIES, DEFAULT_MAX_RATE_LIMIT_RETRIES);
     let max_transient = env_u64(ENV_MAX_TRANSIENT_FAILURES, DEFAULT_MAX_TRANSIENT_FAILURES);
-    let watching = watcher.label();
 
     let mut sigterm =
         signal(SignalKind::terminate()).map_err(|e| AdapterError::Signal("SIGTERM", e))?;
@@ -288,8 +322,6 @@ async fn poll_loop<W: Watcher>(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     info!(
-        topic = topic.as_str(),
-        watching = %watching,
         interval_ms = interval.as_millis() as u64,
         resuming = baseline.is_some(),
         max_polls,
@@ -333,7 +365,6 @@ async fn poll_loop<W: Watcher>(
                 // drift surfaces rather than becoming a silent black hole.
                 consecutive_transient += 1;
                 warn!(
-                    watching = %watching,
                     consecutive_transient,
                     max_transient,
                     error = %err,
@@ -356,10 +387,7 @@ async fn poll_loop<W: Watcher>(
                 // First poll: record the baseline, publish NOTHING (edge-triggered).
                 let base = watcher.first_baseline(&observation);
                 emit_baseline(&mut stdout, &base).await?;
-                info!(
-                    watching = %watching,
-                    "baselined on first poll; published nothing"
-                );
+                info!("baselined on first poll; published nothing");
                 baseline = Some(base);
             }
             Some(prior) => {
@@ -377,7 +405,6 @@ async fn poll_loop<W: Watcher>(
                 }
                 let fired: Vec<&str> = edges.iter().map(|edge| watcher.edge_kind(edge)).collect();
                 info!(
-                    watching = %watching,
                     fired = edges.len(),
                     edges = ?fired,
                     baseline_changed = changed,
@@ -423,7 +450,11 @@ async fn poll_with_backoff<W: Watcher>(
             Ok(observation) => return PollOutcome::Observed(observation),
             // A malformed/incomplete response is transient — surface it to the run
             // loop, which skips the poll and keeps the baseline (never fail-open).
-            Err(err @ GhError::Parse(_)) => return PollOutcome::Transient(err),
+            Err(err @ (GhError::Parse(_) | GhError::SetChangedWhilePaging { .. })) => {
+                return PollOutcome::Transient(err);
+            }
+            // More requests than search returns: polling again will not help.
+            Err(err @ GhError::SearchTruncated { .. }) => return PollOutcome::Fatal(err),
             Err(GhError::RateLimited(detail)) => {
                 rate_limit_retries += 1;
                 if rate_limit_retries > max_rate_limit_retries {
@@ -453,7 +484,10 @@ async fn poll_with_backoff<W: Watcher>(
                 // loop → retry the whole poll
             }
             // Auth missing / bad repo / spawn failure → fatal (exit non-zero).
-            Err(other) => return PollOutcome::Fatal(other),
+            // Named, not `_`, so a new variant has to choose fatal or transient.
+            Err(err @ (GhError::AuthMissing(_) | GhError::Failed(_) | GhError::Spawn { .. })) => {
+                return PollOutcome::Fatal(err);
+            }
         }
     }
 }
@@ -537,13 +571,9 @@ fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
         return Err(AdapterError::EmptyConfig);
     }
     let value: Value = serde_json::from_str(line.trim()).map_err(AdapterError::ParseConfig)?;
-    let kind = match value.get("kind") {
-        None | Some(Value::Null) => "github-pr".to_string(),
-        Some(Value::String(kind)) => kind.clone(),
-        Some(other) => return Err(AdapterError::UnknownKind(other.to_string())),
-    };
-    let target = match kind.as_str() {
-        "github-pr" => {
+    let KindField { kind } = KindField::deserialize(&value).map_err(AdapterError::UnknownKind)?;
+    let target = match kind.unwrap_or(ConfigKind::GithubPr) {
+        ConfigKind::GithubPr => {
             let PrFields {
                 owner,
                 repo,
@@ -555,12 +585,11 @@ fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
                 number,
             }
         }
-        "github-review-requests" => {
+        ConfigKind::GithubReviewRequests => {
             let ReviewRequestsFields { login } =
                 ReviewRequestsFields::deserialize(&value).map_err(AdapterError::ParseConfig)?;
             Target::GithubReviewRequests { login }
         }
-        _ => return Err(AdapterError::UnknownKind(kind)),
     };
     let Common {
         topic,
@@ -709,11 +738,36 @@ mod tests {
             read_config(&bad_login[..]),
             Err(AdapterError::ParseConfig(_))
         ));
-        let unknown = br#"{"kind":"gitlab-mr","topic":"t"}"#;
-        assert!(matches!(
-            read_config(&unknown[..]),
-            Err(AdapterError::UnknownKind(_))
-        ));
+        for unknown in [
+            &br#"{"kind":"gitlab-mr","topic":"t"}"#[..],
+            &br#"{"kind":7,"topic":"t"}"#[..],
+        ] {
+            assert!(matches!(
+                read_config(unknown),
+                Err(AdapterError::UnknownKind(_))
+            ));
+        }
+    }
+
+    /// `kind: null` and an explicit `github-pr` both mean a PR watch; each kind's
+    /// own fields are required.
+    #[test]
+    fn read_config_routes_each_kind_to_its_required_fields() {
+        for pr in [
+            &br#"{"kind":null,"topic":"t","owner":"o","repo":"r","number":1}"#[..],
+            &br#"{"kind":"github-pr","topic":"t","owner":"o","repo":"r","number":1}"#[..],
+        ] {
+            assert_eq!(read_config(pr).unwrap().target, pr_target());
+        }
+        for missing in [
+            &br#"{"kind":"github-pr","topic":"t","repo":"r","number":1}"#[..],
+            &br#"{"kind":"github-review-requests","topic":"t"}"#[..],
+        ] {
+            assert!(matches!(
+                read_config(missing),
+                Err(AdapterError::ParseConfig(_))
+            ));
+        }
     }
 
     #[test]

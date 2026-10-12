@@ -68,7 +68,7 @@ retries like the PR mode, and exits non-zero once 12 retries in a row are rate-l
 mailbox watch github-review-requests <login>
   → CLI parses the login (clap value parser → GithubLogin; refuses @me)
   → daemon: Request::WatchReviewRequests{login} → record the watch + interest, subscribe
-  → supervisor → GithubPrResolver → mailbox-github-pr-adapter
+  → supervisor → GithubResolver → mailbox-github-pr-adapter
        config {kind: "github-review-requests", topic, login, interval_ms, baseline}
   → adapter: gh search → diff against baseline → Publish / Baseline lines
   → host relays; the bridge wakes subscribers
@@ -86,9 +86,10 @@ mailbox watch github-review-requests <login>
   is free text. `build_watch` parses the login back. An invalid login or a non-zero
   `pr` is corrupt.
 - **One adapter program** ([ADR-0030](../adr/0030-review-requests-are-a-mode-of-the-github-adapter.md)).
-  `GithubPrResolver` serves both GitHub kinds and puts `kind` in the config. The
+  `GithubResolver` serves both GitHub kinds and puts `kind` in the config. The
   adapter's poll loop is generic over a `Watcher` (`adapters/github-pr-adapter/src/watcher.rs`).
-  The review-request mode is `review_requests.rs`. A config with no `kind` is a PR
+  The review-request mode is `review_requests.rs` (the set and the diff, pure) and
+  `review_search.rs` (the search, paging and parsing). A config with no `kind` is a PR
   watch, so a daemon still running the old resolver can spawn the new binary.
 
 ### What wakes
@@ -122,11 +123,16 @@ re-fires an event rather than dropping one.
 
 ### Paging
 
-Results are sorted oldest-request-first, 100 to a page. A request that lands
-mid-poll joins the last page rather than shifting earlier results across a page
-boundary. The poll keeps fetching pages until the distinct PRs it has collected
-equal the page's `total_count`. A short page, an overshoot, or the 10-page cap
-before that point means the set changed under it, and the poll is skipped.
+Results are sorted by PR creation time (`sort=created`, oldest first), 100 to a
+page. That gives a stable order, not an append-only one: a new request on an old PR
+lands mid-list and shifts later results across a page boundary. The poll keeps
+fetching pages until the distinct PRs it has collected equal the page's
+`total_count`. A short page, an overshoot, or the 10-page cap before that point
+means the set changed under it, and the poll is skipped. A removal and a shift that
+cancel can pass that check with one PR missing. That PR is then absent for one
+poll, which the two-poll forget absorbs, so it does not fire when it reappears.
+This is reasoned from the paging, not observed; a queue of one page (the one
+measured had 13–14 PRs) cannot hit it.
 
 ### Subject and body
 
@@ -157,8 +163,11 @@ Enterprise host stays correct.
 - `mailbox-protocol`: `GithubLogin` lowercases, refuses `@me` with the way to find a
   login, and refuses everything that could change the query.
 - Adapter unit tests (`review_requests.rs`): entry fires once; exit fires nothing;
-  re-request after two absent polls fires; a one-poll gap does not; fail-closed
-  parsing of every malformed shape; subject and body carry no title.
+  re-request after two absent polls fires; a one-poll gap does not; the baseline
+  round-trips and a foreign one does not parse; subject and body carry no title.
+- Adapter unit tests (`review_search.rs`): paging over canned pages, including the
+  over-1,000 refusal, a short page, an overshoot and the page cap; fail-closed
+  parsing of every malformed shape.
 - Adapter e2e (`tests/adapter_e2e.rs`, fake `gh`): silent baseline then one wake;
   the exact query sent; re-request and restart-without-refire; `incomplete_results`
   skipped; a 101-request queue paged as one observation.

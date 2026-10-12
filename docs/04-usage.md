@@ -505,8 +505,10 @@ new to set up.
 - **New requests only.** What is pending when you start the watch never wakes you.
   To see the backlog, run `gh search prs --review-requested=<login> --state=open`.
 - **Entries, not exits.** A PR leaving the set (reviewed, closed, request withdrawn)
-  wakes nobody. A re-request after a review is an entry, and wakes you, unless it
-  comes within one poll interval of the review.
+  wakes nobody. A re-request after a review should wake you, because GitHub drops
+  a reviewer from the pending set when they review, so the re-request is a new
+  entry. That has not yet been seen end to end. It will not wake you if it comes
+  within one poll interval of the review.
 - **A pointer.** The wake says `review requested: owner/repo#123` and links the PR.
   Read the PR yourself.
 - **Budget.** Each poll is one GitHub search request (per 100 pending requests).

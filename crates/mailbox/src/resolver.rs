@@ -6,7 +6,7 @@
 //!
 //! - [`StubResolver`] points a `stub` watch at the reference stub adapter and
 //!   derives its config from the watch row (card 09).
-//! - [`GithubPrResolver`] points a `github-pr` watch at the real PR poller and
+//! - [`GithubResolver`] points a `github-pr` watch at the real PR poller and
 //!   derives its config (repo/pr/interval) from the watch row (card 10). The same
 //!   program serves `github-review-requests` (design/03, ADR-0030); the config's
 //!   `kind` says which.
@@ -48,7 +48,7 @@ const STUB_ADAPTER_ID: &str = "stub-adapter";
 
 /// Resolves the reference stub adapter for `stub` watches and reports
 /// [`ResolveError::NoAdapter`] for other kinds. `github-pr` is handled by
-/// [`GithubPrResolver`]; the production [`DefaultResolver`] routes each kind to
+/// [`GithubResolver`]; the production [`DefaultResolver`] routes each kind to
 /// the right one, so this resolver's `NoAdapter` arm for github is only reached
 /// if it is used standalone (as in the `watch` unit tests).
 ///
@@ -143,9 +143,9 @@ const GITHUB_PR_ADAPTER_ID: &str = "github-pr-adapter";
 /// is cheap to construct and share behind the supervisor's `Arc`. The baseline is
 /// NOT built here: the supervisor injects the persisted baseline into the config
 /// at spawn (design/01 / card 10), keeping this resolver storage-free.
-pub struct GithubPrResolver;
+pub struct GithubResolver;
 
-impl GithubPrResolver {
+impl GithubResolver {
     /// The github-pr adapter program, and whether it came from the env override.
     /// Same precedence as [`StubResolver::program`]: env override → co-located
     /// beside the bridge binary → bare name on `PATH`.
@@ -170,7 +170,7 @@ impl GithubPrResolver {
     }
 }
 
-impl AdapterResolver for GithubPrResolver {
+impl AdapterResolver for GithubResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
             WatchTarget::Stub { .. } | WatchTarget::Slack { .. } => Err(ResolveError::NoAdapter {
@@ -183,7 +183,7 @@ impl AdapterResolver for GithubPrResolver {
                     "login": login.as_str(),
                     "interval_ms": interval_ms(watch),
                 });
-                Ok(GithubPrResolver::resolved(watch, config))
+                Ok(GithubResolver::resolved(watch, config))
             }
             WatchTarget::GithubPr { repo, pr } => {
                 // The stored `repo` column is `owner/repo`; split it for the
@@ -202,16 +202,16 @@ impl AdapterResolver for GithubPrResolver {
                     "number": pr,
                     "interval_ms": interval_ms(watch),
                 });
-                Ok(GithubPrResolver::resolved(watch, config))
+                Ok(GithubResolver::resolved(watch, config))
             }
         }
     }
 }
 
-impl GithubPrResolver {
+impl GithubResolver {
     /// The GitHub adapter program, with `config`.
     fn resolved(watch: &Watch, config: serde_json::Value) -> ResolvedAdapter {
-        let (program, env_override) = GithubPrResolver::program();
+        let (program, env_override) = GithubResolver::program();
         debug!(
             watch = watch.id.get(),
             kind = watch.target.kind().as_str(),
@@ -240,7 +240,7 @@ const SLACK_ADAPTER_ID: &str = "slack-adapter";
 
 /// The `serve` resolver for `slack-channel` and `slack-thread` watches (design/02).
 /// One adapter program serves both kinds; the config says which. Like
-/// [`GithubPrResolver`] it is storage-free: the supervisor injects the baseline.
+/// [`GithubResolver`] it is storage-free: the supervisor injects the baseline.
 ///
 /// The config carries no credential. The adapter reads its Slack token from the
 /// macOS Keychain itself (ADR-0027), so the token never passes through the bridge.
@@ -299,13 +299,13 @@ impl AdapterResolver for SlackResolver {
 }
 
 /// The production `serve` resolver: routes each watch kind to its adapter —
-/// `stub` to [`StubResolver`], both GitHub kinds to [`GithubPrResolver`], both Slack
+/// `stub` to [`StubResolver`], both GitHub kinds to [`GithubResolver`], both Slack
 /// kinds to [`SlackResolver`]. Matching on the kind (rather than one resolver
 /// knowing every kind) keeps each resolver focused and makes adding a kind a
 /// matter of adding an arm here.
 pub struct DefaultResolver {
     stub: StubResolver,
-    github: GithubPrResolver,
+    github: GithubResolver,
     slack: SlackResolver,
 }
 
@@ -313,7 +313,7 @@ impl Default for DefaultResolver {
     fn default() -> Self {
         Self {
             stub: StubResolver,
-            github: GithubPrResolver,
+            github: GithubResolver,
             slack: SlackResolver,
         }
     }
@@ -441,7 +441,7 @@ mod tests {
         let slack = slack_watch("C0C83CXLUL8");
         for err in [
             StubResolver.resolve(&slack).unwrap_err(),
-            GithubPrResolver.resolve(&slack).unwrap_err(),
+            GithubResolver.resolve(&slack).unwrap_err(),
         ] {
             assert!(matches!(
                 err,
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn github_pr_resolver_builds_config_from_the_watch_row() {
-        let resolved = GithubPrResolver.resolve(&github_watch()).unwrap();
+        let resolved = GithubResolver.resolve(&github_watch()).unwrap();
         let config = resolved.config.value();
         assert_eq!(config["topic"], "github.pr.octocat/hello-world#42");
         assert_eq!(config["owner"], "octocat");
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn github_pr_resolver_reports_no_adapter_for_stub() {
         let watch = stub_watch("demo", Duration::from_millis(250), 0);
-        let err = GithubPrResolver.resolve(&watch).unwrap_err();
+        let err = GithubResolver.resolve(&watch).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::NoAdapter {

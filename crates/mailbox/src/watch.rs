@@ -860,6 +860,50 @@ mod tests {
         );
     }
 
+    /// GitHub logins are case-insensitive, so two spellings are one watch, one
+    /// refcount and one poller; and the drop finds the row the record wrote.
+    #[tokio::test]
+    async fn review_request_watches_share_one_row_whatever_the_login_case() {
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let upper = GithubLogin::parse("Octocat").unwrap();
+        let lower = GithubLogin::parse("octocat").unwrap();
+        let other = GithubLogin::parse("hubot").unwrap();
+        let interval = Duration::from_secs(60);
+        for (login, session) in [(&upper, "s1"), (&lower, "s2"), (&other, "s1")] {
+            record_review_requests(
+                &bus,
+                &storage,
+                &supervisor,
+                login,
+                interval,
+                SessionId::new(session),
+            )
+            .await
+            .unwrap();
+        }
+        let watches = storage.list_watches().await.unwrap();
+        assert_eq!(watches.len(), 2, "one row per person: {watches:?}");
+
+        for (login, session, remaining_interest) in
+            [(&lower, "s1", 1), (&upper, "s2", 0), (&other, "s1", 0)]
+        {
+            let dropped = drop_interest_review_requests(
+                &bus,
+                &storage,
+                &supervisor,
+                login,
+                SessionId::new(session),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dropped.outcome,
+                UnwatchOutcome::Dropped { remaining_interest },
+                "{login} by {session}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn watch_by_a_resumed_session_within_guard_takes_the_explicit_path() {
         // A watch is an EXPLICIT, live-turn action, so `record` → `bus.subscribe`
