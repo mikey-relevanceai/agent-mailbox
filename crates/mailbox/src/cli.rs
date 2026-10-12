@@ -17,8 +17,8 @@ use mailbox::doctor::{Reachability, WakeVerdict};
 use mailbox::storage::{SessionId, StorageConfig, SubscribeKind};
 use mailbox_harness::hook::HookInput;
 use mailbox_protocol::{
-    AdapterId, GithubPr, SlackFilter, SlackFilters, SlackWatch, Subject, Topic, inbox_topic,
-    stub_topic,
+    AdapterId, GithubLogin, GithubPr, SlackFilter, SlackFilters, SlackWatch, Subject, Topic,
+    inbox_topic, stub_topic,
 };
 
 use crate::client;
@@ -384,6 +384,22 @@ pub enum WatchTargetCmd {
     SlackChannel(SlackChannelWatchArgs),
     /// Watch a Slack thread: wakes on each new reply in it.
     SlackThread(SlackThreadWatchArgs),
+    /// Watch a GitHub user's review requests: wakes when an open PR newly asks
+    /// them for a review, directly or through a team they are on. Requests that
+    /// were already pending when the watch started do not wake.
+    GithubReviewRequests(ReviewRequestsWatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewRequestsWatchArgs {
+    /// The GitHub login whose review requests to watch (`gh api user --jq .login`
+    /// prints yours). `@me` is not accepted.
+    #[arg(value_parser = parse_github_login)]
+    pub login: GithubLogin,
+    /// Poll interval in seconds. Each poll is one GitHub search request, and
+    /// search allows 30 a minute for the whole `gh` login.
+    #[arg(long, default_value_t = 60)]
+    pub interval: u64,
 }
 
 #[derive(Args, Debug)]
@@ -463,6 +479,15 @@ pub enum UnwatchTargetCmd {
     SlackChannel(SlackChannelUnwatchArgs),
     /// Stop watching a Slack thread.
     SlackThread(SlackThreadUnwatchArgs),
+    /// Stop watching a GitHub user's review requests.
+    GithubReviewRequests(ReviewRequestsUnwatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewRequestsUnwatchArgs {
+    /// The login, as given to `watch github-review-requests`.
+    #[arg(value_parser = parse_github_login)]
+    pub login: GithubLogin,
 }
 
 #[derive(Args, Debug)]
@@ -720,6 +745,11 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<Exit
             interval_secs: args.interval,
             skip: args.skip.into_filters(),
         },
+        WatchTargetCmd::GithubReviewRequests(args) => Request::WatchReviewRequests {
+            session: resolve_wakeable_session_or_fail(format)?,
+            login: args.login,
+            interval_secs: args.interval,
+        },
     };
     request(format, req).await
 }
@@ -741,6 +771,10 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
         UnwatchTargetCmd::SlackThread(args) => Request::UnwatchSlack {
             session: resolve_session_or_fail(format)?,
             target: parse_slack_thread(&args.thread)?,
+        },
+        UnwatchTargetCmd::GithubReviewRequests(args) => Request::UnwatchReviewRequests {
+            session: resolve_session_or_fail(format)?,
+            login: args.login,
         },
     };
     request(format, req).await
@@ -1162,6 +1196,14 @@ fn request_context(request: &Request) -> String {
         Request::UnwatchSlack { session, target } => {
             format!("unwatching slack {} for {}", target.key(), session.as_str())
         }
+        Request::WatchReviewRequests { session, login, .. } => format!(
+            "watching review requests for {login} for {}",
+            session.as_str()
+        ),
+        Request::UnwatchReviewRequests { session, login } => format!(
+            "unwatching review requests for {login} for {}",
+            session.as_str()
+        ),
         // A status without a session is the bridge's half only, so it names no whose.
         Request::Status { session } => match session {
             Some(session) => format!("status for {}", session.as_str()),
@@ -1458,9 +1500,10 @@ fn render_status_body(report: &StatusReport) {
             // unused 0 sentinel there, so showing `#0` would be noise).
             let entity = match watch.kind {
                 WatchKindWire::GithubPr => format!("{}#{}", watch.repo, watch.pr),
-                WatchKindWire::Stub | WatchKindWire::SlackChannel | WatchKindWire::SlackThread => {
-                    watch.repo.clone()
-                }
+                WatchKindWire::Stub
+                | WatchKindWire::SlackChannel
+                | WatchKindWire::SlackThread
+                | WatchKindWire::GithubReviewRequests => watch.repo.clone(),
             };
             let skipping = match &watch.skip {
                 Some(skip) if !skip.is_empty() => format!(" skip=[{skip}]"),
@@ -1510,6 +1553,7 @@ fn kind_label(kind: WatchKindWire) -> &'static str {
         WatchKindWire::Stub => "stub",
         WatchKindWire::SlackChannel => "slack-channel",
         WatchKindWire::SlackThread => "slack-thread",
+        WatchKindWire::GithubReviewRequests => "github-review-requests",
     }
 }
 
@@ -1559,6 +1603,12 @@ fn parse_pr_spec(spec: &str) -> anyhow::Result<GithubPrTarget> {
 fn parse_stub_label(label: &str) -> anyhow::Result<String> {
     stub_topic(label).with_context(|| format!("invalid stub label {label:?}"))?;
     Ok(label.to_string())
+}
+
+/// Clap value parser for a GitHub login, so a bad one (or `@me`) is a usage error
+/// before any request is sent.
+fn parse_github_login(raw: &str) -> Result<GithubLogin, String> {
+    GithubLogin::parse(raw).map_err(|err| err.to_string())
 }
 
 /// Clap value parser for `--skip`, so a bad filter is a usage error before any

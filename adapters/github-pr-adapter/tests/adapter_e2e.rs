@@ -42,7 +42,8 @@ fn adapter_bin() -> &'static str {
 /// the endpoint path), advances a per-sequence counter, clamps to the last
 /// fixture, and honours `@AUTH` / `@RATE` directive fixtures. Fixtures live in
 /// `$MAILBOX_FAKE_GH_DIR` named `<seq>.<i>` where seq ∈ {pr, reviews,
-/// issue_comments, thread_comments}.
+/// issue_comments, thread_comments, search}. Every `search` invocation's argv is
+/// appended to `search.args`, one argument per line.
 const FAKE_GH: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 dir="${MAILBOX_FAKE_GH_DIR:?MAILBOX_FAKE_GH_DIR must be set}"
@@ -53,6 +54,7 @@ case "${1:-}" in
       */pulls/*/reviews) key="reviews" ;;
       */issues/*/comments) key="issue_comments" ;;
       */pulls/*/comments) key="thread_comments" ;;
+      search/issues) key="search"; printf '%s\n' "$@" >> "$dir/search.args" ;;
       *) echo "fake-gh: unknown api path ${2:-}" >&2; exit 2 ;;
     esac ;;
   *) echo "fake-gh: unsupported invocation: $*" >&2; exit 2 ;;
@@ -588,5 +590,177 @@ fn gh_auth_missing_exits_non_zero() {
         result.stderr.to_lowercase().contains("authentication"),
         "the failure should mention authentication; stderr: {}",
         result.stderr
+    );
+}
+
+// ==== github-review-requests mode (design/03) =====================================
+
+/// A review-request config for `octocat`, polling fast.
+fn review_config(max_polls: u64, baseline: Value) -> Value {
+    json!({
+        "kind": "github-review-requests",
+        "topic": "github.review-requests.octocat",
+        "login": "octocat",
+        "interval_ms": 5,
+        "baseline": baseline,
+        "max_polls": max_polls,
+    })
+}
+
+/// One `search/issues` page holding `prs` (all of them: `total_count` = its length).
+fn search_page(prs: &[(&str, u64)]) -> String {
+    search_page_of(prs, prs.len() as u64)
+}
+
+fn search_page_of(prs: &[(&str, u64)], total_count: u64) -> String {
+    let items: Vec<Value> = prs
+        .iter()
+        .map(|(repo, number)| {
+            json!({
+                "number": number,
+                "title": "a title the adapter must never publish",
+                "html_url": format!("https://github.com/{repo}/pull/{number}"),
+                "repository_url": format!("https://api.github.com/repos/{repo}"),
+                "pull_request": { "url": format!("https://api.github.com/repos/{repo}/pulls/{number}") },
+            })
+        })
+        .collect();
+    json!({ "total_count": total_count, "incomplete_results": false, "items": items }).to_string()
+}
+
+fn review_requested(result: &RunResult) -> Vec<Value> {
+    result
+        .messages()
+        .into_iter()
+        .filter(|m| m["type"] == "publish" && m["body"]["edge"] == "review_requested")
+        .collect()
+}
+
+#[test]
+fn review_requests_baseline_silently_then_wake_only_on_entry() {
+    let fake = FakeGh::new();
+    // Pending before the watch → new request → reviewed (gone) → still gone.
+    fake.fixture("search", 0, &search_page(&[("acme/web", 1)]));
+    fake.fixture(
+        "search",
+        1,
+        &search_page(&[("acme/web", 1), ("acme/api", 7)]),
+    );
+    fake.fixture("search", 2, &search_page(&[("acme/api", 7)]));
+    fake.fixture("search", 3, &search_page(&[("acme/api", 7)]));
+
+    let result = run_adapter(&fake, review_config(4, Value::Null), &[]);
+    assert_eq!(result.code, Some(0), "stderr: {}", result.stderr);
+
+    let fired = review_requested(&result);
+    assert_eq!(
+        fired.len(),
+        1,
+        "only the new request wakes: {}",
+        result.stdout
+    );
+    let event = &fired[0];
+    assert_eq!(event["topic"], "github.review-requests.octocat");
+    assert_eq!(event["subject"]["text"], "review requested: acme/api#7");
+    assert_eq!(
+        event["subject"]["link"],
+        "https://github.com/acme/api/pull/7"
+    );
+    assert_eq!(event["body"]["repo"], "acme/api");
+    assert_eq!(event["body"]["pr"], 7);
+    assert!(
+        !result
+            .stdout
+            .contains("a title the adapter must never publish"),
+        "pointer, not payload"
+    );
+    assert_eq!(result.publish_count(), 1, "leaving the set wakes nobody");
+
+    // The search asked for open PRs requesting octocat, directly or by team.
+    let args = std::fs::read_to_string(fake.dir().join("search.args")).unwrap();
+    assert!(
+        args.lines()
+            .any(|arg| arg == "q=is:pr is:open archived:false review-requested:octocat"),
+        "query args: {args}"
+    );
+}
+
+/// A re-request after a review is a fresh entry; a restart from the persisted
+/// baseline re-fires nothing.
+#[test]
+fn review_requests_re_request_wakes_and_restart_does_not_refire() {
+    let fake = FakeGh::new();
+    fake.fixture("search", 0, &search_page(&[("acme/web", 1)]));
+    fake.fixture("search", 1, &search_page(&[]));
+    fake.fixture("search", 2, &search_page(&[]));
+    fake.fixture("search", 3, &search_page(&[("acme/web", 1)]));
+
+    let first = run_adapter(&fake, review_config(4, Value::Null), &[]);
+    assert_eq!(first.code, Some(0), "stderr: {}", first.stderr);
+    let fired = review_requested(&first);
+    assert_eq!(fired.len(), 1, "the re-request wakes: {}", first.stdout);
+    assert_eq!(fired[0]["subject"]["text"], "review requested: acme/web#1");
+
+    // Restart with what was persisted; the set is unchanged (the fake clamps to
+    // its last fixture), so nothing fires.
+    let baseline = first.last_baseline().expect("a baseline was persisted");
+    let second = run_adapter(&fake, review_config(2, baseline), &[]);
+    assert_eq!(second.code, Some(0), "stderr: {}", second.stderr);
+    assert_eq!(second.publish_count(), 0, "a restart re-fires nothing");
+}
+
+/// GitHub's `incomplete_results` is a partial set: skipped, never diffed as if
+/// the missing PRs had left (which would re-fire them all on the next poll).
+#[test]
+fn review_requests_incomplete_search_is_skipped_not_diffed() {
+    let fake = FakeGh::new();
+    fake.fixture(
+        "search",
+        0,
+        &search_page(&[("acme/web", 1), ("acme/web", 2)]),
+    );
+    fake.fixture(
+        "search",
+        1,
+        &json!({ "total_count": 0, "incomplete_results": true, "items": [] }).to_string(),
+    );
+    fake.fixture(
+        "search",
+        2,
+        &search_page(&[("acme/web", 1), ("acme/web", 2)]),
+    );
+
+    let result = run_adapter(&fake, review_config(2, Value::Null), &[]);
+    assert_eq!(result.code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.publish_count(), 0, "{}", result.stdout);
+    assert_eq!(result.baseline_count(), 1, "only the first poll's baseline");
+}
+
+/// More than one page of requests is one observation. Each search call takes the
+/// next fixture, so pages 1 and 2 of a poll are fixtures 0 and 1.
+#[test]
+fn review_requests_page_through_a_long_queue() {
+    let fake = FakeGh::new();
+    let page_one: Vec<(&str, u64)> = (1..=100).map(|n| ("acme/web", n)).collect();
+    // Poll 1: 101 requests over two pages. Poll 2: the same 101 plus #500.
+    fake.fixture("search", 0, &search_page_of(&page_one, 101));
+    fake.fixture("search", 1, &search_page_of(&[("acme/web", 101)], 101));
+    fake.fixture("search", 2, &search_page_of(&page_one, 102));
+    fake.fixture(
+        "search",
+        3,
+        &search_page_of(&[("acme/web", 101), ("acme/web", 500)], 102),
+    );
+
+    let result = run_adapter(&fake, review_config(2, Value::Null), &[]);
+    assert_eq!(result.code, Some(0), "stderr: {}", result.stderr);
+    let fired = review_requested(&result);
+    assert_eq!(fired.len(), 1, "{}", result.stdout);
+    assert_eq!(fired[0]["body"]["pr"], 500);
+    let args = std::fs::read_to_string(fake.dir().join("search.args")).unwrap();
+    assert_eq!(
+        args.lines().filter(|arg| *arg == "page=2").count(),
+        2,
+        "each poll fetched its second page: {args}"
     );
 }

@@ -55,7 +55,7 @@ That produces four binaries in `target/release/`:
 |---|---|
 | `mailbox` | the bridge CLI + daemon (the one entry point) |
 | `mailbox-stub-adapter` | reference adapter (synthetic edges; for the demo/tests) |
-| `mailbox-github-pr-adapter` | the real GitHub PR poller |
+| `mailbox-github-pr-adapter` | the GitHub poller: one PR, or one user's review requests ([design/03](design/03-review-request-watch.md)) |
 | `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) |
 
 ### Put them on your PATH (co-located)
@@ -440,6 +440,8 @@ Add global `--json` for machine-readable stdout.
 | `mailbox watch slack-channel <channel> [--interval <secs>] [--skip <filter>]…` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
 | `mailbox watch slack-thread <channel>/<ts> [--interval <secs>] [--skip <filter>]…` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
 | `mailbox unwatch slack-channel <channel>` / `unwatch slack-thread <channel>/<ts>` | Stop watching. |
+| `mailbox watch github-review-requests <login> [--interval <secs>]` | Watch a GitHub user's review requests: each open PR that **newly** asks them for a review wakes you, whether the request named them or a team they are on. See [Review requests](#review-requests). |
+| `mailbox unwatch github-review-requests <login>` | Stop watching. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
 | `mailbox unwatch stub <label>` | Drop interest in the stub watch. |
 | `mailbox publish <topic> [--body <json>] [--adapter <id>] [--subject <s>] [--link <url>]` | Publish an event to a topic. It goes to the topic and wakes every subscriber, you included (see below). `--subject` is the one line subscribers see on WAKE. |
@@ -489,6 +491,31 @@ still in Slack. The flag states the whole set: watching again without `--skip` c
 the filters. One adapter serves everyone watching a channel, so the filters are
 shared. Changing them is refused while another session watches it, and otherwise
 restarts the adapter. `mailbox status` shows each watch's `skip=[…]`.
+
+### Review requests
+
+```bash
+mailbox watch github-review-requests "$(gh api user --jq .login)"
+```
+
+Name the login; `@me` is refused, because a watch must name one person and `@me`
+means whoever `gh` is logged in as. Uses the same `gh` login as `github-pr`, nothing
+new to set up.
+
+- **New requests only.** What is pending when you start the watch never wakes you.
+  To see the backlog, run `gh search prs --review-requested=<login> --state=open`.
+- **Entries, not exits.** A PR leaving the set (reviewed, closed, request withdrawn)
+  wakes nobody. A re-request after a review is an entry, and wakes you, unless it
+  comes within one poll interval of the review.
+- **A pointer.** The wake says `review requested: owner/repo#123` and links the PR.
+  Read the PR yourself.
+- **Budget.** Each poll is one GitHub search request (per 100 pending requests).
+  Search allows 30 a minute for your `gh` login, shared with any other `gh search`
+  you run. The default `--interval 60` uses 1. The `github-pr` pollers do not use
+  search.
+
+What to do when a request lands is up to the session holding the watch. The watch
+encodes no policy about reviewing or posting.
 
 ### Publishing: one rule
 

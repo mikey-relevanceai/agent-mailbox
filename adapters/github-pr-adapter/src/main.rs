@@ -1,6 +1,10 @@
-//! The **github-pr adapter**: the MVP's real poller. It polls one GitHub pull
-//! request via `gh` and publishes ONLY the transitions agents care about —
-//! parity with the old `agent-ipc-github`, plus CI.
+//! The **GitHub adapter**: the MVP's real poller. In its `github-pr` mode it polls
+//! one GitHub pull request via `gh` and publishes ONLY the transitions agents care
+//! about — parity with the old `agent-ipc-github`, plus CI. In its
+//! `github-review-requests` mode it polls one login's pending review requests and
+//! publishes each PR that newly asks for one (see [`review_requests`], design/03).
+//! One program serves both because everything but the observe-and-diff step is
+//! the same (ADR-0030); [`watcher::Watcher`] is that step.
 //!
 //! It imports **only** `mailbox-protocol` — never the `mailbox` bridge crate. An
 //! adapter is a separate process that speaks the wire protocol and never touches
@@ -12,7 +16,9 @@
 //! On the FIRST poll the adapter *baselines* — records the current state and
 //! publishes nothing. Thereafter it publishes only on *transitions* (see
 //! [`snapshot::apply`]): mergeable → CONFLICTING (ignoring transient UNKNOWN),
-//! new reviews / review threads / PR comments, and CI rollup transitions.
+//! new reviews / review threads / PR comments, and CI rollup transitions — or, in
+//! review-request mode, a PR entering the requested set
+//! ([`review_requests::apply`]).
 //!
 //! The baseline must survive a restart so an already-fired edge is not re-fired,
 //! and it must NOT live in adapter-side SQLite (ADR-0001). So it round-trips
@@ -26,6 +32,7 @@
 //!
 //! ```json
 //! {
+//!   "kind": "github-pr",
 //!   "topic": "github.pr.octocat/hello-world#42",
 //!   "owner": "octocat", "repo": "hello-world", "number": 42,
 //!   "interval_ms": 60000,
@@ -34,7 +41,15 @@
 //! }
 //! ```
 //!
-//! - `topic`/`owner`/`repo`/`number` (required) — what to poll and where to publish.
+//! or, for review requests,
+//! `{"kind": "github-review-requests", "topic": "github.review-requests.octocat",
+//! "login": "octocat", …}`.
+//!
+//! - `kind` (optional) — `github-pr` (the default, so a pre-ADR-0030 resolver's
+//!   config still works) or `github-review-requests`.
+//! - `topic` (required) — where to publish.
+//! - `owner`/`repo`/`number` (required for `github-pr`) — the PR to poll.
+//! - `login` (required for `github-review-requests`) — whose requests to poll.
 //! - `interval_ms` (optional) — poll cadence; absent or `0` ⇒ [`DEFAULT_INTERVAL_MS`].
 //! - `baseline` (injected by the supervisor) — the persisted snapshot, or `null`
 //!   for "never baselined" (⇒ baseline on the first poll).
@@ -49,23 +64,29 @@
 //! - On SIGTERM/SIGINT → exit promptly with code 0 (clean supervisor teardown).
 
 mod gh;
+mod review_requests;
 mod snapshot;
+mod watcher;
 
 use std::io::BufRead;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, Stdout};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-use mailbox_protocol::{AdapterId, Baseline as BaselineMsg, Message, Publish, Topic, encode_line};
+use mailbox_protocol::{
+    AdapterId, Baseline as BaselineMsg, GithubLogin, Message, Publish, Topic, encode_line,
+};
 
-use gh::{GhClient, GhError};
-use snapshot::{Baseline, Edge, apply};
+use gh::{Gh, GhClient, GhError};
+use watcher::{PrWatcher, ReviewRequestsWatcher, Watcher};
 
 /// Poll cadence used when config omits `interval_ms` or sets it to `0`. ~60s
 /// matches design/01's default; a sane floor so a missing interval is a slow
@@ -111,23 +132,58 @@ const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const ADAPTER_ID: &str = "github-pr-adapter";
 
 /// The adapter's own config, parsed once from the first stdin line.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Config {
-    /// The topic to publish edges on (the resolver passes `github.pr.<o>/<r>#<n>`).
+    /// The topic to publish edges on (the resolver passes `github.pr.<o>/<r>#<n>`
+    /// or `github.review-requests.<login>`).
     topic: String,
+    /// What to poll: the config's `kind` and the fields that kind needs.
+    target: Target,
+    /// Poll cadence in ms; `0`/absent ⇒ [`DEFAULT_INTERVAL_MS`].
+    interval_ms: u64,
+    /// The persisted baseline snapshot injected by the supervisor: `null` for
+    /// "never baselined", else the mode's baseline object.
+    baseline: Value,
+    /// Stop cleanly after this many completed polls; `0`/absent ⇒ forever.
+    max_polls: u64,
+}
+
+/// The fields every mode shares.
+#[derive(Debug, Deserialize)]
+struct Common {
+    topic: String,
+    #[serde(default)]
+    interval_ms: u64,
+    #[serde(default)]
+    baseline: Value,
+    #[serde(default)]
+    max_polls: u64,
+}
+
+/// What this process polls. One program serves both GitHub watch kinds
+/// (ADR-0030); the resolver names the kind in the config.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// One pull request (`kind: "github-pr"`, card 10).
+    GithubPr {
+        owner: String,
+        repo: String,
+        number: u64,
+    },
+    /// One login's review requests (`kind: "github-review-requests"`, design/03).
+    GithubReviewRequests { login: GithubLogin },
+}
+
+#[derive(Deserialize)]
+struct PrFields {
     owner: String,
     repo: String,
     number: u64,
-    /// Poll cadence in ms; `0`/absent ⇒ [`DEFAULT_INTERVAL_MS`].
-    #[serde(default)]
-    interval_ms: u64,
-    /// The persisted baseline snapshot injected by the supervisor: `null` for
-    /// "never baselined", else a [`Baseline`] object.
-    #[serde(default)]
-    baseline: Value,
-    /// Stop cleanly after this many completed polls; `0`/absent ⇒ forever.
-    #[serde(default)]
-    max_polls: u64,
+}
+
+#[derive(Deserialize)]
+struct ReviewRequestsFields {
+    login: GithubLogin,
 }
 
 /// A github-pr adapter failure. Business errors are values in a `Result`, never
@@ -143,6 +199,8 @@ enum AdapterError {
     ConfigTooLarge(u64),
     #[error("could not parse the config line as JSON: {0}")]
     ParseConfig(#[source] serde_json::Error),
+    #[error("config kind {0:?} is not one this adapter serves")]
+    UnknownKind(String),
     #[error("config topic {topic:?} is not a valid topic: {source}")]
     InvalidTopic {
         topic: String,
@@ -170,26 +228,49 @@ async fn main() -> ExitCode {
             // A fatal fault (bad config, gh auth missing, gh failure). Log to
             // stderr (the host drains it into its tracing) and fail non-zero so
             // the supervisor records + surfaces it — no silent spin (design/01).
-            error!(error = %err, "github-pr adapter exiting with an error");
+            error!(error = %err, "github adapter exiting with an error");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Read config, then poll → diff → publish → persist-baseline until `max_polls`
-/// is reached or a termination signal arrives — both clean (`Ok(())`) exits.
+/// Read config and run the mode it names.
 async fn run() -> Result<(), AdapterError> {
     let config = read_config(std::io::stdin().lock())?;
     let topic = topic_of(&config)?;
     let interval = interval_of(&config);
+    let gh = Gh::from_env();
+    match config.target {
+        Target::GithubPr {
+            owner,
+            repo,
+            number,
+        } => {
+            let watcher = PrWatcher::new(GhClient::new(gh, &owner, &repo, number), owner, repo);
+            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls).await
+        }
+        Target::GithubReviewRequests { login } => {
+            let watcher =
+                ReviewRequestsWatcher::new(review_requests::Client::new(gh, login.as_str()));
+            poll_loop(&watcher, topic, interval, config.baseline, config.max_polls).await
+        }
+    }
+}
+
+/// Poll → diff → publish → persist-baseline until `max_polls` is reached or a
+/// termination signal arrives — both clean (`Ok(())`) exits.
+async fn poll_loop<W: Watcher>(
+    watcher: &W,
+    topic: Topic,
+    interval: Duration,
+    injected_baseline: Value,
+    max_polls: u64,
+) -> Result<(), AdapterError> {
     let backoff = rate_limit_backoff();
     let max_rate_limit_retries =
         env_u64(ENV_MAX_RATE_LIMIT_RETRIES, DEFAULT_MAX_RATE_LIMIT_RETRIES);
     let max_transient = env_u64(ENV_MAX_TRANSIENT_FAILURES, DEFAULT_MAX_TRANSIENT_FAILURES);
-    let gh = GhClient::new(&config.owner, &config.repo, config.number);
-    let repo_slug = format!("{}/{}", config.owner, config.repo);
-    let number = config.number;
-    let max_polls = config.max_polls;
+    let watching = watcher.label();
 
     let mut sigterm =
         signal(SignalKind::terminate()).map_err(|e| AdapterError::Signal("SIGTERM", e))?;
@@ -199,7 +280,7 @@ async fn run() -> Result<(), AdapterError> {
 
     // The injected baseline: Some(..) means "resume, diff against it"; None means
     // "first poll baselines and publishes nothing".
-    let mut baseline = parse_injected_baseline(config.baseline);
+    let mut baseline: Option<W::Baseline> = parse_injected_baseline(injected_baseline);
 
     // First tick fires immediately (fast, deterministic first poll for tests);
     // subsequent ticks honour `interval`. Skip missed ticks rather than bursting.
@@ -208,12 +289,11 @@ async fn run() -> Result<(), AdapterError> {
 
     info!(
         topic = topic.as_str(),
-        repo = %repo_slug,
-        pr = number,
+        watching = %watching,
         interval_ms = interval.as_millis() as u64,
         resuming = baseline.is_some(),
         max_polls,
-        "github-pr adapter started"
+        "github adapter started"
     );
 
     let mut polls: u64 = 0;
@@ -232,7 +312,7 @@ async fn run() -> Result<(), AdapterError> {
         // Poll, retrying inside the adapter on a rate limit (one process, no tight
         // loop), and letting a signal win so a slow gh cannot delay shutdown.
         let observation = match poll_with_backoff(
-            &gh,
+            watcher,
             backoff,
             max_rate_limit_retries,
             &mut sigterm,
@@ -253,8 +333,7 @@ async fn run() -> Result<(), AdapterError> {
                 // drift surfaces rather than becoming a silent black hole.
                 consecutive_transient += 1;
                 warn!(
-                    repo = %repo_slug,
-                    pr = number,
+                    watching = %watching,
                     consecutive_transient,
                     max_transient,
                     error = %err,
@@ -275,27 +354,18 @@ async fn run() -> Result<(), AdapterError> {
         match &baseline {
             None => {
                 // First poll: record the baseline, publish NOTHING (edge-triggered).
-                let base = Baseline::from_observation(&observation);
+                let base = watcher.first_baseline(&observation);
                 emit_baseline(&mut stdout, &base).await?;
                 info!(
-                    repo = %repo_slug,
-                    pr = number,
+                    watching = %watching,
                     "baselined on first poll; published nothing"
                 );
                 baseline = Some(base);
             }
             Some(prior) => {
-                let (next, edges) = apply(prior, &observation);
+                let (next, edges) = watcher.apply(prior, &observation);
                 for edge in &edges {
-                    publish_edge(
-                        &mut stdout,
-                        &topic,
-                        edge,
-                        &repo_slug,
-                        number,
-                        observation.pr_url.as_deref(),
-                    )
-                    .await?;
+                    publish_edge(&mut stdout, watcher, &topic, edge, &observation).await?;
                 }
                 let changed = &next != prior;
                 if changed {
@@ -305,14 +375,13 @@ async fn run() -> Result<(), AdapterError> {
                     emit_baseline(&mut stdout, &next).await?;
                     baseline = Some(next);
                 }
-                let fired: Vec<&str> = edges.iter().map(Edge::kind).collect();
+                let fired: Vec<&str> = edges.iter().map(|edge| watcher.edge_kind(edge)).collect();
                 info!(
-                    repo = %repo_slug,
-                    pr = number,
+                    watching = %watching,
                     fired = edges.len(),
                     edges = ?fired,
                     baseline_changed = changed,
-                    "polled PR and evaluated transitions"
+                    "polled and evaluated transitions"
                 );
             }
         }
@@ -321,8 +390,8 @@ async fn run() -> Result<(), AdapterError> {
 }
 
 /// The result of one (possibly rate-limit-retried) poll attempt.
-enum PollOutcome {
-    Observed(snapshot::Observation),
+enum PollOutcome<O> {
+    Observed(O),
     /// A signal arrived while polling or backing off; shut down with this name.
     Signalled(&'static str),
     /// A fatal gh failure (auth, bad repo, or an exhausted rate-limit budget) —
@@ -336,19 +405,19 @@ enum PollOutcome {
 /// Poll once, backing off and retrying on a rate limit (bounded by
 /// `max_rate_limit_retries` — review item G), racing signals so a slow gh or a
 /// long backoff never delays a clean shutdown.
-async fn poll_with_backoff(
-    gh: &GhClient,
+async fn poll_with_backoff<W: Watcher>(
+    watcher: &W,
     backoff: Duration,
     max_rate_limit_retries: u64,
     sigterm: &mut Signal,
     sigint: &mut Signal,
-) -> PollOutcome {
+) -> PollOutcome<W::Observation> {
     let mut rate_limit_retries: u64 = 0;
     loop {
         let result = tokio::select! {
             _ = sigterm.recv() => return PollOutcome::Signalled("SIGTERM"),
             _ = sigint.recv() => return PollOutcome::Signalled("SIGINT"),
-            result = gh.observe() => result,
+            result = watcher.observe() => result,
         };
         match result {
             Ok(observation) => return PollOutcome::Observed(observation),
@@ -398,11 +467,11 @@ fn shutdown(polls: u64, signal: &str) -> Result<(), AdapterError> {
 /// Parse the supervisor-injected baseline. `null` (or absent) ⇒ `None` (first
 /// poll baselines). A snapshot that fails to parse is treated as `None` with a
 /// warning — safer to re-baseline (at most one re-fired edge) than to crash.
-fn parse_injected_baseline(value: Value) -> Option<Baseline> {
+fn parse_injected_baseline<B: DeserializeOwned>(value: Value) -> Option<B> {
     if value.is_null() {
         return None;
     }
-    match serde_json::from_value::<Baseline>(value) {
+    match serde_json::from_value::<B>(value) {
         Ok(baseline) => Some(baseline),
         Err(err) => {
             warn!(
@@ -451,6 +520,10 @@ fn topic_of(config: &Config) -> Result<Topic, AdapterError> {
 
 /// Read and parse the first line of `reader` as [`Config`], bounded by
 /// [`MAX_CONFIG_BYTES`]. Mirrors the stub adapter's bounded single-line read.
+///
+/// A config with no `kind` is a PR watch: that is what every resolver before
+/// ADR-0030 sent, and a daemon still running one may spawn this binary after it
+/// is upgraded and before the daemon is restarted.
 fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
     let mut limited = reader.take(MAX_CONFIG_BYTES + 1);
     let mut line = String::new();
@@ -463,33 +536,70 @@ fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
     if read == 0 || line.trim().is_empty() {
         return Err(AdapterError::EmptyConfig);
     }
-    serde_json::from_str(line.trim()).map_err(AdapterError::ParseConfig)
+    let value: Value = serde_json::from_str(line.trim()).map_err(AdapterError::ParseConfig)?;
+    let kind = match value.get("kind") {
+        None | Some(Value::Null) => "github-pr".to_string(),
+        Some(Value::String(kind)) => kind.clone(),
+        Some(other) => return Err(AdapterError::UnknownKind(other.to_string())),
+    };
+    let target = match kind.as_str() {
+        "github-pr" => {
+            let PrFields {
+                owner,
+                repo,
+                number,
+            } = PrFields::deserialize(&value).map_err(AdapterError::ParseConfig)?;
+            Target::GithubPr {
+                owner,
+                repo,
+                number,
+            }
+        }
+        "github-review-requests" => {
+            let ReviewRequestsFields { login } =
+                ReviewRequestsFields::deserialize(&value).map_err(AdapterError::ParseConfig)?;
+            Target::GithubReviewRequests { login }
+        }
+        _ => return Err(AdapterError::UnknownKind(kind)),
+    };
+    let Common {
+        topic,
+        interval_ms,
+        baseline,
+        max_polls,
+    } = Common::deserialize(value).map_err(AdapterError::ParseConfig)?;
+    Ok(Config {
+        topic,
+        target,
+        interval_ms,
+        baseline,
+        max_polls,
+    })
 }
 
 /// Write one edge as a `Publish` NDJSON line. The body is small opaque content
 /// (never a gh dump — ADR-0001); the subject is the one line of it the bridge will
 /// show on the wake wire (ADR-0022).
-async fn publish_edge(
+async fn publish_edge<W: Watcher>(
     stdout: &mut Stdout,
+    watcher: &W,
     topic: &Topic,
-    edge: &Edge,
-    repo: &str,
-    pr: u64,
-    pr_url: Option<&str>,
+    edge: &W::Edge,
+    observation: &W::Observation,
 ) -> Result<(), AdapterError> {
     let message = Message::Publish(Publish {
         topic: topic.clone(),
         adapter: AdapterId(ADAPTER_ID.to_string()),
-        body: edge.body(repo, pr),
-        subject: edge.subject(pr_url),
+        body: watcher.body(edge),
+        subject: watcher.subject(edge, observation),
     });
     write_message(stdout, &message).await?;
     // The highest-value line: log the fired edge with its decision data at info
     // (review item J) — the kind plus a concise description (id deltas / CI
     // newly-failed names), never the raw gh body.
     info!(
-        edge = edge.kind(),
-        detail = %edge.describe(),
+        edge = watcher.edge_kind(edge),
+        detail = %watcher.describe(edge),
         topic = topic.as_str(),
         "published edge"
     );
@@ -498,9 +608,12 @@ async fn publish_edge(
 
 /// Write the current baseline as a `Baseline` NDJSON line, for the host to relay
 /// to storage (baseline-via-protocol).
-async fn emit_baseline(stdout: &mut Stdout, baseline: &Baseline) -> Result<(), AdapterError> {
+async fn emit_baseline<B: Serialize>(
+    stdout: &mut Stdout,
+    baseline: &B,
+) -> Result<(), AdapterError> {
     let value = serde_json::to_value(baseline)
-        .expect("a Baseline always serializes to JSON (only owned primitives/strings)");
+        .expect("a Baseline always serializes to JSON (only owned primitives/strings/sets)");
     write_message(stdout, &Message::Baseline(BaselineMsg { value })).await
 }
 
@@ -532,13 +645,28 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
+    fn pr_target() -> Target {
+        Target::GithubPr {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 1,
+        }
+    }
+
     #[test]
     fn read_config_parses_a_valid_line() {
         let input =
             br#"{"topic":"github.pr.o/r#1","owner":"o","repo":"r","number":1,"interval_ms":5000}"#;
         let config = read_config(&input[..]).unwrap();
-        assert_eq!(config.owner, "o");
-        assert_eq!(config.number, 1);
+        assert_eq!(
+            config.target,
+            Target::GithubPr {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                number: 1
+            },
+            "a config with no kind is a PR watch, as every resolver before ADR-0030 sent"
+        );
         assert_eq!(config.interval_ms, 5000);
         assert_eq!(config.max_polls, 0);
         assert!(
@@ -560,12 +688,39 @@ mod tests {
     }
 
     #[test]
+    fn read_config_parses_a_review_request_watch() {
+        let input = br#"{"kind":"github-review-requests","topic":"github.review-requests.octocat","login":"Octocat"}"#;
+        let config = read_config(&input[..]).unwrap();
+        assert_eq!(
+            config.target,
+            Target::GithubReviewRequests {
+                login: GithubLogin::parse("octocat").unwrap()
+            }
+        );
+    }
+
+    /// The login is spliced into a search query, so the adapter re-parses it
+    /// rather than trusting whoever wrote its config.
+    #[test]
+    fn read_config_refuses_a_login_that_could_change_the_query_and_an_unknown_kind() {
+        let bad_login =
+            br#"{"kind":"github-review-requests","topic":"t","login":"a review-requested:b"}"#;
+        assert!(matches!(
+            read_config(&bad_login[..]),
+            Err(AdapterError::ParseConfig(_))
+        ));
+        let unknown = br#"{"kind":"gitlab-mr","topic":"t"}"#;
+        assert!(matches!(
+            read_config(&unknown[..]),
+            Err(AdapterError::UnknownKind(_))
+        ));
+    }
+
+    #[test]
     fn interval_floors_zero_to_default() {
         let config = Config {
             topic: "t".to_string(),
-            owner: "o".to_string(),
-            repo: "r".to_string(),
-            number: 1,
+            target: pr_target(),
             interval_ms: 0,
             baseline: Value::Null,
             max_polls: 0,
@@ -575,7 +730,7 @@ mod tests {
 
     #[test]
     fn parse_injected_baseline_null_is_none() {
-        assert!(parse_injected_baseline(Value::Null).is_none());
+        assert!(parse_injected_baseline::<snapshot::Baseline>(Value::Null).is_none());
     }
 
     #[test]
@@ -586,7 +741,7 @@ mod tests {
             "ci": "failure",
             "failed_checks": ["build"]
         });
-        let base = parse_injected_baseline(snapshot).unwrap();
+        let base = parse_injected_baseline::<snapshot::Baseline>(snapshot).unwrap();
         assert_eq!(base.max_review_id, 2);
         assert_eq!(base.ci, snapshot::CiRollup::Failure);
     }
@@ -625,7 +780,8 @@ mod tests {
         });
         let line = format!("{}\n", serde_json::to_string(&config).unwrap());
         let parsed = read_config(line.as_bytes()).expect("mid-band config must be readable");
-        let restored = parse_injected_baseline(parsed.baseline).expect("baseline restores");
+        let restored = parse_injected_baseline::<snapshot::Baseline>(parsed.baseline)
+            .expect("baseline restores");
         assert_eq!(
             restored, baseline,
             "the mid-band baseline round-trips exactly"
@@ -636,9 +792,7 @@ mod tests {
     fn invalid_topic_is_a_typed_error() {
         let config = Config {
             topic: "has space".to_string(),
-            owner: "o".to_string(),
-            repo: "r".to_string(),
-            number: 1,
+            target: pr_target(),
             interval_ms: 0,
             baseline: Value::Null,
             max_polls: 0,

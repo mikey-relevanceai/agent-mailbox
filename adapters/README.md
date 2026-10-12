@@ -70,7 +70,12 @@ prints three `Publish` NDJSON lines, 500 ms apart, then exits 0. Pipe it into
 
 `github-pr-adapter/` is the MVP's real adapter: it polls one GitHub pull request
 via the `gh` CLI and publishes **only the transitions agents care about** — parity
-with the old `agent-ipc-github` skill, plus CI. It imports **only**
+with the old `agent-ipc-github` skill, plus CI. The same program has a second
+mode, picked by the config's `kind`: `github-review-requests` polls one user's
+pending review requests and publishes each PR that newly asks for one
+([design/03](../docs/design/03-review-request-watch.md),
+[ADR-0030](../docs/adr/0030-review-requests-are-a-mode-of-the-github-adapter.md)).
+The rest of this section describes the PR mode. It imports **only**
 `mailbox-protocol` and reaches GitHub by shelling out to `gh` (never linking a
 GitHub SDK or the bridge crate).
 

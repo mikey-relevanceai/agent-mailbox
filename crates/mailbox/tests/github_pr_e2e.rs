@@ -69,6 +69,7 @@ case "${1:-}" in
       */pulls/*/reviews) key="reviews" ;;
       */issues/*/comments) key="issue_comments" ;;
       */pulls/*/comments) key="thread_comments" ;;
+      search/issues) key="search" ;;
       *) echo "fake-gh: unknown api path ${2:-}" >&2; exit 2 ;;
     esac ;;
   *) echo "fake-gh: unsupported invocation: $*" >&2; exit 2 ;;
@@ -112,6 +113,26 @@ fn write_fake_gh(dir: &Path) -> PathBuf {
     std::fs::write(
         dir.join("pr.1"),
         r#"{"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[]}"#,
+    )
+    .unwrap();
+    // Review requests: acme/web#1 is pending before the watch starts; from the
+    // second poll on, acme/api#7 is requested too (the clamp repeats it).
+    let item = |repo: &str, number: u64| {
+        serde_json::json!({
+            "number": number,
+            "html_url": format!("https://github.com/{repo}/pull/{number}"),
+            "repository_url": format!("https://api.github.com/repos/{repo}"),
+            "pull_request": {},
+        })
+    };
+    let page = |items: Vec<serde_json::Value>| {
+        serde_json::json!({ "total_count": items.len(), "incomplete_results": false, "items": items })
+            .to_string()
+    };
+    std::fs::write(dir.join("search.0"), page(vec![item("acme/web", 1)])).unwrap();
+    std::fs::write(
+        dir.join("search.1"),
+        page(vec![item("acme/web", 1), item("acme/api", 7)]),
     )
     .unwrap();
     script
@@ -423,4 +444,86 @@ fn no_refire_across_a_real_adapter_restart() {
         conflicts, 1,
         "a real restart re-injects the persisted baseline and must not re-fire the conflict"
     );
+}
+
+// ==== github-review-requests through the bridge (design/03) =====================
+
+/// A review-request watch runs the same adapter program in its other mode: the
+/// request pending before the watch wakes nobody, the new one surfaces in `read`
+/// once with its subject, the baseline reaches storage, and `unwatch` stops it.
+#[test]
+fn review_request_watch_wakes_once_per_new_request() {
+    let daemon = Daemon::start();
+    let session = "s1";
+
+    let watched = daemon.run_as(
+        session,
+        &[
+            "--json",
+            "watch",
+            "github-review-requests",
+            "Octocat",
+            "--interval",
+            "1",
+        ],
+    );
+    assert_ok(&watched, "watch github-review-requests");
+    assert_eq!(
+        parse_json(&String::from_utf8_lossy(&watched.stdout))["topic"],
+        "github.review-requests.octocat",
+        "the login is lowercased into one topic per person"
+    );
+
+    let requested = |events: &[serde_json::Value]| {
+        events
+            .iter()
+            .filter(|e| e["body"]["edge"] == "review_requested")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut fired = Vec::new();
+    poll_until("the new request surfaced", Duration::from_secs(15), || {
+        fired.extend(requested(&read_events(&daemon, session)));
+        (!fired.is_empty()).then_some(())
+    });
+    poll_until("baseline reached storage", Duration::from_secs(10), || {
+        daemon
+            .baseline_row()
+            .filter(|row| row.contains("acme/api#7"))
+    });
+    let watch_more = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < watch_more {
+        fired.extend(requested(&read_events(&daemon, session)));
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    assert_eq!(fired.len(), 1, "exactly one wake: {fired:?}");
+    assert_eq!(fired[0]["topic"], "github.review-requests.octocat");
+    assert_eq!(fired[0]["subject"]["text"], "review requested: acme/api#7");
+    assert_eq!(
+        fired[0]["subject"]["link"],
+        "https://github.com/acme/api/pull/7"
+    );
+
+    let status = daemon.run_as(session, &["--json", "status"]);
+    assert_ok(&status, "status");
+    let status = parse_json(&String::from_utf8_lossy(&status.stdout));
+    assert_eq!(status["watches"][0]["kind"], "github-review-requests");
+    assert_eq!(status["watches"][0]["repo"], "octocat");
+
+    assert_ok(
+        &daemon.run_as(session, &["unwatch", "github-review-requests", "octocat"]),
+        "unwatch github-review-requests",
+    );
+    poll_until("the adapter stopped", Duration::from_secs(10), || {
+        adapter_pid(&daemon, session).is_none().then_some(())
+    });
+}
+
+#[test]
+fn review_request_watch_refuses_at_me_before_reaching_the_bridge() {
+    let daemon = Daemon::start();
+    let out = daemon.run_as("s1", &["watch", "github-review-requests", "@me"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gh api user"), "stderr: {stderr}");
 }

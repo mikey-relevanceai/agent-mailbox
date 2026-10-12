@@ -26,8 +26,8 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use mailbox_protocol::{
-    AdapterId, Cursor, Event, EventId, Offset, SlackFilters, SlackWatch, Subject, Timestamp, Topic,
-    inbox_topic,
+    AdapterId, Cursor, Event, EventId, GithubLogin, Offset, SlackFilters, SlackWatch, Subject,
+    Timestamp, Topic, inbox_topic,
 };
 
 use super::error::StorageError;
@@ -1771,6 +1771,23 @@ fn build_watch(
             watch: slack_watch(id, pr, count, SlackWatch::parse_thread_key(&repo))?,
             skip: slack_filters(id, filters)?,
         },
+        WatchKind::GithubReviewRequests => {
+            if pr != 0 || count != 0 {
+                return Err(StorageError::Corrupt {
+                    detail: format!(
+                        "github-review-requests watch {} carries a non-zero pr {pr} or publish count {count}",
+                        id.get()
+                    ),
+                });
+            }
+            let login = GithubLogin::parse(&repo).map_err(|err| StorageError::Corrupt {
+                detail: format!(
+                    "github-review-requests watch {} has an invalid login: {err}",
+                    id.get()
+                ),
+            })?;
+            WatchTarget::GithubReviewRequests { login }
+        }
     };
     let state = reconstruct_state(state, child_pid, id)?;
 
@@ -2569,6 +2586,40 @@ mod tests {
         .unwrap();
         let err = do_get_watch(&conn, WatchId::new(1)).unwrap_err();
         assert!(matches!(err, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn review_request_watch_round_trips_its_login() {
+        let conn = migrated();
+        let login = GithubLogin::parse("octocat").unwrap();
+        let id = do_upsert_watch(
+            &conn,
+            &WatchSpec {
+                target: WatchTarget::GithubReviewRequests {
+                    login: login.clone(),
+                },
+                interval: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let watch = do_get_watch(&conn, id).unwrap().expect("the watch exists");
+        assert_eq!(watch.target, WatchTarget::GithubReviewRequests { login });
+    }
+
+    #[test]
+    fn review_request_watch_with_an_invalid_login_or_a_pr_is_corrupt() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'github-review-requests', 'not a login', 0, 60000, 0, 'desired', NULL),
+                    (2, 'github-review-requests', 'octocat', 7, 60000, 0, 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        for id in [1, 2] {
+            let err = do_get_watch(&conn, WatchId::new(id)).unwrap_err();
+            assert!(matches!(err, StorageError::Corrupt { .. }), "watch {id}");
+        }
     }
 
     #[test]

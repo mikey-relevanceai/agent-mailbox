@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "GitHub PR poll adapter: shells out to `gh`, publishes only the transitions agents care about (conflict / reviews / CI), with an edge-triggered baseline persisted via the bridge"
+description = "GitHub poll adapter: shells out to `gh`, publishes only the transitions agents care about (a PR's conflict / reviews / CI, or a user's new review requests), with an edge-triggered baseline persisted via the bridge"
 
 # The real MVP adapter. It speaks ONLY `mailbox-protocol` (NDJSON on stdout) and
 # NEVER links the `mailbox` bridge crate — adapters never import bridge internals

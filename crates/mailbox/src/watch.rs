@@ -32,7 +32,9 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic};
+use mailbox_protocol::{
+    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic,
+};
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
@@ -260,6 +262,35 @@ pub async fn record_slack(
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
 }
 
+/// Record (or reuse) the review-request watch for `login`, attach `session`'s
+/// interest, and subscribe it to `github.review-requests.<login>` (design/03).
+/// The analogue of [`record`] for a person rather than a PR, keyed by
+/// `(kind, login, pr=0)`.
+pub async fn record_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    login: &GithubLogin,
+    interval: Duration,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    let spec = WatchSpec {
+        target: WatchTarget::GithubReviewRequests {
+            login: login.clone(),
+        },
+        interval,
+    };
+    record_watch(
+        bus,
+        storage,
+        supervisor,
+        spec,
+        login.review_requests_topic(),
+        session,
+    )
+    .await
+}
+
 /// Shared body of [`record`]/[`record_stub`]: upsert the watch, attach interest,
 /// align the subscription, and ask the supervisor to run the adapter. Kind-
 /// agnostic — it speaks only in the already-built [`WatchSpec`] and topic — so
@@ -388,6 +419,28 @@ pub async fn drop_interest_slack(
         &slack.key(),
         0,
         slack.topic(),
+        session,
+    )
+    .await
+}
+
+/// Drop `session`'s interest in the review-request watch for `login` and
+/// unsubscribe it. The analogue of [`drop_interest`].
+pub async fn drop_interest_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    login: &GithubLogin,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::GithubReviewRequests,
+        login.as_str(),
+        0,
+        login.review_requests_topic(),
         session,
     )
     .await

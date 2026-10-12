@@ -41,6 +41,7 @@
 
 mod error;
 mod framing;
+mod github_review;
 mod ids;
 mod message;
 mod session;
@@ -55,6 +56,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub use error::{FramingError, IncompatibleVersion, LineError, TopicError, check_version};
 pub use framing::{decode_line, encode_line, read_lines, write_line};
+pub use github_review::{GithubLogin, GithubLoginError};
 pub use ids::{AdapterId, Cursor, EventId, Offset, Timestamp};
 pub use message::{
     Ack, Baseline, ErrorCode, Event, Message, ProtocolError, Publish, ReadRequest, ReadResponse,

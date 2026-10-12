@@ -446,6 +446,7 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
         }
         WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
         WatchTarget::Slack { watch, .. } => Some(watch.topic()),
+        WatchTarget::GithubReviewRequests { login } => Some(login.review_requests_topic()),
     }
 }
 
