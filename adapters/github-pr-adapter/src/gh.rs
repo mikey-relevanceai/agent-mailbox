@@ -75,39 +75,38 @@ pub enum GhError {
     /// keeps the baseline (never fail-open to zeros — review item A).
     #[error("gh returned an unexpected/incomplete response: {0}")]
     Parse(String),
+    /// A review-request search reported more pending requests than GitHub search
+    /// will return (1,000), so the set cannot be seen whole and entries cannot be
+    /// told from churn. Fatal, so the watch shows `failed` (ADR-0030).
+    #[error(
+        "{total_count} open review requests; GitHub search returns at most 1,000, so the set cannot be watched"
+    )]
+    SearchTruncated { total_count: u64 },
+    /// The review-request set changed between the pages of one poll, so the pages
+    /// do not describe one set. TRANSIENT: skip the poll and keep the baseline.
+    #[error(
+        "the review-request set changed while paging: {seen} PRs seen, search reported {total_count}"
+    )]
+    SetChangedWhilePaging { seen: u64, total_count: u64 },
 }
 
-/// A poll client bound to one PR, shelling out to `gh` under the given identity.
-pub struct GhClient {
+/// The `gh` binary, shared by both of the adapter's modes.
+pub struct Gh {
     bin: String,
-    owner: String,
-    repo: String,
-    number: u64,
 }
 
-impl GhClient {
-    /// Build a client for `owner/repo#number`, resolving the `gh` binary from
-    /// [`ENV_GH_BIN`] (else the real `gh` on PATH).
-    pub fn new(owner: impl Into<String>, repo: impl Into<String>, number: u64) -> Self {
+impl Gh {
+    /// Resolve the `gh` binary from [`ENV_GH_BIN`], else the real `gh` on PATH.
+    pub fn from_env() -> Self {
         let bin = std::env::var(ENV_GH_BIN)
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_GH_BIN.to_string());
-        Self {
-            bin,
-            owner: owner.into(),
-            repo: repo.into(),
-            number,
-        }
-    }
-
-    /// `owner/repo`, the slug `gh --repo` wants.
-    fn slug(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
+        Self { bin }
     }
 
     /// Run `gh` with `args`, returning its stdout or a classified [`GhError`].
-    async fn run(&self, args: &[String]) -> Result<String, GhError> {
+    pub async fn run(&self, args: &[String]) -> Result<String, GhError> {
         let output = tokio::process::Command::new(&self.bin)
             .args(args)
             .output()
@@ -124,6 +123,39 @@ impl GhClient {
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         Err(classify_failure(&stderr))
+    }
+}
+
+/// A poll client bound to one PR, shelling out to `gh` under the given identity.
+pub struct GhClient {
+    gh: Gh,
+    owner: String,
+    repo: String,
+    number: u64,
+}
+
+impl GhClient {
+    /// Build a client for `owner/repo#number`.
+    pub fn new(gh: Gh, owner: impl Into<String>, repo: impl Into<String>, number: u64) -> Self {
+        Self {
+            gh,
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// `owner/repo`, the slug `gh --repo` wants.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    async fn run(&self, args: &[String]) -> Result<String, GhError> {
+        self.gh.run(args).await
     }
 
     /// Poll GitHub once and build an [`Observation`]. Four `gh` calls (pr view +

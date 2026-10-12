@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mailbox_protocol::{
-    AdapterId, Event, EventId, IncompatibleVersion, Offset, PROTOCOL_VERSION, SlackFilters,
-    SlackWatch, Subject, Topic, check_version, inbox_topic,
+    AdapterId, Event, EventId, GithubLogin, IncompatibleVersion, Offset, PROTOCOL_VERSION,
+    SlackFilters, SlackWatch, Subject, Topic, check_version, inbox_topic,
 };
 
 use mailbox::storage::{
@@ -133,6 +133,19 @@ pub enum Request {
     UnwatchSlack {
         session: SessionId,
         target: SlackWatch,
+    },
+    /// Declare `session`'s interest in a GitHub user's review requests and
+    /// subscribe it to `github.review-requests.<login>` (design/03). The login
+    /// travels parsed, so decoding the frame is what validates it.
+    WatchReviewRequests {
+        session: SessionId,
+        login: GithubLogin,
+        interval_secs: u64,
+    },
+    /// Drop `session`'s interest in a review-request watch and unsubscribe it.
+    UnwatchReviewRequests {
+        session: SessionId,
+        login: GithubLogin,
     },
     /// Report watches (interest + child pid), and — when the caller is a session —
     /// that session's subscriptions and unread counts.
@@ -574,6 +587,8 @@ pub enum WatchKindWire {
     SlackChannel,
     #[serde(rename = "slack-thread")]
     SlackThread,
+    #[serde(rename = "github-review-requests")]
+    GithubReviewRequests,
 }
 
 impl From<WatchKind> for WatchKindWire {
@@ -583,6 +598,7 @@ impl From<WatchKind> for WatchKindWire {
             WatchKind::Stub => WatchKindWire::Stub,
             WatchKind::SlackChannel => WatchKindWire::SlackChannel,
             WatchKind::SlackThread => WatchKindWire::SlackThread,
+            WatchKind::GithubReviewRequests => WatchKindWire::GithubReviewRequests,
         }
     }
 }
@@ -752,9 +768,34 @@ mod tests {
             },
             interval_secs: 60,
         });
+        round_trip_request(Request::WatchReviewRequests {
+            session: SessionId::new("s1"),
+            login: GithubLogin::parse("octocat").unwrap(),
+            interval_secs: 60,
+        });
+        round_trip_request(Request::UnwatchReviewRequests {
+            session: SessionId::new("s1"),
+            login: GithubLogin::parse("octocat").unwrap(),
+        });
         round_trip_request(Request::Status {
             session: Some(SessionId::new("s1")),
         });
+    }
+
+    /// The daemon never sees an unvalidated login: a frame carrying one that could
+    /// add a qualifier to the adapter's search does not decode.
+    #[test]
+    fn a_review_request_frame_with_an_invalid_login_does_not_decode() {
+        let frame = |login: &str| {
+            format!(
+                r#"{{"version":1,"op":"watch_review_requests","session":"s1","login":"{login}","interval_secs":60}}"#
+            )
+        };
+        assert!(
+            decode_frame::<Request>(&frame("octocat")).is_ok(),
+            "the control frame is otherwise well-formed"
+        );
+        assert!(decode_frame::<Request>(&frame("a review-requested:b")).is_err());
     }
 
     /// The three ops whose caller is optional survive the wire in BOTH shapes. A

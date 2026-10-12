@@ -30,6 +30,7 @@ Also:
 | [design/](design/README.md) | Major system / subsystem designs |
 | [design/01-mvp-github-watch.md](design/01-mvp-github-watch.md) | MVP: GitHub PR watch lifecycle (**Implemented**) |
 | [design/02-slack-watch.md](design/02-slack-watch.md) | Slack channel and thread watches; how Slack is reached and why (**Implemented**) |
+| [design/03-review-request-watch.md](design/03-review-request-watch.md) | GitHub review-request watch: wake when someone is newly asked to review (**Implemented**) |
 
 ## Mental model
 

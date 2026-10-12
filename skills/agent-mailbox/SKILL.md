@@ -2,8 +2,9 @@
 name: agent-mailbox
 description: >-
   Wake this idle Claude Code agent when the world changes — a watched GitHub PR
-  is merged, gains a merge conflict, a review, or a CI failure; a watched Slack
-  channel or thread gets a new message — or message a PEER AGENT
+  is merged, gains a merge conflict, a review, or a CI failure; someone newly
+  asks a watched GitHub user to review a PR; a watched Slack channel or thread
+  gets a new message — or message a PEER AGENT
   directly and wake it in its own session (`mailbox agents` to find it, `mailbox
   send` to poke it). Replaces the older agent-ipc / agent-ipc-github skills. Use
   when the agent should go idle (or do other work) and be nudged to react to an
@@ -82,6 +83,23 @@ seen.) To see whether a watch is currently failing, run `mailbox status`.
 
 You may still find old `mailbox stopped watching this` or `mailbox is watching this
 again` events in a topic's history. Current bridges no longer send them.
+
+### Watch for review requests
+
+```bash
+mailbox watch github-review-requests GITHUB_LOGIN   # e.g. "$(gh api user --jq .login)"
+```
+
+Wakes you when an open PR **newly** asks that user for a review, directly or through
+a team they are on. Requests already pending when you start the watch do not wake
+you: run `gh search prs --review-requested=GITHUB_LOGIN --state=open` for those. A
+PR leaving the set (reviewed, closed, withdrawn) wakes nobody. A re-request after a
+review should wake you again (it is a new entry once your review cleared the old
+one). `@me` is refused; name the login.
+
+The wake says `review requested: OWNER/REPO#N` with the PR's link, and nothing about
+its content. Read the PR with `gh`. What you do about the request is whatever your
+own instructions say; the bridge has no opinion.
 
 ### Watch a Slack channel or thread
 
@@ -348,6 +366,7 @@ Session identity is automatic; none of these take a session argument.
 | list peer agents | `mailbox agents` |
 | message a peer | `mailbox send PEER_ID --text "..."` |
 | watch a PR | `mailbox watch github-pr OWNER/REPO#N` |
+| watch for review requests | `mailbox watch github-review-requests GITHUB_LOGIN` (not `@me`) |
 | watch a Slack channel / thread | `mailbox watch slack-channel CHANNEL_ID` / `mailbox watch slack-thread CHANNEL_ID/THREAD_TS` (or a Slack link); add `--skip user=USER_ID,app=APP_ID` to not be woken by those posts |
 | subscribe to a topic | `mailbox subscribe TOPIC` |
 | publish to a topic | `mailbox publish TOPIC --body '{...}'` |
@@ -355,6 +374,7 @@ Session identity is automatic; none of these take a session argument.
 | read on wake | `mailbox read` |
 | who am I / can I be woken / check state | `mailbox status` |
 | stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N` |
+| stop watching review requests | `mailbox unwatch github-review-requests GITHUB_LOGIN` |
 | stop watching Slack | `mailbox unwatch slack-channel CHANNEL_ID` / `mailbox unwatch slack-thread CHANNEL_ID/THREAD_TS` |
 | unsubscribe | `mailbox unsubscribe TOPIC` |
 

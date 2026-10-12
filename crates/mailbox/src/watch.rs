@@ -32,7 +32,9 @@
 
 use std::time::Duration;
 
-use mailbox_protocol::{GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic};
+use mailbox_protocol::{
+    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic,
+};
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
@@ -260,6 +262,35 @@ pub async fn record_slack(
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
 }
 
+/// Record (or reuse) the review-request watch for `login`, attach `session`'s
+/// interest, and subscribe it to `github.review-requests.<login>` (design/03).
+/// The analogue of [`record`] for a person rather than a PR, keyed by
+/// `(kind, login, pr=0)`.
+pub async fn record_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    login: &GithubLogin,
+    interval: Duration,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    let spec = WatchSpec {
+        target: WatchTarget::GithubReviewRequests {
+            login: login.clone(),
+        },
+        interval,
+    };
+    record_watch(
+        bus,
+        storage,
+        supervisor,
+        spec,
+        login.review_requests_topic(),
+        session,
+    )
+    .await
+}
+
 /// Shared body of [`record`]/[`record_stub`]: upsert the watch, attach interest,
 /// align the subscription, and ask the supervisor to run the adapter. Kind-
 /// agnostic — it speaks only in the already-built [`WatchSpec`] and topic — so
@@ -388,6 +419,28 @@ pub async fn drop_interest_slack(
         &slack.key(),
         0,
         slack.topic(),
+        session,
+    )
+    .await
+}
+
+/// Drop `session`'s interest in the review-request watch for `login` and
+/// unsubscribe it. The analogue of [`drop_interest`].
+pub async fn drop_interest_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    login: &GithubLogin,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::GithubReviewRequests,
+        login.as_str(),
+        0,
+        login.review_requests_topic(),
         session,
     )
     .await
@@ -805,6 +858,50 @@ mod tests {
             1,
             "one shared watch"
         );
+    }
+
+    /// GitHub logins are case-insensitive, so two spellings are one watch, one
+    /// refcount and one poller; and the drop finds the row the record wrote.
+    #[tokio::test]
+    async fn review_request_watches_share_one_row_whatever_the_login_case() {
+        let (bus, storage, supervisor, _dir) = fresh().await;
+        let upper = GithubLogin::parse("Octocat").unwrap();
+        let lower = GithubLogin::parse("octocat").unwrap();
+        let other = GithubLogin::parse("hubot").unwrap();
+        let interval = Duration::from_secs(60);
+        for (login, session) in [(&upper, "s1"), (&lower, "s2"), (&other, "s1")] {
+            record_review_requests(
+                &bus,
+                &storage,
+                &supervisor,
+                login,
+                interval,
+                SessionId::new(session),
+            )
+            .await
+            .unwrap();
+        }
+        let watches = storage.list_watches().await.unwrap();
+        assert_eq!(watches.len(), 2, "one row per person: {watches:?}");
+
+        for (login, session, remaining_interest) in
+            [(&lower, "s1", 1), (&upper, "s2", 0), (&other, "s1", 0)]
+        {
+            let dropped = drop_interest_review_requests(
+                &bus,
+                &storage,
+                &supervisor,
+                login,
+                SessionId::new(session),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dropped.outcome,
+                UnwatchOutcome::Dropped { remaining_interest },
+                "{login} by {session}"
+            );
+        }
     }
 
     #[tokio::test]

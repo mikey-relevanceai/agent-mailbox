@@ -64,7 +64,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use mailbox_protocol::{AdapterId, GithubPr, SlackFilters, SlackWatch, Subject, Timestamp, Topic};
+use mailbox_protocol::{
+    AdapterId, GithubLogin, GithubPr, SlackFilters, SlackWatch, Subject, Timestamp, Topic,
+};
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
@@ -534,6 +536,8 @@ fn request_op(request: &Request) -> &'static str {
         Request::UnwatchStub { .. } => "unwatch_stub",
         Request::WatchSlack { .. } => "watch_slack",
         Request::UnwatchSlack { .. } => "unwatch_slack",
+        Request::WatchReviewRequests { .. } => "watch_review_requests",
+        Request::UnwatchReviewRequests { .. } => "unwatch_review_requests",
         Request::Status { .. } => "status",
         Request::Send { .. } => "send",
         Request::Agents { .. } => "agents",
@@ -558,6 +562,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::UnwatchStub { session, .. }
         | Request::WatchSlack { session, .. }
         | Request::UnwatchSlack { session, .. }
+        | Request::WatchReviewRequests { session, .. }
+        | Request::UnwatchReviewRequests { session, .. }
         | Request::EndSession { session }
         | Request::ResumeSession { session } => Some(session),
         // For a send, the session that acted is the SENDER (the recipient is
@@ -649,6 +655,14 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         }
         Request::UnwatchSlack { session, target } => {
             unwatch_slack(bus, storage, supervisor, session, target).await
+        }
+        Request::WatchReviewRequests {
+            session,
+            login,
+            interval_secs,
+        } => watch_review_requests(bus, storage, supervisor, session, login, interval_secs).await,
+        Request::UnwatchReviewRequests { session, login } => {
+            unwatch_review_requests(bus, storage, supervisor, session, login).await
         }
         Request::Status { session } => status(storage, session).await,
         Request::Send {
@@ -950,6 +964,54 @@ async fn unwatch_slack(
     target: SlackWatch,
 ) -> Response {
     match mailbox::watch::drop_interest_slack(bus, storage, supervisor, &target, session).await {
+        Ok(dropped) => Response::Unwatched {
+            topic: dropped.topic,
+            outcome: dropped.outcome.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::record_review_requests`].
+async fn watch_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    login: GithubLogin,
+    interval_secs: u64,
+) -> Response {
+    match mailbox::watch::record_review_requests(
+        bus,
+        storage,
+        supervisor,
+        &login,
+        Duration::from_secs(interval_secs),
+        session,
+    )
+    .await
+    {
+        Ok(recorded) => Response::Watched {
+            topic: recorded.topic,
+            interest: recorded.interest,
+            subscribe: recorded.subscribe.into(),
+            skip: recorded.skip,
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::drop_interest_review_requests`].
+async fn unwatch_review_requests(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    login: GithubLogin,
+) -> Response {
+    match mailbox::watch::drop_interest_review_requests(bus, storage, supervisor, &login, session)
+        .await
+    {
         Ok(dropped) => Response::Unwatched {
             topic: dropped.topic,
             outcome: dropped.outcome.into(),

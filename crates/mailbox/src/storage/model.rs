@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use mailbox_protocol::{Cursor, Event, Offset, SlackFilters, SlackWatch};
+use mailbox_protocol::{Cursor, Event, GithubLogin, Offset, SlackFilters, SlackWatch};
 // The session identity is shared with the harness, so it lives in the protocol
 // crate (see `mailbox_protocol::session`). Re-exported here so the many existing
 // `mailbox::storage::SessionId` call sites keep working unchanged.
@@ -80,6 +80,9 @@ pub enum WatchKind {
     SlackChannel,
     /// New replies in one Slack thread (`slack-thread`, design/02).
     SlackThread,
+    /// PRs a GitHub user was newly asked to review (`github-review-requests`,
+    /// design/03).
+    GithubReviewRequests,
 }
 
 impl WatchKind {
@@ -92,6 +95,7 @@ impl WatchKind {
             WatchKind::Stub => "stub",
             WatchKind::SlackChannel => "slack-channel",
             WatchKind::SlackThread => "slack-thread",
+            WatchKind::GithubReviewRequests => "github-review-requests",
         }
     }
 
@@ -102,6 +106,7 @@ impl WatchKind {
             "stub" => Some(WatchKind::Stub),
             "slack-channel" => Some(WatchKind::SlackChannel),
             "slack-thread" => Some(WatchKind::SlackThread),
+            "github-review-requests" => Some(WatchKind::GithubReviewRequests),
             _ => None,
         }
     }
@@ -154,6 +159,9 @@ pub enum WatchTarget {
         watch: SlackWatch,
         skip: SlackFilters,
     },
+    /// The review requests of one GitHub user (design/03). Stored with the login
+    /// in the `repo` column and `0` in the others, as a stub stores its label.
+    GithubReviewRequests { login: GithubLogin },
 }
 
 impl WatchTarget {
@@ -163,16 +171,19 @@ impl WatchTarget {
             WatchTarget::GithubPr { .. } => WatchKind::GithubPr,
             WatchTarget::Stub { .. } => WatchKind::Stub,
             WatchTarget::Slack { watch, .. } => slack_kind(watch),
+            WatchTarget::GithubReviewRequests { .. } => WatchKind::GithubReviewRequests,
         }
     }
 
     /// The flat `repo` column: `owner/repo` for github, the label for stub, the
-    /// watch key (`<channel>` or `<channel>/<thread-ts>`) for Slack.
+    /// watch key (`<channel>` or `<channel>/<thread-ts>`) for Slack, the login for
+    /// review requests.
     pub fn repo_column(&self) -> String {
         match self {
             WatchTarget::GithubPr { repo, .. } => repo.clone(),
             WatchTarget::Stub { label, .. } => label.clone(),
             WatchTarget::Slack { watch, .. } => watch.key(),
+            WatchTarget::GithubReviewRequests { login } => login.to_string(),
         }
     }
 
@@ -180,14 +191,18 @@ impl WatchTarget {
     pub fn pr_column(&self) -> u64 {
         match self {
             WatchTarget::GithubPr { pr, .. } => *pr,
-            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } => 0,
+            WatchTarget::Stub { .. }
+            | WatchTarget::Slack { .. }
+            | WatchTarget::GithubReviewRequests { .. } => 0,
         }
     }
 
     /// The flat `publish_count` column: `0` (unused) for github, the count for stub.
     pub fn count_column(&self) -> u64 {
         match self {
-            WatchTarget::GithubPr { .. } | WatchTarget::Slack { .. } => 0,
+            WatchTarget::GithubPr { .. }
+            | WatchTarget::Slack { .. }
+            | WatchTarget::GithubReviewRequests { .. } => 0,
             WatchTarget::Stub { count, .. } => *count,
         }
     }
@@ -196,7 +211,9 @@ impl WatchTarget {
     pub fn skip(&self) -> Option<&SlackFilters> {
         match self {
             WatchTarget::Slack { skip, .. } => Some(skip),
-            WatchTarget::GithubPr { .. } | WatchTarget::Stub { .. } => None,
+            WatchTarget::GithubPr { .. }
+            | WatchTarget::Stub { .. }
+            | WatchTarget::GithubReviewRequests { .. } => None,
         }
     }
 
@@ -206,7 +223,9 @@ impl WatchTarget {
     /// reader cannot parse fails as corrupt rather than running unfiltered.
     pub fn filters_column(&self) -> String {
         match self {
-            WatchTarget::GithubPr { .. } | WatchTarget::Stub { .. } => "[]".to_string(),
+            WatchTarget::GithubPr { .. }
+            | WatchTarget::Stub { .. }
+            | WatchTarget::GithubReviewRequests { .. } => "[]".to_string(),
             WatchTarget::Slack { skip, .. } => {
                 serde_json::to_string(skip).expect("Slack filters always serialize")
             }
