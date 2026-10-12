@@ -710,7 +710,7 @@ fn review_requests_re_request_wakes_and_restart_does_not_refire() {
 }
 
 /// GitHub's `incomplete_results` is a partial set: skipped, never diffed as if
-/// the missing PRs had left (which would re-fire them all on the next poll).
+/// the missing PRs had left.
 #[test]
 fn review_requests_incomplete_search_is_skipped_not_diffed() {
     let fake = FakeGh::new();
@@ -763,4 +763,45 @@ fn review_requests_page_through_a_long_queue() {
         2,
         "each poll fetched its second page: {args}"
     );
+}
+
+/// More pending requests than search returns cannot be watched: the adapter
+/// exits non-zero (the watch shows `failed`) instead of polling again.
+#[test]
+fn review_requests_beyond_the_search_cap_are_fatal() {
+    let fake = FakeGh::new();
+    let page: Vec<(&str, u64)> = (1..=100).map(|n| ("acme/web", n)).collect();
+    fake.fixture("search", 0, &search_page_of(&page, 1_001));
+
+    let result = run_adapter(&fake, review_config(3, Value::Null), &[]);
+    assert_ne!(result.code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.publish_count(), 0);
+    assert_eq!(result.baseline_count(), 0);
+    let args = std::fs::read_to_string(fake.dir().join("search.args")).unwrap();
+    assert_eq!(
+        args.lines().filter(|arg| arg.starts_with("page=")).count(),
+        1,
+        "one request, then out: {args}"
+    );
+}
+
+/// A set that changed between pages is a skipped poll, not a diff: the
+/// baseline is kept and nothing fires when the next poll sees the full set.
+#[test]
+fn review_requests_set_changed_while_paging_is_skipped() {
+    let fake = FakeGh::new();
+    let page_one: Vec<(&str, u64)> = (1..=100).map(|n| ("acme/web", n)).collect();
+    // Poll 1: 101 over two pages. Poll 2: page 2 comes back short of its count.
+    // Poll 3: the same 101 again.
+    fake.fixture("search", 0, &search_page_of(&page_one, 101));
+    fake.fixture("search", 1, &search_page_of(&[("acme/web", 101)], 101));
+    fake.fixture("search", 2, &search_page_of(&page_one, 102));
+    fake.fixture("search", 3, &search_page_of(&[], 102));
+    fake.fixture("search", 4, &search_page_of(&page_one, 101));
+    fake.fixture("search", 5, &search_page_of(&[("acme/web", 101)], 101));
+
+    let result = run_adapter(&fake, review_config(2, Value::Null), &[]);
+    assert_eq!(result.code, Some(0), "stderr: {}", result.stderr);
+    assert_eq!(result.publish_count(), 0, "{}", result.stdout);
+    assert_eq!(result.baseline_count(), 1, "only the first poll's baseline");
 }

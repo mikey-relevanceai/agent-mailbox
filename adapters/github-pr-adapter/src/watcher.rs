@@ -15,7 +15,9 @@ use crate::review_requests;
 use crate::review_search;
 use crate::snapshot;
 
-/// One mode of the adapter. Every method but [`Watcher::observe`] is pure.
+/// One mode of the adapter. Every method but [`Watcher::observe`] is
+/// deterministic and free of side effects other than logging, so call each
+/// once per poll.
 pub trait Watcher {
     type Observation;
     /// Round-tripped through the bridge, so it must serialise.
@@ -52,6 +54,10 @@ impl PrWatcher {
     pub fn repo(&self) -> String {
         self.client.slug()
     }
+
+    pub fn number(&self) -> u64 {
+        self.client.number()
+    }
 }
 
 impl Watcher for PrWatcher {
@@ -84,7 +90,7 @@ impl Watcher for PrWatcher {
     }
 
     fn body(&self, edge: &Self::Edge) -> Value {
-        edge.body(&self.repo(), self.client.number())
+        edge.body(&self.repo(), self.number())
     }
 
     fn subject(&self, edge: &Self::Edge, obs: &Self::Observation) -> Option<Subject> {
@@ -115,7 +121,7 @@ impl Watcher for ReviewRequestsWatcher {
 
     fn first_baseline(&self, obs: &Self::Observation) -> Self::Baseline {
         info!(
-            pending = obs.requested.len(),
+            pending = obs.len(),
             "recorded the review requests already pending; none of them will wake"
         );
         review_requests::Baseline::from_observation(obs)
@@ -129,23 +135,20 @@ impl Watcher for ReviewRequestsWatcher {
         obs: &Self::Observation,
     ) -> (Self::Baseline, Vec<Self::Edge>) {
         let (next, edges) = review_requests::apply(prior, obs);
-        let already_known = obs
-            .requested
+        let already_known = obs.prs().filter(|pr| prior.knows(&pr.key())).count();
+        let back_from_leaving = prior.leaving.iter().filter(|key| obs.contains(key)).count();
+        let forgotten = prior
+            .leaving
             .iter()
-            .filter(|pr| prior.knows(&pr.key()))
-            .count();
-        let back_from_leaving = obs
-            .requested
-            .iter()
-            .filter(|pr| prior.leaving.contains(&pr.key()))
+            .filter(|key| !next.requested.contains(*key))
             .count();
         debug!(
-            observed = obs.requested.len(),
+            observed = obs.len(),
             entered = edges.len(),
             already_known,
             back_from_leaving,
             now_leaving = next.leaving.len(),
-            forgotten = prior.leaving.len() - back_from_leaving,
+            forgotten,
             "diffed the review-request set"
         );
         (next, edges)

@@ -45,9 +45,10 @@ gh api search/issues --method GET \
 
 `review-requested:` matches a direct request and a request to a team the login is
 on. Mikey chose that over `user-review-requested:` (direct only). For him, on
-2026-10-12, both matched the same 13 PRs. None of his teams has ever been requested,
-so the difference has never shown up (measured; [ADR-0030](../adr/0030-review-requests-are-a-mode-of-the-github-adapter.md)
-has the numbers). `archived:false` drops PRs nobody can review.
+2026-10-12, both matched the same 13 PRs, and `team-review-requested:` matched 0
+PRs, open or closed, for either of his two teams (measured;
+[ADR-0030](../adr/0030-review-requests-are-a-mode-of-the-github-adapter.md) has the
+numbers). So the difference has not shown up in his data. `archived:false` drops PRs nobody can review.
 
 The notifications API was the alternative. It was measured and rejected: it had a
 thread for 1 of the 13 pending requests, and that thread's reason was `mention`.

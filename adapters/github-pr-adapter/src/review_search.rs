@@ -7,13 +7,14 @@
 //!
 //! As in the PR mode (review item A), a response that is structurally wrong, or
 //! that GitHub marks `incomplete_results`, is a [`GhError::Parse`] — a skipped
-//! poll that keeps the baseline — never an empty set, which would forget every
-//! PR and re-fire them all on the next healthy poll.
+//! poll that keeps the baseline — never an empty set. The `leaving` guard in
+//! [`crate::review_requests`] absorbs one wrong poll, but two in a row would
+//! forget every PR and re-fire them all on the next healthy poll.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 
-use mailbox_protocol::GithubLogin;
+use mailbox_protocol::{GithubLogin, GithubPr};
 use serde_json::Value;
 use tracing::debug;
 
@@ -92,6 +93,7 @@ where
     F: FnMut(u64) -> Fut,
     Fut: Future<Output = Result<String, GhError>>,
 {
+    // Collected by key so a PR repeated across pages counts once in `seen`.
     let mut requested: BTreeMap<String, RequestedPr> = BTreeMap::new();
     let mut page = 1;
     loop {
@@ -113,9 +115,7 @@ where
         }
         page += 1;
     }
-    Ok(Observation {
-        requested: requested.into_values().collect(),
-    })
+    Ok(Observation::new(requested.into_values()))
 }
 
 /// One page of a `search/issues` response.
@@ -173,22 +173,20 @@ fn parse_item(item: &Value) -> Result<RequestedPr, GhError> {
         .filter(|url| !url.is_empty())
         .ok_or_else(|| GhError::Parse("search item had no `html_url`".into()))?;
     // `https://api.github.com/repos/<owner>/<repo>`; the search item carries no
-    // other field naming the repo.
-    let repo = item
+    // other field naming the repo. `GithubPr::new` is the one parser for a PR's
+    // identity, here as for a `github-pr` watch.
+    let (owner, repo) = item
         .get("repository_url")
         .and_then(Value::as_str)
         .and_then(|url| url.rsplit_once("/repos/"))
-        .map(|(_, slug)| slug)
-        .filter(|slug| {
-            slug.split_once('/')
-                .is_some_and(|(owner, repo)| !owner.is_empty() && !repo.is_empty())
-        })
+        .and_then(|(_, slug)| slug.split_once('/'))
         .ok_or_else(|| {
             GhError::Parse("search item had no `repository_url` naming a repo".into())
         })?;
+    let pr = GithubPr::new(owner, repo, number)
+        .map_err(|err| GhError::Parse(format!("search item is not a valid PR: {err}")))?;
     Ok(RequestedPr {
-        repo: repo.to_string(),
-        number,
+        pr,
         url: url.to_string(),
     })
 }
@@ -230,7 +228,7 @@ mod tests {
     }
 
     fn numbers(obs: &Observation) -> Vec<u64> {
-        obs.requested.iter().map(|pr| pr.number).collect()
+        obs.prs().map(|pr| pr.pr.number()).collect()
     }
 
     #[test]
@@ -251,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_queue_is_an_empty_set_not_an_error() {
         let (result, _) = collect(vec![page_of([], 0)]).await;
-        assert!(result.unwrap().requested.is_empty());
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -262,7 +260,7 @@ mod tests {
             page_of(201..=250, 250),
         ])
         .await;
-        assert_eq!(result.unwrap().requested.len(), 250);
+        assert_eq!(result.unwrap().len(), 250);
         assert_eq!(asked, [1, 2, 3]);
     }
 
@@ -326,8 +324,7 @@ mod tests {
         assert_eq!(
             page.items,
             [RequestedPr {
-                repo: "RelevanceAI/arg".to_string(),
-                number: 7353,
+                pr: GithubPr::new("RelevanceAI", "arg", 7353).unwrap(),
                 url: "https://github.com/RelevanceAI/arg/pull/7353".to_string(),
             }]
         );
@@ -337,6 +334,10 @@ mod tests {
     fn a_partial_or_malformed_page_is_transient_never_empty() {
         let mut no_repo = item("o/r", 1);
         no_repo["repository_url"] = json!("https://api.github.com/repos/");
+        let mut zero = item("o/r", 1);
+        zero["number"] = json!(0);
+        let mut nested = item("o/r", 1);
+        nested["repository_url"] = json!("https://api.github.com/repos/o/r/x");
         let mut an_issue = item("o/r", 1);
         an_issue.as_object_mut().unwrap().remove("pull_request");
         for body in [
@@ -346,6 +347,8 @@ mod tests {
             json!({ "total_count": 0, "incomplete_results": false }),
             json!({ "total_count": 1, "incomplete_results": false, "items": [no_repo] }),
             json!({ "total_count": 1, "incomplete_results": false, "items": [an_issue] }),
+            json!({ "total_count": 1, "incomplete_results": false, "items": [zero] }),
+            json!({ "total_count": 1, "incomplete_results": false, "items": [nested] }),
         ] {
             assert!(
                 matches!(parse_search_page(&body.to_string()), Err(GhError::Parse(_))),

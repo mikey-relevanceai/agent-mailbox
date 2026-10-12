@@ -27,36 +27,62 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mailbox_protocol::Subject;
+use mailbox_protocol::{GithubPr, Subject};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// A PR with a pending review request for the watched login.
+/// A PR with a pending review request for the watched login. The PR is the
+/// protocol's parsed [`GithubPr`], the same type a `github-pr` watch is keyed by,
+/// so `owner/repo#number` is unambiguous (no `/` or `#` inside a segment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestedPr {
-    /// `owner/repo`.
-    pub repo: String,
-    pub number: u64,
+    pub pr: GithubPr,
     /// GitHub's own URL for the PR (correct on GitHub Enterprise too).
     pub url: String,
 }
 
 impl RequestedPr {
+    /// `owner/repo`.
+    pub fn repo(&self) -> String {
+        format!("{}/{}", self.pr.owner(), self.pr.repo())
+    }
+
     /// The PR's identity in the baseline: `owner/repo#number`.
     pub fn key(&self) -> String {
-        format!("{}#{}", self.repo, self.number)
+        format!("{}#{}", self.repo(), self.pr.number())
     }
 }
 
 /// What one poll saw: every open PR currently requesting the login's review.
+/// A set by construction, keyed as the baseline is, so the same PR cannot be
+/// counted twice however the observation was built.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Observation {
-    pub requested: Vec<RequestedPr>,
+    requested: BTreeMap<String, RequestedPr>,
 }
 
 impl Observation {
+    pub fn new(prs: impl IntoIterator<Item = RequestedPr>) -> Self {
+        Self {
+            requested: prs.into_iter().map(|pr| (pr.key(), pr)).collect(),
+        }
+    }
+
+    /// The PRs, in key order.
+    pub fn prs(&self) -> impl Iterator<Item = &RequestedPr> {
+        self.requested.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.requested.len()
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.requested.contains_key(key)
+    }
+
     fn keys(&self) -> BTreeSet<String> {
-        self.requested.iter().map(RequestedPr::key).collect()
+        self.requested.keys().cloned().collect()
     }
 }
 
@@ -120,8 +146,8 @@ impl Edge {
         json!({
             "source": "github-review-requests",
             "edge": self.kind(),
-            "repo": self.0.repo,
-            "pr": self.0.number,
+            "repo": self.0.repo(),
+            "pr": self.0.pr.number(),
             "url": self.0.url,
         })
     }
@@ -130,13 +156,12 @@ impl Edge {
 /// Fold an observation into the baseline: the PRs that entered the set fire,
 /// in key order; the PRs that left it fire nothing.
 pub fn apply(prior: &Baseline, obs: &Observation) -> (Baseline, Vec<Edge>) {
-    let mut entered: BTreeMap<String, &RequestedPr> = BTreeMap::new();
-    for pr in &obs.requested {
-        let key = pr.key();
-        if !prior.knows(&key) {
-            entered.insert(key, pr);
-        }
-    }
+    let edges = obs
+        .prs()
+        .filter(|pr| !prior.knows(&pr.key()))
+        .cloned()
+        .map(Edge)
+        .collect();
     let requested = obs.keys();
     // Missing now but seen last poll → leaving. Missing now and already leaving →
     // forgotten (dropped from both sets).
@@ -146,7 +171,6 @@ pub fn apply(prior: &Baseline, obs: &Observation) -> (Baseline, Vec<Edge>) {
         .filter(|key| !requested.contains(*key))
         .cloned()
         .collect();
-    let edges = entered.into_values().cloned().map(Edge).collect();
     (Baseline { requested, leaving }, edges)
 }
 
@@ -155,17 +179,21 @@ mod tests {
     use super::*;
 
     fn pr(repo: &str, number: u64) -> RequestedPr {
+        let (owner, name) = repo.split_once('/').unwrap();
         RequestedPr {
-            repo: repo.to_string(),
-            number,
+            pr: GithubPr::new(owner, name, number).unwrap(),
             url: format!("https://github.com/{repo}/pull/{number}"),
         }
     }
 
     fn obs(prs: &[RequestedPr]) -> Observation {
-        Observation {
-            requested: prs.to_vec(),
-        }
+        Observation::new(prs.iter().cloned())
+    }
+
+    #[test]
+    fn an_observation_is_a_set() {
+        let twice = obs(&[pr("o/r", 1), pr("o/r", 1), pr("o/r", 2)]);
+        assert_eq!(twice.len(), 2);
     }
 
     fn fired(edges: &[Edge]) -> Vec<String> {

@@ -270,7 +270,7 @@ async fn run() -> Result<(), AdapterError> {
                 "github_watch",
                 kind = "github-pr",
                 repo = %watcher.repo(),
-                pr = number,
+                pr = watcher.number(),
                 topic = topic.as_str()
             );
             poll_loop(&watcher, topic, interval, config.baseline, config.max_polls)
@@ -780,6 +780,14 @@ mod tests {
             max_polls: 0,
         };
         assert_eq!(interval_of(&config).as_millis() as u64, DEFAULT_INTERVAL_MS);
+    }
+
+    /// A baseline that is not this mode's re-baselines silently, rather than
+    /// reading as "nothing known" and waking for every pending review request.
+    #[test]
+    fn a_foreign_baseline_is_no_review_request_baseline() {
+        let pr_mode = serde_json::json!({ "max_review_id": 3, "ci": "failure" });
+        assert!(parse_injected_baseline::<review_requests::Baseline>(pr_mode).is_none());
     }
 
     #[test]
