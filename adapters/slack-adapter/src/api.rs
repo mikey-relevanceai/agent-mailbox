@@ -74,6 +74,7 @@ pub(crate) trait SlackApi {
 }
 
 /// The real transport: `curl` against slack.com.
+#[derive(Clone)]
 pub struct CurlSlack {
     bin: String,
     token: Token,

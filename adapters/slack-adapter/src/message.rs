@@ -48,7 +48,7 @@ pub struct BotProfile {
 /// failing the whole message. Unlike `ts`, these only decorate a message or feed
 /// a `--skip` filter, and an absent id is the safe reading for both: no `user=` or
 /// `app=` condition can match it, so a malformed id wakes rather than silences.
-fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: TryFrom<String>,

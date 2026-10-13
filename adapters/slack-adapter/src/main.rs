@@ -42,8 +42,11 @@
 //! - Offline or a Slack 5xx → skip the poll; only a long streak exits non-zero.
 
 mod api;
+mod mention_loop;
+mod mentions;
 mod message;
 mod names;
+mod socket;
 mod token;
 mod watcher;
 
@@ -91,6 +94,17 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Self-reported provenance. The host stamps its own spawn identity instead.
 const ADAPTER_ID: &str = "slack-adapter";
 
+/// The config line, by mode. `kind: "mentions"` is the mention watch
+/// (design/04); a line with no `kind` is a channel or thread watch, which is
+/// what every config written before the mention watch looks like.
+#[derive(Debug)]
+enum ModeConfig {
+    Poll(Config),
+    Mentions(mention_loop::MentionConfig),
+}
+
+const MENTIONS_KIND: &str = "mentions";
+
 #[derive(Debug, Deserialize)]
 struct Config {
     topic: String,
@@ -117,6 +131,8 @@ enum AdapterError {
     ConfigTooLarge(u64),
     #[error("could not parse the config line as JSON: {0}")]
     ParseConfig(#[source] serde_json::Error),
+    #[error("the config names a watch kind this adapter does not run: {0:?}")]
+    UnknownKind(String),
     #[error("config names an invalid Slack target: {0}")]
     InvalidTarget(#[from] SlackTargetError),
     // The resolver derives both from the same watch row; disagreement means the
@@ -144,32 +160,65 @@ async fn main() -> ExitCode {
 /// Run the watch and log how it ended: once, and inside the watch's span when
 /// the watch is known.
 async fn run() -> ExitCode {
-    let (config, watch) = match read_config(std::io::stdin().lock())
-        .and_then(|config| watch_of(&config).map(|watch| (config, watch)))
-    {
-        Ok(parsed) => parsed,
+    let config = match read_config(std::io::stdin().lock()) {
+        Ok(config) => config,
         Err(err) => {
             error!(error = %err, "slack adapter exited with an error before it knew its watch");
             return ExitCode::FAILURE;
         }
     };
-    let topic = watch.topic();
-    // Every line from here on carries the watch's topic, so a line in the
-    // bridge's log (where several adapters' stderr meet) names its watch. An
-    // error-level span, because adapters run with tracing's default ERROR
-    // filter unless RUST_LOG says otherwise, and an info span would be filtered
-    // out from under the one line that most needs it.
-    let span = error_span!("slack_watch", topic = topic.as_str());
-    match watch_loop(config, watch, topic)
-        .instrument(span.clone())
-        .await
-    {
+    let (span, outcome) = match config {
+        ModeConfig::Poll(config) => {
+            let watch = match watch_of(&config) {
+                Ok(watch) => watch,
+                Err(err) => {
+                    error!(error = %err, "slack adapter exited with an error before it knew its watch");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let topic = watch.topic();
+            // Every line from here on carries the watch's topic, so a line in the
+            // bridge's log (where several adapters' stderr meet) names its watch. An
+            // error-level span, because adapters run with tracing's default ERROR
+            // filter unless RUST_LOG says otherwise, and an info span would be filtered
+            // out from under the one line that most needs it.
+            let span = error_span!("slack_watch", topic = topic.as_str());
+            let outcome = watch_loop(config, watch, topic)
+                .instrument(span.clone())
+                .await;
+            (span, outcome)
+        }
+        ModeConfig::Mentions(config) => {
+            let topic = match config.topic() {
+                Ok(topic) => topic,
+                Err(err) => {
+                    error!(error = %err, "slack adapter exited with an error before it knew its watch");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let span = error_span!("slack_watch", topic = topic.as_str());
+            let outcome = mentions_main(config, topic).instrument(span.clone()).await;
+            (span, outcome)
+        }
+    };
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             span.in_scope(|| error!(error = %err, "slack adapter exited with an error"));
             ExitCode::FAILURE
         }
     }
+}
+
+async fn mentions_main(
+    config: mention_loop::MentionConfig,
+    topic: Topic,
+) -> Result<(), AdapterError> {
+    let mut sigterm =
+        signal(SignalKind::terminate()).map_err(|e| AdapterError::Signal("SIGTERM", e))?;
+    let mut sigint =
+        signal(SignalKind::interrupt()).map_err(|e| AdapterError::Signal("SIGINT", e))?;
+    mention_loop::run(config, topic, &mut sigterm, &mut sigint).await
 }
 
 async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(), AdapterError> {
@@ -423,7 +472,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
+fn read_config(reader: impl BufRead) -> Result<ModeConfig, AdapterError> {
     let mut limited = reader.take(MAX_CONFIG_BYTES + 1);
     let mut line = String::new();
     let read = limited
@@ -435,7 +484,16 @@ fn read_config(reader: impl BufRead) -> Result<Config, AdapterError> {
     if read == 0 || line.trim().is_empty() {
         return Err(AdapterError::EmptyConfig);
     }
-    serde_json::from_str(line.trim()).map_err(AdapterError::ParseConfig)
+    let value: Value = serde_json::from_str(line.trim()).map_err(AdapterError::ParseConfig)?;
+    match value.get("kind").and_then(Value::as_str) {
+        None => serde_json::from_value(value)
+            .map(ModeConfig::Poll)
+            .map_err(AdapterError::ParseConfig),
+        Some(MENTIONS_KIND) => serde_json::from_value(value)
+            .map(ModeConfig::Mentions)
+            .map_err(AdapterError::ParseConfig),
+        Some(other) => Err(AdapterError::UnknownKind(other.to_string())),
+    }
 }
 
 async fn publish(
@@ -499,7 +557,26 @@ mod tests {
     use super::*;
 
     fn config(line: &str) -> Config {
-        read_config(line.as_bytes()).unwrap()
+        match read_config(line.as_bytes()).unwrap() {
+            ModeConfig::Poll(config) => config,
+            other => panic!("expected a poll config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_config_with_kind_mentions_is_the_mention_watch() {
+        let parsed = read_config(
+            &br#"{"kind":"mentions","topic":"slack.mentions","skip":[{"user":"U0AB7RJSQBE"}]}"#[..],
+        )
+        .unwrap();
+        let ModeConfig::Mentions(config) = parsed else {
+            panic!("expected the mention watch, got {parsed:?}");
+        };
+        assert_eq!(config.skip.iter().count(), 1);
+        assert!(matches!(
+            read_config(&br#"{"kind":"reactions","topic":"x"}"#[..]),
+            Err(AdapterError::UnknownKind(_))
+        ));
     }
 
     #[test]
