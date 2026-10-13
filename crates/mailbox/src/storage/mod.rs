@@ -44,8 +44,9 @@ pub use error::StorageError;
 pub use mailbox_protocol::Cursor;
 pub use model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget, slack_kind,
+    ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    slack_kind,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the

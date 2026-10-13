@@ -62,7 +62,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Opening the WebSocket must not hang the adapter.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The mention watch's config line (`kind: "mentions"`).
+/// The mention watch's config line (`kind: "slack-mentions"`).
 #[derive(Debug, Deserialize)]
 pub struct MentionConfig {
     pub topic: String,

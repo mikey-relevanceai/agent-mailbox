@@ -33,8 +33,8 @@ use mailbox_protocol::{
 use super::error::StorageError;
 use super::model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -1732,8 +1732,10 @@ fn build_watch(
     // PR number" are rejected as corrupt and unrepresentable downstream. Only
     // this store writes these rows, and it always writes the unused column as 0
     // (and an unused `filters` as `[]`).
-    if !matches!(kind, WatchKind::SlackChannel | WatchKind::SlackThread)
-        && !slack_filters(id, filters)?.is_empty()
+    if !matches!(
+        kind,
+        WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackMentions
+    ) && !slack_filters(id, filters)?.is_empty()
     {
         return Err(StorageError::Corrupt {
             detail: format!(
@@ -1787,6 +1789,19 @@ fn build_watch(
                 ),
             })?;
             WatchTarget::GithubReviewRequests { login }
+        }
+        WatchKind::SlackMentions => {
+            if pr != 0 || count != 0 || repo != SLACK_MENTIONS_KEY {
+                return Err(StorageError::Corrupt {
+                    detail: format!(
+                        "slack-mentions watch {} has key {repo:?}, pr {pr} and publish count {count}; expected {SLACK_MENTIONS_KEY:?}, 0 and 0",
+                        id.get()
+                    ),
+                });
+            }
+            WatchTarget::SlackMentions {
+                skip: slack_filters(id, filters)?,
+            }
         }
     };
     let state = reconstruct_state(state, child_pid, id)?;

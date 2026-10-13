@@ -33,15 +33,17 @@
 use std::time::Duration;
 
 use mailbox_protocol::{
-    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic,
+    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, slack_mentions_topic,
+    stub_topic,
 };
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    FilterChange, RecordInterestOutcome, ResumeOutcome, SessionId, Storage, StorageError,
-    SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget, slack_kind,
+    FilterChange, RecordInterestOutcome, ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, Storage,
+    StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget,
+    slack_kind,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -262,6 +264,33 @@ pub async fn record_slack(
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
 }
 
+/// Record (or reuse) the bridge's one mention watch, attach `session`'s
+/// interest, and subscribe it to `slack.mentions` (design/04). Its filters
+/// behave as a channel watch's do (ADR-0029): `skip` is the whole set, and a
+/// change is refused while another session shares the watch.
+pub async fn record_slack_mentions(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    skip: SlackFilters,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    let spec = WatchSpec {
+        target: WatchTarget::SlackMentions { skip },
+        // The adapter holds a connection and polls nothing.
+        interval: Duration::ZERO,
+    };
+    record_watch(
+        bus,
+        storage,
+        supervisor,
+        spec,
+        slack_mentions_topic(),
+        session,
+    )
+    .await
+}
+
 /// Record (or reuse) the review-request watch for `login`, attach `session`'s
 /// interest, and subscribe it to `github.review-requests.<login>` (design/03).
 /// The analogue of [`record`] for a person rather than a PR, keyed by
@@ -419,6 +448,27 @@ pub async fn drop_interest_slack(
         &slack.key(),
         0,
         slack.topic(),
+        session,
+    )
+    .await
+}
+
+/// Drop `session`'s interest in the mention watch and unsubscribe it from
+/// `slack.mentions`.
+pub async fn drop_interest_slack_mentions(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::SlackMentions,
+        SLACK_MENTIONS_KEY,
+        0,
+        slack_mentions_topic(),
         session,
     )
     .await

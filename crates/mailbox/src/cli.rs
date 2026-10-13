@@ -388,6 +388,16 @@ pub enum WatchTargetCmd {
     /// them for a review, directly or through a team they are on. Requests that
     /// were already pending when the watch started do not wake.
     GithubReviewRequests(ReviewRequestsWatchArgs),
+    /// Watch for @mentions of the Slack app's bot, in any conversation it is in,
+    /// thread replies included: wakes within seconds of each one. Needs the
+    /// app-level token in the Keychain (design/04).
+    SlackMentions(SlackMentionsWatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SlackMentionsWatchArgs {
+    #[command(flatten)]
+    pub skip: SlackSkipArgs,
 }
 
 #[derive(Args, Debug)]
@@ -424,7 +434,7 @@ pub struct SlackThreadWatchArgs {
     pub skip: SlackSkipArgs,
 }
 
-/// The filters both Slack watch kinds take (ADR-0029).
+/// The filters every Slack watch kind takes (ADR-0029).
 #[derive(Args, Debug)]
 pub struct SlackSkipArgs {
     /// Do not wake for messages matching this filter: `key=value[,key=value]`, every
@@ -481,6 +491,8 @@ pub enum UnwatchTargetCmd {
     SlackThread(SlackThreadUnwatchArgs),
     /// Stop watching a GitHub user's review requests.
     GithubReviewRequests(ReviewRequestsUnwatchArgs),
+    /// Stop watching for @mentions of the Slack bot.
+    SlackMentions,
 }
 
 #[derive(Args, Debug)]
@@ -745,6 +757,10 @@ async fn run_watch(format: OutputFormat, args: WatchArgs) -> anyhow::Result<Exit
             interval_secs: args.interval,
             skip: args.skip.into_filters(),
         },
+        WatchTargetCmd::SlackMentions(args) => Request::WatchSlackMentions {
+            session: resolve_wakeable_session_or_fail(format)?,
+            skip: args.skip.into_filters(),
+        },
         WatchTargetCmd::GithubReviewRequests(args) => Request::WatchReviewRequests {
             session: resolve_wakeable_session_or_fail(format)?,
             login: args.login,
@@ -775,6 +791,9 @@ async fn run_unwatch(format: OutputFormat, args: UnwatchArgs) -> anyhow::Result<
         UnwatchTargetCmd::GithubReviewRequests(args) => Request::UnwatchReviewRequests {
             session: resolve_session_or_fail(format)?,
             login: args.login,
+        },
+        UnwatchTargetCmd::SlackMentions => Request::UnwatchSlackMentions {
+            session: resolve_session_or_fail(format)?,
         },
     };
     request(format, req).await
@@ -1066,9 +1085,11 @@ async fn request(format: OutputFormat, request: Request) -> anyhow::Result<ExitC
 /// not be woken by messages that will wake it. The daemon echoes what it
 /// recorded, and an old one echoes nothing.
 fn unapplied_filters(request: &Request, response: &Response) -> Option<String> {
-    let (Request::WatchSlack { skip: asked, .. }, Response::Watched { topic, skip, .. }) =
-        (request, response)
-    else {
+    let asked = match request {
+        Request::WatchSlack { skip, .. } | Request::WatchSlackMentions { skip, .. } => skip,
+        _ => return None,
+    };
+    let Response::Watched { topic, skip, .. } = response else {
         return None;
     };
     // An old daemon replying to a request with no filters did what was asked.
@@ -1195,6 +1216,12 @@ fn request_context(request: &Request) -> String {
         } => format!("watching slack {} for {}", target.key(), session.as_str()),
         Request::UnwatchSlack { session, target } => {
             format!("unwatching slack {} for {}", target.key(), session.as_str())
+        }
+        Request::WatchSlackMentions { session, .. } => {
+            format!("watching slack mentions for {}", session.as_str())
+        }
+        Request::UnwatchSlackMentions { session } => {
+            format!("unwatching slack mentions for {}", session.as_str())
         }
         Request::WatchReviewRequests { session, login, .. } => format!(
             "watching review requests for {login} for {}",
@@ -1503,11 +1530,18 @@ fn render_status_body(report: &StatusReport) {
                 WatchKindWire::Stub
                 | WatchKindWire::SlackChannel
                 | WatchKindWire::SlackThread
-                | WatchKindWire::GithubReviewRequests => watch.repo.clone(),
+                | WatchKindWire::GithubReviewRequests
+                | WatchKindWire::SlackMentions => watch.repo.clone(),
             };
             let skipping = match &watch.skip {
                 Some(skip) if !skip.is_empty() => format!(" skip=[{skip}]"),
                 _ => String::new(),
+            };
+            // The mention watch is pushed to over Socket Mode, so it has no
+            // poll interval to show.
+            let interval = match watch.kind {
+                WatchKindWire::SlackMentions => "push".to_string(),
+                _ => format_interval(watch.interval_ms),
             };
             println!(
                 "  {} {}  state={} interest={} interval={} child={}{skipping}",
@@ -1515,7 +1549,7 @@ fn render_status_body(report: &StatusReport) {
                 entity,
                 state,
                 watch.interest,
-                format_interval(watch.interval_ms),
+                interval,
                 child
             );
         }
@@ -1554,6 +1588,7 @@ fn kind_label(kind: WatchKindWire) -> &'static str {
         WatchKindWire::SlackChannel => "slack-channel",
         WatchKindWire::SlackThread => "slack-thread",
         WatchKindWire::GithubReviewRequests => "github-review-requests",
+        WatchKindWire::SlackMentions => "slack-mentions",
     }
 }
 

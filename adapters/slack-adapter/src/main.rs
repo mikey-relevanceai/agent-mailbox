@@ -94,7 +94,7 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Self-reported provenance. The host stamps its own spawn identity instead.
 const ADAPTER_ID: &str = "slack-adapter";
 
-/// The config line, by mode. `kind: "mentions"` is the mention watch
+/// The config line, by mode. `kind: "slack-mentions"` is the mention watch
 /// (design/04); a line with no `kind` is a channel or thread watch, which is
 /// what every config written before the mention watch looks like.
 #[derive(Debug)]
@@ -103,7 +103,7 @@ enum ModeConfig {
     Mentions(mention_loop::MentionConfig),
 }
 
-const MENTIONS_KIND: &str = "mentions";
+const MENTIONS_KIND: &str = "slack-mentions";
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn a_config_with_kind_mentions_is_the_mention_watch() {
         let parsed = read_config(
-            &br#"{"kind":"mentions","topic":"slack.mentions","skip":[{"user":"U0AB7RJSQBE"}]}"#[..],
+            &br#"{"kind":"slack-mentions","topic":"slack.mentions","skip":[{"user":"U0AB7RJSQBE"}]}"#[..],
         )
         .unwrap();
         let ModeConfig::Mentions(config) = parsed else {
