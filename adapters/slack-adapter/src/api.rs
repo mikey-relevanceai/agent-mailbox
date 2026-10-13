@@ -218,6 +218,20 @@ pub(crate) fn classify(code: &str, retry_after: Option<Duration>) -> SlackError 
     }
 }
 
+/// Parse a reply into `T`; a shape Slack does not normally send skips the poll.
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(
+    method: &str,
+    reply: Value,
+) -> Result<T, SlackError> {
+    // The serde error itself is not included: it can quote the value it choked on.
+    serde_json::from_value(reply).map_err(|err| {
+        SlackError::Transient(format!(
+            "{method} reply had an unexpected shape ({:?})",
+            err.classify()
+        ))
+    })
+}
+
 /// The first non-empty line of `text`, so an error never dumps curl's whole stderr.
 fn first_line(text: &str) -> String {
     text.lines()

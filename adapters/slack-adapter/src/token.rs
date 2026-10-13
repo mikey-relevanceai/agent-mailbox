@@ -1,4 +1,4 @@
-//! Where the Slack token comes from: the macOS Keychain, read through the
+//! Where the Slack tokens come from: the macOS Keychain, read through the
 //! `security` CLI (ADR-0027).
 //!
 //! The token is never passed in through the bridge, in this adapter's config, or
@@ -10,14 +10,47 @@
 
 use std::fmt;
 
-/// The Keychain service name the token is stored under. Store it with:
-/// `security add-generic-password -s agent-mailbox.slack -a "$USER" -w`
-pub const KEYCHAIN_SERVICE: &str = "agent-mailbox.slack";
-
 /// Env var overriding the `security` binary, so tests can point at a fake.
 pub const ENV_SECURITY_BIN: &str = "MAILBOX_SLACK_SECURITY_BIN";
 
 const DEFAULT_SECURITY_BIN: &str = "security";
+
+/// Which of the app's two tokens to read. Each has its own Keychain item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The bot token (`xoxb-`), for Web API calls: reading conversations and
+    /// looking up names.
+    Bot,
+    /// The app-level token (`xapp-`, scope `connections:write`), which can do
+    /// nothing but open a Socket Mode connection (design/04). It is a separate
+    /// item, not a second field, because Slack issues and rotates them
+    /// separately.
+    App,
+}
+
+impl Credential {
+    /// The Keychain service name the token is stored under.
+    pub fn service(self) -> &'static str {
+        match self {
+            Credential::Bot => "agent-mailbox.slack",
+            Credential::App => "agent-mailbox.slack-app-token",
+        }
+    }
+
+    fn prefixes(self) -> &'static [&'static str] {
+        match self {
+            Credential::Bot => &["xoxb-", "xoxp-"],
+            Credential::App => &["xapp-"],
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Credential::Bot => "a Slack bot token (xoxb-… or xoxp-…)",
+            Credential::App => "a Slack app-level token (xapp-…)",
+        }
+    }
+}
 
 /// A Slack token. `Debug` is redacted so it cannot reach a log by accident.
 #[derive(Clone)]
@@ -38,29 +71,31 @@ impl fmt::Debug for Token {
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error(
-        "no Slack token in the Keychain under service {KEYCHAIN_SERVICE:?}; store one with: security add-generic-password -s {KEYCHAIN_SERVICE} -a \"$USER\" -w"
+        "no Slack token in the Keychain under service {service:?}; store one with: security add-generic-password -U -s {service} -a \"$USER\" -w"
     )]
-    Missing,
+    Missing { service: &'static str },
     #[error("could not run {bin:?} to read the Slack token from the Keychain: {source}")]
     Spawn {
         bin: String,
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "the Keychain item {KEYCHAIN_SERVICE:?} is not a Slack token (expected xoxb-… or xoxp-…)"
-    )]
-    Malformed,
+    #[error("the Keychain item {service:?} is not {expected}")]
+    Malformed {
+        service: &'static str,
+        expected: &'static str,
+    },
 }
 
-/// Read the token from the Keychain.
-pub async fn load() -> Result<Token, TokenError> {
+/// Read one of the app's tokens from the Keychain.
+pub async fn load(credential: Credential) -> Result<Token, TokenError> {
     let bin = std::env::var(ENV_SECURITY_BIN)
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_SECURITY_BIN.to_string());
+    let service = credential.service();
     let output = tokio::process::Command::new(&bin)
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .args(["find-generic-password", "-s", service, "-w"])
         .output()
         .await
         .map_err(|source| TokenError::Spawn {
@@ -70,19 +105,25 @@ pub async fn load() -> Result<Token, TokenError> {
     // `security` exits non-zero when the item does not exist. Its stderr is not
     // forwarded: it names the item, which the error above already does.
     if !output.status.success() {
-        return Err(TokenError::Missing);
+        return Err(TokenError::Missing { service });
     }
-    parse(&String::from_utf8_lossy(&output.stdout))
+    parse(credential, &String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse(stdout: &str) -> Result<Token, TokenError> {
+fn parse(credential: Credential, stdout: &str) -> Result<Token, TokenError> {
     let token = stdout.trim();
     // A token is a single header-safe word; anything else would corrupt the curl
     // config it is written into, so it is refused rather than escaped.
-    let well_formed = (token.starts_with("xoxb-") || token.starts_with("xoxp-"))
+    let well_formed = credential
+        .prefixes()
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
         && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !well_formed {
-        return Err(TokenError::Malformed);
+        return Err(TokenError::Malformed {
+            service: credential.service(),
+            expected: credential.describe(),
+        });
     }
     Ok(Token(token.to_string()))
 }
@@ -102,20 +143,36 @@ mod tests {
 
     #[test]
     fn accepts_bot_and_user_tokens_and_trims_the_newline() {
-        assert_eq!(parse("xoxb-1-2-abc\n").unwrap().expose(), "xoxb-1-2-abc");
-        assert_eq!(parse("xoxp-1-2-abc").unwrap().expose(), "xoxp-1-2-abc");
+        let bot = |raw| parse(Credential::Bot, raw).unwrap();
+        assert_eq!(bot("xoxb-1-2-abc\n").expose(), "xoxb-1-2-abc");
+        assert_eq!(bot("xoxp-1-2-abc").expose(), "xoxp-1-2-abc");
     }
 
     #[test]
     fn refuses_anything_that_could_break_out_of_a_header() {
         for bad in ["", "hunter2", "xoxb-ok\"\nurl = \"https://evil", "xoxb-a b"] {
-            assert!(matches!(parse(bad), Err(TokenError::Malformed)), "{bad:?}");
+            assert!(
+                matches!(
+                    parse(Credential::Bot, bad),
+                    Err(TokenError::Malformed { .. })
+                ),
+                "{bad:?}"
+            );
         }
+    }
+
+    /// Each item holds one kind of token, so a token stored under the wrong
+    /// service is caught at start rather than as a confusing `invalid_auth`.
+    #[test]
+    fn each_credential_accepts_only_its_own_kind_of_token() {
+        assert!(parse(Credential::App, "xapp-1-A0-123-abc").is_ok());
+        assert!(parse(Credential::App, "xoxb-1-2-abc").is_err());
+        assert!(parse(Credential::Bot, "xapp-1-A0-123-abc").is_err());
     }
 
     #[test]
     fn debug_never_shows_the_token() {
-        let token = parse("xoxb-secret").unwrap();
+        let token = parse(Credential::Bot, "xoxb-secret").unwrap();
         assert!(!format!("{token:?}").contains("secret"));
     }
 }

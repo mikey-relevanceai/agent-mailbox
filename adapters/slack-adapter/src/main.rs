@@ -43,6 +43,7 @@
 
 mod api;
 mod message;
+mod names;
 mod token;
 mod watcher;
 
@@ -185,7 +186,7 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
         signal(SignalKind::interrupt()).map_err(|e| AdapterError::Signal("SIGINT", e))?;
     let mut stdout = tokio::io::stdout();
 
-    let token = token::load().await?;
+    let token = token::load(token::Credential::Bot).await?;
     let skip = config.skip.to_string();
     let skip_count = config.skip.iter().count();
     let mut watcher = Watcher::new(CurlSlack::new(token), watch, config.skip);
