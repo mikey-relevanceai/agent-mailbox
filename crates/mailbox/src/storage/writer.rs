@@ -1459,7 +1459,8 @@ fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, Stora
     // Saturate rather than wrap on the (practically impossible) overflow of an
     // interval, PR number, or count that exceeds i64 — a wrapped negative would be
     // silently wrong, whereas a clamp is at worst a harmless over-large value.
-    let interval_ms = i64::try_from(spec.interval.as_millis()).unwrap_or(i64::MAX);
+    let interval = spec.target.interval_column(spec.interval);
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
     let pr = i64::try_from(spec.target.pr_column()).unwrap_or(i64::MAX);
     let count = i64::try_from(spec.target.count_column()).unwrap_or(i64::MAX);
     let id: i64 = conn.query_row(
@@ -2623,6 +2624,12 @@ mod tests {
             id,
             "there is one bot watch, keyed by its fixed key"
         );
+        // A caller asking for an interval still writes a row the reader accepts.
+        let polled = WatchSpec {
+            interval: std::time::Duration::from_secs(60),
+            ..spec.clone()
+        };
+        assert_eq!(do_upsert_watch(&conn, &polled).unwrap(), id);
         let watch = do_get_watch(&conn, id).unwrap().expect("the watch exists");
         assert_eq!(watch.target, target);
     }

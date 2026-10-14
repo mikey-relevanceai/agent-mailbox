@@ -531,8 +531,8 @@ Two limits ([ADR-0031](adr/0031-the-bot-watch-listens-over-socket-mode.md)):
   5-minute one is from Slack's docs. A laptop asleep for longer misses what was sent
   meanwhile.
 - **One bot watch per Slack app.** Slack sends each event to one of the app's
-  connections, so two bridges on the same app split the messages. The adapter logs a
-  warning when it sees another connection.
+  connections, so two bridges on the same app split the messages. The adapter logs an
+  error when it sees another connection.
 
 ### Review requests
 

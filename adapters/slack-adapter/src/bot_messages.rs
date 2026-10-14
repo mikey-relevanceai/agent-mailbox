@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::api::SlackApi;
-use crate::identity::Identity;
+use crate::identity::BotIdentity;
 use crate::message::Subtype;
 use crate::names::{Names, channel_label};
 use crate::socket::{BotMessage, ConversationId, Via};
@@ -98,7 +98,7 @@ pub enum Skip {
     Hidden,
     /// A change to a message or the conversation (`message_changed`,
     /// `message_deleted`, …) or a `bot_message`: nobody said anything to the bot.
-    Subtype(String),
+    Subtype(Subtype),
     /// Posted by the bot itself.
     Own,
     Filtered(SlackFilter),
@@ -110,7 +110,7 @@ impl Skip {
         match self {
             Skip::Duplicate => "duplicate".to_string(),
             Skip::Hidden => "hidden".to_string(),
-            Skip::Subtype(subtype) => format!("subtype {subtype}"),
+            Skip::Subtype(subtype) => format!("subtype {}", subtype.as_str()),
             Skip::Own => "the bot's own message".to_string(),
             Skip::Filtered(filter) => format!("--skip {filter}"),
         }
@@ -171,7 +171,10 @@ impl Wake {
                 "user",
                 message.user.as_ref().map(|u| u.as_str().to_string()),
             ),
-            ("bot_id", message.bot_id.clone()),
+            (
+                "bot_id",
+                message.bot_id.as_ref().map(|b| b.as_str().to_string()),
+            ),
             (
                 "app_id",
                 message.app_id.as_ref().map(|a| a.as_str().to_string()),
@@ -198,7 +201,7 @@ impl Wake {
 pub(crate) struct BotMessages<A> {
     /// Web API calls with the bot token, for names.
     api: A,
-    identity: Identity,
+    identity: BotIdentity,
     skip: SlackFilters,
     seen: Seen,
     names: Names,
@@ -206,7 +209,7 @@ pub(crate) struct BotMessages<A> {
 }
 
 impl<A: SlackApi> BotMessages<A> {
-    pub fn new(api: A, identity: Identity, skip: SlackFilters, seen: Seen) -> Self {
+    pub fn new(api: A, identity: BotIdentity, skip: SlackFilters, seen: Seen) -> Self {
         Self {
             api,
             identity,
@@ -227,11 +230,10 @@ impl<A: SlackApi> BotMessages<A> {
         if let Some(skip) = self.skip_reason(&message) {
             return Disposition::Skip(skip);
         }
-        let permalink = self.identity.workspace.permalink(
-            message.conversation.as_str(),
-            &message.ts,
-            message.parent(),
-        );
+        let permalink =
+            self.identity
+                .workspace
+                .permalink(&message.conversation, &message.ts, message.parent());
         let (author, place, names_resolved) =
             match tokio::time::timeout(LOOKUP_BUDGET, self.describe(&message)).await {
                 Ok((author, place)) => (author, place, true),
@@ -268,11 +270,11 @@ impl<A: SlackApi> BotMessages<A> {
         match &message.subtype {
             None | Some(Subtype::FileShare | Subtype::MeMessage | Subtype::ThreadBroadcast) => {}
             Some(other @ (Subtype::BotMessage | Subtype::Other(_))) => {
-                return Some(Skip::Subtype(other.as_str().to_string()));
+                return Some(Skip::Subtype(other.clone()));
             }
         }
-        let by_bot_user = message.user.is_some() && message.user == self.identity.bot_user;
-        let by_bot_id = message.bot_id.is_some() && message.bot_id == self.identity.bot_id;
+        let by_bot_user = message.user.as_ref() == Some(&self.identity.user);
+        let by_bot_id = message.bot_id.as_ref() == Some(&self.identity.bot_id);
         if by_bot_user || by_bot_id {
             return Some(Skip::Own);
         }
@@ -301,7 +303,7 @@ impl<A: SlackApi> BotMessages<A> {
         if let Some(label) = self.places.get(conversation) {
             return label.clone();
         }
-        match channel_label(&self.api, conversation.as_str()).await {
+        match channel_label(&self.api, conversation).await {
             Ok(label) => {
                 let label = label.unwrap_or_else(|| conversation.to_string());
                 self.places.insert(conversation.clone(), label.clone());
@@ -320,7 +322,7 @@ fn author_id(message: &BotMessage) -> String {
         .user
         .as_ref()
         .map(|user| user.as_str().to_string())
-        .or_else(|| message.bot_id.clone())
+        .or_else(|| message.bot_id.as_ref().map(|b| b.as_str().to_string()))
         .unwrap_or_else(|| "someone".to_string())
 }
 
@@ -333,6 +335,7 @@ mod tests {
     use super::*;
     use crate::api::SlackError;
     use crate::identity::WorkspaceUrl;
+    use crate::socket::SlackBotId;
 
     const WORKSPACE: &str = "https://tryrelevance.slack.com/";
     const CHANNEL: &str = "C0C83CXLUL8";
@@ -391,12 +394,16 @@ mod tests {
     }
 
     fn watch(slack: &FakeSlack, skip: SlackFilters) -> BotMessages<&FakeSlack> {
-        let identity = Identity {
-            workspace: WorkspaceUrl::parse(WORKSPACE),
-            bot_user: Some(SlackUserId::parse(BOT_USER).unwrap()),
-            bot_id: Some("B0C74MURRK5".to_string()),
+        let identity = BotIdentity {
+            workspace: WorkspaceUrl::from_auth_test(WORKSPACE),
+            user: SlackUserId::parse(BOT_USER).unwrap(),
+            bot_id: bot_id("B0C74MURRK5"),
         };
         BotMessages::new(slack, identity, skip, Seen::default())
+    }
+
+    fn bot_id(raw: &str) -> SlackBotId {
+        SlackBotId::parse(raw).unwrap()
     }
 
     fn woken(disposition: Disposition) -> Wake {
@@ -507,15 +514,15 @@ mod tests {
         let cases: [(BotMessage, Skip); 5] = [
             (
                 with(|m| m.subtype = Some(Subtype::Other("message_changed".into()))),
-                Skip::Subtype("message_changed".into()),
+                Skip::Subtype(Subtype::Other("message_changed".into())),
             ),
             (
                 with(|m| m.subtype = Some(Subtype::Other("message_deleted".into()))),
-                Skip::Subtype("message_deleted".into()),
+                Skip::Subtype(Subtype::Other("message_deleted".into())),
             ),
             (
                 with(|m| m.subtype = Some(Subtype::BotMessage)),
-                Skip::Subtype("bot_message".into()),
+                Skip::Subtype(Subtype::BotMessage),
             ),
             (
                 with(|m| m.user = Some(SlackUserId::parse(BOT_USER).unwrap())),
@@ -524,7 +531,7 @@ mod tests {
             (
                 with(|m| {
                     m.user = None;
-                    m.bot_id = Some("B0C74MURRK5".into());
+                    m.bot_id = Some(bot_id("B0C74MURRK5"));
                 }),
                 Skip::Own,
             ),
@@ -536,6 +543,79 @@ mod tests {
         assert_eq!(skipped(watch.dispose(hidden).await), Skip::Hidden);
         let file = with(|m| m.subtype = Some(Subtype::FileShare));
         assert!(matches!(watch.dispose(file).await, Disposition::Wake(_)));
+    }
+
+    /// Keyed by where the message is, not how it arrived: one message delivered
+    /// as a mention and as a DM wakes once, in either order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_message_arriving_as_a_mention_and_a_dm_wakes_once() {
+        let slack = FakeSlack::default();
+        for (first, second) in [(Via::Mention, Via::Dm), (Via::Dm, Via::Mention)] {
+            let mut watch = watch(&slack, SlackFilters::default());
+            let wake = woken(watch.dispose(message(first, DM, None)).await);
+            watch.published(&wake);
+            assert_eq!(
+                skipped(watch.dispose(message(second, DM, None)).await),
+                Skip::Duplicate
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dm_in_a_thread_says_so_and_links_into_the_thread() {
+        let slack = FakeSlack::default();
+        let wake = woken(
+            watch(&slack, SlackFilters::default())
+                .dispose(message(Via::Dm, DM, Some(PARENT)))
+                .await,
+        );
+        assert_eq!(
+            wake.subject().unwrap().text(),
+            format!("DM from Name of {MIKEY} in a thread")
+        );
+        assert_eq!(
+            wake.permalink,
+            format!("{WORKSPACE}archives/{DM}/p1791349500000002?thread_ts={PARENT}&cid={DM}")
+        );
+    }
+
+    /// Someone saying something with a file, a `/me`, or a reply also sent to the
+    /// conversation still wakes; an author with no user falls back to an id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dms_that_say_something_wake_whatever_their_author_shape() {
+        let slack = FakeSlack::default();
+        let mut watch = watch(&slack, SlackFilters::default());
+        for (i, subtype) in [Subtype::MeMessage, Subtype::ThreadBroadcast]
+            .into_iter()
+            .enumerate()
+        {
+            let mut message = dm();
+            message.ts = SlackTs::parse(&format!("1791935600.00000{i}")).unwrap();
+            message.subtype = Some(subtype);
+            assert!(matches!(watch.dispose(message).await, Disposition::Wake(_)));
+        }
+        let mut other_bot = dm();
+        other_bot.user = None;
+        other_bot.bot_id = Some(bot_id("B0OTHERBOT"));
+        assert_eq!(woken(watch.dispose(other_bot).await).author, "B0OTHERBOT");
+        let mut nobody = dm();
+        nobody.ts = SlackTs::parse("1791935700.000001").unwrap();
+        nobody.user = None;
+        assert_eq!(woken(watch.dispose(nobody).await).author, "someone");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_app_filter_drops_a_dm_posted_through_that_app() {
+        let slack = FakeSlack::default();
+        let skip = SlackFilters::new(vec![SlackFilter::parse("app=A08SF47R6P4").unwrap()]);
+        let mut watch = watch(&slack, skip);
+        let mut through_app = dm();
+        through_app.app_id = Some(mailbox_protocol::SlackAppId::parse("A08SF47R6P4").unwrap());
+        assert!(matches!(
+            skipped(watch.dispose(through_app).await),
+            Skip::Filtered(_)
+        ));
+        assert!(matches!(watch.dispose(dm()).await, Disposition::Wake(_)));
     }
 
     /// The two forms the bot's own DM posts were seen in on 2026-10-15, once it
@@ -550,7 +630,7 @@ mod tests {
             let mut message = dm();
             message.ts = SlackTs::parse(ts).unwrap();
             message.user = user.map(|user| SlackUserId::parse(user).unwrap());
-            message.bot_id = Some("B0C74MURRK5".into());
+            message.bot_id = Some(bot_id("B0C74MURRK5"));
             message.app_id = Some(mailbox_protocol::SlackAppId::parse("A0C7AJ9AMUJ").unwrap());
             message.subtype = subtype;
             message
@@ -560,7 +640,7 @@ mod tests {
         let as_bot_message = own(None, Some(Subtype::BotMessage), "1791935500.000002");
         assert_eq!(
             skipped(watch.dispose(as_bot_message).await),
-            Skip::Subtype("bot_message".into())
+            Skip::Subtype(Subtype::BotMessage)
         );
         assert!(slack.calls.borrow().is_empty());
     }

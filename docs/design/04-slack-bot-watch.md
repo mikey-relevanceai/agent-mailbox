@@ -192,7 +192,11 @@ The woken agent reads the message through its own Slack access.
 ### Connections end
 
 - **Refresh.** Slack recycles connections "every few hours" (its docs). The adapter
-  reconnects at once after a refresh on a connection that said `hello`.
+  reconnects at once after a refresh on a connection that said `hello`. It closes
+  the old connection before opening the new one. A message Slack sends in that gap
+  goes unacknowledged and should arrive on its 1-minute retry (inferred from the
+  offline measurement below); opening the new one first would avoid even that, and
+  was not built.
 - **Dead socket.** The adapter pings every 30 s and drops a connection that has
   carried nothing for 90 s. It measures that silence on the wall clock as well as
   the monotonic one. On macOS the monotonic clock is not expected to advance while
@@ -262,12 +266,21 @@ hour. But "apps receiving less than 1,000 events per hour will not be automatica
 disabled" (Events API page). A sleeping laptop fails every delivery. This bot is
 addressed far less often than that floor (inferred from use, not measured).
 
+## Logging
+
+Adapters run with tracing's default `ERROR` filter unless `RUST_LOG` says otherwise.
+On 2026-10-15 every one of the 2,123 Slack adapter lines in the live daemon log was
+`ERROR` (measured by a reviewer). So the two signs that wakes are being lost are
+logged at `error`, where they reach the bridge log: another Socket Mode consumer on
+the same app, and a message dropped as malformed. Everything else (connects,
+reconnects, each publish and skip) is `info` or `debug`, for a run with `RUST_LOG`.
+
 ## One consumer per app
 
 Slack allows 10 connections per app and sends each event to **one** of them: "each
 payload may be sent to any of the connections" (Socket Mode page). So two bridges
 running a bot watch for the same app split the messages between them. That could be
-two machines, or a test daemon beside the real one. The adapter warns when `hello`
+two machines, or a test daemon beside the real one. The adapter logs an error when `hello`
 reports more than one connection. It cannot fix this; the remedy is one bot watch per
 app. Posting through the Web API, as Dispatch does, opens no Socket Mode connection
 and takes nothing (inferred: `num_connections` read 1 on 2026-10-15, after Dispatch
@@ -279,13 +292,14 @@ had started posting as the bot).
 |---|---|
 | No app token, or no bot token, in the Keychain | Exit non-zero at start, naming the `security add-generic-password` command |
 | A token stored under the wrong item (`xoxb-` as the app token) | Exit non-zero at start: malformed |
+| A user token (`xoxp-`) as the bot token, which the poll modes accept | Exit non-zero at start: `auth.test` returned no `bot_id`. Run with it, the bot watch would take that person's own messages for the bot's |
 | `apps.connections.open` or `auth.test` rejects its token | Exit non-zero |
 | Socket Mode turned off (`link_disabled`) | Exit non-zero |
 | Offline, Slack 5xx, rate limited, WebSocket will not open, disconnect before `hello` | Back off and retry; exit after 10 in a row, and the supervisor restarts it |
 | Silent socket (sleep, network change) | Replaced, within about 30 s of waking |
 | The daemon died | The adapter exits at its next ping tick |
-| A malformed message | Acknowledged, logged with its envelope id, dropped |
-| Another consumer of the same app | Warned at `hello`; messages are split |
+| A malformed message | Acknowledged, logged at `error` with its envelope id, dropped |
+| Another consumer of the same app | Logged at `error` at `hello`; messages are split |
 
 ## Test plan
 

@@ -34,6 +34,7 @@ use crate::api::{SlackApi, SlackError, parse};
 use crate::identity::{WorkspaceUrl, identify};
 use crate::message::{SlackMessage, Subtype};
 use crate::names::Names;
+use crate::socket::ConversationId;
 
 /// Messages per page. Slack's cap for an internal app is 1,000; 200 keeps each
 /// reply small, and a second page is only needed when more than 200 messages
@@ -295,13 +296,13 @@ impl<A: SlackApi> Watcher<A> {
         }
         let identity = identify(&self.api).await?;
         let channel = self.watch.channel();
-        let channel_label = crate::names::channel_label(&self.api, channel.as_str())
+        let channel_label = crate::names::channel_label(&self.api, &ConversationId::from(channel))
             .await?
             .unwrap_or_else(|| channel.to_string());
         info!(
             workspace = %identity.workspace,
             channel = %channel_label,
-            bot = identity.bot_user.as_ref().map_or("", |user| user.as_str()),
+            bot = identity.user.as_ref().map_or("", |user| user.as_str()),
             "connected to Slack"
         );
         let context = Context {
@@ -537,9 +538,11 @@ impl<A: SlackApi> Watcher<A> {
     }
 
     fn permalink(&self, context: &Context, ts: &SlackTs) -> String {
-        context
-            .workspace
-            .permalink(self.watch.channel().as_str(), ts, self.watch.thread_ts())
+        context.workspace.permalink(
+            &ConversationId::from(self.watch.channel()),
+            ts,
+            self.watch.thread_ts(),
+        )
     }
 }
 

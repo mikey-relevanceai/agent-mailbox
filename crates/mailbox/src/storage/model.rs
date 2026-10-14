@@ -212,6 +212,19 @@ impl WatchTarget {
         }
     }
 
+    /// The flat `interval_ms` column: what was asked for, except for the bot
+    /// watch, which Slack pushes to and which is always written as zero, so the
+    /// write side cannot produce a row the reader calls corrupt.
+    pub fn interval_column(&self, requested: Duration) -> Duration {
+        match self {
+            WatchTarget::SlackBot { .. } => Duration::ZERO,
+            WatchTarget::GithubPr { .. }
+            | WatchTarget::Stub { .. }
+            | WatchTarget::Slack { .. }
+            | WatchTarget::GithubReviewRequests { .. } => requested,
+        }
+    }
+
     /// The flat `publish_count` column: `0` (unused) for github, the count for stub.
     pub fn count_column(&self) -> u64 {
         match self {

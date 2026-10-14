@@ -36,12 +36,12 @@ use serde_json::Value;
 use tokio::io::AsyncWrite;
 use tokio::signal::unix::Signal;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::{CurlSlack, SlackApi, SlackError};
 use crate::bot_messages::{BotMessages, Disposition, Seen, Skip, Wake};
 use crate::error::AdapterError;
-use crate::identity::{Identity, identify};
+use crate::identity::{BotIdentity, identify};
 use crate::limits::{Limits, env_u64};
 use crate::output::{ADAPTER_ID, write_message};
 use crate::socket::{Content, DisconnectReason, Envelope, Frame, ack};
@@ -186,7 +186,7 @@ pub async fn run(
         let failure = tokio::select! {
             _ = sigterm.recv() => return stopped("SIGTERM"),
             _ = sigint.recv() => return stopped("SIGINT"),
-            identified = identify(&web) => match identified.map_err(classify) {
+            identified = identify(&web) => match identified.and_then(BotIdentity::require).map_err(classify) {
                 Ok(identity) => break identity,
                 Err(OpenError::Fatal(err)) => return Err(err.into()),
                 Err(OpenError::Transient { reason, wait }) => (reason, wait),
@@ -202,7 +202,8 @@ pub async fn run(
     let mut bot = BotMessages::new(web, identity, config.skip, seen.unwrap_or_default());
 
     streak.reset();
-    let mut disconnected_at: Option<Instant> = None;
+    // Wall clock, so a gap that spans a sleep is reported whole.
+    let mut disconnected_at: Option<SystemTime> = None;
     loop {
         let opened = tokio::select! {
             _ = sigterm.recv() => return stopped("SIGTERM"),
@@ -216,7 +217,7 @@ pub async fn run(
                 let connection = Connection {
                     ping,
                     parent,
-                    disconnected_for: disconnected_at.map(|at| at.elapsed()),
+                    disconnected_for: disconnected_at.and_then(|at| at.elapsed().ok()),
                 };
                 let end = serve(
                     socket,
@@ -228,7 +229,7 @@ pub async fn run(
                     sigint,
                 )
                 .await?;
-                disconnected_at = Some(Instant::now());
+                disconnected_at = Some(SystemTime::now());
                 match end {
                     End::Signalled(name) => return stopped(name),
                     End::Orphaned => {
@@ -268,11 +269,11 @@ pub async fn run(
     }
 }
 
-fn log_identity(identity: &Identity) {
+fn log_identity(identity: &BotIdentity) {
     info!(
         workspace = %identity.workspace,
-        bot_user = identity.bot_user.as_ref().map_or("", |user| user.as_str()),
-        bot_id = identity.bot_id.as_deref().unwrap_or(""),
+        bot_user = identity.user.as_str(),
+        bot_id = identity.bot_id.as_str(),
         "identified the bot"
     );
 }
@@ -485,8 +486,11 @@ where
                 );
                 // Slack sends each event to ONE of an app's connections, so a
                 // second consumer of this app takes some of its events.
+                // Logged at error: adapters run at the ERROR filter by default
+                // (measured: every line the live daemon logged from the Slack
+                // adapter was ERROR), and this is the only sign of lost wakes.
                 if num_connections.is_some_and(|n| n > 1) {
-                    warn!(
+                    error!(
                         num_connections = num_connections.unwrap_or(0),
                         "another Socket Mode connection is open for this Slack app; each event goes to only one of them"
                     );
@@ -541,9 +545,11 @@ async fn handle_envelope<A: SlackApi, W: AsyncWrite + Unpin>(
     let message = match envelope.content {
         Content::Message(message) => *message,
         Content::Malformed { field } => {
-            warn!(
+            // At error, for the same reason as the split-consumer warning: a
+            // message to the bot was lost.
+            error!(
                 envelope_id = %envelope.id,
-                field,
+                field = field.as_str(),
                 "dropped a message to the bot with a malformed field"
             );
             return Ok(());
@@ -588,23 +594,24 @@ async fn handle_envelope<A: SlackApi, W: AsyncWrite + Unpin>(
         }
         Disposition::Skip(skip) => {
             let reason = skip.reason();
-            let log = |reason: &str| {
-                info!(
-                    via,
-                    envelope_id = %envelope.id,
-                    event_id = %event_id,
-                    channel = %conversation,
-                    retry_attempt = envelope.retry_attempt,
-                    reason,
-                    "skipped a message to the bot"
-                );
-            };
+            // Edits, deletions and the bot's own posts are routine, so they are
+            // logged a level down; the fields are the same either way.
+            macro_rules! skipped {
+                ($level:ident) => {
+                    $level!(
+                        via,
+                        envelope_id = %envelope.id,
+                        event_id = %event_id,
+                        channel = %conversation,
+                        retry_attempt = envelope.retry_attempt,
+                        reason = %reason,
+                        "skipped a message to the bot"
+                    )
+                };
+            }
             match skip {
-                // Routine, so not worth a line each at the default level.
-                Skip::Subtype(_) | Skip::Hidden | Skip::Own => {
-                    debug!(via, envelope_id = %envelope.id, reason = %reason, "skipped a message to the bot");
-                }
-                Skip::Duplicate | Skip::Filtered(_) => log(&reason),
+                Skip::Subtype(_) | Skip::Hidden | Skip::Own => skipped!(debug),
+                Skip::Duplicate | Skip::Filtered(_) => skipped!(info),
             }
         }
     }
@@ -675,7 +682,7 @@ mod tests {
 
     use super::*;
     use crate::identity::WorkspaceUrl;
-    use crate::socket::{BotMessage, ConversationId, EnvelopeId, Via};
+    use crate::socket::{BotMessage, ConversationId, EnvelopeId, MalformedField, SlackBotId, Via};
 
     #[test]
     fn the_streak_doubles_its_wait_honours_slack_and_gives_up() {
@@ -741,10 +748,10 @@ mod tests {
     }
 
     fn bot() -> BotMessages<Offline> {
-        let identity = Identity {
-            workspace: WorkspaceUrl::parse("https://w.slack.com/"),
-            bot_user: None,
-            bot_id: None,
+        let identity = BotIdentity {
+            workspace: WorkspaceUrl::from_auth_test("https://w.slack.com/"),
+            user: SlackUserId::parse("U0C6VHAA4LX").unwrap(),
+            bot_id: SlackBotId::parse("B0C74MURRK5").unwrap(),
         };
         BotMessages::new(Offline, identity, SlackFilters::default(), Seen::default())
     }
@@ -814,7 +821,9 @@ mod tests {
         let (mut bot, mut out) = (bot(), Vec::new());
         let topic = slack_bot_topic();
         for content in [
-            Content::Malformed { field: "ts" },
+            Content::Malformed {
+                field: MalformedField::Ts,
+            },
             Content::OtherEvent("reaction_added".into()),
             Content::NotAnEvent,
         ] {

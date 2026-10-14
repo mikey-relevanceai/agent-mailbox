@@ -168,7 +168,10 @@ own.
 - Every session watching the bot is woken by every message to it. If more than one
   agent watches, they all see it; nothing routes a message to one of them.
 - Edits, deletions and the bot's own posts do not wake you. If you post as the bot,
-  your posts will not wake you either.
+  your posts will not wake you either. If you reply through **your Slack connector**
+  instead, in a DM with the bot, you post as a person and your reply wakes you.
+  Read the subject: if it is your own message, there is nothing to do, or add
+  `--skip user=USER_ID,app=CONNECTOR_APP_ID` as for the channel watch.
 - A message sent while this machine had no connection to Slack for more than a few
   minutes (the laptop asleep) is lost. Nothing tells you.
 - `--skip user=USER_ID` and `--skip app=APP_ID` work as for the channel watch.

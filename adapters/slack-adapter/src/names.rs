@@ -10,6 +10,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::api::{SlackApi, parse};
+use crate::socket::ConversationId;
 
 #[derive(Deserialize)]
 struct UserInfo {
@@ -82,11 +83,11 @@ impl Names {
 /// connecting, the bot watch as a missing decoration.
 pub(crate) async fn channel_label<A: SlackApi>(
     api: &A,
-    channel: &str,
+    channel: &ConversationId,
 ) -> Result<Option<String>, crate::api::SlackError> {
     let info: ChannelInfo = parse(
         "conversations.info",
-        api.call("conversations.info", &[("channel", channel)])
+        api.call("conversations.info", &[("channel", channel.as_str())])
             .await?,
     )?;
     Ok(info.channel.name.map(|name| format!("#{name}")))

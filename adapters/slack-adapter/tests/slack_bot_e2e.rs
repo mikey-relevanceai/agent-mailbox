@@ -592,3 +592,50 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     )
 }
+
+/// The bot's own DM posts, in both forms measured on 2026-10-15, never wake:
+/// the ids that identify them come from the fake `auth.test`, so this also
+/// pins that they are read from it.
+#[test]
+fn the_bots_own_posts_are_acknowledged_and_never_published() {
+    let server = FakeSocketMode::start(vec![vec![
+        hello(),
+        dm(
+            "env-1",
+            "Ev1",
+            "1791935500.000001",
+            json!({"user": "U0C6VHAA4LX", "bot_id": "B0C74MURRK5", "app_id": "A0C7AJ9AMUJ"}),
+        ),
+        dm(
+            "env-2",
+            "Ev2",
+            "1791935500.000002",
+            json!({"user": null, "subtype": "bot_message", "bot_id": "B0C74MURRK5",
+                "app_id": "A0C7AJ9AMUJ"}),
+        ),
+        dm("env-3", "Ev3", "1791935500.000003", json!({})),
+        Step::AwaitAcks(3),
+    ]]);
+    let harness = Harness::new();
+    let child = harness.spawn(config(Value::Null), &server, &[]);
+    wait_until("all three acknowledged", || server.acks().len() == 3);
+    let output = terminate(child);
+    assert_eq!(publishes(&output), ["Ev3"], "only the person's DM wakes");
+}
+
+#[test]
+fn a_rejected_bot_token_ends_the_adapter_before_it_connects() {
+    let server = FakeSocketMode::start(Vec::new());
+    let harness = Harness::new();
+    let output = harness
+        .spawn(
+            config(Value::Null),
+            &server,
+            &[("FAKE_BOT_TOKEN", "xoxb-the-one-slack-wants")],
+        )
+        .wait_with_output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_auth"));
+    assert_eq!(server.connections(), 0);
+}

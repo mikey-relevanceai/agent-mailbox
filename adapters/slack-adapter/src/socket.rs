@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use mailbox_protocol::{SlackAppId, SlackTs, SlackUserId};
+use mailbox_protocol::{SlackAppId, SlackChannelId, SlackTs, SlackUserId};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -84,9 +84,68 @@ impl ConversationId {
     }
 }
 
+/// Every channel a channel watch can name is a conversation the bot can be
+/// addressed in.
+impl From<&SlackChannelId> for ConversationId {
+    fn from(channel: &SlackChannelId) -> Self {
+        Self(channel.as_str().to_string())
+    }
+}
+
 impl fmt::Display for ConversationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// A bot's id (`B…`), which a message it posts carries as `bot_id`. Distinct
+/// from the bot's user id, which a message carries as `user`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SlackBotId(String);
+
+impl SlackBotId {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let ok = raw.starts_with('B')
+            && raw.len() >= 3
+            && raw.len() <= MAX_ID_LEN
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        ok.then(|| Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// For `lenient`: a malformed `bot_id` reads as absent.
+impl TryFrom<String> for SlackBotId {
+    type Error = ();
+
+    fn try_from(raw: String) -> Result<Self, ()> {
+        Self::parse(&raw).ok_or(())
+    }
+}
+
+/// A field of a message to the bot that would not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedField {
+    /// The event itself: a field of the wrong type, say.
+    Event,
+    Channel,
+    Ts,
+    ThreadTs,
+}
+
+impl MalformedField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MalformedField::Event => "event",
+            MalformedField::Channel => "channel",
+            MalformedField::Ts => "ts",
+            MalformedField::ThreadTs => "thread_ts",
+        }
     }
 }
 
@@ -133,7 +192,7 @@ pub enum Content {
     Message(Box<BotMessage>),
     /// An `app_mention` or a DM whose channel or `ts` will not parse. Still
     /// acknowledged; logged by field and dropped.
-    Malformed { field: &'static str },
+    Malformed { field: MalformedField },
     /// Some other event type, named for the log.
     OtherEvent(String),
     /// An envelope that is not an Events API event (`slash_commands`, …), or
@@ -172,7 +231,7 @@ pub struct BotMessage {
     /// Present when the message is in a thread.
     pub thread_ts: Option<SlackTs>,
     pub user: Option<SlackUserId>,
-    pub bot_id: Option<String>,
+    pub bot_id: Option<SlackBotId>,
     pub app_id: Option<SlackAppId>,
     /// `message_changed`, `message_deleted`, `bot_message`, `file_share`, …
     pub subtype: Option<Subtype>,
@@ -204,12 +263,13 @@ struct RawFrame {
     kind: Option<String>,
     #[serde(default)]
     envelope_id: Option<String>,
+    // Decorations read as Values, so an odd type cannot cost the frame its ack.
     #[serde(default)]
-    num_connections: Option<u64>,
+    num_connections: Option<Value>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
-    retry_attempt: Option<u64>,
+    retry_attempt: Option<Value>,
     #[serde(default)]
     payload: Option<Value>,
 }
@@ -228,14 +288,15 @@ struct RawMessage {
     thread_ts: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     user: Option<SlackUserId>,
-    #[serde(default)]
-    bot_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    bot_id: Option<SlackBotId>,
     #[serde(default, deserialize_with = "lenient")]
     app_id: Option<SlackAppId>,
     #[serde(default)]
     subtype: Option<Subtype>,
+    // `null` reads as not hidden, rather than failing the message.
     #[serde(default)]
-    hidden: bool,
+    hidden: Option<bool>,
 }
 
 impl Frame {
@@ -245,7 +306,7 @@ impl Frame {
         match kind.as_deref() {
             Some("hello") => {
                 return Ok(Frame::Hello {
-                    num_connections: raw.num_connections,
+                    num_connections: raw.num_connections.as_ref().and_then(Value::as_u64),
                 });
             }
             Some("disconnect") => {
@@ -280,7 +341,11 @@ impl Frame {
         Ok(Frame::Envelope(Box::new(Envelope {
             id: EnvelopeId(raw_id),
             kind: kind.unwrap_or_default(),
-            retry_attempt: raw.retry_attempt.unwrap_or(0),
+            retry_attempt: raw
+                .retry_attempt
+                .as_ref()
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             content,
         })))
     }
@@ -299,8 +364,16 @@ fn content_of(mut payload: Value) -> Content {
     let Some(event) = payload.get_mut("event").map(Value::take) else {
         return Content::NotAnEvent;
     };
+    // Read the type first, so a mention or DM that will not parse is reported
+    // as a dropped message rather than passed off as some other event.
+    let event_type = event.get("type").and_then(Value::as_str).map(str::to_owned);
     let Ok(raw) = serde_json::from_value::<RawMessage>(event) else {
-        return Content::OtherEvent("<unreadable event>".to_string());
+        return match event_type.as_deref() {
+            Some("app_mention" | "message") => Content::Malformed {
+                field: MalformedField::Event,
+            },
+            other => Content::OtherEvent(other.unwrap_or("<no type>").to_string()),
+        };
     };
     let via = match (raw.kind.as_str(), raw.channel_type.as_deref()) {
         ("app_mention", _) => Via::Mention,
@@ -309,17 +382,25 @@ fn content_of(mut payload: Value) -> Content {
         (other, _) => return Content::OtherEvent(other.to_string()),
     };
     let Some(conversation) = raw.channel.as_deref().and_then(ConversationId::parse) else {
-        return Content::Malformed { field: "channel" };
+        return Content::Malformed {
+            field: MalformedField::Channel,
+        };
     };
     let Some(ts) = raw.ts.as_deref().and_then(|ts| SlackTs::parse(ts).ok()) else {
-        return Content::Malformed { field: "ts" };
+        return Content::Malformed {
+            field: MalformedField::Ts,
+        };
     };
     let thread_ts = match raw.thread_ts.as_deref().map(SlackTs::parse) {
         None => None,
         Some(Ok(parent)) => Some(parent),
         // Read as absent, a malformed `thread_ts` would pass a reply off as a
         // top-level message.
-        Some(Err(_)) => return Content::Malformed { field: "thread_ts" },
+        Some(Err(_)) => {
+            return Content::Malformed {
+                field: MalformedField::ThreadTs,
+            };
+        }
     };
     Content::Message(Box::new(BotMessage {
         via,
@@ -332,7 +413,7 @@ fn content_of(mut payload: Value) -> Content {
         bot_id: raw.bot_id,
         app_id: raw.app_id,
         subtype: raw.subtype,
-        hidden: raw.hidden,
+        hidden: raw.hidden.unwrap_or(false),
     }))
 }
 
@@ -472,12 +553,22 @@ mod tests {
         assert!(message.hidden);
     }
 
+    /// Only `im` is a DM. Group DMs (`mpim`) are not part of this watch, and a
+    /// `message` with no `channel_type` is not assumed to be one.
     #[test]
     fn a_message_outside_a_dm_is_another_event() {
-        let frame = events_api("env-1", dm(json!({"channel_type": "channel"})));
+        for channel_type in ["channel", "group", "mpim"] {
+            let frame = events_api("env-1", dm(json!({"channel_type": channel_type})));
+            assert_eq!(
+                content(&frame),
+                Content::OtherEvent(format!("message.{channel_type}"))
+            );
+        }
+        let mut untyped = dm(json!({}));
+        untyped.as_object_mut().unwrap().remove("channel_type");
         assert_eq!(
-            content(&frame),
-            Content::OtherEvent("message.channel".to_string())
+            content(&events_api("env-1", untyped)),
+            Content::OtherEvent("message".to_string())
         );
     }
 
@@ -504,19 +595,41 @@ mod tests {
     #[test]
     fn a_malformed_message_is_still_an_envelope_to_ack() {
         let bad_ts = events_api("env-4", mention("C0C83CXLUL8", "not-a-ts", None));
-        assert_eq!(content(&bad_ts), Content::Malformed { field: "ts" });
+        assert_eq!(
+            content(&bad_ts),
+            Content::Malformed {
+                field: MalformedField::Ts
+            }
+        );
         let bad_thread = events_api(
             "env-5",
             mention("C0C83CXLUL8", "1791349500.000002", Some("nope")),
         );
         assert_eq!(
             content(&bad_thread),
-            Content::Malformed { field: "thread_ts" }
+            Content::Malformed {
+                field: MalformedField::ThreadTs
+            }
         );
         let bad_channel = events_api("env-6", mention("#general", "1791349500.000002", None));
         assert_eq!(
             content(&bad_channel),
-            Content::Malformed { field: "channel" }
+            Content::Malformed {
+                field: MalformedField::Channel
+            }
+        );
+    }
+
+    /// A mention whose fields will not deserialize is a dropped message, and
+    /// says so, rather than an event the bot does not care about.
+    #[test]
+    fn an_unreadable_mention_is_malformed_not_another_event() {
+        let frame = events_api("env-1", json!({"type": "app_mention", "hidden": "yes"}));
+        assert_eq!(
+            content(&frame),
+            Content::Malformed {
+                field: MalformedField::Event
+            }
         );
     }
 
@@ -530,6 +643,23 @@ mod tests {
         .to_string();
         let message = message(&frame);
         assert_eq!((message.event_id, message.event_time), (None, None));
+    }
+
+    #[test]
+    fn odd_decorations_keep_the_frame_and_the_message() {
+        let hello = r#"{"type":"hello","num_connections":"two"}"#;
+        assert_eq!(
+            Frame::parse(hello).unwrap(),
+            Frame::Hello {
+                num_connections: None
+            }
+        );
+        let frame = json!({
+            "envelope_id": "env-1", "type": "events_api", "retry_attempt": "1",
+            "payload": {"event": dm(json!({"hidden": null}))},
+        })
+        .to_string();
+        assert!(!message(&frame).hidden);
     }
 
     #[test]

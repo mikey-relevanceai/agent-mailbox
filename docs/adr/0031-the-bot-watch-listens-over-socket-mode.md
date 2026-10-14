@@ -71,7 +71,9 @@ table):
 
 6. **Only someone saying something to the bot wakes.** Edits, deletions, `hidden`
    events, `bot_message` and other subtypes do not wake. Neither do the bot's own
-   posts, identified by its user and bot id from `auth.test`. The bot does post, for
+   posts, identified by its user and bot id from `auth.test`. The bot watch refuses
+   to run on a token with no `bot_id`: with a user token, the "own" user would be a
+   person, whose own messages would then be skipped. The bot does post, for
    Dispatch. Its DM posts were seen as the bot's user with no subtype, and as a
    `bot_message` with no user (measured by the orchestrator on 2026-10-15). Then the
    `--skip` filters apply.
@@ -97,7 +99,7 @@ table):
    method page). That cost is not worth it for an interactive summons, where the
    person can ask again.
 
-9. **One consumer per app.** The adapter warns when `hello` reports more than one
+9. **One consumer per app.** The adapter logs an error when `hello` reports more than one
    connection. It exits when the daemon that started it is gone, so an orphan does
    not keep a connection and take a share of the events. It does not try to
    coordinate beyond that.
@@ -112,8 +114,8 @@ table):
   retries for 24 hours. Its docs do not say whether that covers Socket Mode, and it
   was not tried. It is the first thing to try if the gap matters.
 - Running a second bot watch for the same app splits the messages between them. That
-  could be on another machine, or a test daemon beside the real one. The warning is
-  the only signal.
+  could be on another machine, or a test daemon beside the real one. The error-level log line
+  is the only signal.
 - **Linux** now links OpenSSL into the Slack adapter, where before it needed only
   `curl`. The Slack adapter still cannot work on Linux, because there is no Keychain
   (ADR-0027). The release build runs on `ubuntu-22.04`, which is expected to have the
