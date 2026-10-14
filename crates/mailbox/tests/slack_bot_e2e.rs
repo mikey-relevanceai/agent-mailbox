@@ -1,11 +1,11 @@
-//! The mention watch through the bridge (design/04): `mailbox watch
+//! The bot watch through the bridge (design/04): `mailbox watch
 //! slack-bot` records the watch, the daemon spawns the Slack adapter with
-//! the mention config, and what the adapter publishes on `slack.bot`
+//! the bot config, and what the adapter publishes on `slack.bot`
 //! reaches the session's `mailbox read`.
 //!
 //! The adapter here is a FAKE: a script that records the config it was given and
-//! publishes one mention. The real adapter needs a Socket Mode server, and its
-//! own e2e tests (`adapters/slack-adapter/tests/mention_e2e.rs`) run it against
+//! publishes one message. The real adapter needs a Socket Mode server, and its
+//! own e2e tests (`adapters/slack-adapter/tests/slack_bot_e2e.rs`) run it against
 //! one. This proves the plumbing between them: CLI parsing, the control request,
 //! storage, the resolver's config, the host relay, and `--skip` behaving as it
 //! does for the other Slack kinds (ADR-0029).
@@ -23,10 +23,10 @@ mod common;
 
 use common::{mailbox_command, poll_until};
 
-const SESSION: &str = "mention-e2e-session";
+const SESSION: &str = "bot-e2e-session";
 const MIKEY: &str = "U0AB7RJSQBE";
 
-/// A fake Slack adapter: saves its config line, publishes one mention, then
+/// A fake Slack adapter: saves its config line, publishes one message, then
 /// waits for SIGTERM the way the real one holds its connection.
 const FAKE_ADAPTER: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -112,7 +112,7 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 #[test]
-fn a_mention_reaches_the_watching_session() {
+fn a_message_to_the_bot_reaches_the_watching_session() {
     let bridge = Bridge::start();
     let skip = format!("user={MIKEY}");
     let watched = bridge.json(&["watch", "slack-bot", "--skip", &skip]);
@@ -145,7 +145,7 @@ fn a_mention_reaches_the_watching_session() {
     assert_eq!(watch["repo"], "bot");
     assert_eq!(watch["state"], "running");
 
-    // One mention watch per bridge, shared: another session asking for it with
+    // One bot watch per bridge, shared: another session asking for it with
     // other filters would change what wakes this one, so it is refused.
     let refused = bridge.run_as("another-session", &["watch", "slack-bot"]);
     assert!(!refused.status.success());

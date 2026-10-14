@@ -79,7 +79,7 @@ impl Names {
 
 /// `#<name>` for a channel, or `None` when Slack would not say. Errors are the
 /// caller's to classify: the channel watch treats a failure here as part of
-/// connecting, the mention watch as a missing decoration.
+/// connecting, the bot watch as a missing decoration.
 pub(crate) async fn channel_label<A: SlackApi>(
     api: &A,
     channel: &str,
