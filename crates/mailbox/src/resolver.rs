@@ -455,6 +455,37 @@ mod tests {
         );
     }
 
+    /// The mention watch's config has a `kind`, which is how the adapter tells it
+    /// from a channel watch, and no interval, because nothing is polled.
+    #[test]
+    fn slack_resolver_builds_the_mention_config() {
+        let watch = Watch {
+            id: WatchId::new(4),
+            target: WatchTarget::SlackMentions {
+                skip: SlackFilters::new(vec![SlackFilter::parse("user=U0AB7RJSQBE").unwrap()]),
+            },
+            interval: Duration::ZERO,
+            state: WatchState::Desired,
+        };
+        let resolved = DefaultResolver::default().resolve(&watch).unwrap();
+        assert_eq!(
+            resolved.config.value(),
+            &json!({"kind": "slack-mentions", "topic": "slack.mentions",
+                "skip": [{"user": "U0AB7RJSQBE"}]})
+        );
+        for err in [
+            StubResolver.resolve(&watch).unwrap_err(),
+            GithubResolver.resolve(&watch).unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                ResolveError::NoAdapter {
+                    kind: WatchKind::SlackMentions
+                }
+            ));
+        }
+    }
+
     #[test]
     fn each_resolver_refuses_the_kinds_that_are_not_its_own() {
         let stub = stub_watch("demo", Duration::from_millis(250), 0);

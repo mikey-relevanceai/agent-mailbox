@@ -2500,6 +2500,30 @@ mod tests {
     /// Agents mostly have a Slack link in hand, so both commands take one; each
     /// refuses the other's kind of link rather than guessing what was meant.
     #[test]
+    fn the_mention_watch_takes_skip_filters_and_no_target() {
+        let cli = Cli::try_parse_from([
+            "mailbox",
+            "watch",
+            "slack-mentions",
+            "--skip",
+            "user=U0AB7RJSQBE",
+        ])
+        .unwrap();
+        let Command::Watch(WatchArgs {
+            target: WatchTargetCmd::SlackMentions(args),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected watch slack-mentions");
+        };
+        assert_eq!(args.skip.into_filters().iter().count(), 1);
+        assert!(
+            Cli::try_parse_from(["mailbox", "watch", "slack-mentions", "C0C83CXLUL8"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["mailbox", "unwatch", "slack-mentions"]).is_ok());
+    }
+
+    #[test]
     fn slack_watch_arguments_accept_ids_and_links_and_refuse_the_wrong_kind() {
         let base = "https://tryrelevance.slack.com/archives/C0C83CXLUL8";
         let channel = SlackWatch::parse_channel_key("C0C83CXLUL8").unwrap();

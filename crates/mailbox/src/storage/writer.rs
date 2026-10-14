@@ -2604,6 +2604,44 @@ mod tests {
     }
 
     #[test]
+    fn the_mention_watch_round_trips_its_filters() {
+        let conn = migrated();
+        let target = WatchTarget::SlackMentions {
+            skip: SlackFilters::new(vec![
+                mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE").unwrap(),
+            ]),
+        };
+        let spec = WatchSpec {
+            target: target.clone(),
+            interval: std::time::Duration::ZERO,
+        };
+        let id = do_upsert_watch(&conn, &spec).unwrap();
+        assert_eq!(
+            do_upsert_watch(&conn, &spec).unwrap(),
+            id,
+            "there is one mention watch, keyed by its fixed key"
+        );
+        let watch = do_get_watch(&conn, id).unwrap().expect("the watch exists");
+        assert_eq!(watch.target, target);
+    }
+
+    #[test]
+    fn a_mention_watch_with_another_key_or_a_pr_is_corrupt() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'slack-mentions', 'C0C83CXLUL8', 0, 0, 0, 'desired', NULL),
+                    (2, 'slack-mentions', 'bot', 7, 0, 0, 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        for id in [1, 2] {
+            let err = do_get_watch(&conn, WatchId::new(id)).unwrap_err();
+            assert!(matches!(err, StorageError::Corrupt { .. }), "watch {id}");
+        }
+    }
+
+    #[test]
     fn review_request_watch_round_trips_its_login() {
         let conn = migrated();
         let login = GithubLogin::parse("octocat").unwrap();
