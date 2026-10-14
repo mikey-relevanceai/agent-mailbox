@@ -33,8 +33,8 @@ use mailbox_protocol::{
 use super::error::StorageError;
 use super::model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
-    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -1459,7 +1459,8 @@ fn do_upsert_watch(conn: &Connection, spec: &WatchSpec) -> Result<WatchId, Stora
     // Saturate rather than wrap on the (practically impossible) overflow of an
     // interval, PR number, or count that exceeds i64 — a wrapped negative would be
     // silently wrong, whereas a clamp is at worst a harmless over-large value.
-    let interval_ms = i64::try_from(spec.interval.as_millis()).unwrap_or(i64::MAX);
+    let interval = spec.target.interval_column(spec.interval);
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
     let pr = i64::try_from(spec.target.pr_column()).unwrap_or(i64::MAX);
     let count = i64::try_from(spec.target.count_column()).unwrap_or(i64::MAX);
     let id: i64 = conn.query_row(
@@ -1732,8 +1733,10 @@ fn build_watch(
     // PR number" are rejected as corrupt and unrepresentable downstream. Only
     // this store writes these rows, and it always writes the unused column as 0
     // (and an unused `filters` as `[]`).
-    if !matches!(kind, WatchKind::SlackChannel | WatchKind::SlackThread)
-        && !slack_filters(id, filters)?.is_empty()
+    if !matches!(
+        kind,
+        WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackBot
+    ) && !slack_filters(id, filters)?.is_empty()
     {
         return Err(StorageError::Corrupt {
             detail: format!(
@@ -1787,6 +1790,21 @@ fn build_watch(
                 ),
             })?;
             WatchTarget::GithubReviewRequests { login }
+        }
+        WatchKind::SlackBot => {
+            // Nothing is polled, so a non-zero interval would be a placeholder
+            // someone mistook for a cadence.
+            if pr != 0 || count != 0 || interval_ms != 0 || repo != SLACK_BOT_KEY {
+                return Err(StorageError::Corrupt {
+                    detail: format!(
+                        "slack-bot watch {} has key {repo:?}, pr {pr}, publish count {count} and interval {interval_ms}ms; expected {SLACK_BOT_KEY:?}, 0, 0 and 0",
+                        id.get()
+                    ),
+                });
+            }
+            WatchTarget::SlackBot {
+                skip: slack_filters(id, filters)?,
+            }
         }
     };
     let state = reconstruct_state(state, child_pid, id)?;
@@ -2586,6 +2604,51 @@ mod tests {
         .unwrap();
         let err = do_get_watch(&conn, WatchId::new(1)).unwrap_err();
         assert!(matches!(err, StorageError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn the_bot_watch_round_trips_its_filters() {
+        let conn = migrated();
+        let target = WatchTarget::SlackBot {
+            skip: SlackFilters::new(vec![
+                mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE").unwrap(),
+            ]),
+        };
+        let spec = WatchSpec {
+            target: target.clone(),
+            interval: std::time::Duration::ZERO,
+        };
+        let id = do_upsert_watch(&conn, &spec).unwrap();
+        assert_eq!(
+            do_upsert_watch(&conn, &spec).unwrap(),
+            id,
+            "there is one bot watch, keyed by its fixed key"
+        );
+        // A caller asking for an interval still writes a row the reader accepts.
+        let polled = WatchSpec {
+            interval: std::time::Duration::from_secs(60),
+            ..spec.clone()
+        };
+        assert_eq!(do_upsert_watch(&conn, &polled).unwrap(), id);
+        let watch = do_get_watch(&conn, id).unwrap().expect("the watch exists");
+        assert_eq!(watch.target, target);
+    }
+
+    #[test]
+    fn a_bot_watch_with_another_key_a_pr_or_an_interval_is_corrupt() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
+             VALUES (1, 'slack-bot', 'C0C83CXLUL8', 0, 0, 0, 'desired', NULL),
+                    (2, 'slack-bot', 'bot', 7, 0, 0, 'desired', NULL),
+                    (3, 'slack-bot', 'bot', 0, 60000, 0, 'desired', NULL)",
+            [],
+        )
+        .unwrap();
+        for id in [1, 2, 3] {
+            let err = do_get_watch(&conn, WatchId::new(id)).unwrap_err();
+            assert!(matches!(err, StorageError::Corrupt { .. }), "watch {id}");
+        }
     }
 
     #[test]

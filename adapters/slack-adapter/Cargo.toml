@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Slack poll adapter: watches one channel's top level or one thread, publishes each new message, with an edge-triggered baseline persisted via the bridge"
+description = "Slack adapter: polls one channel's top level or one thread, or listens for @mentions of the bot over Socket Mode, and publishes each to the bridge"
 
 # Speaks ONLY `mailbox-protocol` (NDJSON on stdout) and never links the `mailbox`
 # bridge crate (ADR-0001). It reaches Slack by shelling out to `curl`
 # (`MAILBOX_SLACK_CURL_BIN` for tests) and reads its token from the macOS Keychain
-# through `security` (`MAILBOX_SLACK_SECURITY_BIN` for tests) — ADR-0027. The bin
+# through `security` (`MAILBOX_SLACK_SECURITY_BIN` for tests) — ADR-0027. The
+# mention mode also holds a Socket Mode WebSocket, which `curl` cannot, so it
+# links a WebSocket client over the platform's TLS (ADR-0031). The bin
 # name is what the bridge's Slack resolver looks for (`MAILBOX_SLACK_ADAPTER_BIN`
 # overrides it).
 [[bin]]
@@ -29,6 +31,9 @@ tokio = { version = "1.52.3", features = ["rt", "macros", "time", "signal", "io-
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.18"
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "macros", "time"] }

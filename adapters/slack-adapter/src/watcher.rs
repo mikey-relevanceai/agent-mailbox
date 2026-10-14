@@ -23,8 +23,6 @@
 //! read, past the cursor, never published. It is skipped only after the wake
 //! rules would have woken for it, so a skip's logged reason is the real one.
 
-use std::collections::HashMap;
-
 use mailbox_protocol::{
     Poster, SlackAppId, SlackFilter, SlackFilters, SlackTs, SlackUserId, SlackWatch, Subject,
 };
@@ -32,8 +30,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::api::{SlackApi, SlackError};
+use crate::api::{SlackApi, SlackError, parse};
+use crate::identity::{WorkspaceUrl, identify};
 use crate::message::{SlackMessage, Subtype};
+use crate::names::Names;
+use crate::socket::ConversationId;
 
 /// Messages per page. Slack's cap for an internal app is 1,000; 200 keeps each
 /// reply small, and a second page is only needed when more than 200 messages
@@ -218,49 +219,10 @@ struct Pages {
 /// Workspace facts fetched once per process, on the first successful poll.
 #[derive(Debug, Clone)]
 pub struct Context {
-    /// `https://<workspace>.slack.com/`, for building permalinks without a call.
-    workspace_url: String,
+    /// For building permalinks without a call.
+    workspace: WorkspaceUrl,
     /// `#<name>`, or the channel id if Slack would not say.
     pub channel_label: String,
-}
-
-#[derive(Deserialize)]
-struct AuthTest {
-    url: String,
-    #[serde(default)]
-    user: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChannelInfo {
-    channel: ChannelName,
-}
-
-#[derive(Deserialize)]
-struct ChannelName {
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UserInfo {
-    user: UserNames,
-}
-
-#[derive(Deserialize)]
-struct UserNames {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    real_name: Option<String>,
-    #[serde(default)]
-    profile: Option<UserProfile>,
-}
-
-#[derive(Deserialize)]
-struct UserProfile {
-    #[serde(default)]
-    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -278,17 +240,6 @@ struct ResponseMetadata {
     next_cursor: Option<String>,
 }
 
-/// Parse a reply into `T`; a shape Slack does not normally send skips the poll.
-fn parse<T: serde::de::DeserializeOwned>(method: &str, reply: Value) -> Result<T, SlackError> {
-    // The serde error itself is not included: it can quote the value it choked on.
-    serde_json::from_value(reply).map_err(|err| {
-        SlackError::Transient(format!(
-            "{method} reply had an unexpected shape ({:?})",
-            err.classify()
-        ))
-    })
-}
-
 /// One watch's reads against Slack.
 pub(crate) struct Watcher<A> {
     api: A,
@@ -297,7 +248,7 @@ pub(crate) struct Watcher<A> {
     /// Joining is tried once per process: a second `not_in_channel` after a
     /// successful join means something else is wrong.
     tried_join: bool,
-    names: HashMap<SlackUserId, String>,
+    names: Names,
     skip: SlackFilters,
     page_size: usize,
     max_pages: usize,
@@ -311,7 +262,7 @@ impl<A: SlackApi> Watcher<A> {
             skip,
             context: None,
             tried_join: false,
-            names: HashMap::new(),
+            names: Names::default(),
             page_size: PAGE_SIZE,
             max_pages: MAX_PAGES,
         }
@@ -343,27 +294,19 @@ impl<A: SlackApi> Watcher<A> {
         if let Some(context) = &self.context {
             return Ok(context.clone());
         }
-        let auth: AuthTest = parse("auth.test", self.api.call("auth.test", &[]).await?)?;
-        let mut workspace_url = auth.url;
-        if !workspace_url.ends_with('/') {
-            workspace_url.push('/');
-        }
-        let channel = self.watch.channel().to_string();
-        let info: ChannelInfo = parse(
-            "conversations.info",
-            self.api
-                .call("conversations.info", &[("channel", &channel)])
-                .await?,
-        )?;
-        let channel_label = info.channel.name.map_or(channel, |name| format!("#{name}"));
+        let identity = identify(&self.api).await?;
+        let channel = self.watch.channel();
+        let channel_label = crate::names::channel_label(&self.api, &ConversationId::from(channel))
+            .await?
+            .unwrap_or_else(|| channel.to_string());
         info!(
-            workspace = %workspace_url,
+            workspace = %identity.workspace,
             channel = %channel_label,
-            bot = auth.user.as_deref().unwrap_or(""),
+            bot = identity.user.as_ref().map_or("", |user| user.as_str()),
             "connected to Slack"
         );
         let context = Context {
-            workspace_url,
+            workspace: identity.workspace,
             channel_label,
         };
         self.context = Some(context.clone());
@@ -590,47 +533,16 @@ impl<A: SlackApi> Watcher<A> {
         }
     }
 
-    /// A user's display name, cached for the life of the process. Any failure
-    /// falls back to the id: a name only decorates the subject.
     async fn user_name(&mut self, user: &SlackUserId) -> String {
-        if let Some(name) = self.names.get(user) {
-            return name.clone();
-        }
-        let reply = self
-            .api
-            .call("users.info", &[("user", user.as_str())])
-            .await;
-        let names = match reply.and_then(|reply| parse::<UserInfo>("users.info", reply)) {
-            Ok(info) => info.user,
-            Err(err) => {
-                debug!(user = user.as_str(), error = %err, "could not look up a user's name; using the id");
-                return user.as_str().to_string();
-            }
-        };
-        let name = [
-            names.profile.and_then(|profile| profile.display_name),
-            names.real_name,
-            names.name,
-        ]
-        .into_iter()
-        .flatten()
-        .find(|name| !name.is_empty())
-        .unwrap_or_else(|| user.as_str().to_string());
-        self.names.insert(user.clone(), name.clone());
-        name
+        self.names.get(&self.api, user).await
     }
 
     fn permalink(&self, context: &Context, ts: &SlackTs) -> String {
-        let channel = self.watch.channel();
-        let base = format!(
-            "{}archives/{channel}/p{}",
-            context.workspace_url,
-            ts.permalink_digits()
-        );
-        match self.watch.thread_ts() {
-            Some(parent) => format!("{base}?thread_ts={parent}&cid={channel}"),
-            None => base,
-        }
+        context.workspace.permalink(
+            &ConversationId::from(self.watch.channel()),
+            ts,
+            self.watch.thread_ts(),
+        )
     }
 }
 

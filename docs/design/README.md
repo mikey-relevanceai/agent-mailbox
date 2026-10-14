@@ -13,6 +13,7 @@ ADRs ([`../adr/`](../adr/)) record the durable *choice*. Designs record the
 | [01-mvp-github-watch](01-mvp-github-watch.md) | Implemented | GitHub PR watch (conflicts, reviews, CI); refcounted multi-session interest; no zombie pollers |
 | [02-slack-watch](02-slack-watch.md) | Implemented | Slack channel and thread watches: polling with an internal app's bot token, what wakes, the cursor |
 | [03-review-request-watch](03-review-request-watch.md) | Implemented | GitHub review-request watch: one user's pending requests via search, wake on entry, a second mode of the GitHub adapter |
+| [04-slack-bot-watch](04-slack-bot-watch.md) | Implemented | Slack bot watch: @mentions and DMs over Socket Mode, one wake per message, the offline gap |
 
 Likely next designs:
 

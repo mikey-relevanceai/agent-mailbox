@@ -200,7 +200,9 @@ retries a failed watch while someone still wants it.
 
 ## Later
 
-- **Socket Mode**, for seconds rather than a minute. It needs an app-level token and
-  an event subscription on the app, which may need re-approval, and it still needs
-  this polling to backfill after the laptop sleeps.
+- **Socket Mode**, for seconds rather than a minute. Built for @mentions of the bot
+  and DMs to it in [design/04](04-slack-bot-watch.md), without a polling backfill:
+  Slack's own retries cover a disconnect of a few minutes, and a longer one loses
+  events ([ADR-0031](../adr/0031-the-bot-watch-listens-over-socket-mode.md)). The
+  channel and thread watches still poll.
 - **Reactions** (`reactions:read` is granted) if agents start signalling with them.

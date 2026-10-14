@@ -214,7 +214,7 @@ crates/
 adapters/
   stub-adapter/       # reference adapter (synthetic edges; demo/tests)
   github-pr-adapter/  # the GitHub poller: one PR, or one user's review requests (via `gh`)
-  slack-adapter/      # Slack channel/thread poller (via `curl`, token in the Keychain)
+  slack-adapter/      # Slack channel/thread poller and bot listener (tokens in the Keychain)
 docs/
 scripts/demo.sh       # self-contained end-to-end demo
 skills/agent-mailbox/ # drop-in Claude Code skill (replaces agent-ipc); embedded in

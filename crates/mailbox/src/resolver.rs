@@ -28,7 +28,7 @@
 use serde_json::json;
 use tracing::debug;
 
-use mailbox_protocol::AdapterId;
+use mailbox_protocol::{AdapterId, SLACK_BOT_CONFIG_KIND, slack_bot_topic};
 
 use crate::host::AdapterConfig;
 use crate::host::subprocess::AdapterSpec;
@@ -89,7 +89,8 @@ impl AdapterResolver for StubResolver {
             // them here.
             WatchTarget::GithubPr { .. }
             | WatchTarget::Slack { .. }
-            | WatchTarget::GithubReviewRequests { .. } => Err(ResolveError::NoAdapter {
+            | WatchTarget::GithubReviewRequests { .. }
+            | WatchTarget::SlackBot { .. } => Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             }),
             WatchTarget::Stub { label, count } => {
@@ -173,9 +174,11 @@ impl GithubResolver {
 impl AdapterResolver for GithubResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
-            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } => Err(ResolveError::NoAdapter {
-                kind: watch.target.kind(),
-            }),
+            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } | WatchTarget::SlackBot { .. } => {
+                Err(ResolveError::NoAdapter {
+                    kind: watch.target.kind(),
+                })
+            }
             WatchTarget::GithubReviewRequests { login } => {
                 let config = json!({
                     "kind": WatchKind::GithubReviewRequests.as_str(),
@@ -238,8 +241,12 @@ const DEFAULT_SLACK_ADAPTER_BIN: &str = "mailbox-slack-adapter";
 /// not the child).
 const SLACK_ADAPTER_ID: &str = "slack-adapter";
 
-/// The `serve` resolver for `slack-channel` and `slack-thread` watches (design/02).
-/// One adapter program serves both kinds; the config says which. Like
+/// The `serve` resolver for `slack-channel` and `slack-thread` watches (design/02)
+/// and the `slack-bot` watch (design/04). One adapter program serves all
+/// three; the config says which. A bot watch's config carries
+/// `kind: "slack-bot"`; a config with no `kind` is a channel or thread
+/// watch, so a daemon that predates the bot watch still drives a newer
+/// adapter. Like
 /// [`GithubResolver`] it is storage-free: the supervisor injects the baseline.
 ///
 /// The config carries no credential. The adapter reads its Slack token from the
@@ -271,18 +278,35 @@ impl SlackResolver {
 
 impl AdapterResolver for SlackResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
-        let WatchTarget::Slack { watch: slack, skip } = &watch.target else {
-            return Err(ResolveError::NoAdapter {
-                kind: watch.target.kind(),
-            });
+        let (config, skip) = match &watch.target {
+            WatchTarget::Slack { watch: slack, skip } => (
+                json!({
+                    "topic": slack.topic().as_str(),
+                    "channel": slack.channel().as_str(),
+                    "thread_ts": slack.thread_ts().map(|ts| ts.to_string()),
+                    "interval_ms": interval_ms(watch),
+                    "skip": skip,
+                }),
+                skip,
+            ),
+            // No interval: the adapter holds a Socket Mode connection and polls
+            // nothing.
+            WatchTarget::SlackBot { skip } => (
+                json!({
+                    "kind": SLACK_BOT_CONFIG_KIND,
+                    "topic": slack_bot_topic().as_str(),
+                    "skip": skip,
+                }),
+                skip,
+            ),
+            WatchTarget::GithubPr { .. }
+            | WatchTarget::Stub { .. }
+            | WatchTarget::GithubReviewRequests { .. } => {
+                return Err(ResolveError::NoAdapter {
+                    kind: watch.target.kind(),
+                });
+            }
         };
-        let config = json!({
-            "topic": slack.topic().as_str(),
-            "channel": slack.channel().as_str(),
-            "thread_ts": slack.thread_ts().map(|ts| ts.to_string()),
-            "interval_ms": interval_ms(watch),
-            "skip": skip,
-        });
         let (program, env_override) = SlackResolver::program();
         debug!(
             watch = watch.id.get(),
@@ -324,7 +348,9 @@ impl AdapterResolver for DefaultResolver {
         match watch.target.kind() {
             WatchKind::Stub => self.stub.resolve(watch),
             WatchKind::GithubPr | WatchKind::GithubReviewRequests => self.github.resolve(watch),
-            WatchKind::SlackChannel | WatchKind::SlackThread => self.slack.resolve(watch),
+            WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackBot => {
+                self.slack.resolve(watch)
+            }
         }
     }
 }
@@ -427,6 +453,37 @@ mod tests {
             resolved.config.value()["skip"],
             json!([{"user": "U0AB7RJSQBE", "app": "A08SF47R6P4"}])
         );
+    }
+
+    /// The bot watch's config has a `kind`, which is how the adapter tells it
+    /// from a channel watch, and no interval, because nothing is polled.
+    #[test]
+    fn slack_resolver_builds_the_bot_config() {
+        let watch = Watch {
+            id: WatchId::new(4),
+            target: WatchTarget::SlackBot {
+                skip: SlackFilters::new(vec![SlackFilter::parse("user=U0AB7RJSQBE").unwrap()]),
+            },
+            interval: Duration::ZERO,
+            state: WatchState::Desired,
+        };
+        let resolved = DefaultResolver::default().resolve(&watch).unwrap();
+        assert_eq!(
+            resolved.config.value(),
+            &json!({"kind": "slack-bot", "topic": "slack.bot",
+                "skip": [{"user": "U0AB7RJSQBE"}]})
+        );
+        for err in [
+            StubResolver.resolve(&watch).unwrap_err(),
+            GithubResolver.resolve(&watch).unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                ResolveError::NoAdapter {
+                    kind: WatchKind::SlackBot
+                }
+            ));
+        }
     }
 
     #[test]

@@ -77,7 +77,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use mailbox_protocol::SessionId;
-use mailbox_protocol::{GithubPr, Topic, stub_topic};
+use mailbox_protocol::{GithubPr, Topic, slack_bot_topic, stub_topic};
 
 use crate::bus::Bus;
 use crate::clock::now_millis;
@@ -447,6 +447,7 @@ pub fn topic_for_watch(watch: &Watch) -> Option<Topic> {
         WatchTarget::Stub { label, .. } => stub_topic(label).ok(),
         WatchTarget::Slack { watch, .. } => Some(watch.topic()),
         WatchTarget::GithubReviewRequests { login } => Some(login.review_requests_topic()),
+        WatchTarget::SlackBot { .. } => Some(slack_bot_topic()),
     }
 }
 

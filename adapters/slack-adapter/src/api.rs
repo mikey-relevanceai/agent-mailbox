@@ -73,14 +73,24 @@ pub(crate) trait SlackApi {
     async fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, SlackError>;
 }
 
-/// The real transport: `curl` against slack.com.
-pub struct CurlSlack {
+/// The real transport: `curl` against slack.com, authenticated with a token of
+/// kind `C` ([`crate::token::Bot`] or [`crate::token::App`]).
+pub struct CurlSlack<C> {
     bin: String,
-    token: Token,
+    token: Token<C>,
 }
 
-impl CurlSlack {
-    pub fn new(token: Token) -> Self {
+impl<C> Clone for CurlSlack<C> {
+    fn clone(&self) -> Self {
+        Self {
+            bin: self.bin.clone(),
+            token: self.token.clone(),
+        }
+    }
+}
+
+impl<C> CurlSlack<C> {
+    pub fn new(token: Token<C>) -> Self {
         let bin = std::env::var(ENV_CURL_BIN)
             .ok()
             .filter(|value| !value.is_empty())
@@ -89,7 +99,7 @@ impl CurlSlack {
     }
 }
 
-impl SlackApi for CurlSlack {
+impl<C> SlackApi for CurlSlack<C> {
     async fn call(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, SlackError> {
         let mut child = tokio::process::Command::new(&self.bin)
             .args(["-sS", "--max-time", REQUEST_TIMEOUT_SECS, "-K", "-"])
@@ -129,7 +139,7 @@ impl SlackApi for CurlSlack {
 /// The curl config for one call. Every value is form-encoded, and the token is
 /// header-safe by construction ([`crate::token`]), so nothing here needs quoting
 /// beyond the surrounding `"`.
-fn curl_config(method: &str, params: &[(&str, &str)], token: &Token) -> String {
+fn curl_config<C>(method: &str, params: &[(&str, &str)], token: &Token<C>) -> String {
     let form = params
         .iter()
         .map(|(key, value)| format!("{}={}", form_encode(key), form_encode(value)))
@@ -216,6 +226,20 @@ pub(crate) fn classify(code: &str, retry_after: Option<Duration>) -> SlackError 
         }
         other => SlackError::Failed(other.to_string()),
     }
+}
+
+/// Parse a reply into `T`; a shape Slack does not normally send skips the poll.
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(
+    method: &str,
+    reply: Value,
+) -> Result<T, SlackError> {
+    // The serde error itself is not included: it can quote the value it choked on.
+    serde_json::from_value(reply).map_err(|err| {
+        SlackError::Transient(format!(
+            "{method} reply had an unexpected shape ({:?})",
+            err.classify()
+        ))
+    })
 }
 
 /// The first non-empty line of `text`, so an error never dumps curl's whole stderr.

@@ -33,15 +33,16 @@
 use std::time::Duration;
 
 use mailbox_protocol::{
-    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, stub_topic,
+    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, slack_bot_topic, stub_topic,
 };
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    FilterChange, RecordInterestOutcome, ResumeOutcome, SessionId, Storage, StorageError,
-    SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget, slack_kind,
+    FilterChange, RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY, SessionId, Storage,
+    StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget,
+    slack_kind,
 };
 use crate::supervisor::{Supervisor, SupervisorError};
 
@@ -262,6 +263,25 @@ pub async fn record_slack(
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
 }
 
+/// Record (or reuse) the bridge's one bot watch, attach `session`'s
+/// interest, and subscribe it to `slack.bot` (design/04). Its filters
+/// behave as a channel watch's do (ADR-0029): `skip` is the whole set, and a
+/// change is refused while another session shares the watch.
+pub async fn record_slack_bot(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    skip: SlackFilters,
+    session: SessionId,
+) -> Result<WatchRecorded, WatchError> {
+    let spec = WatchSpec {
+        target: WatchTarget::SlackBot { skip },
+        // The adapter holds a connection and polls nothing.
+        interval: Duration::ZERO,
+    };
+    record_watch(bus, storage, supervisor, spec, slack_bot_topic(), session).await
+}
+
 /// Record (or reuse) the review-request watch for `login`, attach `session`'s
 /// interest, and subscribe it to `github.review-requests.<login>` (design/03).
 /// The analogue of [`record`] for a person rather than a PR, keyed by
@@ -419,6 +439,27 @@ pub async fn drop_interest_slack(
         &slack.key(),
         0,
         slack.topic(),
+        session,
+    )
+    .await
+}
+
+/// Drop `session`'s interest in the bot watch and unsubscribe it from
+/// `slack.bot`.
+pub async fn drop_interest_slack_bot(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Result<WatchDropped, WatchError> {
+    drop_interest_for(
+        bus,
+        storage,
+        supervisor,
+        WatchKind::SlackBot,
+        SLACK_BOT_KEY,
+        0,
+        slack_bot_topic(),
         session,
     )
     .await

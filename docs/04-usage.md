@@ -56,7 +56,7 @@ That produces four binaries in `target/release/`:
 | `mailbox` | the bridge CLI + daemon (the one entry point) |
 | `mailbox-stub-adapter` | reference adapter (synthetic edges; for the demo/tests) |
 | `mailbox-github-pr-adapter` | the GitHub poller: one PR, or one user's review requests ([design/03](design/03-review-request-watch.md)) |
-| `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) |
+| `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) and bot listener ([design/04](design/04-slack-bot-watch.md)) |
 
 ### Put them on your PATH (co-located)
 
@@ -440,6 +440,8 @@ Add global `--json` for machine-readable stdout.
 | `mailbox watch slack-channel <channel> [--interval <secs>] [--skip <filter>]…` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
 | `mailbox watch slack-thread <channel>/<ts> [--interval <secs>] [--skip <filter>]…` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
 | `mailbox unwatch slack-channel <channel>` / `unwatch slack-thread <channel>/<ts>` | Stop watching. |
+| `mailbox watch slack-bot [--skip <filter>]…` | Watch the Slack bot: wakes within seconds when someone @mentions it (anywhere it has been invited, thread replies included) or DMs it. Needs a second, app-level token. See [The Slack bot](#the-slack-bot-mentions-and-dms). |
+| `mailbox unwatch slack-bot` | Stop watching. |
 | `mailbox watch github-review-requests <login> [--interval <secs>]` | Watch a GitHub user's review requests: each open PR that **newly** asks them for a review wakes you, whether the request named them or a team they are on. See [Review requests](#review-requests). |
 | `mailbox unwatch github-review-requests <login>` | Stop watching. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
@@ -491,6 +493,46 @@ still in Slack. The flag states the whole set: watching again without `--skip` c
 the filters. One adapter serves everyone watching a channel, so the filters are
 shared. Changing them is refused while another session watches it, and otherwise
 restarts the adapter. `mailbox status` shows each watch's `skip=[…]`.
+
+### The Slack bot: mentions and DMs
+
+`mailbox watch slack-bot` wakes you when someone @mentions the Slack bot or sends it
+a DM, so a person can summon an agent from Slack
+([design/04](design/04-slack-bot-watch.md)). Both arrive over Slack's Socket Mode,
+an outbound WebSocket, so they take seconds and cover thread replies. Nothing is
+polled. Edits, deletions and the bot's own posts do not wake.
+
+It needs the same app as the other Slack watches, plus, once per app:
+
+1. Bot scopes `app_mentions:read`, `im:history` and `im:read`. Adding them needs
+   re-approval and a reinstall, if your workspace requires that.
+2. **Socket Mode** turned on, and the bot events `app_mention` and `message.im`
+   added under **Event Subscriptions**.
+3. **App Home → Messages Tab** on, with "Allow users to send … messages" ticked, so
+   people can DM the bot.
+4. An **app-level token** with scope `connections:write` (Basic Information →
+   App-Level Tokens), stored beside the bot token:
+
+   ```bash
+   security add-generic-password -U -s agent-mailbox.slack-app-token -a "$USER" -w
+   ```
+
+Invite the bot to each channel whose mentions it should hear (`/invite @<bot>`). A
+private channel works once it is invited.
+
+The event names who wrote and where, and links the message. Read the message through
+your Slack connector. `--skip` works as for the other Slack watches. There is one bot
+watch per bridge, so every session watching it wakes for every message to the bot.
+
+Two limits ([ADR-0031](adr/0031-the-bot-watch-listens-over-socket-mode.md)):
+
+- **While no connection is open, messages are lost after a few minutes.** Slack
+  retries a delivery at about 1 and 5 minutes. The 1-minute retry was measured; the
+  5-minute one is from Slack's docs. A laptop asleep for longer misses what was sent
+  meanwhile.
+- **One bot watch per Slack app.** Slack sends each event to one of the app's
+  connections, so two bridges on the same app split the messages. The adapter logs an
+  error when it sees another connection.
 
 ### Review requests
 

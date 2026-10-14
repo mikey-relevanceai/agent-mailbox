@@ -536,6 +536,8 @@ fn request_op(request: &Request) -> &'static str {
         Request::UnwatchStub { .. } => "unwatch_stub",
         Request::WatchSlack { .. } => "watch_slack",
         Request::UnwatchSlack { .. } => "unwatch_slack",
+        Request::WatchSlackBot { .. } => "watch_slack_bot",
+        Request::UnwatchSlackBot { .. } => "unwatch_slack_bot",
         Request::WatchReviewRequests { .. } => "watch_review_requests",
         Request::UnwatchReviewRequests { .. } => "unwatch_review_requests",
         Request::Status { .. } => "status",
@@ -562,6 +564,8 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         | Request::UnwatchStub { session, .. }
         | Request::WatchSlack { session, .. }
         | Request::UnwatchSlack { session, .. }
+        | Request::WatchSlackBot { session, .. }
+        | Request::UnwatchSlackBot { session }
         | Request::WatchReviewRequests { session, .. }
         | Request::UnwatchReviewRequests { session, .. }
         | Request::EndSession { session }
@@ -655,6 +659,12 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         }
         Request::UnwatchSlack { session, target } => {
             unwatch_slack(bus, storage, supervisor, session, target).await
+        }
+        Request::WatchSlackBot { session, skip } => {
+            watch_slack_bot(bus, storage, supervisor, session, skip).await
+        }
+        Request::UnwatchSlackBot { session } => {
+            unwatch_slack_bot(bus, storage, supervisor, session).await
         }
         Request::WatchReviewRequests {
             session,
@@ -964,6 +974,41 @@ async fn unwatch_slack(
     target: SlackWatch,
 ) -> Response {
     match mailbox::watch::drop_interest_slack(bus, storage, supervisor, &target, session).await {
+        Ok(dropped) => Response::Unwatched {
+            topic: dropped.topic,
+            outcome: dropped.outcome.into(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::record_slack_bot`].
+async fn watch_slack_bot(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+    skip: SlackFilters,
+) -> Response {
+    match mailbox::watch::record_slack_bot(bus, storage, supervisor, skip, session).await {
+        Ok(recorded) => Response::Watched {
+            topic: recorded.topic,
+            interest: recorded.interest,
+            subscribe: recorded.subscribe.into(),
+            skip: recorded.skip,
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Thin translation over [`mailbox::watch::drop_interest_slack_bot`].
+async fn unwatch_slack_bot(
+    bus: &Bus,
+    storage: &Storage,
+    supervisor: &Supervisor,
+    session: SessionId,
+) -> Response {
+    match mailbox::watch::drop_interest_slack_bot(bus, storage, supervisor, session).await {
         Ok(dropped) => Response::Unwatched {
             topic: dropped.topic,
             outcome: dropped.outcome.into(),
