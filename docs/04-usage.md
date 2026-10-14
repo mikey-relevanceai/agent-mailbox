@@ -56,7 +56,7 @@ That produces four binaries in `target/release/`:
 | `mailbox` | the bridge CLI + daemon (the one entry point) |
 | `mailbox-stub-adapter` | reference adapter (synthetic edges; for the demo/tests) |
 | `mailbox-github-pr-adapter` | the GitHub poller: one PR, or one user's review requests ([design/03](design/03-review-request-watch.md)) |
-| `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) |
+| `mailbox-slack-adapter` | the Slack channel/thread poller ([design/02](design/02-slack-watch.md)) and @mention listener ([design/04](design/04-slack-mention-watch.md)) |
 
 ### Put them on your PATH (co-located)
 
@@ -440,6 +440,8 @@ Add global `--json` for machine-readable stdout.
 | `mailbox watch slack-channel <channel> [--interval <secs>] [--skip <filter>]…` | Watch a Slack channel's top level: each new message wakes you; thread replies do not. `<channel>` is an id (`C0C83CXLUL8`) or a Slack link. Needs a token in the Keychain — see [Slack watches](#slack-watches). |
 | `mailbox watch slack-thread <channel>/<ts> [--interval <secs>] [--skip <filter>]…` | Watch one Slack thread: each new reply wakes you. Also takes a Slack link to any message in the thread. |
 | `mailbox unwatch slack-channel <channel>` / `unwatch slack-thread <channel>/<ts>` | Stop watching. |
+| `mailbox watch slack-mentions [--skip <filter>]…` | Watch for @mentions of the Slack bot, anywhere it has been invited, thread replies included. Wakes within seconds. Needs a second, app-level token. See [Slack mentions](#slack-mentions). |
+| `mailbox unwatch slack-mentions` | Stop watching. |
 | `mailbox watch github-review-requests <login> [--interval <secs>]` | Watch a GitHub user's review requests: each open PR that **newly** asks them for a review wakes you, whether the request named them or a team they are on. See [Review requests](#review-requests). |
 | `mailbox unwatch github-review-requests <login>` | Stop watching. |
 | `mailbox watch stub <label> [--interval-ms <n>] [--count <n>]` | Watch the reference stub publisher (synthetic edges; for the demo/tests). |
@@ -491,6 +493,43 @@ still in Slack. The flag states the whole set: watching again without `--skip` c
 the filters. One adapter serves everyone watching a channel, so the filters are
 shared. Changing them is refused while another session watches it, and otherwise
 restarts the adapter. `mailbox status` shows each watch's `skip=[…]`.
+
+### Slack mentions
+
+`mailbox watch slack-mentions` wakes you when someone @mentions the Slack bot, so a
+person can summon an agent from Slack ([design/04](design/04-slack-mention-watch.md)).
+The mention arrives over Slack's Socket Mode, an outbound WebSocket, so it takes
+seconds and covers thread replies. Nothing is polled.
+
+It needs the same app as the other Slack watches, plus, once per app:
+
+1. Bot scope `app_mentions:read` (re-approval and a reinstall, if your workspace
+   requires it).
+2. **Socket Mode** turned on, and the bot event `app_mention` added under **Event
+   Subscriptions**.
+3. An **app-level token** with scope `connections:write` (Basic Information →
+   App-Level Tokens), stored beside the bot token:
+
+   ```bash
+   security add-generic-password -U -s agent-mailbox.slack-app-token -a "$USER" -w
+   ```
+
+Invite the bot to each conversation it should hear (`/invite @<bot>`). A private
+channel works once it is invited.
+
+The event names the channel and links the message; read the message through your Slack
+connector. `--skip` works as for the other Slack watches. There is one mention watch
+per bridge, so every session watching it wakes for every mention.
+
+Two limits ([ADR-0031](adr/0031-mentions-arrive-over-socket-mode.md)):
+
+- **While no connection is open, mentions are lost after a few minutes.** Slack
+  retries a delivery at about 1 and 5 minutes (a 1-minute redelivery was measured;
+  the 5-minute one is from Slack's docs). A laptop asleep for longer misses the
+  mentions made meanwhile.
+- **One mention watch per Slack app.** Slack sends each event to one of the app's
+  connections, so two bridges on the same app split the mentions. The adapter logs a
+  warning when it sees another connection.
 
 ### Review requests
 

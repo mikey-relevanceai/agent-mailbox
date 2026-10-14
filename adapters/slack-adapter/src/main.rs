@@ -1,5 +1,8 @@
 //! The **Slack adapter**: polls one Slack channel's top level, or one thread, and
-//! publishes each new message (design/02).
+//! publishes each new message (design/02). With `kind: "slack-mentions"` in its
+//! config it is instead the mention watch, a Socket Mode client that publishes
+//! each @mention of the bot ([`mention_loop`], design/04). The rest of this
+//! header describes the poll modes.
 //!
 //! It imports **only** `mailbox-protocol`, never the `mailbox` bridge crate
 //! (ADR-0001). It reaches Slack through `curl` ([`api`]) with a token it reads
