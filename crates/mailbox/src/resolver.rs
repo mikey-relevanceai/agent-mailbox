@@ -28,7 +28,7 @@
 use serde_json::json;
 use tracing::debug;
 
-use mailbox_protocol::{AdapterId, slack_mentions_topic};
+use mailbox_protocol::{AdapterId, SLACK_BOT_CONFIG_KIND, slack_bot_topic};
 
 use crate::host::AdapterConfig;
 use crate::host::subprocess::AdapterSpec;
@@ -90,7 +90,7 @@ impl AdapterResolver for StubResolver {
             WatchTarget::GithubPr { .. }
             | WatchTarget::Slack { .. }
             | WatchTarget::GithubReviewRequests { .. }
-            | WatchTarget::SlackMentions { .. } => Err(ResolveError::NoAdapter {
+            | WatchTarget::SlackBot { .. } => Err(ResolveError::NoAdapter {
                 kind: watch.target.kind(),
             }),
             WatchTarget::Stub { label, count } => {
@@ -174,11 +174,11 @@ impl GithubResolver {
 impl AdapterResolver for GithubResolver {
     fn resolve(&self, watch: &Watch) -> Result<ResolvedAdapter, ResolveError> {
         match &watch.target {
-            WatchTarget::Stub { .. }
-            | WatchTarget::Slack { .. }
-            | WatchTarget::SlackMentions { .. } => Err(ResolveError::NoAdapter {
-                kind: watch.target.kind(),
-            }),
+            WatchTarget::Stub { .. } | WatchTarget::Slack { .. } | WatchTarget::SlackBot { .. } => {
+                Err(ResolveError::NoAdapter {
+                    kind: watch.target.kind(),
+                })
+            }
             WatchTarget::GithubReviewRequests { login } => {
                 let config = json!({
                     "kind": WatchKind::GithubReviewRequests.as_str(),
@@ -242,10 +242,10 @@ const DEFAULT_SLACK_ADAPTER_BIN: &str = "mailbox-slack-adapter";
 const SLACK_ADAPTER_ID: &str = "slack-adapter";
 
 /// The `serve` resolver for `slack-channel` and `slack-thread` watches (design/02)
-/// and the `slack-mentions` watch (design/04). One adapter program serves all
-/// three; the config says which. A mention watch's config carries
-/// `kind: "slack-mentions"`; a config with no `kind` is a channel or thread
-/// watch, so a daemon that predates the mention watch still drives a newer
+/// and the `slack-bot` watch (design/04). One adapter program serves all
+/// three; the config says which. A bot watch's config carries
+/// `kind: "slack-bot"`; a config with no `kind` is a channel or thread
+/// watch, so a daemon that predates the bot watch still drives a newer
 /// adapter. Like
 /// [`GithubResolver`] it is storage-free: the supervisor injects the baseline.
 ///
@@ -291,10 +291,10 @@ impl AdapterResolver for SlackResolver {
             ),
             // No interval: the adapter holds a Socket Mode connection and polls
             // nothing.
-            WatchTarget::SlackMentions { skip } => (
+            WatchTarget::SlackBot { skip } => (
                 json!({
-                    "kind": WatchKind::SlackMentions.as_str(),
-                    "topic": slack_mentions_topic().as_str(),
+                    "kind": SLACK_BOT_CONFIG_KIND,
+                    "topic": slack_bot_topic().as_str(),
                     "skip": skip,
                 }),
                 skip,
@@ -348,7 +348,7 @@ impl AdapterResolver for DefaultResolver {
         match watch.target.kind() {
             WatchKind::Stub => self.stub.resolve(watch),
             WatchKind::GithubPr | WatchKind::GithubReviewRequests => self.github.resolve(watch),
-            WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackMentions => {
+            WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackBot => {
                 self.slack.resolve(watch)
             }
         }
@@ -455,13 +455,13 @@ mod tests {
         );
     }
 
-    /// The mention watch's config has a `kind`, which is how the adapter tells it
+    /// The bot watch's config has a `kind`, which is how the adapter tells it
     /// from a channel watch, and no interval, because nothing is polled.
     #[test]
-    fn slack_resolver_builds_the_mention_config() {
+    fn slack_resolver_builds_the_bot_config() {
         let watch = Watch {
             id: WatchId::new(4),
-            target: WatchTarget::SlackMentions {
+            target: WatchTarget::SlackBot {
                 skip: SlackFilters::new(vec![SlackFilter::parse("user=U0AB7RJSQBE").unwrap()]),
             },
             interval: Duration::ZERO,
@@ -470,7 +470,7 @@ mod tests {
         let resolved = DefaultResolver::default().resolve(&watch).unwrap();
         assert_eq!(
             resolved.config.value(),
-            &json!({"kind": "slack-mentions", "topic": "slack.mentions",
+            &json!({"kind": "slack-bot", "topic": "slack.bot",
                 "skip": [{"user": "U0AB7RJSQBE"}]})
         );
         for err in [
@@ -480,7 +480,7 @@ mod tests {
             assert!(matches!(
                 err,
                 ResolveError::NoAdapter {
-                    kind: WatchKind::SlackMentions
+                    kind: WatchKind::SlackBot
                 }
             ));
         }

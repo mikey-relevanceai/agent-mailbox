@@ -44,7 +44,7 @@ pub use error::StorageError;
 pub use mailbox_protocol::Cursor;
 pub use model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
     TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
     slack_kind,
 };

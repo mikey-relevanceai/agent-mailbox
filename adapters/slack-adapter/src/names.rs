@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use mailbox_protocol::{SlackChannelId, SlackUserId};
+use mailbox_protocol::SlackUserId;
 use serde::Deserialize;
 use tracing::debug;
 
@@ -82,11 +82,11 @@ impl Names {
 /// connecting, the mention watch as a missing decoration.
 pub(crate) async fn channel_label<A: SlackApi>(
     api: &A,
-    channel: &SlackChannelId,
+    channel: &str,
 ) -> Result<Option<String>, crate::api::SlackError> {
     let info: ChannelInfo = parse(
         "conversations.info",
-        api.call("conversations.info", &[("channel", channel.as_str())])
+        api.call("conversations.info", &[("channel", channel)])
             .await?,
     )?;
     Ok(info.channel.name.map(|name| format!("#{name}")))

@@ -33,7 +33,7 @@ use mailbox_protocol::{
 use super::error::StorageError;
 use super::model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
+    ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
     TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
 };
 
@@ -1734,7 +1734,7 @@ fn build_watch(
     // (and an unused `filters` as `[]`).
     if !matches!(
         kind,
-        WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackMentions
+        WatchKind::SlackChannel | WatchKind::SlackThread | WatchKind::SlackBot
     ) && !slack_filters(id, filters)?.is_empty()
     {
         return Err(StorageError::Corrupt {
@@ -1790,16 +1790,18 @@ fn build_watch(
             })?;
             WatchTarget::GithubReviewRequests { login }
         }
-        WatchKind::SlackMentions => {
-            if pr != 0 || count != 0 || repo != SLACK_MENTIONS_KEY {
+        WatchKind::SlackBot => {
+            // Nothing is polled, so a non-zero interval would be a placeholder
+            // someone mistook for a cadence.
+            if pr != 0 || count != 0 || interval_ms != 0 || repo != SLACK_BOT_KEY {
                 return Err(StorageError::Corrupt {
                     detail: format!(
-                        "slack-mentions watch {} has key {repo:?}, pr {pr} and publish count {count}; expected {SLACK_MENTIONS_KEY:?}, 0 and 0",
+                        "slack-bot watch {} has key {repo:?}, pr {pr}, publish count {count} and interval {interval_ms}ms; expected {SLACK_BOT_KEY:?}, 0, 0 and 0",
                         id.get()
                     ),
                 });
             }
-            WatchTarget::SlackMentions {
+            WatchTarget::SlackBot {
                 skip: slack_filters(id, filters)?,
             }
         }
@@ -2604,9 +2606,9 @@ mod tests {
     }
 
     #[test]
-    fn the_mention_watch_round_trips_its_filters() {
+    fn the_bot_watch_round_trips_its_filters() {
         let conn = migrated();
-        let target = WatchTarget::SlackMentions {
+        let target = WatchTarget::SlackBot {
             skip: SlackFilters::new(vec![
                 mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE").unwrap(),
             ]),
@@ -2619,23 +2621,24 @@ mod tests {
         assert_eq!(
             do_upsert_watch(&conn, &spec).unwrap(),
             id,
-            "there is one mention watch, keyed by its fixed key"
+            "there is one bot watch, keyed by its fixed key"
         );
         let watch = do_get_watch(&conn, id).unwrap().expect("the watch exists");
         assert_eq!(watch.target, target);
     }
 
     #[test]
-    fn a_mention_watch_with_another_key_or_a_pr_is_corrupt() {
+    fn a_bot_watch_with_another_key_a_pr_or_an_interval_is_corrupt() {
         let conn = migrated();
         conn.execute(
             "INSERT INTO watch (id, kind, repo, pr, interval_ms, publish_count, state, child_pid)
-             VALUES (1, 'slack-mentions', 'C0C83CXLUL8', 0, 0, 0, 'desired', NULL),
-                    (2, 'slack-mentions', 'bot', 7, 0, 0, 'desired', NULL)",
+             VALUES (1, 'slack-bot', 'C0C83CXLUL8', 0, 0, 0, 'desired', NULL),
+                    (2, 'slack-bot', 'bot', 7, 0, 0, 'desired', NULL),
+                    (3, 'slack-bot', 'bot', 0, 60000, 0, 'desired', NULL)",
             [],
         )
         .unwrap();
-        for id in [1, 2] {
+        for id in [1, 2, 3] {
             let err = do_get_watch(&conn, WatchId::new(id)).unwrap_err();
             assert!(matches!(err, StorageError::Corrupt { .. }), "watch {id}");
         }

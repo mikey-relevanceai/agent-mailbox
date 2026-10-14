@@ -33,15 +33,14 @@
 use std::time::Duration;
 
 use mailbox_protocol::{
-    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, slack_mentions_topic,
-    stub_topic,
+    GithubLogin, GithubPr, SlackFilters, SlackWatch, Topic, TopicError, slack_bot_topic, stub_topic,
 };
 use tracing::{debug, info, warn};
 
 use crate::bus::{Bus, BusError};
 use crate::clock::now_millis;
 use crate::storage::{
-    FilterChange, RecordInterestOutcome, ResumeOutcome, SLACK_MENTIONS_KEY, SessionId, Storage,
+    FilterChange, RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY, SessionId, Storage,
     StorageError, SubjectBudget, SubscribeOutcome, WatchKind, WatchSpec, WatchState, WatchTarget,
     slack_kind,
 };
@@ -264,11 +263,11 @@ pub async fn record_slack(
     record_watch(bus, storage, supervisor, spec, slack.topic(), session).await
 }
 
-/// Record (or reuse) the bridge's one mention watch, attach `session`'s
-/// interest, and subscribe it to `slack.mentions` (design/04). Its filters
+/// Record (or reuse) the bridge's one bot watch, attach `session`'s
+/// interest, and subscribe it to `slack.bot` (design/04). Its filters
 /// behave as a channel watch's do (ADR-0029): `skip` is the whole set, and a
 /// change is refused while another session shares the watch.
-pub async fn record_slack_mentions(
+pub async fn record_slack_bot(
     bus: &Bus,
     storage: &Storage,
     supervisor: &Supervisor,
@@ -276,19 +275,11 @@ pub async fn record_slack_mentions(
     session: SessionId,
 ) -> Result<WatchRecorded, WatchError> {
     let spec = WatchSpec {
-        target: WatchTarget::SlackMentions { skip },
+        target: WatchTarget::SlackBot { skip },
         // The adapter holds a connection and polls nothing.
         interval: Duration::ZERO,
     };
-    record_watch(
-        bus,
-        storage,
-        supervisor,
-        spec,
-        slack_mentions_topic(),
-        session,
-    )
-    .await
+    record_watch(bus, storage, supervisor, spec, slack_bot_topic(), session).await
 }
 
 /// Record (or reuse) the review-request watch for `login`, attach `session`'s
@@ -453,9 +444,9 @@ pub async fn drop_interest_slack(
     .await
 }
 
-/// Drop `session`'s interest in the mention watch and unsubscribe it from
-/// `slack.mentions`.
-pub async fn drop_interest_slack_mentions(
+/// Drop `session`'s interest in the bot watch and unsubscribe it from
+/// `slack.bot`.
+pub async fn drop_interest_slack_bot(
     bus: &Bus,
     storage: &Storage,
     supervisor: &Supervisor,
@@ -465,10 +456,10 @@ pub async fn drop_interest_slack_mentions(
         bus,
         storage,
         supervisor,
-        WatchKind::SlackMentions,
-        SLACK_MENTIONS_KEY,
+        WatchKind::SlackBot,
+        SLACK_BOT_KEY,
         0,
-        slack_mentions_topic(),
+        slack_bot_topic(),
         session,
     )
     .await

@@ -1,13 +1,14 @@
-//! End-to-end tests for the Slack adapter's mention mode (design/04): the REAL
+//! End-to-end tests for the Slack adapter's bot mode (design/04): the REAL
 //! built binary against a FAKE Socket Mode server (a WebSocket on loopback), a
 //! FAKE `curl` (the Web API, including `apps.connections.open`) and a FAKE
 //! `security` (the Keychain, holding both tokens).
 //!
-//! The unit tests in `socket.rs` and `mentions.rs` cover parsing and which
-//! mentions wake. These cover what only the process shows: each envelope is
-//! acknowledged, one mention wakes once across a redelivery, a refresh and a
-//! restart, a dead connection is replaced, and the failures that cannot be
-//! retried end the process.
+//! The unit tests in `socket.rs`, `bot_messages.rs` and `socket_loop.rs` cover
+//! parsing, which messages wake and the publish-then-remember order. These cover
+//! what only the process shows: each envelope is acknowledged, one message wakes
+//! once across a redelivery, a refresh and a restart, a dead connection is
+//! replaced, failures are retried within a budget, and the failures that cannot
+//! be retried end the process.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -26,14 +27,16 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 const BOT_TOKEN: &str = "xoxb-test-bot";
 const APP_TOKEN: &str = "xapp-1-A0-test-app";
 const CHANNEL: &str = "C0AEL6NV7GC";
+const DM: &str = "D0C8ABCDEF";
 
 fn adapter_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mailbox-slack-adapter")
 }
 
-/// A fake `curl` for the methods the mention mode calls. `apps.connections.open`
-/// must carry the app token and answers with the fake server's URL; everything
-/// else must carry the bot token. Logs each method and every argument.
+/// A fake `curl` for the methods the bot mode calls. `apps.connections.open`
+/// must carry the app token and answers with the fake server's URL, after
+/// failing with a 503 the first `$FAKE_OPEN_FAILURES` times; everything else
+/// must carry the bot token. Logs each method and every argument.
 const FAKE_CURL: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 dir="${FAKE_SLACK_DIR:?}"
@@ -48,6 +51,12 @@ want="Authorization: Bearer ${FAKE_BOT_TOKEN:?}"
 if [ "$auth" != "$want" ]; then
   printf '{"ok":false,"error":"invalid_auth"}'
 elif [ "$method" = "apps.connections.open" ]; then
+  n=0; [ -f "$dir/opens" ] && n="$(cat "$dir/opens")"
+  echo $((n + 1)) > "$dir/opens"
+  if [ "$n" -lt "${FAKE_OPEN_FAILURES:-0}" ]; then
+    printf '\n@@mailbox-slack-status 503 \n' >&2
+    exit 0
+  fi
   printf '{"ok":true,"url":"%s"}' "${FAKE_SOCKET_URL:?}"
 else
   cat "$dir/$method.json"
@@ -203,6 +212,15 @@ fn mention(envelope_id: &str, event_id: &str, ts: &str) -> Step {
     mention_retry(envelope_id, event_id, ts, 0)
 }
 
+fn dm(envelope_id: &str, event_id: &str, ts: &str, extra: Value) -> Step {
+    let mut event = json!({"type": "message", "channel_type": "im", "channel": DM,
+        "user": "U0AB7RJSQBE", "ts": ts, "text": "secret plans"});
+    for (key, value) in extra.as_object().unwrap() {
+        event[key] = value.clone();
+    }
+    envelope(envelope_id, 0, event, event_id)
+}
+
 fn mention_retry(envelope_id: &str, event_id: &str, ts: &str, retry_attempt: u64) -> Step {
     envelope(
         envelope_id,
@@ -229,7 +247,7 @@ impl Harness {
         };
         fixture(
             "auth.test",
-            json!({"ok": true, "url": "https://tryrelevance.slack.com/", "user_id": "U0C6VHAA4LX"}),
+            json!({"ok": true, "url": "https://tryrelevance.slack.com/", "user_id": "U0C6VHAA4LX", "bot_id": "B0C74MURRK5"}),
         );
         fixture(
             "conversations.info",
@@ -283,7 +301,7 @@ fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn config(baseline: Value) -> Value {
-    json!({"kind": "slack-mentions", "topic": "slack.mentions", "baseline": baseline})
+    json!({"kind": "slack-bot", "topic": "slack.bot", "baseline": baseline})
 }
 
 /// Wait until `done` holds, or fail naming what never happened.
@@ -323,8 +341,12 @@ fn event_ids(publishes: &[&Value]) -> Vec<String> {
         .collect()
 }
 
+fn publishes(output: &Output) -> Vec<String> {
+    event_ids(&of_type(&lines(output), "publish"))
+}
+
 #[test]
-fn each_mention_wakes_once_and_every_envelope_is_acknowledged() {
+fn each_message_wakes_once_and_every_envelope_is_acknowledged() {
     let server = FakeSocketMode::start(vec![
         vec![
             hello(),
@@ -337,41 +359,50 @@ fn each_mention_wakes_once_and_every_envelope_is_acknowledged() {
         ],
         vec![
             hello(),
-            mention("env-4", "Ev2", "1791935316.656669"),
-            Step::AwaitAcks(1),
+            dm("env-4", "Ev2", "1791935316.656669", json!({})),
+            // An edit of that DM: nobody said anything new.
+            dm(
+                "env-5",
+                "Ev3",
+                "1791935320.000001",
+                json!({"subtype": "message_changed", "hidden": true}),
+            ),
+            Step::AwaitAcks(2),
         ],
     ]);
     let harness = Harness::new();
     let child = harness.spawn(config(Value::Null), &server, &[]);
-    wait_until("all four envelopes acknowledged", || {
-        server.acks().len() == 4
+    wait_until("all five envelopes acknowledged", || {
+        server.acks().len() == 5
     });
     let output = terminate(child);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
 
-    assert_eq!(server.acks(), ["env-1", "env-2", "env-3", "env-4"]);
+    assert_eq!(server.acks(), ["env-1", "env-2", "env-3", "env-4", "env-5"]);
     assert_eq!(server.connections(), 2, "a refresh opens a new connection");
 
     let lines = lines(&output);
-    let publishes = of_type(&lines, "publish");
+    let published = of_type(&lines, "publish");
     assert_eq!(
-        event_ids(&publishes),
+        event_ids(&published),
         ["Ev1", "Ev2"],
-        "the redelivery wakes nobody"
+        "the redelivery and the edit wake nobody"
     );
-    assert_eq!(publishes[0]["topic"], "slack.mentions");
+    assert_eq!(published[0]["topic"], "slack.bot");
     assert_eq!(
-        publishes[0]["subject"]["text"],
+        published[0]["subject"]["text"],
         "mention from Mikey Hudson in #mikeys-private-test-arena"
     );
     assert_eq!(
-        publishes[0]["subject"]["link"],
+        published[0]["subject"]["link"],
         format!("https://tryrelevance.slack.com/archives/{CHANNEL}/p1791935308038199")
     );
+    assert_eq!(published[1]["body"]["kind"], "slack_dm");
+    assert_eq!(published[1]["subject"]["text"], "DM from Mikey Hudson");
     assert!(
         !output_text(&output).contains("secret plans"),
-        "mention text never leaves Slack"
+        "message text never leaves Slack"
     );
     assert!(
         !output_text(&output).contains("secret-ticket"),
@@ -379,7 +410,13 @@ fn each_mention_wakes_once_and_every_envelope_is_acknowledged() {
     );
 
     let last_baseline = of_type(&lines, "baseline").last().unwrap()["value"].clone();
-    assert_eq!(last_baseline, json!({"seen_event_ids": ["Ev1", "Ev2"]}));
+    assert_eq!(
+        last_baseline,
+        json!({"seen_messages": [
+            format!("{CHANNEL}/1791935308.038199"),
+            format!("{DM}/1791935316.656669"),
+        ]})
+    );
 }
 
 #[test]
@@ -390,10 +427,11 @@ fn a_redelivery_after_a_restart_is_dropped_by_the_injected_baseline() {
         Step::AwaitAcks(1),
     ]]);
     let harness = Harness::new();
-    let child = harness.spawn(config(json!({"seen_event_ids": ["Ev1"]})), &server, &[]);
+    let baseline = json!({"seen_messages": [format!("{CHANNEL}/1791935308.038199")]});
+    let child = harness.spawn(config(baseline), &server, &[]);
     wait_until("the redelivery acknowledged", || server.acks().len() == 1);
     let output = terminate(child);
-    assert!(of_type(&lines(&output), "publish").is_empty());
+    assert!(publishes(&output).is_empty());
 }
 
 /// A laptop that sleeps keeps a socket that looks open and carries nothing. The
@@ -418,8 +456,80 @@ fn a_silent_connection_is_replaced() {
         server.acks().len() == 1
     });
     let output = terminate(child);
-    assert_eq!(event_ids(&of_type(&lines(&output), "publish")), ["Ev1"]);
+    assert_eq!(publishes(&output), ["Ev1"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("no frame from Slack"));
+}
+
+/// A filtered message and a malformed one are acknowledged like any other, so
+/// Slack does not redeliver them, and neither is published.
+#[test]
+fn filtered_and_malformed_messages_are_acknowledged_and_not_published() {
+    let server = FakeSocketMode::start(vec![vec![
+        hello(),
+        dm("env-1", "Ev1", "1791935316.656669", json!({})),
+        mention("env-2", "Ev2", "not-a-ts"),
+        dm(
+            "env-3",
+            "Ev3",
+            "1791935320.000001",
+            json!({"user": "U0OTHERPERSON"}),
+        ),
+        Step::AwaitAcks(3),
+    ]]);
+    let harness = Harness::new();
+    let config = json!({"kind": "slack-bot", "topic": "slack.bot",
+        "skip": [{"user": "U0AB7RJSQBE"}]});
+    let child = harness.spawn(config, &server, &[]);
+    wait_until("all three acknowledged", || server.acks().len() == 3);
+    let output = terminate(child);
+    assert_eq!(
+        publishes(&output),
+        ["Ev3"],
+        "the filtered DM and the malformed mention are dropped"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("malformed field"), "{stderr}");
+}
+
+/// The network being down is retried, and a connection that works afterwards
+/// carries on as if nothing happened.
+#[test]
+fn failed_connections_are_retried_until_one_works() {
+    let server = FakeSocketMode::start(vec![vec![
+        hello(),
+        mention("env-1", "Ev1", "1791935308.038199"),
+        Step::AwaitAcks(1),
+    ]]);
+    let harness = Harness::new();
+    let child = harness.spawn(config(Value::Null), &server, &[("FAKE_OPEN_FAILURES", "2")]);
+    wait_until("the mention after two failures", || {
+        server.acks().len() == 1
+    });
+    let output = terminate(child);
+    assert_eq!(publishes(&output), ["Ev1"]);
+    assert_eq!(harness.log("opens").trim(), "3");
+}
+
+/// A connection Slack drops before saying hello never worked, so it counts
+/// against the budget like any other failure instead of reconnecting at once,
+/// forever.
+#[test]
+fn disconnects_before_hello_spend_the_failure_budget() {
+    let refused = || vec![disconnect("refresh_requested")];
+    let server = FakeSocketMode::start(vec![refused(), refused(), refused(), refused()]);
+    let harness = Harness::new();
+    let output = harness
+        .spawn(
+            config(Value::Null),
+            &server,
+            &[("MAILBOX_SLACK_MAX_TRANSIENT_FAILURES", "3")],
+        )
+        .wait_with_output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("disconnected before hello"), "{stderr}");
+    assert_eq!(server.connections(), 3);
 }
 
 #[test]

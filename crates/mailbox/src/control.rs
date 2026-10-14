@@ -134,18 +134,18 @@ pub enum Request {
         session: SessionId,
         target: SlackWatch,
     },
-    /// Declare `session`'s interest in the mention watch and subscribe it to
-    /// `slack.mentions` (design/04). There is one mention watch per bridge, so
-    /// nothing names a target.
-    WatchSlackMentions {
+    /// Declare `session`'s interest in the bot watch (mentions and DMs) and
+    /// subscribe it to `slack.bot` (design/04). There is one bot watch per
+    /// bridge, so nothing names a target.
+    WatchSlackBot {
         session: SessionId,
-        /// The mentions that must not wake (ADR-0029). The whole set, as for
+        /// The messages that must not wake (ADR-0029). The whole set, as for
         /// [`Request::WatchSlack`].
         #[serde(default, skip_serializing_if = "SlackFilters::is_empty")]
         skip: SlackFilters,
     },
-    /// Drop `session`'s interest in the mention watch and unsubscribe it.
-    UnwatchSlackMentions { session: SessionId },
+    /// Drop `session`'s interest in the bot watch and unsubscribe it.
+    UnwatchSlackBot { session: SessionId },
     /// Declare `session`'s interest in a GitHub user's review requests and
     /// subscribe it to `github.review-requests.<login>` (design/03). The login
     /// travels parsed, so decoding the frame is what validates it.
@@ -601,8 +601,8 @@ pub enum WatchKindWire {
     SlackThread,
     #[serde(rename = "github-review-requests")]
     GithubReviewRequests,
-    #[serde(rename = "slack-mentions")]
-    SlackMentions,
+    #[serde(rename = "slack-bot")]
+    SlackBot,
 }
 
 impl From<WatchKind> for WatchKindWire {
@@ -613,7 +613,7 @@ impl From<WatchKind> for WatchKindWire {
             WatchKind::SlackChannel => WatchKindWire::SlackChannel,
             WatchKind::SlackThread => WatchKindWire::SlackThread,
             WatchKind::GithubReviewRequests => WatchKindWire::GithubReviewRequests,
-            WatchKind::SlackMentions => WatchKindWire::SlackMentions,
+            WatchKind::SlackBot => WatchKindWire::SlackBot,
         }
     }
 }
@@ -792,13 +792,13 @@ mod tests {
             session: SessionId::new("s1"),
             login: GithubLogin::parse("octocat").unwrap(),
         });
-        round_trip_request(Request::WatchSlackMentions {
+        round_trip_request(Request::WatchSlackBot {
             session: SessionId::new("s1"),
             skip: SlackFilters::new(vec![
                 mailbox_protocol::SlackFilter::parse("user=U0AB7RJSQBE").unwrap(),
             ]),
         });
-        round_trip_request(Request::UnwatchSlackMentions {
+        round_trip_request(Request::UnwatchSlackBot {
             session: SessionId::new("s1"),
         });
         round_trip_request(Request::Status {

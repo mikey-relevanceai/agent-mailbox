@@ -63,7 +63,9 @@ pub use message::{
     Subscribe, Unsubscribe,
 };
 pub use session::SessionId;
-pub use slack::{SlackChannelId, SlackTargetError, SlackTs, SlackWatch, slack_mentions_topic};
+pub use slack::{
+    SLACK_BOT_CONFIG_KIND, SlackChannelId, SlackTargetError, SlackTs, SlackWatch, slack_bot_topic,
+};
 pub use slack_filter::{
     Poster, SlackAppId, SlackFilter, SlackFilterError, SlackFilters, SlackUserId,
 };

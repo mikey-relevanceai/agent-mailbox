@@ -3,7 +3,7 @@
 //! ```text
 //! slack.channel.<channel-id>                 e.g. slack.channel.C0C83CXLUL8
 //! slack.thread.<channel-id>/<thread-ts>      e.g. slack.thread.C0C83CXLUL8/1791349480.652779
-//! slack.mentions                             every @mention of the app's bot (design/04)
+//! slack.bot                                  every @mention of the app's bot, and every DM to it (design/04)
 //! ```
 //!
 //! A channel watch wakes on new top-level messages; a thread watch wakes on new
@@ -27,10 +27,10 @@ const SLACK_CHANNEL_PREFIX: &str = "slack.channel.";
 /// Prefix shared by every Slack thread topic.
 const SLACK_THREAD_PREFIX: &str = "slack.thread.";
 
-/// The mention watch's topic. It names no entity: a bridge reaches one Slack
-/// app, whose tokens are the ones in the Keychain (ADR-0027), so there is one
-/// bot whose mentions it can hear.
-const SLACK_MENTIONS_TOPIC: &str = "slack.mentions";
+/// The bot watch's topic. It names no entity: a bridge reaches one Slack app,
+/// whose tokens are the ones in the Keychain (ADR-0027), so there is one bot to
+/// mention or message.
+const SLACK_BOT_TOPIC: &str = "slack.bot";
 
 /// Slack ids are short; this bounds what an untrusted CLI arg or stored row can
 /// make us carry, well under the topic length limit.
@@ -298,9 +298,15 @@ impl SlackWatch {
     }
 }
 
-/// The topic every @mention of the app's bot is published on (design/04).
-pub fn slack_mentions_topic() -> Topic {
-    Topic::parse(SLACK_MENTIONS_TOPIC).expect("the mentions topic is a valid topic")
+/// The `kind` in the Slack adapter's config that selects the bot watch. The
+/// bridge's resolver writes it and the adapter reads it, so it lives here, in
+/// the one crate both may import (ADR-0001).
+pub const SLACK_BOT_CONFIG_KIND: &str = "slack-bot";
+
+/// The topic every @mention of the app's bot, and every DM to it, is published
+/// on (design/04).
+pub fn slack_bot_topic() -> Topic {
+    Topic::parse(SLACK_BOT_TOPIC).expect("the bot topic is a valid topic")
 }
 
 #[cfg(test)]
@@ -308,8 +314,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_mentions_topic_is_fixed() {
-        assert_eq!(slack_mentions_topic().as_str(), "slack.mentions");
+    fn the_bot_topic_is_fixed() {
+        assert_eq!(slack_bot_topic().as_str(), "slack.bot");
     }
 
     #[test]

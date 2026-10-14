@@ -1,7 +1,8 @@
 //! The **Slack adapter**: polls one Slack channel's top level, or one thread, and
-//! publishes each new message (design/02). With `kind: "slack-mentions"` in its
-//! config it is instead the mention watch, a Socket Mode client that publishes
-//! each @mention of the bot ([`mention_loop`], design/04). The rest of this
+//! publishes each new message (design/02). With `kind: "slack-bot"` in its
+//! config it is instead the bot watch, a Socket Mode client that publishes each
+//! @mention of the bot and each DM to it ([`socket_loop`], design/04). The rest
+//! of this
 //! header describes the poll modes.
 //!
 //! It imports **only** `mailbox-protocol`, never the `mailbox` bridge crate
@@ -45,11 +46,15 @@
 //! - Offline or a Slack 5xx → skip the poll; only a long streak exits non-zero.
 
 mod api;
-mod mention_loop;
-mod mentions;
+mod bot_messages;
+mod error;
+mod identity;
+mod limits;
 mod message;
 mod names;
+mod output;
 mod socket;
+mod socket_loop;
 mod token;
 mod watcher;
 
@@ -59,54 +64,37 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncWriteExt, Stdout};
+use tokio::io::Stdout;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, error_span, info, warn};
 
 use mailbox_protocol::{
-    AdapterId, Baseline as BaselineMsg, Message, Publish, SlackChannelId, SlackFilters,
-    SlackTargetError, SlackTs, SlackWatch, Topic, encode_line,
+    AdapterId, Baseline as BaselineMsg, Message, Publish, SLACK_BOT_CONFIG_KIND, SlackChannelId,
+    SlackFilters, SlackTs, SlackWatch, Topic,
 };
 
 use api::{CurlSlack, SlackApi, SlackError};
+use error::AdapterError;
+use limits::Limits;
+use output::{ADAPTER_ID, write_message};
 use watcher::{Baseline, NewMessage, Watcher};
 
 /// One poll a minute is about 2% of Slack's Tier 3 budget for an internal app
 /// (design/02), and soon enough for agents chatting in a channel.
 const DEFAULT_INTERVAL_MS: u64 = 60_000;
 
-/// Wait after a rate limit that came with no `Retry-After`.
-const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 30_000;
-const ENV_RATE_LIMIT_BACKOFF_MS: &str = "MAILBOX_SLACK_RATE_LIMIT_BACKOFF_MS";
-
-/// Consecutive rate limits before exiting non-zero, so a persistent limit
-/// surfaces through the supervisor instead of hiding behind a live process.
-const DEFAULT_MAX_RATE_LIMIT_RETRIES: u64 = 12;
-const ENV_MAX_RATE_LIMIT_RETRIES: &str = "MAILBOX_SLACK_MAX_RATE_LIMIT_RETRIES";
-
-/// Consecutive skipped polls before exiting non-zero: a chosen budget, ten
-/// minutes at the default interval, not one derived from measured outages. Past
-/// it, the supervisor's give-up notice is the more useful signal.
-const DEFAULT_MAX_TRANSIENT_FAILURES: u64 = 10;
-const ENV_MAX_TRANSIENT_FAILURES: &str = "MAILBOX_SLACK_MAX_TRANSIENT_FAILURES";
-
 /// The config line is small; this only bounds a hostile or broken one.
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
-/// Self-reported provenance. The host stamps its own spawn identity instead.
-const ADAPTER_ID: &str = "slack-adapter";
-
-/// The config line, by mode. `kind: "slack-mentions"` is the mention watch
-/// (design/04); a line with no `kind` is a channel or thread watch, which is
-/// what every config written before the mention watch looks like.
+/// The config line, by mode. `kind: "slack-bot"` is the bot watch (design/04);
+/// a line with no `kind` is a channel or thread watch, which is what every
+/// config written before the bot watch looks like.
 #[derive(Debug)]
 enum ModeConfig {
     Poll(Config),
-    Mentions(mention_loop::MentionConfig),
+    Bot(socket_loop::BotConfig),
 }
-
-const MENTIONS_KIND: &str = "slack-mentions";
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -122,36 +110,6 @@ struct Config {
     baseline: Value,
     #[serde(default)]
     max_polls: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum AdapterError {
-    #[error("could not read the config line from stdin: {0}")]
-    ReadConfig(#[source] std::io::Error),
-    #[error("no config line on stdin (expected one JSON object as the first line)")]
-    EmptyConfig,
-    #[error("config line exceeds the {0}-byte limit")]
-    ConfigTooLarge(u64),
-    #[error("could not parse the config line as JSON: {0}")]
-    ParseConfig(#[source] serde_json::Error),
-    #[error("the config names a watch kind this adapter does not run: {0:?}")]
-    UnknownKind(String),
-    #[error("config names an invalid Slack target: {0}")]
-    InvalidTarget(#[from] SlackTargetError),
-    // The resolver derives both from the same watch row; disagreement means the
-    // bridge and this adapter have drifted, and publishing would be rejected.
-    #[error("config topic {topic:?} does not match the Slack target's topic {expected:?}")]
-    TopicMismatch { topic: String, expected: String },
-    #[error("could not install the {0} signal handler: {1}")]
-    Signal(&'static str, #[source] std::io::Error),
-    #[error(transparent)]
-    Token(#[from] token::TokenError),
-    #[error(transparent)]
-    Slack(#[from] SlackError),
-    #[error("could not encode a line: {0}")]
-    Encode(#[from] mailbox_protocol::FramingError),
-    #[error("could not write a line to stdout: {0}")]
-    Write(#[source] std::io::Error),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -191,7 +149,7 @@ async fn run() -> ExitCode {
                 .await;
             (span, outcome)
         }
-        ModeConfig::Mentions(config) => {
+        ModeConfig::Bot(config) => {
             let topic = match config.topic() {
                 Ok(topic) => topic,
                 Err(err) => {
@@ -200,7 +158,7 @@ async fn run() -> ExitCode {
                 }
             };
             let span = error_span!("slack_watch", topic = topic.as_str());
-            let outcome = mentions_main(config, topic).instrument(span.clone()).await;
+            let outcome = bot_main(config, topic).instrument(span.clone()).await;
             (span, outcome)
         }
     };
@@ -213,15 +171,12 @@ async fn run() -> ExitCode {
     }
 }
 
-async fn mentions_main(
-    config: mention_loop::MentionConfig,
-    topic: Topic,
-) -> Result<(), AdapterError> {
+async fn bot_main(config: socket_loop::BotConfig, topic: Topic) -> Result<(), AdapterError> {
     let mut sigterm =
         signal(SignalKind::terminate()).map_err(|e| AdapterError::Signal("SIGTERM", e))?;
     let mut sigint =
         signal(SignalKind::interrupt()).map_err(|e| AdapterError::Signal("SIGINT", e))?;
-    mention_loop::run(config, topic, &mut sigterm, &mut sigint).await
+    socket_loop::run(config, topic, &mut sigterm, &mut sigint).await
 }
 
 async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(), AdapterError> {
@@ -238,7 +193,7 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
         signal(SignalKind::interrupt()).map_err(|e| AdapterError::Signal("SIGINT", e))?;
     let mut stdout = tokio::io::stdout();
 
-    let token = token::load(token::Credential::Bot).await?;
+    let token = token::load::<token::Bot>().await?;
     let skip = config.skip.to_string();
     let skip_count = config.skip.iter().count();
     let mut watcher = Watcher::new(CurlSlack::new(token), watch, config.skip);
@@ -324,29 +279,6 @@ async fn watch_loop(config: Config, watch: SlackWatch, topic: Topic) -> Result<(
             }
         }
         polls += 1;
-    }
-}
-
-/// Retry budgets, from the environment so tests can shrink them.
-struct Limits {
-    rate_limit_backoff: Duration,
-    max_rate_limit_retries: u64,
-    max_transient: u64,
-}
-
-impl Limits {
-    fn from_env() -> Self {
-        Self {
-            rate_limit_backoff: Duration::from_millis(env_u64(
-                ENV_RATE_LIMIT_BACKOFF_MS,
-                DEFAULT_RATE_LIMIT_BACKOFF_MS,
-            )),
-            max_rate_limit_retries: env_u64(
-                ENV_MAX_RATE_LIMIT_RETRIES,
-                DEFAULT_MAX_RATE_LIMIT_RETRIES,
-            ),
-            max_transient: env_u64(ENV_MAX_TRANSIENT_FAILURES, DEFAULT_MAX_TRANSIENT_FAILURES),
-        }
     }
 }
 
@@ -468,13 +400,6 @@ fn watch_of(config: &Config) -> Result<SlackWatch, AdapterError> {
     Ok(watch)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
 fn read_config(reader: impl BufRead) -> Result<ModeConfig, AdapterError> {
     let mut limited = reader.take(MAX_CONFIG_BYTES + 1);
     let mut line = String::new();
@@ -492,8 +417,8 @@ fn read_config(reader: impl BufRead) -> Result<ModeConfig, AdapterError> {
         None => serde_json::from_value(value)
             .map(ModeConfig::Poll)
             .map_err(AdapterError::ParseConfig),
-        Some(MENTIONS_KIND) => serde_json::from_value(value)
-            .map(ModeConfig::Mentions)
+        Some(SLACK_BOT_CONFIG_KIND) => serde_json::from_value(value)
+            .map(ModeConfig::Bot)
             .map_err(AdapterError::ParseConfig),
         Some(other) => Err(AdapterError::UnknownKind(other.to_string())),
     }
@@ -533,19 +458,6 @@ async fn emit_baseline(stdout: &mut Stdout, baseline: &Baseline) -> Result<(), A
     .await
 }
 
-/// One NDJSON line, flushed: stdout is block-buffered when piped, and the host
-/// must see each line promptly and in order.
-async fn write_message(stdout: &mut Stdout, message: &Message) -> Result<(), AdapterError> {
-    let line = encode_line(message)?;
-    stdout
-        .write_all(line.as_bytes())
-        .await
-        .map_err(AdapterError::Write)?;
-    stdout.write_all(b"\n").await.map_err(AdapterError::Write)?;
-    stdout.flush().await.map_err(AdapterError::Write)?;
-    Ok(())
-}
-
 /// Tracing to stderr, filtered by `RUST_LOG`; the host drains it into its own
 /// logs. Message text is never logged.
 fn init_tracing() {
@@ -567,13 +479,13 @@ mod tests {
     }
 
     #[test]
-    fn a_config_with_kind_mentions_is_the_mention_watch() {
+    fn a_config_with_kind_slack_bot_is_the_bot_watch() {
         let parsed = read_config(
-            &br#"{"kind":"slack-mentions","topic":"slack.mentions","skip":[{"user":"U0AB7RJSQBE"}]}"#[..],
+            &br#"{"kind":"slack-bot","topic":"slack.bot","skip":[{"user":"U0AB7RJSQBE"}]}"#[..],
         )
         .unwrap();
-        let ModeConfig::Mentions(config) = parsed else {
-            panic!("expected the mention watch, got {parsed:?}");
+        let ModeConfig::Bot(config) = parsed else {
+            panic!("expected the bot watch, got {parsed:?}");
         };
         assert_eq!(config.skip.iter().count(), 1);
         assert!(matches!(

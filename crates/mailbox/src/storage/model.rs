@@ -83,8 +83,8 @@ pub enum WatchKind {
     /// PRs a GitHub user was newly asked to review (`github-review-requests`,
     /// design/03).
     GithubReviewRequests,
-    /// @mentions of the Slack app's bot (`slack-mentions`, design/04).
-    SlackMentions,
+    /// @mentions of the Slack app's bot and DMs to it (`slack-bot`, design/04).
+    SlackBot,
 }
 
 impl WatchKind {
@@ -98,7 +98,7 @@ impl WatchKind {
             WatchKind::SlackChannel => "slack-channel",
             WatchKind::SlackThread => "slack-thread",
             WatchKind::GithubReviewRequests => "github-review-requests",
-            WatchKind::SlackMentions => "slack-mentions",
+            WatchKind::SlackBot => "slack-bot",
         }
     }
 
@@ -110,7 +110,7 @@ impl WatchKind {
             "slack-channel" => Some(WatchKind::SlackChannel),
             "slack-thread" => Some(WatchKind::SlackThread),
             "github-review-requests" => Some(WatchKind::GithubReviewRequests),
-            "slack-mentions" => Some(WatchKind::SlackMentions),
+            "slack-bot" => Some(WatchKind::SlackBot),
             _ => None,
         }
     }
@@ -166,14 +166,15 @@ pub enum WatchTarget {
     /// The review requests of one GitHub user (design/03). Stored with the login
     /// in the `repo` column and `0` in the others, as a stub stores its label.
     GithubReviewRequests { login: GithubLogin },
-    /// Every @mention of the Slack app's bot (design/04). There is one per
-    /// bridge, so its `repo` column holds the fixed [`SLACK_MENTIONS_KEY`].
-    SlackMentions { skip: SlackFilters },
+    /// Every @mention of the Slack app's bot and every DM to it (design/04).
+    /// There is one per bridge, so its `repo` column holds the fixed
+    /// [`SLACK_BOT_KEY`]. Slack pushes to it, so its interval is always zero.
+    SlackBot { skip: SlackFilters },
 }
 
-/// The `repo` column of the one mention watch. It names what is mentioned: the
-/// bot whose tokens are in the Keychain.
-pub const SLACK_MENTIONS_KEY: &str = "bot";
+/// The `repo` column of the one bot watch. It names what is watched: the bot
+/// whose tokens are in the Keychain.
+pub const SLACK_BOT_KEY: &str = "bot";
 
 impl WatchTarget {
     /// The discriminant persisted in the `watch.kind` column.
@@ -183,7 +184,7 @@ impl WatchTarget {
             WatchTarget::Stub { .. } => WatchKind::Stub,
             WatchTarget::Slack { watch, .. } => slack_kind(watch),
             WatchTarget::GithubReviewRequests { .. } => WatchKind::GithubReviewRequests,
-            WatchTarget::SlackMentions { .. } => WatchKind::SlackMentions,
+            WatchTarget::SlackBot { .. } => WatchKind::SlackBot,
         }
     }
 
@@ -196,7 +197,7 @@ impl WatchTarget {
             WatchTarget::Stub { label, .. } => label.clone(),
             WatchTarget::Slack { watch, .. } => watch.key(),
             WatchTarget::GithubReviewRequests { login } => login.to_string(),
-            WatchTarget::SlackMentions { .. } => SLACK_MENTIONS_KEY.to_string(),
+            WatchTarget::SlackBot { .. } => SLACK_BOT_KEY.to_string(),
         }
     }
 
@@ -207,7 +208,7 @@ impl WatchTarget {
             WatchTarget::Stub { .. }
             | WatchTarget::Slack { .. }
             | WatchTarget::GithubReviewRequests { .. }
-            | WatchTarget::SlackMentions { .. } => 0,
+            | WatchTarget::SlackBot { .. } => 0,
         }
     }
 
@@ -217,7 +218,7 @@ impl WatchTarget {
             WatchTarget::GithubPr { .. }
             | WatchTarget::Slack { .. }
             | WatchTarget::GithubReviewRequests { .. }
-            | WatchTarget::SlackMentions { .. } => 0,
+            | WatchTarget::SlackBot { .. } => 0,
             WatchTarget::Stub { count, .. } => *count,
         }
     }
@@ -225,7 +226,7 @@ impl WatchTarget {
     /// The watch's filters, for the kinds that have any.
     pub fn skip(&self) -> Option<&SlackFilters> {
         match self {
-            WatchTarget::Slack { skip, .. } | WatchTarget::SlackMentions { skip } => Some(skip),
+            WatchTarget::Slack { skip, .. } | WatchTarget::SlackBot { skip } => Some(skip),
             WatchTarget::GithubPr { .. }
             | WatchTarget::Stub { .. }
             | WatchTarget::GithubReviewRequests { .. } => None,
@@ -241,7 +242,7 @@ impl WatchTarget {
             WatchTarget::GithubPr { .. }
             | WatchTarget::Stub { .. }
             | WatchTarget::GithubReviewRequests { .. } => "[]".to_string(),
-            WatchTarget::Slack { skip, .. } | WatchTarget::SlackMentions { skip } => {
+            WatchTarget::Slack { skip, .. } | WatchTarget::SlackBot { skip } => {
                 serde_json::to_string(skip).expect("Slack filters always serialize")
             }
         }

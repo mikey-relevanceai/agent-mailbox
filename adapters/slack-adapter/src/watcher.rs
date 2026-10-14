@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::api::{SlackApi, SlackError, parse};
+use crate::identity::{WorkspaceUrl, identify};
 use crate::message::{SlackMessage, Subtype};
 use crate::names::Names;
 
@@ -217,17 +218,10 @@ struct Pages {
 /// Workspace facts fetched once per process, on the first successful poll.
 #[derive(Debug, Clone)]
 pub struct Context {
-    /// `https://<workspace>.slack.com/`, for building permalinks without a call.
-    workspace_url: String,
+    /// For building permalinks without a call.
+    workspace: WorkspaceUrl,
     /// `#<name>`, or the channel id if Slack would not say.
     pub channel_label: String,
-}
-
-#[derive(Deserialize)]
-struct AuthTest {
-    url: String,
-    #[serde(default)]
-    user: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -299,23 +293,19 @@ impl<A: SlackApi> Watcher<A> {
         if let Some(context) = &self.context {
             return Ok(context.clone());
         }
-        let auth: AuthTest = parse("auth.test", self.api.call("auth.test", &[]).await?)?;
-        let mut workspace_url = auth.url;
-        if !workspace_url.ends_with('/') {
-            workspace_url.push('/');
-        }
+        let identity = identify(&self.api).await?;
         let channel = self.watch.channel();
-        let channel_label = crate::names::channel_label(&self.api, channel)
+        let channel_label = crate::names::channel_label(&self.api, channel.as_str())
             .await?
             .unwrap_or_else(|| channel.to_string());
         info!(
-            workspace = %workspace_url,
+            workspace = %identity.workspace,
             channel = %channel_label,
-            bot = auth.user.as_deref().unwrap_or(""),
+            bot = identity.bot_user.as_ref().map_or("", |user| user.as_str()),
             "connected to Slack"
         );
         let context = Context {
-            workspace_url,
+            workspace: identity.workspace,
             channel_label,
         };
         self.context = Some(context.clone());
@@ -547,16 +537,9 @@ impl<A: SlackApi> Watcher<A> {
     }
 
     fn permalink(&self, context: &Context, ts: &SlackTs) -> String {
-        let channel = self.watch.channel();
-        let base = format!(
-            "{}archives/{channel}/p{}",
-            context.workspace_url,
-            ts.permalink_digits()
-        );
-        match self.watch.thread_ts() {
-            Some(parent) => format!("{base}?thread_ts={parent}&cid={channel}"),
-            None => base,
-        }
+        context
+            .workspace
+            .permalink(self.watch.channel().as_str(), ts, self.watch.thread_ts())
     }
 }
 
