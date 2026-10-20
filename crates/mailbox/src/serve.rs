@@ -70,13 +70,15 @@ use mailbox_protocol::{
 
 use mailbox::bus::Bus;
 use mailbox::resolver::DefaultResolver;
-use mailbox::storage::{SessionId, Storage, StorageConfig, SubscribeKind};
+use mailbox::storage::{
+    HistoryScope, SessionId, Storage, StorageConfig, SubscribeKind, history_cutoff,
+};
 use mailbox::supervisor::{RestartPolicy, Supervisor, reconcile_startup};
 use mailbox::wake::Waker;
 
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, StatusReport, TopicStatus, decode_frame,
-    encode_frame,
+    AgentSummary, GithubPrTarget, HistoryEvent, Request, Response, StatusReport, TopicStatus,
+    decode_frame, encode_frame,
 };
 
 /// Hard cap on a single control frame (request line). Sized for the largest
@@ -544,6 +546,7 @@ fn request_op(request: &Request) -> &'static str {
         Request::Send { .. } => "send",
         Request::Agents { .. } => "agents",
         Request::Topics { .. } => "topics",
+        Request::History { .. } => "history",
         Request::EndSession { .. } => "end_session",
         Request::ResumeSession { .. } => "resume_session",
     }
@@ -575,20 +578,50 @@ fn request_session(request: &Request) -> Option<&SessionId> {
         // a human sent it. `agents` marks its caller and otherwise ignores it, so it
         // too may arrive without one, as does `status` (whose watch table is global).
         // All three log as `session="-"`, like a publish.
+        // `history` joins them: its session scopes the default view and owns the
+        // read-state reported, but a human browsing one topic by name has none.
         Request::Send { from: session, .. }
         | Request::Agents { session }
-        | Request::Status { session } => session.as_ref(),
+        | Request::Status { session }
+        | Request::History { session, .. } => session.as_ref(),
     }
 }
 
 /// The topic a request directly names, if any (watch/unwatch name a target, not
 /// a `Topic`, so they are logged by op + session only).
+///
+/// Exhaustive ON PURPOSE, with no `_` arm. A wildcard here let `history` — a
+/// request that names a topic — log `topic="-"` while still compiling, and that
+/// field is exactly what an operator greps to see who read whose inbox
+/// ([ADR-0032](../../../docs/adr/0032-history-reads-past-the-cursor-without-moving-it.md)
+/// makes reading a peer's inbox legal, which makes it worth recording). Listing
+/// the topic-less variants costs one line each and makes the compiler ask the
+/// question for the next variant, exactly as [`request_session`] does.
 fn request_topic(request: &Request) -> Option<&Topic> {
     match request {
         Request::Publish { topic, .. }
         | Request::Subscribe { topic, .. }
         | Request::Unsubscribe { topic, .. } => Some(topic),
-        _ => None,
+        // Named only when the caller narrowed to one; a default-scope `history`
+        // spans every subscribed topic, so it logs none, like `read`.
+        Request::History { topic, .. } => topic.as_ref(),
+        Request::Read { .. }
+        | Request::Watch { .. }
+        | Request::Unwatch { .. }
+        | Request::WatchStub { .. }
+        | Request::UnwatchStub { .. }
+        | Request::WatchSlack { .. }
+        | Request::UnwatchSlack { .. }
+        | Request::WatchSlackBot { .. }
+        | Request::UnwatchSlackBot { .. }
+        | Request::WatchReviewRequests { .. }
+        | Request::UnwatchReviewRequests { .. }
+        | Request::Status { .. }
+        | Request::Send { .. }
+        | Request::Agents { .. }
+        | Request::Topics { .. }
+        | Request::EndSession { .. }
+        | Request::ResumeSession { .. } => None,
     }
 }
 
@@ -683,6 +716,12 @@ async fn dispatch(ctx: &Ctx, request: Request) -> Response {
         } => send(bus, storage, from, to, body, subject).await,
         Request::Agents { session } => agents(storage, session).await,
         Request::Topics { prefix } => topics(storage, prefix).await,
+        Request::History {
+            session,
+            topic,
+            within_ms,
+            limit,
+        } => history(storage, session, topic, within_ms, limit).await,
         Request::EndSession { session } => end_session(storage, supervisor, session).await,
         Request::ResumeSession { session } => resume_session(storage, supervisor, session).await,
     }
@@ -745,6 +784,38 @@ async fn topics(storage: &Storage, prefix: Option<String>) -> Response {
     match storage.list_topics(prefix).await {
         Ok(topics) => Response::Topics {
             topics: topics.into_iter().map(TopicStatus::from).collect(),
+        },
+        Err(err) => Response::error(err.to_string()),
+    }
+}
+
+/// Look back through the durable log without consuming anything (ADR-0032).
+///
+/// A thin translation like its neighbours: the scoping rule lives on
+/// [`HistoryScope::from_parts`], so it is testable without a daemon and applies to
+/// any client of the socket, not just the CLI.
+///
+/// What the daemon does own is the clock. The request carries a lookback DURATION
+/// rather than an instant, and it is subtracted here because this is the process
+/// that stamped those events — a cutoff computed client-side would compare one
+/// process's clock against another's.
+async fn history(
+    storage: &Storage,
+    session: Option<SessionId>,
+    topic: Option<Topic>,
+    within_ms: Option<u64>,
+    limit: Option<u32>,
+) -> Response {
+    let scope = match HistoryScope::from_parts(topic, session) {
+        Ok(scope) => scope,
+        Err(err) => return Response::error(err.to_string()),
+    };
+
+    let since = history_cutoff(mailbox::clock::now_millis(), within_ms);
+
+    match storage.recent_events(scope, since, limit).await {
+        Ok(entries) => Response::History {
+            events: entries.into_iter().map(HistoryEvent::from).collect(),
         },
         Err(err) => Response::error(err.to_string()),
     }

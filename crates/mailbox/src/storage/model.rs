@@ -371,6 +371,117 @@ pub struct TopicSummary {
     pub last_event: Option<mailbox_protocol::Timestamp>,
 }
 
+/// Why a history read named no readable slice of the log.
+///
+/// One reason, so a unit struct rather than an enum with a single variant: the
+/// caller is nobody AND named no topic. A business error in the return type of
+/// [`HistoryScope::from_parts`] rather than a panic or a silent default, because
+/// the honest answer is a refusal — see that constructor for why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoHistoryScope;
+
+impl std::fmt::Display for NoHistoryScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neutral on purpose: this reaches every client of the socket, and only the
+        // CLI has a `--topic` flag to suggest. The CLI adds that hint itself.
+        write!(f, "history needs a topic when the caller has no session")
+    }
+}
+
+impl std::error::Error for NoHistoryScope {}
+
+/// Which slice of the durable log a history read covers (ADR-0032).
+///
+/// Modelled as a sum rather than two nullable fields because the two shapes ask
+/// genuinely different questions and answer them with different SQL: "everything
+/// addressed to me, newest first across topics" versus "this one topic". A pair
+/// of `Option`s would make "no session and no topic" — which has no answer —
+/// spellable everywhere downstream; as a sum it cannot be spelled past
+/// [`from_parts`](HistoryScope::from_parts), which is the one place it is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// Every topic `session` is subscribed to, ordered newest-first ACROSS all of
+    /// them. Read-state is reported for every entry, because a subscription is
+    /// exactly what gives a session read-state on a topic.
+    Subscribed { session: SessionId },
+    /// One named topic, whether or not anyone subscribes to it — mailboxes are
+    /// not private (ADR-0032), so `agent.<someone-else>` is a legal target here.
+    ///
+    /// `reader` is the CALLER, not a filter: it decides whether read-state can be
+    /// reported, and only when that caller is subscribed to this topic. A caller
+    /// with no subscription has no cursor on it, so there is nothing honest to
+    /// say and [`HistoryEntry::read`] stays `None`.
+    Topic {
+        topic: mailbox_protocol::Topic,
+        reader: Option<SessionId>,
+    },
+}
+
+impl HistoryScope {
+    /// Build a scope from the two optional halves a caller supplies, or refuse.
+    ///
+    /// This is the whole of history's scoping rule, kept in ONE place because more
+    /// than one client reaches it: the CLI is the usual caller, but `Request::History`
+    /// is equally reachable by anything speaking the socket protocol, and a rule
+    /// enforced at the CLI edge would simply not apply to those. Living on the type
+    /// it produces also means it is unit-testable without a daemon.
+    ///
+    /// A named topic always wins, and a session alongside it is the READER, not a
+    /// second filter — that is what lets someone look at a peer's inbox while still
+    /// being told their own read-state where they have one.
+    ///
+    /// Neither half is a refusal, not a default. "The newest events across the
+    /// topics belonging to nobody" has no answer, and both available defaults —
+    /// every topic, or none — would be a guess returned as a result.
+    pub fn from_parts(
+        topic: Option<mailbox_protocol::Topic>,
+        session: Option<SessionId>,
+    ) -> Result<Self, NoHistoryScope> {
+        match (topic, session) {
+            (Some(topic), reader) => Ok(HistoryScope::Topic { topic, reader }),
+            (None, Some(session)) => Ok(HistoryScope::Subscribed { session }),
+            (None, None) => Err(NoHistoryScope),
+        }
+    }
+}
+
+/// The oldest stamp a history read admits, given the reader's clock and a lookback.
+///
+/// Pure, with `now_ms` passed in, so the edge cases are testable without a daemon
+/// or a real clock. The daemon is the true edge for this value: the CLI bounds what
+/// it sends, but any socket client can send any `u64`.
+///
+/// Saturating at every step, never wrapping. A lookback longer than the clock has
+/// run yields a cutoff before every stored event — so it reads the whole log —
+/// rather than wrapping into a FUTURE cutoff, which would return an empty page that
+/// reads as "nothing happened".
+pub fn history_cutoff(now_ms: i64, within_ms: Option<u64>) -> Option<mailbox_protocol::Timestamp> {
+    within_ms.map(|within| {
+        let within = i64::try_from(within).unwrap_or(i64::MAX);
+        mailbox_protocol::Timestamp(now_ms.saturating_sub(within))
+    })
+}
+
+/// One event as `mailbox history` reports it: the stored event, plus the caller's
+/// read-state on it when there is one to report (ADR-0032).
+///
+/// A read model with no creation twin, like [`TopicSummary`] — only a query mints
+/// one. It is deliberately NOT [`crate::bus::Delivery`]: that type's invariant is
+/// a completed read whose cursors have already advanced, and history advances
+/// nothing, so reusing it would state something untrue in the type system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryEntry {
+    pub event: mailbox_protocol::Event,
+    /// Whether the caller's delivery cursor is already at or past this event.
+    ///
+    /// `None` means "no read-state to report" — no session asked, or the session
+    /// that asked is not subscribed to this topic — and is deliberately distinct
+    /// from `Some(false)` ("you are subscribed and this is still unread"). An
+    /// unsubscribed caller reading a peer's inbox must not be told that peer's
+    /// mail is unread, nor that it is read.
+    pub read: Option<bool>,
+}
+
 /// How many subjects a caller of `unread_digest` wants per topic.
 ///
 /// A named choice rather than a count with a magic zero: `status` prints counts and
@@ -513,4 +624,66 @@ pub enum ResumeOutcome {
 pub struct ExpiredSuspensions {
     pub interests: u64,
     pub subscriptions: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use mailbox_protocol::{Timestamp, Topic};
+
+    /// The whole of history's scoping rule. A named topic wins and KEEPS the
+    /// session as its reader — dropping it would silently withhold the caller's
+    /// own read-state on a topic they do subscribe to.
+    #[test]
+    fn from_parts_resolves_every_combination_or_refuses() {
+        let topic = Topic::parse("team.ci").unwrap();
+        let session = SessionId::new("s-a");
+
+        assert_eq!(
+            HistoryScope::from_parts(Some(topic.clone()), Some(session.clone())),
+            Ok(HistoryScope::Topic {
+                topic: topic.clone(),
+                reader: Some(session.clone()),
+            })
+        );
+        assert_eq!(
+            HistoryScope::from_parts(Some(topic.clone()), None),
+            Ok(HistoryScope::Topic {
+                topic,
+                reader: None
+            })
+        );
+        assert_eq!(
+            HistoryScope::from_parts(None, Some(session.clone())),
+            Ok(HistoryScope::Subscribed { session })
+        );
+        assert_eq!(HistoryScope::from_parts(None, None), Err(NoHistoryScope));
+    }
+
+    /// The refusal reaches every socket client, so it must not name a CLI flag;
+    /// the CLI adds its own remedy.
+    #[test]
+    fn the_refusal_is_client_neutral() {
+        let message = NoHistoryScope.to_string();
+        assert!(message.contains("needs a topic"), "{message}");
+        assert!(!message.contains("--"), "no CLI flag names here: {message}");
+    }
+
+    #[test]
+    fn cutoff_subtracts_the_lookback_from_the_given_clock() {
+        assert_eq!(history_cutoff(10_000, None), None, "no lookback, no floor");
+        assert_eq!(history_cutoff(10_000, Some(3_000)), Some(Timestamp(7_000)));
+    }
+
+    /// A lookback past what the clock can represent must still read EVERYTHING.
+    /// Wrapping instead would produce a future cutoff and an empty page that looks
+    /// exactly like a quiet log.
+    #[test]
+    fn an_enormous_lookback_saturates_rather_than_wrapping() {
+        let cutoff = history_cutoff(1_700_000_000_000, Some(u64::MAX)).unwrap();
+        assert!(cutoff.0 < 0, "before every stored stamp: {cutoff:?}");
+        let cutoff = history_cutoff(i64::MIN + 5, Some(u64::MAX)).unwrap();
+        assert_eq!(cutoff, Timestamp(i64::MIN), "saturates, never wraps");
+    }
 }

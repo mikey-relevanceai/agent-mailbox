@@ -43,10 +43,10 @@ pub use error::StorageError;
 // the cursor type without reaching into `mailbox-protocol` directly.
 pub use mailbox_protocol::Cursor;
 pub use model::{
-    EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
-    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
-    slack_kind,
+    EndSessionOutcome, ExpiredSuspensions, FilterChange, HistoryEntry, HistoryScope,
+    NoHistoryScope, Pid, ReadPage, RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY, SessionId,
+    SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId,
+    WatchKind, WatchSpec, WatchState, WatchTarget, history_cutoff, slack_kind,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -277,6 +277,34 @@ impl Storage {
         self.call(|reply| Command::ReadEvents {
             topic,
             cursor,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// The newest events in `scope`, newest first, optionally only those stamped
+    /// at or after `since` — the read behind `mailbox history` (ADR-0032).
+    ///
+    /// **It advances no cursor.** That is the whole point of the surface: `read`
+    /// is the only thing that consumes, and a turn that dies after `read` commits
+    /// has no other way to get its mail back. Observing mail is not reading it —
+    /// the same property [`unread_digest`](Self::unread_digest) has.
+    ///
+    /// Newest-first is the opposite of [`read_events`](Self::read_events), and
+    /// deliberately so: the question this answers is "what are the last N things
+    /// that happened", which a forward cursor cannot express without first
+    /// knowing the head. The two coexist (ADR-0032); this one is not a paging
+    /// primitive and returns no continuation cursor.
+    pub async fn recent_events(
+        &self,
+        scope: HistoryScope,
+        since: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> Result<Vec<HistoryEntry>, StorageError> {
+        self.call(|reply| Command::RecentEvents {
+            scope,
+            since,
             limit,
             reply,
         })
