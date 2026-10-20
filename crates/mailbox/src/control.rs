@@ -43,7 +43,7 @@ use mailbox_protocol::{
 };
 
 use mailbox::storage::{
-    SessionId, SubscribeKind, SubscribeOutcome, TopicSummary, WatchKind, WatchState,
+    HistoryEntry, SessionId, SubscribeKind, SubscribeOutcome, TopicSummary, WatchKind, WatchState,
 };
 use mailbox::watch::{SessionResumed, SessionStatusView, StatusView, UnwatchOutcome, WatchEntry};
 
@@ -204,6 +204,29 @@ pub enum Request {
     /// List known topics with subscriber/event counts, optionally filtered to a
     /// prefix (card-16 discovery).
     Topics { prefix: Option<String> },
+    /// Look back through the durable log WITHOUT advancing anything (ADR-0032).
+    ///
+    /// `session` is OPTIONAL and, when present, does two things: it scopes the
+    /// default view to that session's subscribed topics, and it is whose
+    /// read-state each entry reports. `topic` narrows to one topic — any topic,
+    /// including another agent's inbox, because mailboxes are not private.
+    ///
+    /// Neither set is refused by the daemon: "the newest events across the topics
+    /// belonging to nobody" has no answer, and inventing one (every topic? none?)
+    /// would be a guess dressed as a result.
+    History {
+        session: Option<SessionId>,
+        topic: Option<Topic>,
+        /// A LOOKBACK DURATION in milliseconds, not an instant: "only events from
+        /// the last N ms". The daemon subtracts it from its own clock, because the
+        /// daemon is what stamped those timestamps in the first place — a cutoff
+        /// computed client-side would compare one process's clock against
+        /// another's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
     /// End a session (the harness `SessionEnd` hook, card 11): suspend all its
     /// subscriptions and interests, stopping any adapter whose last interest it
     /// held. No topic here — it tears down everything for the session at once.
@@ -245,6 +268,10 @@ pub enum Response {
     Unsubscribed { topic: Topic },
     /// A read returned these unread events (cursors already advanced).
     Read { events: Vec<Event> },
+    /// A history look-back returned these events, NEWEST FIRST — the opposite of
+    /// [`Response::Read`]'s order, because the question is "what were the last
+    /// few things" (ADR-0032). No cursor moved to produce this.
+    History { events: Vec<HistoryEvent> },
     /// A watch was recorded: this session's interest is attached and it is
     /// subscribed to the PR topic. `interest` is the refcount driving card-08
     /// adapter supervision.
@@ -417,6 +444,36 @@ pub struct TopicStatus {
     pub events: u64,
     /// Unix millis of the newest event; absent on a topic with no events.
     pub last_event_ms: Option<i64>,
+}
+
+/// One event as `mailbox history` reports it. Wire twin of [`HistoryEntry`].
+///
+/// The event is FLATTENED, so a history entry is a `read` event on the wire and an
+/// agent can hand it to whatever already consumes `read` output without unwrapping
+/// a layer. `read` is a sibling key rather than part of `Event` because it is not a
+/// property of the event at all — the same event is read for one session and unread
+/// for another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEvent {
+    #[serde(flatten)]
+    pub event: Event,
+    /// Whether the CALLER has already consumed this event.
+    ///
+    /// Absent — never `false` — when there is no read-state to report: no session
+    /// asked, or the session that asked is not subscribed to this topic. The
+    /// distinction matters when browsing a peer's inbox, where "unread" would be a
+    /// claim about someone else's cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
+}
+
+impl From<HistoryEntry> for HistoryEvent {
+    fn from(entry: HistoryEntry) -> Self {
+        HistoryEvent {
+            event: entry.event,
+            read: entry.read,
+        }
+    }
 }
 
 impl From<TopicSummary> for TopicStatus {
@@ -842,6 +899,57 @@ mod tests {
             });
             round_trip_request(Request::Status { session });
         }
+    }
+
+    /// Every combination of `history`'s two optional halves survives the wire,
+    /// including the both-absent one the daemon refuses — a frame the client can
+    /// send must decode, so the refusal is a decision and not a parse failure.
+    #[test]
+    fn history_round_trips_with_every_combination_of_scope() {
+        for session in [Some(SessionId::new("s-a")), None] {
+            for topic in [Some(Topic::parse("team.ci").unwrap()), None] {
+                for within_ms in [Some(7_200_000), None] {
+                    round_trip_request(Request::History {
+                        session: session.clone(),
+                        topic: topic.clone(),
+                        within_ms,
+                        limit: Some(20),
+                    });
+                }
+            }
+        }
+    }
+
+    /// A history entry is a `read` event plus one key, so anything that already
+    /// consumes `read` output can consume this. `read` is ABSENT rather than
+    /// `false` when there is no read-state, which is the distinction that stops a
+    /// caller browsing a peer's inbox inferring that peer's cursor.
+    #[test]
+    fn history_event_flattens_the_event_and_omits_absent_read_state() {
+        let event = Event {
+            id: EventId("evt-1".to_string()),
+            offset: Offset(3),
+            topic: Topic::parse("team.ci").unwrap(),
+            timestamp: mailbox_protocol::Timestamp(1_700_000_000_000),
+            body: serde_json::json!({ "n": 1 }),
+            subject: None,
+        };
+
+        let marked = serde_json::to_value(HistoryEvent {
+            event: event.clone(),
+            read: Some(false),
+        })
+        .unwrap();
+        assert_eq!(marked["id"], "evt-1", "the event is flat, not nested");
+        assert_eq!(marked["offset"], 3);
+        assert_eq!(marked["read"], false);
+
+        let unmarked = serde_json::to_value(HistoryEvent { event, read: None }).unwrap();
+        assert_eq!(unmarked["id"], "evt-1");
+        assert!(
+            unmarked.get("read").is_none(),
+            "no read-state is an absent key, never false: {unmarked}"
+        );
     }
 
     #[test]

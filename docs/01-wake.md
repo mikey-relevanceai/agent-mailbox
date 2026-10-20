@@ -300,6 +300,13 @@ sequenceDiagram
     Agent->>Agent: react (tools, edits, replies)
 ```
 
+**`read` is the only step that consumes**, and it consumes in the same transaction
+that returns the events — so a turn that dies *after* that commit has taken its mail
+without ever seeing it, and the next `status` reports zero unread. `mailbox history`
+reads the same durable log and advances nothing, which is how that mail is recovered
+([ADR-0032](adr/0032-history-reads-past-the-cursor-without-moving-it.md),
+[usage](04-usage.md#looking-back-through-mail)).
+
 ## Contrast with `agent-ipc`
 
 The earlier `agent-ipc` skill used a durable NDJSON inbox + FIFO kick + `ipc-arm.sh`

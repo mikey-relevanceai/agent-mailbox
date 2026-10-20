@@ -386,7 +386,10 @@ subscribe  ──►  (idle; the hooks keep you armed)  ──►  read  ──�
 3. **read** — on wake (a message tagged `[agent-mailbox]`, naming each topic with
    what changed on it), run `mailbox read`. It returns unread events and advances your
    cursor (exactly-once, advance-on-read). The wake tells you *what* changed and links
-   to it; `read` is still where the event bodies are.
+   to it; `read` is still where the event bodies are. **If a `read` result is ever
+   lost** — the turn died, the context was compacted — the cursor still moved, and
+   `mailbox history` is the escape hatch that hands those events back
+   ([Looking back through mail](#looking-back-through-mail)).
 4. **react** — do the work: resolve the conflict, address the review, fix CI.
 5. **unsubscribe** — `mailbox unsubscribe <topic>` (or `mailbox unwatch …`) when
    you no longer care. `SessionEnd` does this for you if you just end the session.
@@ -411,7 +414,7 @@ them; `mailbox status` confirms who you are.
 | Session | Commands | Why |
 |---|---|---|
 | **required** | `read`, `subscribe`, `unsubscribe`, `watch`, `unwatch` | The caller IS the subject — "my unread", "my interest". They have no meaning without an identity, so they fail with an error naming the variable. |
-| **optional** | `send`, `agents`, `status` | The identity buys an extra, not the answer: `send` stamps a reply address, `agents` marks which row is you, `status` adds your own half to a bridge-global watch table. All three work without one — see [§4's human poke](#a-human-poking-an-agent-from-a-terminal) and [§5](#5-mailbox-status-for-humans). |
+| **optional** | `send`, `agents`, `status`, `history` | The identity buys an extra, not the answer: `send` stamps a reply address, `agents` marks which row is you, `status` adds your own half to a bridge-global watch table, and `history` scopes the default view to your topics and decides whose read-state is reported. All four work without one — see [§4's human poke](#a-human-poking-an-agent-from-a-terminal), [§5](#5-mailbox-status-for-humans) and [Looking back through mail](#looking-back-through-mail). |
 | **never** | `publish`, `topics`, `doctor` | `publish` resolves no caller at all (ADR-0018), `topics` is a global read, and `doctor` probes *named* sessions (since [ADR-0021](adr/0021-delete-the-sentinel-fallback.md) deleted the probe it does not read the ambient one at all — a session can measure itself). |
 
 To run a command **as a named session** from a script or by hand (there is nothing in
@@ -450,6 +453,7 @@ Add global `--json` for machine-readable stdout.
 | `mailbox send <target> [--text <s>] [--body <json>] [--subject <s>] [--link <url>]` | Message a peer agent (see below). Works with no session; the message then carries no `from`. |
 | `mailbox agents [--json]` | List the agents you can `send` to. Works with no session; no row is then marked as you. |
 | `mailbox topics [--prefix <p>] [--json]` | List known topics with subscriber/event counts. |
+| `mailbox history [--topic <t>] [--since <d>] [--limit <n>]` | Look back through the durable log, **consuming nothing**. Newest first, each entry marked read/unread. See [Looking back through mail](#looking-back-through-mail). |
 
 ### Slack watches
 
@@ -775,6 +779,69 @@ mailbox topics --prefix agent.
 
 A topic exists because something subscribed or published to it; a topic with
 subscribers and no events (a fresh inbox) is listed just as honestly as a busy one.
+
+### Looking back through mail
+
+`read` consumes. The events and the cursor advance commit in one transaction, so a
+turn that dies *after* that commit has consumed its mail without ever seeing it —
+and `mailbox status` will report zero unread, because as far as the bridge is
+concerned it was delivered. Nothing about that is recoverable from `read`.
+
+`mailbox history` is what hands it back. It reads the same durable log and
+**advances nothing**:
+
+```bash
+mailbox history
+```
+
+```text
+3 event(s), newest first — nothing was consumed:
+  unread [github.pr.owner/repo#42] offset=7 id=evt-9 body={"kind":"ci_failed",…}
+         · CI failed: build https://github.com/owner/repo/actions/runs/9/job/2
+  read   [github.pr.owner/repo#42] offset=6 id=evt-8 body={"kind":"review",…}
+         · new comment
+  read   [agent.9d2e7c05-…] offset=1 id=evt-7 body={"from":"700a3bf5-…",…}
+         · from 700a3bf5-1c4d: PR 42 is approved, please rebase
+```
+
+Newest first, across every topic you subscribe to, each line prefixed with whether
+**you** have already consumed it. That prefix is the point: after a lost turn it is
+what separates "I read this and never acted on it" from "this arrived afterwards".
+
+| Flag | What it does |
+|---|---|
+| `--topic <t>` | One topic instead of all of yours. **Any** topic — see below. |
+| `--since <d>` | Only the last `<d>`: `90s`, `30m`, `2h`, `7d`. The unit is mandatory. |
+| `--limit <n>` | Newest `<n>` events (default 20, max 1000). |
+
+**It never consumes.** Browsing does not drain your inbox, and it does not stop a
+wake: events you look at here are still unread until a `read` takes them. An agent
+that only ever browsed would keep being woken about the same mail — correctly.
+
+**`--since` refuses a bare number.** `--since 30` is half a minute to one reader and
+half an hour to another, and guessing wrong hands back a truncated window that looks
+exactly like a complete one. Say `30m`.
+
+**Mailboxes are not private.** `--topic agent.<someone-else>` works, deliberately
+([ADR-0032](adr/0032-history-reads-past-the-cursor-without-moving-it.md)): every
+session runs as the same user against the same SQLite file, so a refusal here would
+be advice, not a boundary. What you do *not* get is that agent's read-state — the
+`read` field is absent rather than false, because their cursor is not yours to
+report:
+
+```bash
+mailbox history --topic agent.9d2e7c05-… --limit 1
+```
+
+```text
+1 event(s), newest first — nothing was consumed:
+  ?      [agent.9d2e7c05-…] offset=1 id=evt-7 body={"from":"700a3bf5-…",…}
+         · from 700a3bf5-1c4d: PR 42 is approved, please rebase
+```
+
+A human at a terminal can do the same with no session at all — `--topic` is then
+required, since "the newest events across the topics belonging to nobody" has no
+answer and the bridge refuses rather than picking one.
 
 ---
 

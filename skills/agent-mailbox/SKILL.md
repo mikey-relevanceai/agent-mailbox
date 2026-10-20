@@ -43,10 +43,11 @@ commands below. `mailbox status` shows who you are and whether anything can wake
 (and works even if the bridge is down, though those two lines are all it can tell you
 then).
 
-Three commands do not need an identity and so tolerate its absence: `mailbox agents`
-(it only marks which row is you), `mailbox send` (it only stamps a reply address), and
+Four commands do not need an identity and so tolerate its absence: `mailbox agents`
+(it only marks which row is you), `mailbox send` (it only stamps a reply address),
 `mailbox status` (with no session it reports the bridge's watch table and omits your
-half). That is what lets a human run them from a plain terminal — see
+half), and `mailbox history --topic ...` (naming a topic scopes it without you). That
+is what lets a human run them from a plain terminal — see
 [When a message has no `from`](#when-a-message-has-no-from).
 
 ## Prerequisites (assume already set up; do not do these yourself)
@@ -235,6 +236,22 @@ event's subject shown beside its body. React to what you read — resolve the co
 address the review, fix CI, reply to the peer. Then just end your turn. **You do
 nothing to stay wakeable** — the infrastructure keeps you armed for the next message.
 
+**If a `read` result went missing, use `mailbox history`.** The cursor advances in the
+same transaction that returns the events, so a turn that died mid-read — an API error,
+a compaction that ate the tool result — consumed that mail without you ever seeing it,
+and `mailbox status` will say zero unread. `mailbox history` reads the same durable log
+and consumes nothing, newest first, each event marked `read` or `unread` so you can
+tell what you had already taken. Reach for it whenever you suspect you were told
+something you cannot find:
+
+```bash
+mailbox history              # your topics, newest first
+mailbox history --since 2h   # just the recent window
+```
+
+It is a **view, not a second inbox**: browsing never drains anything and never stops a
+wake. `read` is still the only thing that consumes.
+
 Two things the wake deliberately does NOT tell you:
 
 - **The count is the truth, the subjects are a sample.** Only the newest few events
@@ -401,6 +418,7 @@ Session identity is automatic; none of these take a session argument.
 | publish to a topic | `mailbox publish TOPIC --body '{...}'` |
 | list topics | `mailbox topics [--prefix agent.]` |
 | read on wake | `mailbox read` |
+| look back at mail already read | `mailbox history [--topic T] [--since 2h] [--limit N]` |
 | who am I / can I be woken / check state | `mailbox status` |
 | stop watching a PR | `mailbox unwatch github-pr OWNER/REPO#N` |
 | stop watching review requests | `mailbox unwatch github-review-requests GITHUB_LOGIN` |

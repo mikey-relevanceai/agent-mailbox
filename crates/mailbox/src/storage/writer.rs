@@ -32,9 +32,10 @@ use mailbox_protocol::{
 
 use super::error::StorageError;
 use super::model::{
-    EndSessionOutcome, ExpiredSuspensions, FilterChange, Pid, ReadPage, RecordInterestOutcome,
-    ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome,
-    TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget,
+    EndSessionOutcome, ExpiredSuspensions, FilterChange, HistoryEntry, HistoryScope, Pid, ReadPage,
+    RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY, SessionId, SubjectBudget, SubscribeKind,
+    SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState,
+    WatchTarget,
 };
 
 /// How long after a session ends its tombstone refuses a re-subscription of the
@@ -59,6 +60,17 @@ const DEFAULT_READ_LIMIT: u32 = 256;
 /// serialization; a read-only side connection is a deliberately-deferred perf
 /// optimisation per ADR-0003 — see the module docs.)
 const MAX_READ_LIMIT: u32 = 1000;
+
+/// Default page size for `history` (ADR-0032), deliberately far smaller than
+/// [`DEFAULT_READ_LIMIT`].
+///
+/// The two defaults answer different questions. A `read` must hand over
+/// everything that is waiting, so its default is a bound on a catch-up. A
+/// `history` is someone asking "what were the last few things" — usually an agent
+/// recovering a turn whose `read` result was lost — and its output lands in a
+/// context window, so defaulting to 256 events would bury the answer. `--limit`
+/// raises it to [`MAX_READ_LIMIT`] for anyone who does want the backlog.
+const DEFAULT_HISTORY_LIMIT: u32 = 20;
 
 /// Convert a wire [`Offset`] (u64) into the `i64` SQLite stores.
 ///
@@ -269,6 +281,14 @@ pub(crate) enum Command {
     ListTopics {
         prefix: Option<String>,
         reply: oneshot::Sender<Result<Vec<TopicSummary>, StorageError>>,
+    },
+    /// The newest events in a scope, newest first (`history`, ADR-0032). A pure
+    /// read: it advances no cursor and delivers no event.
+    RecentEvents {
+        scope: HistoryScope,
+        since: Option<Timestamp>,
+        limit: Option<u32>,
+        reply: oneshot::Sender<Result<Vec<HistoryEntry>, StorageError>>,
     },
     GetBaseline {
         watch: WatchId,
@@ -611,6 +631,26 @@ fn handle(conn: &mut Connection, cmd: Command) {
             });
             let _ = reply.send(result);
         }
+        Command::RecentEvents {
+            scope,
+            since,
+            limit,
+            reply,
+        } => {
+            let result = do_recent_events(conn, &scope, since, limit);
+            log_on_err(&result, "recent_events", || match &scope {
+                HistoryScope::Subscribed { session } => format!(
+                    "scope=subscribed session={} since={since:?} limit={limit:?}",
+                    session.as_str()
+                ),
+                HistoryScope::Topic { topic, reader } => format!(
+                    "scope=topic topic={} reader={} since={since:?} limit={limit:?}",
+                    topic.as_str(),
+                    reader.as_ref().map_or("-", SessionId::as_str)
+                ),
+            });
+            let _ = reply.send(result);
+        }
         Command::GetBaseline { watch, reply } => {
             let result = do_get_baseline(conn, watch);
             log_on_err(&result, "get_baseline", || format!("watch={}", watch.get()));
@@ -841,6 +881,136 @@ fn do_read_events(
         None => cursor,
     };
     Ok(ReadPage { events, next })
+}
+
+/// [`EVENT_COLUMNS`], qualified to a table alias and aliased straight back to the
+/// bare names [`EventRow::read`] looks up.
+///
+/// Derived from the one list rather than written out a second time: the whole
+/// reason `EVENT_COLUMNS` exists is that two hand-maintained select lists drift,
+/// and a history read that silently stopped carrying `subject` would be exactly
+/// that bug. Qualification is not optional here — the history reads join
+/// `subscription` and `delivery_cursor`, and `delivery_cursor` has both a `topic`
+/// and an `offset` of its own, so a bare `offset` is ambiguous in SQLite.
+fn qualified_event_columns(alias: &str) -> String {
+    EVENT_COLUMNS
+        .split(", ")
+        .map(|column| format!("{alias}.{column} AS {column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The newest events in `scope`, newest first — the read behind `mailbox history`
+/// (ADR-0032).
+///
+/// **Advances no cursor.** It is a `SELECT` and nothing else; the read-state it
+/// reports is a comparison against `delivery_cursor`, never a write to it.
+///
+/// The two scopes order by different columns on purpose. A single topic orders by
+/// `offset DESC`, which walks `idx_event_topic_offset` backwards. A cross-topic
+/// read cannot use offsets at all — they are per-topic, so "offset 4" on two
+/// topics says nothing about which happened first — and orders by `event_row_id`,
+/// the global monotonic sequence. That scan has no index behind it; at local mail
+/// volumes a bounded backwards walk is the right trade (ADR-0032).
+fn do_recent_events(
+    conn: &Connection,
+    scope: &HistoryScope,
+    since: Option<Timestamp>,
+    limit: Option<u32>,
+) -> Result<Vec<HistoryEntry>, StorageError> {
+    let limit = limit.unwrap_or(DEFAULT_HISTORY_LIMIT).min(MAX_READ_LIMIT) as i64;
+    // A floor on the stored stamp. Absent means "no floor", which `i64::MIN`
+    // expresses without needing a second statement for the unfiltered case.
+    let since_ms = since.map_or(i64::MIN, |stamp| stamp.0);
+    let columns = qualified_event_columns("e");
+
+    match scope {
+        // Every subscribed topic at once. The JOIN is what scopes it, so read-state
+        // is always reportable here: a row exists only because a subscription does.
+        HistoryScope::Subscribed { session } => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT e.topic AS topic, {columns},
+                        COALESCE(c.offset, -1) >= e.offset AS already_read
+                 FROM event e
+                 JOIN subscription s ON s.topic = e.topic AND s.session_id = ?1
+                 LEFT JOIN delivery_cursor c ON c.topic = e.topic AND c.session_id = ?1
+                 WHERE e.timestamp >= ?2
+                 ORDER BY e.event_row_id DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(
+                params![session.as_str(), since_ms, limit],
+                |row| -> rusqlite::Result<(String, EventRow, i64)> {
+                    Ok((
+                        row.get("topic")?,
+                        EventRow::read(row)?,
+                        row.get("already_read")?,
+                    ))
+                },
+            )?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (topic_text, event_row, already_read) = row?;
+                // A subscription row can only hold a topic this bridge accepted, so
+                // a value that fails the grammar now is corrupt storage, not input.
+                let topic = Topic::parse(&topic_text).map_err(|_| StorageError::Corrupt {
+                    detail: format!("invalid topic {topic_text:?} stored"),
+                })?;
+                out.push(HistoryEntry {
+                    event: event_row.into_event(&topic)?,
+                    read: Some(already_read != 0),
+                });
+            }
+            Ok(out)
+        }
+        // One named topic, subscribed or not — mailboxes are not private
+        // (ADR-0032). `reader` binds as SQL NULL when there is no caller, and
+        // `session_id = NULL` matches nothing, so `subscribed` falls out as 0 and
+        // read-state is correctly withheld with no second query to keep in step.
+        HistoryScope::Topic { topic, reader } => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {columns},
+                        (SELECT COUNT(*) FROM subscription s
+                          WHERE s.topic = e.topic AND s.session_id = ?2) AS subscribed,
+                        COALESCE((SELECT c.offset FROM delivery_cursor c
+                                   WHERE c.topic = e.topic AND c.session_id = ?2), -1) AS cursor
+                 FROM event e
+                 WHERE e.topic = ?1 AND e.timestamp >= ?3
+                 ORDER BY e.offset DESC
+                 LIMIT ?4"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    topic.as_str(),
+                    reader.as_ref().map(SessionId::as_str),
+                    since_ms,
+                    limit
+                ],
+                |row| -> rusqlite::Result<(EventRow, i64, i64)> {
+                    Ok((
+                        EventRow::read(row)?,
+                        row.get("subscribed")?,
+                        row.get("cursor")?,
+                    ))
+                },
+            )?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (event_row, subscribed, cursor) = row?;
+                let offset = event_row.offset;
+                out.push(HistoryEntry {
+                    event: event_row.into_event(topic)?,
+                    // No subscription, no read-state. `Some(false)` here would tell
+                    // a caller browsing a peer's inbox that the peer's mail is
+                    // unread, which is not this caller's to know or to say.
+                    read: (subscribed > 0).then_some(cursor >= offset),
+                });
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Unsubscribe `session` from `topic`, live AND suspended (ADR-0026).
@@ -3547,5 +3717,190 @@ mod tests {
         .unwrap();
         // A cursor past i64::MAX yields nothing, NOT a wrapped replay of the log.
         assert!(page.events.is_empty());
+    }
+
+    /// Publish `count` events onto `topic` at a fixed stamp, for the history reads
+    /// below. The stamp is explicit so `since` can be tested against a known clock
+    /// rather than a real one.
+    fn seed(conn: &mut Connection, topic: &Topic, count: usize, at_ms: i64) {
+        for n in 0..count {
+            do_publish(
+                conn,
+                topic,
+                &AdapterId("t".to_string()),
+                Timestamp(at_ms),
+                serde_json::json!({ "n": n }),
+                None,
+            )
+            .unwrap();
+        }
+    }
+
+    fn topic_scope(topic: &Topic) -> HistoryScope {
+        HistoryScope::Topic {
+            topic: topic.clone(),
+            reader: None,
+        }
+    }
+
+    /// An unbounded `history` still bounds itself. Nothing in the CLI enforces a
+    /// default, so a caller that omits `--limit` is relying on this — and 20 rather
+    /// than `DEFAULT_READ_LIMIT` is what keeps a look-back readable in the context
+    /// window it lands in.
+    #[test]
+    fn recent_events_defaults_to_a_small_page() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.hist").unwrap();
+        seed(&mut conn, &topic, 25, 0);
+
+        let entries = do_recent_events(&conn, &topic_scope(&topic), None, None).unwrap();
+        assert_eq!(entries.len(), DEFAULT_HISTORY_LIMIT as usize);
+        // Newest first: the default takes the NEWEST 20 of 25, not the oldest.
+        assert_eq!(entries[0].event.offset, Offset(24));
+        assert_eq!(entries[19].event.offset, Offset(5));
+    }
+
+    /// A caller cannot talk the writer into materialising an unbounded page. The
+    /// whole page is built into a `Vec` on the single writer thread, so an
+    /// unclamped `limit` would stall every other command behind it.
+    #[test]
+    fn recent_events_clamps_a_limit_above_the_hard_cap() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.hist").unwrap();
+        // More rows than the cap, so the clamp is what bounds the page rather than
+        // the log running out — the failure mode this guards is a caller talking the
+        // writer into materialising an unbounded `Vec` on its single thread.
+        let seeded = MAX_READ_LIMIT as usize + 5;
+        seed(&mut conn, &topic, seeded, 0);
+
+        let entries = do_recent_events(&conn, &topic_scope(&topic), None, Some(u32::MAX)).unwrap();
+        assert_eq!(entries.len(), MAX_READ_LIMIT as usize);
+        // And it is still the NEWEST page that survives the clamp.
+        assert_eq!(entries[0].event.offset, Offset(seeded as u64 - 1));
+    }
+
+    /// `since` is a floor on the stored stamp. Driven by explicit timestamps rather
+    /// than a real clock, so the boundary is exact instead of approximately-now.
+    #[test]
+    fn recent_events_since_floors_on_the_stored_timestamp() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.hist").unwrap();
+        seed(&mut conn, &topic, 1, 1_000);
+        seed(&mut conn, &topic, 1, 3_000);
+
+        let all = do_recent_events(&conn, &topic_scope(&topic), None, None).unwrap();
+        assert_eq!(all.len(), 2, "no floor returns both");
+
+        // Inclusive: an event stamped exactly at the floor is inside the window.
+        let at =
+            do_recent_events(&conn, &topic_scope(&topic), Some(Timestamp(3_000)), None).unwrap();
+        assert_eq!(at.len(), 1);
+        assert_eq!(at[0].event.timestamp, Timestamp(3_000));
+
+        let above =
+            do_recent_events(&conn, &topic_scope(&topic), Some(Timestamp(3_001)), None).unwrap();
+        assert!(above.is_empty(), "a floor past everything returns nothing");
+    }
+
+    /// Read-state is reported only for a caller that actually has a cursor here.
+    /// Without a subscription it is `None` — never `false` — because "unread" would
+    /// be a claim about a cursor the caller does not own (ADR-0032).
+    #[test]
+    fn recent_events_reports_read_state_only_for_a_subscriber() {
+        let mut conn = migrated();
+        let topic = Topic::parse("t.hist").unwrap();
+        let subscriber = SessionId::new("s-in");
+        let onlooker = SessionId::new("s-out");
+        subscribe_explicit(&mut conn, &subscriber, &topic, 0).unwrap();
+        seed(&mut conn, &topic, 2, 0);
+
+        // Consume the first event only, so the two entries must differ.
+        do_read_unread(&mut conn, &subscriber, Some(1)).unwrap();
+
+        let mine = do_recent_events(
+            &conn,
+            &HistoryScope::Topic {
+                topic: topic.clone(),
+                reader: Some(subscriber),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mine[0].read, Some(false), "newest is still unread");
+        assert_eq!(mine[1].read, Some(true), "the consumed one is marked read");
+
+        let theirs = do_recent_events(
+            &conn,
+            &HistoryScope::Topic {
+                topic,
+                reader: Some(onlooker),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            theirs.iter().all(|entry| entry.read.is_none()),
+            "no subscription, no read-state: {theirs:?}"
+        );
+    }
+
+    /// The subscribed scope orders across topics by the GLOBAL row id. Offsets are
+    /// per-topic, so two topics both have an offset 0 — ordering by offset would
+    /// interleave them arbitrarily while still looking sorted.
+    #[test]
+    fn recent_events_orders_across_topics_by_global_sequence() {
+        let mut conn = migrated();
+        let (a, b) = (
+            Topic::parse("t.hist.a").unwrap(),
+            Topic::parse("t.hist.b").unwrap(),
+        );
+        let session = SessionId::new("s-a");
+        subscribe_explicit(&mut conn, &session, &a, 0).unwrap();
+        subscribe_explicit(&mut conn, &session, &b, 0).unwrap();
+
+        // Interleaved, and every event shares one timestamp so ordering cannot fall
+        // back on the clock: only the append sequence can produce the right answer.
+        seed(&mut conn, &a, 1, 0);
+        seed(&mut conn, &b, 1, 0);
+        seed(&mut conn, &a, 1, 0);
+
+        let entries =
+            do_recent_events(&conn, &HistoryScope::Subscribed { session }, None, None).unwrap();
+        let order: Vec<(&str, u64)> = entries
+            .iter()
+            .map(|e| (e.event.topic.as_str(), e.event.offset.0))
+            .collect();
+        assert_eq!(
+            order,
+            [("t.hist.a", 1), ("t.hist.b", 0), ("t.hist.a", 0)],
+            "newest-first by append order, not by per-topic offset"
+        );
+    }
+
+    /// A topic string the grammar rejects is CORRUPT STORAGE, not user input: only
+    /// topics this bridge accepted are ever written. The read must say so rather
+    /// than skip the row, which would silently under-report someone's mail.
+    #[test]
+    fn recent_events_rejects_a_corrupt_stored_topic() {
+        let conn = migrated();
+        let session = SessionId::new("s-a");
+        // A subscription and an event whose topic could never have been accepted.
+        conn.execute(
+            "INSERT INTO subscription (session_id, topic) VALUES ('s-a', 'NOT A TOPIC')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event (topic, offset, event_id, adapter, timestamp, body)
+             VALUES ('NOT A TOPIC', 0, 'evt-1', 'a', 0, '{}')",
+            [],
+        )
+        .unwrap();
+
+        let err =
+            do_recent_events(&conn, &HistoryScope::Subscribed { session }, None, None).unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt { .. }), "{err:?}");
     }
 }

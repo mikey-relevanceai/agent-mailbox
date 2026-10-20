@@ -8,6 +8,7 @@
 
 use std::convert::Infallible;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
@@ -23,8 +24,8 @@ use mailbox_protocol::{
 
 use crate::client;
 use crate::control::{
-    AgentSummary, GithubPrTarget, Request, Response, ResumeState, SessionStatus, StatusReport,
-    SubscribeState, TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
+    AgentSummary, GithubPrTarget, HistoryEvent, Request, Response, ResumeState, SessionStatus,
+    StatusReport, SubscribeState, TopicStatus, UnwatchResultWire, WatchKindWire, WatchStateWire,
 };
 use crate::serve;
 
@@ -107,6 +108,8 @@ pub enum Command {
     Agents,
     /// List known topics with their subscriber and event counts.
     Topics(TopicsArgs),
+    /// Look back through mail you have already read, without consuming anything.
+    History(HistoryArgs),
     /// Actively prove which sessions can be woken right now, by bumping each
     /// sentinel and requiring the wake hook to answer.
     Doctor(DoctorArgs),
@@ -173,6 +176,62 @@ fn session_from_env_value(raw: &str) -> Option<SessionId> {
 /// the label's grammar — but expressed as a `value_parser` so clap brands it.
 fn parse_session(raw: &str) -> Result<SessionId, Infallible> {
     Ok(SessionId::new(raw))
+}
+
+/// Parse a `history --since` lookback: a positive count and a unit, `2h`-style.
+///
+/// A bare number is REFUSED rather than assumed. `--since 30` means half a minute
+/// to one reader and half an hour to another, and the cost of guessing wrong is a
+/// caller who thinks they have seen everything from the last half hour. Making the
+/// unit mandatory is one keystroke against a silently truncated answer.
+///
+/// Hand-rolled rather than pulling a duration crate: the grammar is four units and
+/// the error messages are the actual product here — a parser that says which units
+/// exist beats a dependency that says `invalid value`.
+fn parse_lookback(raw: &str) -> Result<Duration, String> {
+    let text = raw.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("{text:?} needs a unit: s, m, h or d (e.g. 90s, 30m, 2h, 7d)"))?;
+    let (count, unit) = text.split_at(split);
+
+    let count: u64 = count
+        .parse()
+        .map_err(|_| format!("{text:?} must start with a whole number of units, e.g. 2h"))?;
+    // A zero window can only ever return nothing, and "nothing" is the answer that
+    // tells an agent its lost turn consumed nothing — so it must never be produced
+    // by a typo.
+    if count == 0 {
+        return Err(format!(
+            "{text:?} is an empty window; use a positive count, e.g. 2h"
+        ));
+    }
+    let seconds_per = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        other => {
+            return Err(format!(
+                "unknown unit {other:?}: use s, m, h or d (e.g. 90s, 30m, 2h, 7d)"
+            ));
+        }
+    };
+
+    // A lookback nobody could mean is a typo, not a request for the whole log, and
+    // saying so beats overflowing into some arbitrary clamp.
+    //
+    // The ceiling is checked in MILLISECONDS, not seconds, because milliseconds are
+    // what crosses the wire: a value that fits `Duration` but not a `u64` of millis
+    // would be truncated later into a tiny window, and "584 million years" arriving
+    // as "384ms" returns an empty page that reads as "nothing happened". This bounds
+    // what THIS client sends; the daemon saturates independently
+    // (`storage::history_cutoff`), because any socket client can send any `u64`.
+    count
+        .checked_mul(seconds_per)
+        .filter(|seconds| seconds.checked_mul(1_000).is_some())
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("{text:?} is too long a lookback to be meaningful"))
 }
 
 /// The `harness` command group: Claude Code hook targets.
@@ -347,6 +406,31 @@ pub struct TopicsArgs {
     /// Only list topics starting with this prefix (e.g. `agent.`, `github.pr.`).
     #[arg(long)]
     pub prefix: Option<String>,
+}
+
+/// `history`: look back through the log without moving a cursor (ADR-0032).
+///
+/// The surface exists for one failure in particular: `read` advances the cursor in
+/// the same transaction that returns the events, so a turn that dies after the
+/// commit has consumed its mail without ever seeing it. Nothing else can hand it
+/// back.
+///
+/// With no `--topic` it reads the caller's own subscribed topics, so an agent
+/// recovering a lost turn just runs `mailbox history`. `--topic` takes ANY topic,
+/// another agent's inbox included — mailboxes here are not private, and a refusal
+/// that `sqlite3` steps around is advice pretending to be a boundary.
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// One topic to look back through, instead of every topic you subscribe to.
+    /// Any topic, including another agent's `agent.<id>` inbox.
+    #[arg(long)]
+    pub topic: Option<String>,
+    /// Only events from the last <SINCE>, e.g. `90s`, `30m`, `2h`, `7d`.
+    #[arg(long, value_parser = parse_lookback)]
+    pub since: Option<Duration>,
+    /// Maximum events to return, newest first (bridge default if omitted).
+    #[arg(long)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -543,6 +627,7 @@ pub async fn run(format: OutputFormat, command: Command) -> anyhow::Result<ExitC
         Command::Send(args) => run_send(format, args).await,
         Command::Agents => run_agents(format).await,
         Command::Topics(args) => run_topics(format, args).await,
+        Command::History(args) => run_history(format, args).await,
         // `doctor` is dispatched synchronously by `main` (it is socket-free and
         // read-only) and never reaches here.
         Command::Doctor(_) => unreachable!("doctor is handled synchronously in main"),
@@ -613,6 +698,50 @@ async fn run_read(format: OutputFormat, args: ReadArgs) -> anyhow::Result<ExitCo
         },
     )
     .await
+}
+
+/// `history`: look back through the durable log, consuming nothing (ADR-0032).
+///
+/// **The session is optional** (see [`resolve_session_optional`]), and it is used
+/// when present: it scopes the default view to the caller's own subscribed topics
+/// and it is whose read-state each entry reports. A human with `--topic` needs
+/// neither, and refusing them would refuse the workflow of looking at what an
+/// agent was told.
+///
+/// The one unanswerable combination — no session AND no topic — is refused by
+/// `HistoryScope::from_parts` on the daemon side rather than here, so every client
+/// of the socket gets the same answer and not just this one.
+async fn run_history(format: OutputFormat, args: HistoryArgs) -> anyhow::Result<ExitCode> {
+    let topic = args.topic.as_deref().map(parse_topic).transpose()?;
+    let session = resolve_session_optional();
+    // The daemon's refusal is deliberately client-neutral — other socket clients
+    // have no `--topic` flag — so the remedy is attached here, the one client that
+    // knows what its flag is called. The rule itself still lives daemon-side.
+    let unscoped = topic.is_none() && session.is_none();
+    let outcome = request(
+        format,
+        Request::History {
+            session,
+            topic,
+            // Milliseconds on the wire, and the DURATION rather than a cutoff: the
+            // daemon stamped these events, so the daemon subtracts from its own
+            // clock (see `Request::History`).
+            // `try_from`, never `as`: the parser already bounds this, and a checked
+            // crossing between the two integer worlds is how the rest of the crate
+            // spells one (`clock::now_millis`, `sqlite_to_offset`). A silent wrap
+            // here would shrink a huge window into a tiny one.
+            within_ms: args
+                .since
+                .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX)),
+            limit: args.limit,
+        },
+    )
+    .await;
+    if unscoped {
+        outcome.context("pass --topic <topic>, or run this from a Claude Code session")
+    } else {
+        outcome
+    }
 }
 
 /// `send`: message a peer agent. The body the bridge publishes is
@@ -1243,6 +1372,13 @@ fn request_context(request: &Request) -> String {
             None => format!("sending to {} (no sender session)", to.as_str()),
         },
         Request::Agents { .. } => "listing agents".to_string(),
+        // Names the slice being read, not the caller: with no session this is still
+        // a legitimate command, and "history for " would read as a bug.
+        Request::History { topic, session, .. } => match (topic, session) {
+            (Some(topic), _) => format!("reading history of {}", topic.as_str()),
+            (None, Some(session)) => format!("reading history for {}", session.as_str()),
+            (None, None) => "reading history (no session, no topic)".to_string(),
+        },
         Request::Topics { prefix } => match prefix {
             Some(prefix) => format!("listing topics under {prefix:?}"),
             None => "listing topics".to_string(),
@@ -1348,6 +1484,7 @@ fn render_human(response: &Response) {
         ),
         Response::Agents { agents } => render_agents(agents),
         Response::Topics { topics } => render_topics(topics),
+        Response::History { events } => render_history(events),
         Response::SessionEnded {
             subscriptions_dropped,
             interests_dropped,
@@ -1423,6 +1560,47 @@ fn render_agents(agents: &[AgentSummary]) {
             liveness,
             me
         );
+    }
+}
+
+/// Render a `history` look-back, newest first (ADR-0032).
+///
+/// Two things this deliberately does that `read`'s renderer does not. Every line
+/// is prefixed with its read-state, because the whole reason to run this is to
+/// work out which events you had already consumed when a turn died — and `?` for
+/// "no read-state to report" is kept visibly distinct from `unread`, since a
+/// caller browsing a peer's inbox is being told nothing about that peer's cursor.
+/// And the count line says the events were not consumed, because a command that
+/// prints mail looks exactly like one that just drained it.
+fn render_history(events: &[HistoryEvent]) {
+    if events.is_empty() {
+        println!("no events (nothing matched; history never consumes anything)");
+        return;
+    }
+    println!(
+        "{} event(s), newest first — nothing was consumed:",
+        events.len()
+    );
+    for entry in events {
+        let state = match entry.read {
+            Some(true) => "read  ",
+            Some(false) => "unread",
+            None => "?     ",
+        };
+        println!(
+            "  {} [{}] offset={} id={} body={}",
+            state,
+            entry.event.topic.as_str(),
+            entry.event.offset.0,
+            entry.event.id.0,
+            entry.event.body
+        );
+        if let Some(subject) = &entry.event.subject {
+            match subject.link() {
+                Some(link) => println!("         · {} {}", subject.text(), link),
+                None => println!("         · {}", subject.text()),
+            }
+        }
     }
 }
 
@@ -2562,6 +2740,64 @@ mod tests {
         assert!(parse_slack_channel(&format!("{base}/p1791349480652779")).is_err());
         assert!(parse_slack_thread(base).is_err());
         assert!(parse_slack_channel("#team-arg-agent-watercooler").is_err());
+    }
+
+    /// Each unit means what it says, and the arithmetic is checked at the boundary
+    /// where a caller would notice: `--since 7d` must be a week, not seven of
+    /// something else.
+    #[test]
+    fn lookback_units_parse_to_their_durations() {
+        assert_eq!(parse_lookback("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_lookback("30m").unwrap(), Duration::from_secs(1_800));
+        assert_eq!(parse_lookback("2h").unwrap(), Duration::from_secs(7_200));
+        assert_eq!(parse_lookback("7d").unwrap(), Duration::from_secs(604_800));
+        // Surrounding whitespace is a shell artefact, not a different request.
+        assert_eq!(parse_lookback(" 2h ").unwrap(), Duration::from_secs(7_200));
+    }
+
+    /// A bare number is REFUSED rather than assumed, and the refusal names the
+    /// units that exist.
+    ///
+    /// This is the load-bearing half of the parser. `--since 30` means half a
+    /// minute to one reader and half an hour to another, and guessing wrong hands
+    /// back a truncated window that looks exactly like a complete one — the caller
+    /// concludes nothing else happened. A rejected flag cannot do that.
+    #[test]
+    fn lookback_refuses_what_it_would_have_to_guess_at() {
+        let bare = parse_lookback("30").unwrap_err();
+        assert!(bare.contains("needs a unit"), "{bare}");
+        assert!(
+            bare.contains("2h"),
+            "the error shows the shape wanted: {bare}"
+        );
+
+        let unknown = parse_lookback("5w").unwrap_err();
+        assert!(unknown.contains("unknown unit"), "{unknown}");
+        assert!(
+            unknown.contains('d'),
+            "and points at the units that do exist: {unknown}"
+        );
+
+        assert!(parse_lookback("abc").is_err(), "no leading number");
+        assert!(parse_lookback("").is_err(), "empty is not a duration");
+        assert!(parse_lookback("h").is_err(), "a unit with no count");
+
+        // A count that cannot be a real lookback is a typo, and saying so beats
+        // silently clamping to some arbitrary ceiling.
+        let huge = parse_lookback("999999999999999999999d");
+        assert!(huge.is_err(), "an absurd lookback is refused: {huge:?}");
+
+        // The millisecond ceiling, pinned at its exact boundary. Both counts parse
+        // as `u64` seconds, so only the `* 1000` check separates them — the one
+        // that used to wrap into a 384ms window.
+        assert!(parse_lookback("18446744073709551s").is_ok());
+        assert!(parse_lookback("18446744073709552s").is_err());
+
+        let zero = parse_lookback("0s").unwrap_err();
+        assert!(zero.contains("empty window"), "{zero}");
+        // Units are exact and lowercase; anything else is a guess we refuse.
+        assert!(parse_lookback("2H").is_err());
+        assert!(parse_lookback("1.5h").is_err());
     }
 
     /// Every state of knowledge gets its own words, and the two that no integration
