@@ -69,7 +69,7 @@ publishing while the session is idle ...
 $ mailbox publish demo.hello --body '{"msg":"wake up"}' --subject 'the demo said hello' --link 'https://example.com/demo'
 published event evt-2 at offset 1
 the wake delivered to the session's inbox (what changed and where — never the body):
-    {"message":{"content":"[agent-mailbox] mail on 1 topic — run `mailbox read`\n\ndemo.hello — 1 unread\n  · the demo said hello\n    https://example.com/demo\n","role":"user"},"type":"user"}
+    {"message":{"content":"<cross-session-message from-name=\"agent-mailbox\">\n[agent-mailbox] one new message from demo.hello — the demo said hello\nhttps://example.com/demo\n\nRun `mailbox read` to read it.\n</cross-session-message>","role":"user"},"type":"user"}
 $ mailbox read
 1 unread event(s):
   [demo.hello] offset=1 id=evt-2 body={"msg":"wake up"}
@@ -184,12 +184,11 @@ local stack can stand in for.
    turn with a message like:
 
    ```text
-   [agent-mailbox] mail on 1 topic — run `mailbox read`
-
-   github.pr.OWNER/REPO#N — 1 unread
-     · CI failed: build
-       https://github.com/OWNER/REPO/actions/runs/…
+   › Message from @agent-mailbox: [agent-mailbox] one new message from github.pr.OWNER/REPO#N — CI failed: build (ctrl+o to expand)
    ```
+
+   Ctrl+O expands it to the full text the agent received, which adds the run's link
+   and a reminder to run `mailbox read`.
 
    The agent then:
 

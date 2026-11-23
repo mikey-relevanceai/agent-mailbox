@@ -63,6 +63,13 @@ agent.983eae5f-0b09 — 1 unread
   · from 700a3bf5-1c4d: PR 42 review finished
 ```
 
+> **Amended by [ADR-0033](0033-the-wake-rides-the-cross-session-envelope.md).** The
+> text is now wrapped in Claude Code's `<cross-session-message>` envelope, which makes
+> the pane show only the first line. So the first line carries the news: `one new
+> message from <source> — <subject>` for one event, or `<n> new messages …` for
+> several. The per-topic blocks above follow it when there is more than one event.
+> Everything below about subjects is unchanged.
+
 Five things make this safe to put in front of a model, and each is load-bearing:
 
 1. **`Subject` is a parsed type, not a string** (`mailbox-protocol/src/subject.rs`).

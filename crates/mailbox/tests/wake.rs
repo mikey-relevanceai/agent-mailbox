@@ -53,12 +53,19 @@ fn a_subscriber_with_an_inbox_socket_is_woken() {
     let content = frame["message"]["content"]
         .as_str()
         .expect("string content");
+    // Claude Code's cross-session envelope, which makes the pane show the wake as
+    // one line (ADR-0033); inside it, the tag that tells the agent who woke it.
     assert!(
-        content.starts_with("[agent-mailbox]"),
-        "the tag that tells the agent who woke it: {content}"
+        content
+            .starts_with("<cross-session-message from-name=\"agent-mailbox\">\n[agent-mailbox] "),
+        "the envelope, then the tag: {content}"
     );
     assert!(
-        content.contains("stub.demo — 1 unread"),
+        content.ends_with("\n</cross-session-message>"),
+        "the envelope closes the content: {content}"
+    );
+    assert!(
+        content.contains("one new message from stub.demo"),
         "the wake names the topic and what is waiting on it: {content}"
     );
 }
@@ -129,10 +136,12 @@ fn the_peer_frame_describes_the_mail_and_never_carries_the_event_body() {
     let content = frame["message"]["content"]
         .as_str()
         .expect("string content");
-    assert!(content.contains("stub.demo — 1 unread"), "{content}");
     // What DOES cross: the one line the publisher wrote for this purpose, and the
     // link it points at.
-    assert!(content.contains("· something changed"), "{content}");
+    assert!(
+        content.contains("one new message from stub.demo — something changed\n"),
+        "{content}"
+    );
     assert!(
         content.contains("https://example.com/the-thing"),
         "{content}"
