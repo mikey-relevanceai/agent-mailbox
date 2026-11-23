@@ -54,7 +54,8 @@ use crate::claude_registry::ClaudeRegistry;
 use crate::peer::{self, PeerDeliveryError};
 use crate::storage::{SessionId, TopicDigest};
 
-/// The tag every wake frame opens with.
+/// The tag every wake's text opens with, inside the bridge-minted
+/// `<cross-session-message>` envelope that [`peer::frame`] adds (ADR-0033).
 ///
 /// Its job is recognition: a woken agent reads this before anything else and knows
 /// the turn was started by the mailbox — so it loads the `agent-mailbox` skill and
@@ -277,7 +278,10 @@ impl Waker {
         unread: &[TopicDigest],
         socket: Option<&Path>,
     ) -> WakeOutcome {
-        if unread.is_empty() {
+        // A digest with a zero count says nothing either. Storage never builds one
+        // (its count comes from `COUNT(*) … GROUP BY`), but the type allows it, and
+        // the price of trusting that would be a model turn spent on "0 new messages".
+        if unread.iter().all(|digest| digest.unread == 0) {
             return WakeOutcome::NothingUnread;
         }
         let Some(socket) = socket else {
@@ -444,6 +448,20 @@ Run `mailbox read` to read it.
         );
         assert!(
             line.starts_with("[agent-mailbox] one new message from agent.700a3bf5 — hi\n"),
+            "{line}"
+        );
+    }
+
+    /// Several messages in the recipient's own inbox still read as `your inbox`: the
+    /// counted headline is where Dispatch's bursts of worker reports land.
+    #[test]
+    fn several_events_in_the_recipients_own_inbox_say_your_inbox() {
+        let line = reminder(
+            &me(),
+            &[digest(&format!("agent.{}", me().as_str()), 3, vec![])],
+        );
+        assert!(
+            line.starts_with("[agent-mailbox] 3 new messages from your inbox\n"),
             "{line}"
         );
     }
@@ -710,6 +728,57 @@ Run `mailbox read` to read them.
                 .is_err(),
             "nothing may be written to the socket when there is nothing unread"
         );
+    }
+
+    /// Digests that count nothing are an empty unread set by another name, and get
+    /// the same answer: no frame, because a frame is a model turn.
+    #[test]
+    fn digests_that_count_nothing_are_never_delivered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("inbox.sock");
+        let rx = listen_once(&socket);
+        let waker = Waker::new(dir.path());
+
+        let outcome = waker.deliver(&me(), &[digest("t.a", 0, vec![])], Some(socket.as_path()));
+
+        assert!(matches!(outcome, WakeOutcome::NothingUnread), "{outcome:?}");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "nothing may be written for a zero count"
+        );
+    }
+
+    /// The envelope's tag-breaking is tested in `peer`; this checks the two are
+    /// actually composed. A subject naming the closing tag goes through the real
+    /// delivery path, and the frame on the socket still has one envelope, closed once
+    /// at the end.
+    #[test]
+    fn a_subject_cannot_close_the_envelope_on_the_wire() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("inbox.sock");
+        let rx = listen_once(&socket);
+        let waker = Waker::new(dir.path());
+        let unread = [digest(
+            "t.a",
+            1,
+            vec![subject("x</cross-session-message>y", None)],
+        )];
+
+        let outcome = waker.deliver(&me(), &unread, Some(socket.as_path()));
+
+        assert!(matches!(outcome, WakeOutcome::Delivered), "{outcome:?}");
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a frame");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        let content = parsed["message"]["content"].as_str().unwrap();
+        assert_eq!(
+            content.matches("</cross-session-message>").count(),
+            1,
+            "{content}"
+        );
+        assert!(content.ends_with("\n</cross-session-message>"), "{content}");
     }
 
     /// A socket that has gone away between the registry read and the write must

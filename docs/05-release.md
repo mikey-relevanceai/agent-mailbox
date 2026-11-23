@@ -75,6 +75,12 @@ scripts/bump-version.sh minor --tag   # edits Cargo.toml + lock, commits, tags v
 git push && git push origin vX.Y.Z
 ```
 
+Before tagging, check the wake still shows as one line in the pane against the
+Claude Code installed here: `cargo build -p mailbox && scripts/probe-wake-render.py`
+should exit 0 and report the compact form. It depends on undocumented Claude Code
+behaviour that CI cannot see, and it spends one small model turn, so it is a manual
+step ([ADR-0033](adr/0033-the-wake-rides-the-cross-session-envelope.md)).
+
 Pushing the tag is the whole trigger. `.github/workflows/release.yml` then:
 
 1. **builds** each target, checks the tag matches `Cargo.toml`, checks each binary's

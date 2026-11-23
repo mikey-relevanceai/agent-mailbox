@@ -59,7 +59,11 @@ Reading the Claude Code bundle (2.1.330) found the reason. The pane picks its
 compact peer renderer (`UserCrossSessionMessage` in the bundle) for message text
 that opens with a `<cross-session-message …>` tag. A raw socket frame with plain
 text falls through to the ordinary user-message renderer, which prints everything.
-`SendMessage`, Claude Code's own session-to-session tool, always writes that tag:
+`SendMessage`, Claude Code's own session-to-session tool, writes that tag. It is in
+the 2.1.330 bundle's sender. It is also in all 47 session-to-session messages found in
+this machine's transcripts from the 3 weeks to 2026-11-24, across 11 sessions
+(measured; a 48th message without it was one of this investigation's own probes).
+One of them:
 
 ```text
 <cross-session-message from="uds:/tmp/cc-socks/2517.sock" from-name="directory-sync-orchestrator-qskcgt-22" from-mode="bypass">
@@ -245,7 +249,7 @@ Recorded so the next person does not repeat them.
 - **Shorten our frame and leave the wrapper.** It saves about 2 lines of a 12-line
   block per wake (estimate). The wrapper was most of the block.
 - **Coalesce wakes over a short window.** At most 23 of Dispatch's 115 wakes came
-  within 60 seconds of the previous one, and every wake, Mikey's Slack DMs to the
+  within 60 seconds of the previous one (measured from transcript timestamps), and every wake, Mikey's Slack DMs to the
   bot included, would wait for the window. The envelope removes more noise at no
   latency.
 - **A Claude Code setting, or MCP channels.** The docs list no setting that hides

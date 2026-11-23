@@ -93,7 +93,8 @@ Five properties are deliberate, and each is pinned by a test:
 - **One line in the pane.** The `<cross-session-message>` tag is what Claude Code's
   own `SendMessage` uses, and the pane draws text that opens with it as a single
   collapsed line. Without it, Claude Code prints its whole peer wrapper around every
-  wake — about 8 lines on top of ours. The model still receives the wrapper, the tag
+  wake — about 8 lines on top of ours at 120 columns (an estimate from character
+  counts; ADR-0033). The model still receives the wrapper, the tag
   and the full text either way; only the pane changes.
 - **Tagged `[agent-mailbox]`.** The first thing inside the envelope, so a woken agent
   knows which system started its turn and which skill to load. The envelope's opening

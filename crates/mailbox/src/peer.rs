@@ -19,8 +19,9 @@
 //! ([ADR-0033](../../docs/adr/0033-the-wake-rides-the-cross-session-envelope.md)).
 //! The tag is what makes the receiving pane show the wake as one dim line —
 //! `› Message from @agent-mailbox: <first line> (ctrl+o to expand)` — instead of
-//! Claude Code's full peer wrapper around every wake. Without it a busy pane is
-//! mostly wrapper.
+//! Claude Code's full peer wrapper around every wake. Without it the wrapper was
+//! about two thirds of each wake's characters in Dispatch's pane (measured over a
+//! week; ADR-0033).
 //!
 //! We take the tag and nothing else from `SendMessage`'s envelope. In particular
 //! there is no `from-mode` attribute, because that asserts the sender's permission
@@ -117,13 +118,15 @@ pub enum PeerDeliveryError {
 /// Undocumented: it comes from reading Claude Code's bundle, where the pane picks
 /// its compact peer renderer for text that opens with `<cross-session-message …>`,
 /// and from watching that happen in a throwaway session (ADR-0033). If a release
-/// renames it, the wake still lands and is still read; the pane goes back to
-/// showing Claude Code's full wrapper.
+/// renames it, the wake should still land and be read, with the pane going back to
+/// Claude Code's full wrapper. That is inferred from the bundle, where the text test
+/// simply fails over to the ordinary renderer; it has not been observed.
 const ENVELOPE_TAG: &str = "cross-session-message";
 
 /// The name the receiving pane shows the wake as coming from:
-/// `› Message from @agent-mailbox: …`.
-pub const SENDER_NAME: &str = "agent-mailbox";
+/// `› Message from @agent-mailbox: …`. It is the same identity as
+/// [`crate::wake::PREFIX`], and a test keeps the two in step.
+const SENDER_NAME: &str = "agent-mailbox";
 
 /// Build the wake frame for `content`.
 ///
@@ -142,9 +145,12 @@ pub fn frame(content: &str) -> String {
 
 /// Wrap `content` in the cross-session envelope.
 ///
-/// The layout is exact because Claude Code parses it exactly: the opening tag and
-/// the body are separated by one newline, and so are the body and the closing tag.
-/// A trailing newline on the body would become part of the message.
+/// The layout copies what `SendMessage` writes, as seen in a real transcript: one
+/// newline after the opening tag and one before the closing tag. In the 2.1.330
+/// bundle the envelope parser rebuilds that exact text and ignores anything that does
+/// not match it, and the renderer strips exactly those two newlines (read, not
+/// measured; ADR-0033). So we copy the layout exactly rather than find out what else
+/// it tolerates, and a trailing newline is trimmed off the body.
 fn envelope(content: &str) -> String {
     let body = neutralise_tag(content.trim_end_matches('\n'));
     format!("<{ENVELOPE_TAG} from-name=\"{SENDER_NAME}\">\n{body}\n</{ENVELOPE_TAG}>")
@@ -235,9 +241,10 @@ mod tests {
 
     /// The exact bytes another process parses. Pinned because this is a wire format
     /// we do not own: Claude Code's minimal injection frame, carrying its
-    /// cross-session envelope (ADR-0033). Claude Code parses the envelope exactly —
-    /// one newline after the opening tag, one before the closing tag — so the layout
-    /// is part of what is pinned.
+    /// cross-session envelope (ADR-0033). The layout around the body — one newline
+    /// after the opening tag, one before the closing tag — copies `SendMessage`, and
+    /// the bundle's parser looks for exactly that (read, not measured), so it is part
+    /// of what is pinned.
     #[test]
     fn the_frame_is_the_minimal_shape_carrying_the_envelope() {
         let wire = frame("[agent-mailbox] one new message from t.a\n");
@@ -316,6 +323,37 @@ mod tests {
             content.contains("x<\\/cross-session-message> <\\Cross-Session-Message"),
             "the words survive, only the tags break: {content}"
         );
+    }
+
+    /// The pane's `@agent-mailbox` and the text's `[agent-mailbox]` are one identity:
+    /// a woken agent is told who started its turn by both. Renaming one alone would
+    /// split it.
+    #[test]
+    fn the_sender_name_and_the_prefix_name_the_same_system() {
+        assert_eq!(crate::wake::PREFIX, format!("[{SENDER_NAME}]"));
+    }
+
+    /// The edges of the tag-breaking scan, where byte-index slicing would go wrong:
+    /// a tag at either end, adjacent tags, multi-byte text beside a match, a `<`
+    /// as the last character, and a truncated tag name.
+    #[test]
+    fn tag_breaking_handles_the_edges() {
+        let cases = [
+            ("</cross-session-message>", "<\\/cross-session-message>"),
+            ("x<cross-session-message", "x<\\cross-session-message"),
+            (
+                "<<cross-session-message></CROSS-SESSION-MESSAGE>",
+                "<<\\cross-session-message><\\/CROSS-SESSION-MESSAGE>",
+            ),
+            ("é<cross-session-messageé", "é<\\cross-session-messageé"),
+            ("ends with <", "ends with <"),
+            ("<cross-session-messag", "<cross-session-messag"),
+            ("</", "</"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(neutralise_tag(input), expected, "input {input:?}");
+        }
     }
 
     /// Text that merely mentions `<` is left alone.

@@ -113,6 +113,8 @@ def main():
     for match in re.finditer(re.escape(COMPACT) + r"[^\n]*?\(ctrl\+o to expand\)", text):
         print(f"  › {match.group(0)}")
     print(f"raw terminal stream: {raw_path}")
+    if COMPACT not in text or WRAPPER in text:
+        sys.exit("FAIL: the wake did not render as one compact line")
 
 
 def parse_args():
