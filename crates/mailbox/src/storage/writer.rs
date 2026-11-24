@@ -2118,11 +2118,19 @@ fn do_unread_digest(
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
+        // The count comes from `COUNT(*) … GROUP BY`, which cannot produce a zero or
+        // a negative, so either is a broken query rather than a quiet topic.
+        let unread = u64::try_from(unread)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| StorageError::Corrupt {
+                detail: format!("unread count {unread} for topic {topic_str:?}"),
+            })?;
         let digest = by_topic
             .entry(topic.clone())
             .or_insert_with(|| TopicDigest {
                 topic,
-                unread: unread.max(0) as u64,
+                unread,
                 subjects: Vec::new(),
             });
         // Subjects land in `ORDER BY n.rank ASC` order — newest first, which is what
@@ -2952,7 +2960,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .find(|digest| &digest.topic == topic)
-            .map(|digest| digest.unread)
+            .map(|digest| digest.unread.get())
             .unwrap_or(0)
     }
 

@@ -755,7 +755,7 @@ async fn unread_digest_reports_per_topic_and_does_not_consume() {
     assert_eq!(
         digest
             .iter()
-            .map(|d| (d.topic.clone(), d.unread))
+            .map(|d| (d.topic.clone(), d.unread.get()))
             .collect::<Vec<_>>(),
         vec![(t1.clone(), 2), (t2.clone(), 1)],
         "per-topic unread counts, in topic order"
@@ -811,7 +811,11 @@ async fn unread_digest_returns_the_newest_subjects_per_topic_with_the_full_count
         .await
         .unwrap();
     assert_eq!(digest.len(), 1);
-    assert_eq!(digest[0].unread, 5, "the count is of everything unread");
+    assert_eq!(
+        digest[0].unread.get(),
+        5,
+        "the count is of everything unread"
+    );
     assert_eq!(
         digest[0]
             .subjects
@@ -874,7 +878,7 @@ async fn unread_digest_keeps_each_topics_subjects_to_that_topic() {
     assert_eq!(
         digest
             .iter()
-            .map(|d| (d.topic.clone(), d.unread))
+            .map(|d| (d.topic.clone(), d.unread.get()))
             .collect::<Vec<_>>(),
         vec![
             (described.clone(), 3),
@@ -939,7 +943,7 @@ async fn unread_digest_counts_subject_less_events_without_describing_them() {
         .unread_digest(session, SubjectBudget::Newest(NonZeroU32::new(3).unwrap()))
         .await
         .unwrap();
-    assert_eq!(digest[0].unread, 4);
+    assert_eq!(digest[0].unread.get(), 4);
     assert_eq!(
         digest[0]
             .subjects

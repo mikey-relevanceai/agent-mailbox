@@ -79,40 +79,168 @@ pub const SUBJECTS_PER_TOPIC: NonZeroU32 = NonZeroU32::new(3).unwrap();
 /// screenful.
 const MAX_TOPICS: usize = 8;
 
-/// The reminder delivered on the wake wire, to `recipient`.
+/// One session's unread mail: what a wake for that session is built from.
 ///
-/// One function rather than a format string at the call site, so there is ONE
-/// definition of the wake wire's content — one place to read to know exactly what a
-/// woken agent sees, and one place for the tests that pin what may never appear in
-/// it.
-///
-/// Everything here is either minted by the bridge (the prefix, the counts, the topic
-/// names) or a parsed [`Subject`](mailbox_protocol::Subject), which is single-line
-/// and length-bounded by construction. That is what keeps the layout below
-/// unforgeable by the adapters whose text it renders.
-///
-/// # The first line is written for a person
-///
-/// Claude Code shows a wake in the pane as one collapsed line: `› Message from
-/// @agent-mailbox: <first line> (ctrl+o to expand)` (ADR-0033). So the first line
-/// carries the news itself — `one new message from <where> — <subject>`, or a count
-/// — and everything after it is for the agent, which receives the whole text.
-pub fn reminder(recipient: &SessionId, unread: &[TopicDigest]) -> String {
-    let mut out = headline(recipient, unread);
-    out.push('\n');
+/// The session and its mail travel as one value because the wake's wording depends
+/// on both — the session's own inbox reads as `your inbox` — and three loose
+/// arguments would let one session's id be paired with another's mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUnread {
+    pub session: SessionId,
+    pub unread: Vec<TopicDigest>,
+}
 
-    if let Some((_, subject)) = the_only_event(unread) {
-        // The headline already said it; the link is the one thing left to add. On
-        // its own line, because a link is for following.
-        if let Some(link) = subject.and_then(|s| s.link()) {
-            let _ = writeln!(out, "{link}");
-        }
-        out.push_str("\nRun `mailbox read` to read it.\n");
-        return out;
+/// The text of a wake, as [`Wake::render`] composed it.
+///
+/// A newtype with a private constructor so that [`peer::deliver`] — which sends it
+/// under the `agent-mailbox` name — can only ever be handed text this module wrote:
+/// the prefix first, and nothing but bridge-minted text and parsed subjects after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder(String);
+
+impl Reminder {
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    let shown = unread.len().min(MAX_TOPICS);
-    for digest in &unread[..shown] {
+    /// Arbitrary text, for tests of the wire layer that need to probe it with
+    /// content `render` would never produce.
+    #[cfg(test)]
+    pub(crate) fn from_test_text(text: &str) -> Self {
+        Self(text.to_owned())
+    }
+}
+
+/// A wake worth sending: a recipient, and mail in one of three shapes.
+///
+/// There is no empty shape. [`Wake::of`] returns `None` for a session with nothing
+/// unread, so "nothing may be delivered idly" is decided once, here, and no caller
+/// can render a wake that announces nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct Wake<'a> {
+    recipient: &'a SessionId,
+    shape: Shape<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Shape<'a> {
+    /// Exactly one event: the headline carries it whole.
+    OneEvent(&'a TopicDigest),
+    /// Two or more events, all on one topic.
+    OneTopic(&'a TopicDigest),
+    /// Mail on two or more topics.
+    ManyTopics(&'a [TopicDigest]),
+}
+
+impl<'a> Wake<'a> {
+    /// The wake for `mail`, or `None` when there is nothing to say.
+    pub fn of(mail: &'a SessionUnread) -> Option<Self> {
+        let shape = match mail.unread.as_slice() {
+            [] => return None,
+            [digest] if digest.unread.get() == 1 => Shape::OneEvent(digest),
+            [digest] => Shape::OneTopic(digest),
+            several => Shape::ManyTopics(several),
+        };
+        Some(Self {
+            recipient: &mail.session,
+            shape,
+        })
+    }
+
+    /// The reminder delivered on the wake wire.
+    ///
+    /// One function rather than a format string at the call site, so there is ONE
+    /// definition of the wake wire's content — one place to read to know exactly what
+    /// a woken agent sees, and one place for the tests that pin what may never appear
+    /// in it.
+    ///
+    /// Everything here is either minted by the bridge (the prefix, the counts, the
+    /// topic names) or a parsed [`Subject`], which is single-line and length-bounded by
+    /// construction. That is what keeps the layout below unforgeable by the adapters
+    /// whose text it renders.
+    ///
+    /// # The first line is written for a person
+    ///
+    /// Claude Code shows a wake in the pane as one collapsed line: `› Message from
+    /// @agent-mailbox: <first line> (ctrl+o to expand)` (ADR-0033). So the first line
+    /// carries the news itself — `one new message from <where> — <subject>`, or a
+    /// count — and everything after it is for the agent, which receives the whole text.
+    pub fn render(&self) -> Reminder {
+        let mut out = self.headline();
+        out.push('\n');
+        match self.shape {
+            Shape::OneEvent(digest) => {
+                // The headline already said it; the link is the one thing left to add.
+                // On its own line, because a link is for following.
+                if let Some(link) = digest.subjects.first().and_then(Subject::link) {
+                    let _ = writeln!(out, "{link}");
+                }
+                out.push_str("\nRun `mailbox read` to read it.\n");
+            }
+            Shape::OneTopic(digest) => {
+                write_topic_blocks(&mut out, std::slice::from_ref(digest));
+                out.push_str("\nRun `mailbox read` to read them.\n");
+            }
+            Shape::ManyTopics(digests) => {
+                write_topic_blocks(&mut out, digests);
+                out.push_str("\nRun `mailbox read` to read them.\n");
+            }
+        }
+        Reminder(out)
+    }
+
+    /// The first line of a wake: the prefix, then what arrived and where from.
+    ///
+    /// - one event: `[agent-mailbox] one new message from <where> — <subject>`, the
+    ///   subject left off when its publisher gave none;
+    /// - several on one topic: `[agent-mailbox] <n> new messages from <where>`;
+    /// - several topics: `[agent-mailbox] <n> new messages on <k> topics`.
+    fn headline(&self) -> String {
+        match self.shape {
+            Shape::OneEvent(digest) => {
+                let source = self.source_name(&digest.topic);
+                match digest.subjects.first() {
+                    Some(subject) => format!(
+                        "{PREFIX} one new message from {source} — {}",
+                        subject.text()
+                    ),
+                    None => format!("{PREFIX} one new message from {source}"),
+                }
+            }
+            Shape::OneTopic(digest) => format!(
+                "{PREFIX} {} new messages from {}",
+                digest.unread,
+                self.source_name(&digest.topic)
+            ),
+            Shape::ManyTopics(digests) => {
+                let total: u64 = digests.iter().map(|digest| digest.unread.get()).sum();
+                format!("{PREFIX} {total} new messages on {} topics", digests.len())
+            }
+        }
+    }
+
+    /// Where a wake's mail came from, as the headline names it.
+    ///
+    /// The recipient's own inbox reads as `your inbox`. Its topic is
+    /// `agent.<a 36-character session id>`, and on a one-line preview that id would
+    /// push the subject — the part a person wants — off the edge of the pane.
+    fn source_name<'t>(&self, topic: &'t Topic) -> &'t str {
+        if topic
+            .as_agent_inbox()
+            .is_ok_and(|owner| &owner == self.recipient)
+        {
+            "your inbox"
+        } else {
+            topic.as_str()
+        }
+    }
+}
+
+/// A block per topic, for the agent: its count, its newest subjects and their links,
+/// and an honest count of what was left out.
+fn write_topic_blocks(out: &mut String, digests: &[TopicDigest]) {
+    let shown = digests.len().min(MAX_TOPICS);
+    for digest in &digests[..shown] {
         let _ = writeln!(
             out,
             "\n{} — {} unread",
@@ -129,74 +257,17 @@ pub fn reminder(recipient: &SessionId, unread: &[TopicDigest]) -> String {
         }
         // Only ever an undercount of what `read` will hand over, never a surprise in
         // the other direction.
-        let undescribed = digest.unread.saturating_sub(digest.subjects.len() as u64);
+        let undescribed = digest
+            .unread
+            .get()
+            .saturating_sub(digest.subjects.len() as u64);
         if undescribed > 0 && !digest.subjects.is_empty() {
             let _ = writeln!(out, "  · …and {undescribed} earlier");
         }
     }
-
-    if unread.len() > shown {
-        let hidden = unread.len() - shown;
+    if digests.len() > shown {
+        let hidden = digests.len() - shown;
         let _ = writeln!(out, "\n…and {hidden} more {}", topics_noun(hidden));
-    }
-    out.push_str("\nRun `mailbox read` to read them.\n");
-    out
-}
-
-/// The first line of a wake: the prefix, then what arrived and where from.
-///
-/// - one event: `[agent-mailbox] one new message from <where> — <subject>`, the
-///   subject left off when its publisher gave none;
-/// - several on one topic: `[agent-mailbox] <n> new messages from <where>`;
-/// - several topics: `[agent-mailbox] <n> new messages on <k> topics`.
-fn headline(recipient: &SessionId, unread: &[TopicDigest]) -> String {
-    if let Some((digest, subject)) = the_only_event(unread) {
-        let source = source_name(recipient, &digest.topic);
-        return match subject {
-            Some(subject) => format!(
-                "{PREFIX} one new message from {source} — {}",
-                subject.text()
-            ),
-            None => format!("{PREFIX} one new message from {source}"),
-        };
-    }
-    let total: u64 = unread.iter().map(|digest| digest.unread).sum();
-    match unread {
-        [digest] => format!(
-            "{PREFIX} {total} new messages from {}",
-            source_name(recipient, &digest.topic)
-        ),
-        _ => format!(
-            "{PREFIX} {total} new messages on {} {}",
-            unread.len(),
-            topics_noun(unread.len())
-        ),
-    }
-}
-
-/// The digest and subject of the single unread event, when there is exactly one.
-///
-/// `None` means "not exactly one event", so the caller renders the counted form.
-fn the_only_event(unread: &[TopicDigest]) -> Option<(&TopicDigest, Option<&Subject>)> {
-    match unread {
-        [digest] if digest.unread == 1 => Some((digest, digest.subjects.first())),
-        _ => None,
-    }
-}
-
-/// Where a wake's mail came from, as the headline names it.
-///
-/// The recipient's own inbox reads as `your inbox`. Its topic is
-/// `agent.<a 36-character session id>`, and on a one-line preview that id would push
-/// the subject — the part a person wants — off the edge of the pane.
-fn source_name<'a>(recipient: &SessionId, topic: &'a Topic) -> &'a str {
-    if topic
-        .as_agent_inbox()
-        .is_ok_and(|owner| &owner == recipient)
-    {
-        "your inbox"
-    } else {
-        topic.as_str()
     }
 }
 
@@ -269,32 +340,17 @@ impl Waker {
     /// keeps the decision a pure function of its inputs, so every branch is testable
     /// without a registry on disk.
     ///
-    /// An empty `unread` set is never delivered: see the module docs. There is no
+    /// An empty unread set is never delivered: see the module docs. There is no
     /// anti-loop between here and the model. It reports [`WakeOutcome::NothingUnread`]
-    /// — NOT `NoInbox`, which is a fault and this is not. A digest counting zero is
-    /// treated as absent, so it never reaches the headline's counts either.
-    pub fn deliver(
-        &self,
-        recipient: &SessionId,
-        unread: &[TopicDigest],
-        socket: Option<&Path>,
-    ) -> WakeOutcome {
-        // A digest with a zero count says nothing. Storage never builds one (its
-        // count comes from `COUNT(*) … GROUP BY`), but the type allows it, and trusting
-        // that would cost a model turn on "0 new messages", or a wrong headline count
-        // beside real mail. Dropped here, once, before anything counts topics.
-        let unread: Vec<TopicDigest> = unread
-            .iter()
-            .filter(|digest| digest.unread > 0)
-            .cloned()
-            .collect();
-        if unread.is_empty() {
+    /// — NOT `NoInbox`, which is a fault and this is not.
+    pub fn deliver(&self, mail: &SessionUnread, socket: Option<&Path>) -> WakeOutcome {
+        let Some(wake) = Wake::of(mail) else {
             return WakeOutcome::NothingUnread;
-        }
+        };
         let Some(socket) = socket else {
             return WakeOutcome::NoInbox;
         };
-        match peer::deliver(socket, &reminder(recipient, &unread)) {
+        match peer::deliver(socket, &wake.render()) {
             Ok(()) => WakeOutcome::Delivered,
             Err(error) => WakeOutcome::Failed { error },
         }
@@ -303,7 +359,7 @@ impl Waker {
     /// Wake every session in `unread_by_session`, then log the aggregate outcome.
     ///
     /// Reads Claude Code's session registry ONCE per publish and never caches it.
-    pub fn wake_all(&self, unread_by_session: &[(SessionId, Vec<TopicDigest>)], topic: &Topic) {
+    pub fn wake_all(&self, unread_by_session: &[SessionUnread], topic: &Topic) {
         let registry = ClaudeRegistry::read_dir(&self.sessions_dir);
         self.wake_all_with_registry(unread_by_session, topic, &registry);
     }
@@ -318,14 +374,15 @@ impl Waker {
     /// a publish, and the other subscribers still get their wake.
     pub fn wake_all_with_registry(
         &self,
-        unread_by_session: &[(SessionId, Vec<TopicDigest>)],
+        unread_by_session: &[SessionUnread],
         topic: &Topic,
         registry: &ClaudeRegistry,
     ) {
         let (mut delivered, mut no_inbox, mut failed, mut quiet) = (0usize, 0usize, 0usize, 0usize);
 
-        for (session, unread) in unread_by_session {
-            match self.deliver(session, unread, registry.inbox_socket(session)) {
+        for mail in unread_by_session {
+            let session = &mail.session;
+            match self.deliver(mail, registry.inbox_socket(session)) {
                 WakeOutcome::Delivered => delivered += 1,
                 // The ordinary no-op: this subscriber had nothing unread by the time we
                 // read it. Counted, never warned about.
@@ -385,7 +442,7 @@ mod tests {
     fn digest(topic: &str, unread: u64, subjects: Vec<Subject>) -> TopicDigest {
         TopicDigest {
             topic: Topic::parse(topic).unwrap(),
-            unread,
+            unread: std::num::NonZeroU64::new(unread).expect("a digest counts at least one event"),
             subjects,
         }
     }
@@ -397,6 +454,27 @@ mod tests {
     /// The session every reminder test is addressed to.
     fn me() -> SessionId {
         SessionId::new("983eae5f-0b09-4d1a-9f0e-6a1c2d3e4f50")
+    }
+
+    /// `unread`, as `me()`'s mail.
+    fn mail(unread: &[TopicDigest]) -> SessionUnread {
+        SessionUnread {
+            session: me(),
+            unread: unread.to_vec(),
+        }
+    }
+
+    /// The text a wake for `recipient` would carry.
+    fn reminder(recipient: &SessionId, unread: &[TopicDigest]) -> String {
+        let mail = SessionUnread {
+            session: recipient.clone(),
+            unread: unread.to_vec(),
+        };
+        Wake::of(&mail)
+            .expect("a test reminder has mail in it")
+            .render()
+            .as_str()
+            .to_owned()
     }
 
     /// One event: the headline says what it is and where from, then the link.
@@ -682,7 +760,7 @@ Run `mailbox read` to read them.
         let waker = Waker::new(dir.path());
         let unread = [digest("t.a", 1, vec![subject("new comment", None)])];
 
-        let outcome = waker.deliver(&me(), &unread, Some(socket.as_path()));
+        let outcome = waker.deliver(&mail(&unread), Some(socket.as_path()));
 
         assert!(matches!(outcome, WakeOutcome::Delivered), "{outcome:?}");
         let line = rx
@@ -710,7 +788,7 @@ Run `mailbox read` to read them.
         let unread = [digest("t.a", 1, vec![])];
 
         assert!(matches!(
-            waker.deliver(&me(), &unread, None),
+            waker.deliver(&mail(&unread), None),
             WakeOutcome::NoInbox
         ));
     }
@@ -725,7 +803,7 @@ Run `mailbox read` to read them.
         let rx = listen_once(&socket);
         let waker = Waker::new(dir.path());
 
-        let outcome = waker.deliver(&me(), &[], Some(socket.as_path()));
+        let outcome = waker.deliver(&mail(&[]), Some(socket.as_path()));
 
         assert!(
             matches!(outcome, WakeOutcome::NothingUnread),
@@ -736,43 +814,6 @@ Run `mailbox read` to read them.
                 .is_err(),
             "nothing may be written to the socket when there is nothing unread"
         );
-    }
-
-    /// Digests that count nothing are an empty unread set by another name, and get
-    /// the same answer. No socket is passed: `NothingUnread` rather than `NoInbox`
-    /// proves the guard fired before delivery was even considered.
-    #[test]
-    fn digests_that_count_nothing_are_never_delivered() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let outcome = Waker::new(dir.path()).deliver(&me(), &[digest("t.a", 0, vec![])], None);
-        assert!(matches!(outcome, WakeOutcome::NothingUnread), "{outcome:?}");
-    }
-
-    /// A zero-count digest beside real mail is dropped, not described: the headline
-    /// counts only the topics that have something on them.
-    #[test]
-    fn a_zero_count_digest_beside_a_real_one_is_not_described() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let socket = dir.path().join("inbox.sock");
-        let rx = listen_once(&socket);
-        let unread = [
-            digest("t.empty", 0, vec![]),
-            digest("t.a", 1, vec![subject("hi", None)]),
-        ];
-
-        let outcome = Waker::new(dir.path()).deliver(&me(), &unread, Some(socket.as_path()));
-
-        assert!(matches!(outcome, WakeOutcome::Delivered), "{outcome:?}");
-        let line = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("a frame");
-        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
-        let content = parsed["message"]["content"].as_str().unwrap();
-        assert!(
-            content.contains("\n[agent-mailbox] one new message from t.a — hi\n"),
-            "{content}"
-        );
-        assert!(!content.contains("t.empty"), "{content}");
     }
 
     /// The envelope's tag-breaking is tested in `peer`; this checks the two are
@@ -794,7 +835,7 @@ Run `mailbox read` to read them.
             )],
         )];
 
-        let outcome = waker.deliver(&me(), &unread, Some(socket.as_path()));
+        let outcome = waker.deliver(&mail(&unread), Some(socket.as_path()));
 
         assert!(matches!(outcome, WakeOutcome::Delivered), "{outcome:?}");
         let line = rx
@@ -827,7 +868,7 @@ Run `mailbox read` to read them.
         let waker = Waker::new(dir.path());
         let unread = [digest("t.a", 1, vec![])];
 
-        let outcome = waker.deliver(&me(), &unread, Some(&dir.path().join("gone.sock")));
+        let outcome = waker.deliver(&mail(&unread), Some(&dir.path().join("gone.sock")));
 
         assert!(matches!(outcome, WakeOutcome::Failed { .. }), "{outcome:?}");
     }

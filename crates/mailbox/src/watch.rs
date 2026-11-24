@@ -570,7 +570,7 @@ async fn session_status(
         .unread_digest(session.clone(), SubjectBudget::CountsOnly)
         .await?
         .into_iter()
-        .map(|digest| (digest.topic, digest.unread))
+        .map(|digest| (digest.topic, digest.unread.get()))
         .collect();
     Ok(SessionStatusView {
         session,

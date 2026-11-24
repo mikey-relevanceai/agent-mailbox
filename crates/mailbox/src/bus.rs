@@ -50,7 +50,7 @@ use mailbox_protocol::{AdapterId, Event, Subject, Timestamp, Topic};
 
 use crate::clock::now_millis;
 use crate::storage::{Storage, StorageError};
-use crate::wake::{self, Waker};
+use crate::wake::{self, SessionUnread, Waker};
 // Re-exported so callers depend on `bus::SessionId` / `bus::SubscribeOutcome` and
 // storage stays free to change its representation without touching call sites.
 pub use crate::storage::{SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome};
@@ -244,7 +244,7 @@ impl Bus {
                 )
                 .await
             {
-                Ok(digest) => unread_by_session.push((session, digest)),
+                Ok(unread) => unread_by_session.push(SessionUnread { session, unread }),
                 Err(err) => warn!(
                     session = session.as_str(),
                     topic = topic.as_str(),

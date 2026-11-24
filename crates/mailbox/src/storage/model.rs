@@ -524,7 +524,11 @@ impl SubjectBudget {
 pub struct TopicDigest {
     pub topic: mailbox_protocol::Topic,
     /// Events on this topic beyond the session's delivery cursor.
-    pub unread: u64,
+    ///
+    /// Never zero: a topic with nothing unread has no digest at all. The wake's
+    /// wording branches on this count ("one new message" against "N new messages"),
+    /// so a zero would read as news.
+    pub unread: std::num::NonZeroU64,
     /// Subjects of the newest unread events that have one, newest first.
     pub subjects: Vec<mailbox_protocol::Subject>,
 }
