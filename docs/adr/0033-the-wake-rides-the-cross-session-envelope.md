@@ -45,7 +45,8 @@ session's own permission settings. A peer cannot grant escalation: […]
 - **In lines on screen**, that is roughly 8 lines of wrapper and 4 of frame per wake
   at 120 columns. This is an estimate from character counts; the pane width varies.
 
-The wrapper was about two thirds of every block, and it is not ours.
+The wrapper was about three quarters of every block's characters (583 of a median
+744, measured) and about two thirds of its lines (estimate), and it is not ours.
 
 ### Why Claude Code showed the whole block
 
@@ -60,10 +61,12 @@ compact peer renderer (`UserCrossSessionMessage` in the bundle) for message text
 that opens with a `<cross-session-message …>` tag. A raw socket frame with plain
 text falls through to the ordinary user-message renderer, which prints everything.
 `SendMessage`, Claude Code's own session-to-session tool, writes that tag. It is in
-the 2.1.330 bundle's sender. It is also in all 47 session-to-session messages found in
-this machine's transcripts from the 3 weeks to 2026-11-24, across 11 sessions
-(measured; a 48th message without it was one of this investigation's own probes).
-One of them:
+the 2.1.330 bundle's sender, and it is in all 49 such messages found on this machine
+(measured, 2026-11-24). They were picked out by their sender address, not by the tag:
+a user message whose `origin.from` is a `uds:` socket address, which Claude Code
+records from a frame's top-level `from`. `SendMessage` sends one and the mailbox
+never has. The search covered transcripts modified in the 21 days before, reached 9
+receiving sessions, and excluded this investigation's own probe sessions. One of them:
 
 ```text
 <cross-session-message from="uds:/tmp/cc-socks/2517.sock" from-name="directory-sync-orchestrator-qskcgt-22" from-mode="bypass">
@@ -144,6 +147,10 @@ Claude Code ships as a single Bun executable with minified JavaScript inside it
    - the sender, `SendMessage`'s socket client (`[uds-client] Sending …`), writes
      `{type, message, priority, from, msg_id}` with the content wrapped in the
      envelope;
+   - the function that reads `from-name` and the body out of the envelope (`ji`)
+     rebuilds the envelope from what it parsed and gives up if the result differs
+     from the text it was given. So the sender's name only reaches the message's
+     origin when the layout matches `SendMessage`'s exactly;
    - the user-message renderer calls `poe(text)`. That is true when the text,
      optionally after a wrapper prefix, opens with `<cross-session-message…>`. When
      it is true the renderer hands off to `UserCrossSessionMessage`, which draws
@@ -248,8 +255,9 @@ Recorded so the next person does not repeat them.
   would offer a reply address that leads to no session.
 - **Shorten our frame and leave the wrapper.** It saves about 2 lines of a 12-line
   block per wake (estimate). The wrapper was most of the block.
-- **Coalesce wakes over a short window.** At most 23 of Dispatch's 115 wakes came
-  within 60 seconds of the previous one (measured from transcript timestamps), and every wake, Mikey's Slack DMs to the
+- **Coalesce wakes over a short window.** 23 of Dispatch's 115 wakes in the 7 days
+  to 2026-11-23 came within 60 seconds of the previous one (measured from transcript
+  timestamps), so a 60-second window could have merged at most 23, and every wake, Mikey's Slack DMs to the
   bot included, would wait for the window. The envelope removes more noise at no
   latency.
 - **A Claude Code setting, or MCP channels.** The docs list no setting that hides

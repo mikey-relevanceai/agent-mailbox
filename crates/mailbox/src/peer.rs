@@ -20,8 +20,8 @@
 //! The tag is what makes the receiving pane show the wake as one dim line —
 //! `› Message from @agent-mailbox: <first line> (ctrl+o to expand)` — instead of
 //! Claude Code's full peer wrapper around every wake. Without it the wrapper was
-//! about two thirds of each wake's characters in Dispatch's pane (measured over a
-//! week; ADR-0033).
+//! about three quarters of each wake's characters in Dispatch's pane (583 of a
+//! median 744, measured over a week; ADR-0033).
 //!
 //! We take the tag and nothing else from `SendMessage`'s envelope. In particular
 //! there is no `from-mode` attribute, because that asserts the sender's permission
@@ -145,12 +145,13 @@ pub fn frame(content: &str) -> String {
 
 /// Wrap `content` in the cross-session envelope.
 ///
-/// The layout copies what `SendMessage` writes, as seen in a real transcript: one
+/// The layout copies what `SendMessage` writes, as seen in real transcripts: one
 /// newline after the opening tag and one before the closing tag. In the 2.1.330
-/// bundle the envelope parser rebuilds that exact text and ignores anything that does
-/// not match it, and the renderer strips exactly those two newlines (read, not
-/// measured; ADR-0033). So we copy the layout exactly rather than find out what else
-/// it tolerates, and a trailing newline is trimmed off the body.
+/// bundle the renderer strips exactly those two newlines, and the function that
+/// reads `from-name` out of the envelope (`ji`) rebuilds the envelope and gives up if
+/// it differs from the text (read, not measured; ADR-0033). So we copy the layout
+/// exactly rather than find out what else it tolerates, and trim a trailing newline
+/// off the body.
 fn envelope(content: &str) -> String {
     let body = neutralise_tag(content.trim_end_matches('\n'));
     format!("<{ENVELOPE_TAG} from-name=\"{SENDER_NAME}\">\n{body}\n</{ENVELOPE_TAG}>")
@@ -243,8 +244,8 @@ mod tests {
     /// we do not own: Claude Code's minimal injection frame, carrying its
     /// cross-session envelope (ADR-0033). The layout around the body — one newline
     /// after the opening tag, one before the closing tag — copies `SendMessage`, and
-    /// the bundle's parser looks for exactly that (read, not measured), so it is part
-    /// of what is pinned.
+    /// the bundle's renderer and envelope reader expect exactly that (read, not
+    /// measured), so it is part of what is pinned.
     #[test]
     fn the_frame_is_the_minimal_shape_carrying_the_envelope() {
         let wire = frame("[agent-mailbox] one new message from t.a\n");
