@@ -18,6 +18,7 @@ pub mod clock;
 pub mod doctor;
 pub mod host;
 pub mod peer;
+pub mod reminder;
 pub mod resolver;
 pub mod storage;
 pub mod supervisor;

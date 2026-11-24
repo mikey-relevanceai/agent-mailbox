@@ -2118,14 +2118,7 @@ fn do_unread_digest(
         let topic = Topic::parse(&topic_str).map_err(|_| StorageError::Corrupt {
             detail: format!("invalid topic {topic_str:?} stored in subscription"),
         })?;
-        // The count comes from `COUNT(*) … GROUP BY`, which cannot produce a zero or
-        // a negative, so either is a broken query rather than a quiet topic.
-        let unread = u64::try_from(unread)
-            .ok()
-            .and_then(std::num::NonZeroU64::new)
-            .ok_or_else(|| StorageError::Corrupt {
-                detail: format!("unread count {unread} for topic {topic_str:?}"),
-            })?;
+        let unread = unread_count(unread, &topic_str)?;
         let digest = by_topic
             .entry(topic.clone())
             .or_insert_with(|| TopicDigest {
@@ -2155,6 +2148,21 @@ fn do_unread_digest(
         }
     }
     Ok(by_topic.into_values().collect())
+}
+
+/// Parse a digest row's `COUNT(*)` into a count that is never zero.
+///
+/// `COUNT(*) … GROUP BY` cannot produce a zero or a negative, so either means a
+/// broken query, not a quiet topic. It fails the whole digest as `Corrupt` rather
+/// than clamping, as the code before `NonZeroU64` did: a wake built on a made-up
+/// count would announce mail that is not there.
+fn unread_count(raw: i64, topic: &str) -> Result<std::num::NonZeroU64, StorageError> {
+    u64::try_from(raw)
+        .ok()
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or_else(|| StorageError::Corrupt {
+            detail: format!("unread count {raw} for topic {topic:?}"),
+        })
 }
 
 /// The sessions that have REGISTERED an agent inbox (card-16 `agents`).
@@ -2951,6 +2959,24 @@ mod tests {
             subject,
         )
         .unwrap();
+    }
+
+    /// A digest's count is never zero, and a zero or negative from the query is
+    /// corrupt storage, not a quiet topic: it must fail loudly rather than clamp into
+    /// a wake that announces mail that is not there.
+    #[test]
+    fn a_digest_count_must_be_positive() {
+        assert_eq!(unread_count(1, "t.a").unwrap().get(), 1);
+        assert_eq!(
+            unread_count(i64::MAX, "t.a").unwrap().get(),
+            i64::MAX as u64
+        );
+        for bad in [0, -1, i64::MIN] {
+            assert!(
+                matches!(unread_count(bad, "t.a"), Err(StorageError::Corrupt { .. })),
+                "{bad} must be refused"
+            );
+        }
     }
 
     /// The unread count as `status` reports it: EVERY event beyond the cursor, whoever

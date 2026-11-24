@@ -44,9 +44,10 @@ pub use error::StorageError;
 pub use mailbox_protocol::Cursor;
 pub use model::{
     EndSessionOutcome, ExpiredSuspensions, FilterChange, HistoryEntry, HistoryScope,
-    NoHistoryScope, Pid, ReadPage, RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY, SessionId,
-    SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest, TopicSummary, Watch, WatchId,
-    WatchKind, WatchSpec, WatchState, WatchTarget, history_cutoff, slack_kind,
+    NoHistoryScope, Pid, ReadPage, RecordInterestOutcome, ResumeOutcome, SLACK_BOT_KEY,
+    SessionDigest, SessionId, SubjectBudget, SubscribeKind, SubscribeOutcome, TopicDigest,
+    TopicSummary, Watch, WatchId, WatchKind, WatchSpec, WatchState, WatchTarget, history_cutoff,
+    slack_kind,
 };
 // The one permitted read-only side connection (ADR-0003), used by the wake
 // waiter. Crate-private like its `Command` sibling — its only consumer is the
@@ -578,13 +579,15 @@ impl Storage {
         &self,
         session: SessionId,
         subjects: SubjectBudget,
-    ) -> Result<Vec<TopicDigest>, StorageError> {
-        self.call(|reply| Command::UnreadDigest {
-            session,
-            subjects,
-            reply,
-        })
-        .await
+    ) -> Result<SessionDigest, StorageError> {
+        let topics = self
+            .call(|reply| Command::UnreadDigest {
+                session: session.clone(),
+                subjects,
+                reply,
+            })
+            .await?;
+        Ok(SessionDigest::new(session, topics))
     }
 
     /// The topics `session` is currently subscribed to, in ascending topic order.

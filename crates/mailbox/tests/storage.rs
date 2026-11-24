@@ -751,7 +751,8 @@ async fn unread_digest_reports_per_topic_and_does_not_consume() {
     let digest = storage
         .unread_digest(session.clone(), SubjectBudget::CountsOnly)
         .await
-        .unwrap();
+        .unwrap()
+        .into_topics();
     assert_eq!(
         digest
             .iter()
@@ -773,6 +774,7 @@ async fn unread_digest_reports_per_topic_and_does_not_consume() {
             .unread_digest(session, SubjectBudget::CountsOnly)
             .await
             .unwrap()
+            .into_topics()
             .is_empty()
     );
 }
@@ -810,6 +812,12 @@ async fn unread_digest_returns_the_newest_subjects_per_topic_with_the_full_count
         )
         .await
         .unwrap();
+    assert_eq!(
+        digest.session(),
+        &session,
+        "the digest is labelled with the session it was read for"
+    );
+    let digest = digest.into_topics();
     assert_eq!(digest.len(), 1);
     assert_eq!(
         digest[0].unread.get(),
@@ -873,7 +881,8 @@ async fn unread_digest_keeps_each_topics_subjects_to_that_topic() {
     let digest = storage
         .unread_digest(session, SubjectBudget::Newest(NonZeroU32::new(2).unwrap()))
         .await
-        .unwrap();
+        .unwrap()
+        .into_topics();
 
     assert_eq!(
         digest
@@ -942,7 +951,8 @@ async fn unread_digest_counts_subject_less_events_without_describing_them() {
     let digest = storage
         .unread_digest(session, SubjectBudget::Newest(NonZeroU32::new(3).unwrap()))
         .await
-        .unwrap();
+        .unwrap()
+        .into_topics();
     assert_eq!(digest[0].unread.get(), 4);
     assert_eq!(
         digest[0]

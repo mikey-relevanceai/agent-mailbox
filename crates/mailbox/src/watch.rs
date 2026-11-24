@@ -569,6 +569,7 @@ async fn session_status(
     let unread = storage
         .unread_digest(session.clone(), SubjectBudget::CountsOnly)
         .await?
+        .into_topics()
         .into_iter()
         .map(|digest| (digest.topic, digest.unread.get()))
         .collect();

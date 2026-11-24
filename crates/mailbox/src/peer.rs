@@ -43,10 +43,10 @@
 //! # Body-free, still
 //!
 //! The socket *could* carry an event body; it must not. The content is a
-//! [`Reminder`], which only [`crate::wake::Wake::render`] can build — topic names,
+//! [`Reminder`], which only [`crate::reminder::Wake::render`] can build — topic names,
 //! counts, and bounded subject lines — and the body stays in the durable log until
 //! the agent's `read`. This module does not decide what may be in it; that decision
-//! lives in one place, and it is [`crate::wake`]. Taking the type rather than a
+//! lives in one place, and it is [`crate::reminder`]. Taking the type rather than a
 //! string is what makes that hold: nothing else can be sent under the
 //! `agent-mailbox` name.
 //!
@@ -64,7 +64,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::wake::Reminder;
+use crate::reminder::{Reminder, SENDER_NAME};
 
 /// How long a single delivery may spend writing before we give up on it.
 ///
@@ -126,11 +126,6 @@ pub enum PeerDeliveryError {
 /// Claude Code's full wrapper. That is inferred from the bundle, where the text test
 /// simply fails over to the ordinary renderer; it has not been observed.
 const ENVELOPE_TAG: &str = "cross-session-message";
-
-/// The name the receiving pane shows the wake as coming from:
-/// `› Message from @agent-mailbox: …`. It is the same identity as
-/// [`crate::wake::PREFIX`], and a test keeps the two in step.
-const SENDER_NAME: &str = "agent-mailbox";
 
 /// Build the wake frame for `reminder`.
 ///
@@ -338,17 +333,6 @@ mod tests {
         );
     }
 
-    /// The pane's `@agent-mailbox` and the text's `[agent-mailbox]` are one identity:
-    /// a woken agent is told who started its turn by both. Renaming one alone would
-    /// split it.
-    #[test]
-    fn the_sender_name_and_the_prefix_name_the_same_system() {
-        assert_eq!(crate::wake::PREFIX, format!("[{SENDER_NAME}]"));
-    }
-
-    /// The edges of the tag-breaking scan, where byte-index slicing would go wrong:
-    /// a tag at either end, adjacent tags, multi-byte text beside a match, a `<`
-    /// as the last character, and a truncated tag name.
     #[test]
     fn tag_breaking_handles_the_edges() {
         let cases = [
