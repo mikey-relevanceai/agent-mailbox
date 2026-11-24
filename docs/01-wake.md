@@ -43,14 +43,20 @@ An idle subscribed session costs **zero** model turns until real mail arrives.
 ## The frame
 
 ```json
-{"type":"user","message":{"role":"user","content":"[agent-mailbox] mail on 2 topics …"}}
+{"type":"user","message":{"role":"user","content":"<cross-session-message from-name=\"agent-mailbox\">\n[agent-mailbox] 3 new messages on 2 topics\n…\n</cross-session-message>"}}
 ```
 
-Newline-terminated, written to the session's `messagingSocketPath`. What the agent
-reads is:
+Newline-terminated, written to the session's `messagingSocketPath`. The pane shows it
+as one dim line ([ADR-0033](adr/0033-the-wake-rides-the-cross-session-envelope.md)):
+
+```text
+› Message from @agent-mailbox: [agent-mailbox] 3 new messages on 2 topics (ctrl+o to expand)
+```
+
+What the agent reads, inside the envelope, is:
 
 ```
-[agent-mailbox] mail on 2 topics — run `mailbox read`
+[agent-mailbox] 3 new messages on 2 topics
 
 github.pr.acme/web#42 — 2 unread
   · CI failed: build
@@ -60,24 +66,48 @@ github.pr.acme/web#42 — 2 unread
 
 agent.983eae5f-0b09 — 1 unread
   · from 700a3bf5-1c4d: PR 42 review finished
+
+Run `mailbox read` to read them.
 ```
 
-Four properties are deliberate, and each is pinned by a test:
+A single event puts everything in the first line, because that is the line the pane
+shows:
+
+```
+[agent-mailbox] one new message from github.pr.acme/web#42 — CI failed: build
+https://github.com/acme/web/actions/runs/9/job/2
+
+Run `mailbox read` to read it.
+```
+
+The headline names the session's own inbox as `your inbox`. Its topic is
+`agent.<session id>`, and the 36-character id would push the subject off the preview.
+
+Five properties are deliberate, and each is pinned by a test:
 
 - **Pointer, not payload** ([ADR-0022](adr/0022-the-wake-carries-a-subject.md)).
   `content` carries topic names, unread counts, and each event's `subject` — one line
   its publisher wrote saying *what* changed, and a link to it. The event **body** stays
   in the durable log until the agent's `read`. The socket *could* carry a body; it must
   not, or the agent would have two places to look for the truth.
-- **Tagged `[agent-mailbox]`.** The first thing on the wire, so a woken agent knows
-  which system started its turn and which skill to load. A `Subject` cannot contain a
-  newline, so nothing after that line can forge another one — or a second bullet, or a
-  second topic block.
-- **No permission class asserted.** The richer envelope `SendMessage` writes carries a
-  `from-mode` field claiming whether the sender bypasses permission prompts. It is
-  believed without verification — and claiming `bypass` is exactly what makes an
-  ordinary permission-prompting session HOLD the message. The honest frame is the more
-  deliverable one.
+- **One line in the pane.** The `<cross-session-message>` tag is what Claude Code's
+  own `SendMessage` uses, and the pane draws text that opens with it as a single
+  collapsed line. Without it, Claude Code prints its whole peer wrapper around every
+  wake — about 8 lines on top of ours at 120 columns (an estimate from character
+  counts; ADR-0033). The model still receives the wrapper, the tag and the full
+  text either way; only the pane changes.
+- **Tagged `[agent-mailbox]`.** The first thing inside the envelope, so a woken agent
+  knows which system started its turn and which skill to load. The envelope's opening
+  tag before it is fixed bridge text. A `Subject` cannot contain a newline, so nothing
+  after that line can forge another one — or a second bullet, or a second topic block.
+  An envelope tag inside the text is broken (`<` becomes `<\`) the way Claude Code's
+  own sender does it, so a subject cannot close the envelope early either.
+- **No permission class asserted.** The envelope `SendMessage` writes also carries a
+  `from-mode` attribute claiming whether the sender bypasses permission prompts. It
+  is believed without verification — and claiming `bypass` is exactly what makes an
+  ordinary permission-prompting session HOLD the message. We take the tag and
+  `from-name` only: no `from-mode`, and no top-level `from` reply address, since there
+  is no Claude session at our end to reply to.
 - **Never empty.** Delivery *is* the turn; there is no second opinion between the
   socket and the model. A wake with nothing unread would spend a model turn announcing
   nothing, so it is not sent.
@@ -233,6 +263,25 @@ The daemon logs its per-publish outcome at INFO:
 | `a subscriber has no Claude Code inbox socket, so it cannot be woken` | that session lost its socket after subscribing |
 | `could not deliver a subscriber's wake` | the socket refused the frame; the event is still durable |
 
+## Checking how a wake renders
+
+The one-line pane rendering depends on undocumented Claude Code behaviour: the pane
+draws text that opens with `<cross-session-message …>` through its compact peer
+renderer ([ADR-0033](adr/0033-the-wake-rides-the-cross-session-envelope.md)). After a
+Claude Code upgrade, or if wakes start showing as full blocks again, check it:
+
+```bash
+cargo build -p mailbox
+scripts/probe-wake-render.py            # one event, default permission mode
+scripts/probe-wake-render.py --bypass   # a bypassPermissions receiver, like an unattended fleet
+```
+
+It starts a private `mailbox serve` and a throwaway Claude Code session (no user
+settings, so no hooks reach the shared bridge), publishes to it, and reports whether
+the pane showed `Message from @agent-mailbox` or Claude Code's full wrapper. Each run
+spends one small Haiku turn. ADR-0033 records how the renderer was found in the
+Claude Code bundle, in case the tag changes and has to be found again.
+
 ## Design notes
 
 **No coalescing.** Every publish to a subscribed topic delivers a frame. A burst of N
@@ -293,7 +342,7 @@ sequenceDiagram
     Adapter->>Bridge: publish(topic, event)
     Bridge->>Bridge: append durable log; advance offset
     Bridge->>Bridge: look up subscribers in ~/.claude/sessions
-    Bridge->>Claude: write the inbox socket ("[agent-mailbox] mail on X — · what changed")
+    Bridge->>Claude: write the inbox socket ("[agent-mailbox] one new message from X — what changed")
     Claude->>Agent: start a turn with the message
     Agent->>Bridge: read(my cursors)
     Bridge-->>Agent: unread events (bodies live here, never on the wake wire)

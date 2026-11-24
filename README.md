@@ -34,14 +34,21 @@ the durable log until it runs `mailbox read`
 ([ADR-0022](docs/adr/0022-the-wake-carries-a-subject.md)):
 
 ```text
-[agent-mailbox] mail on 1 topic — run `mailbox read`
+[agent-mailbox] 2 new messages from github.pr.acme/web#42
 
 github.pr.acme/web#42 — 2 unread
   · CI failed: build
     https://github.com/acme/web/actions/runs/9/job/2
   · new comment
     https://github.com/acme/web/pull/42#issuecomment-2145678
+
+Run `mailbox read` to read them.
 ```
+
+In the pane that is one line, `› Message from @agent-mailbox: [agent-mailbox] 2 new
+messages from github.pr.acme/web#42 (ctrl+o to expand)`: the wake rides Claude Code's
+cross-session envelope, so a busy pane is not buried in wakes
+([ADR-0033](docs/adr/0033-the-wake-rides-the-cross-session-envelope.md)).
 
 Requires **Claude Code 2.1.226+**, plus two settings that are not on by default —
 see [Setup: what the wake depends on](#setup-what-the-wake-depends-on). A session

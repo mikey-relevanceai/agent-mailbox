@@ -68,6 +68,13 @@ same-user file registration):
 Claude Code's own startup log publishes a minimal equivalent, and it is the one we
 use: `{"type":"user","message":{"role":"user","content":"…"}}`, newline-terminated.
 
+> **Amended by [ADR-0033](0033-the-wake-rides-the-cross-session-envelope.md).** The
+> content inside that minimal frame is now wrapped in the `<cross-session-message>`
+> tag, with `from-name="agent-mailbox"` and no `from-mode`. The tag alone is what
+> makes Claude Code's pane show a peer message as one line; `from-mode` turned out to
+> be separable from it. Everything this ADR says about not claiming a permission class
+> still holds.
+
 Three further findings shape the decision:
 
 1. **The permission class is self-asserted in the frame and unverified.** A sender

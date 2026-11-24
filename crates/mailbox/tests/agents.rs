@@ -81,9 +81,11 @@ fn round_trip_two_idle_agents_wake_each_other() {
     // never deliver" has to hold (ADR-0022).
     let frame = inbox_b.next_frame(SETTLE).expect("B is woken on its inbox");
     let content = frame["message"]["content"].as_str().unwrap_or_default();
+    // B's own inbox is named as such: the 36-character topic would push the
+    // sender and subject off the one-line pane preview (ADR-0033).
     assert!(
-        content.contains(&format!("agent.{b}")),
-        "the wake names B's inbox topic: {content}"
+        content.contains("[agent-mailbox] one new message from your inbox"),
+        "the wake says the mail is in B's own inbox: {content}"
     );
     assert!(
         content.contains(&format!("message from {a}")),
@@ -111,8 +113,10 @@ fn round_trip_two_idle_agents_wake_each_other() {
         frame["message"]["content"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("agent.{a}")),
-        "the reply's wake names A's inbox topic"
+            .contains(&format!(
+                "one new message from your inbox — message from {b}"
+            )),
+        "the reply's wake says it is in A's own inbox, and who it is from"
     );
 
     let events = env.read_events(a);
@@ -184,9 +188,11 @@ fn a_human_with_no_session_can_list_agents_and_poke_one() {
         .next_frame(SETTLE)
         .expect("a human's message wakes B like any other");
     let content = frame["message"]["content"].as_str().unwrap_or_default();
+    // B's own inbox is named as such: the 36-character topic would push the
+    // sender and subject off the one-line pane preview (ADR-0033).
     assert!(
-        content.contains(&format!("agent.{b}")),
-        "the wake names B's inbox topic: {content}"
+        content.contains("[agent-mailbox] one new message from your inbox"),
+        "the wake says the mail is in B's own inbox: {content}"
     );
     // The bridge stamps what it VERIFIED, so an unstamped message says so rather
     // than naming a sender nobody checked.
@@ -243,7 +249,9 @@ fn a_sent_subject_reaches_the_peer_wake_but_the_message_text_does_not() {
     let frame = inbox_b.next_frame(SETTLE).expect("B is woken");
     let content = frame["message"]["content"].as_str().unwrap_or_default();
     assert!(
-        content.contains(&format!("· from {a}: stop rebasing, PR 42 is wrong")),
+        content.contains(&format!(
+            "from your inbox — from {a}: stop rebasing, PR 42 is wrong"
+        )),
         "the sender's subject, attributed to the sender the BRIDGE verified: {content}"
     );
     assert!(

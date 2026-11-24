@@ -204,10 +204,12 @@ mailbox publish TOPIC --body '{"...":"..."}'
 ### On wake
 
 When the world changes, the bridge writes to your session's inbox and you start a
-turn with a message like this:
+turn with a message from another session named `agent-mailbox`. It arrives wrapped
+in a `<cross-session-message from-name="agent-mailbox">` tag, and the text inside
+reads like this:
 
 ```text
-[agent-mailbox] mail on 2 topics — run `mailbox read`
+[agent-mailbox] 3 new messages on 2 topics
 
 github.pr.OWNER/REPO#42 — 2 unread
   · CI failed: build
@@ -217,12 +219,25 @@ github.pr.OWNER/REPO#42 — 2 unread
 
 agent.983eae5f-0b09 — 1 unread
   · from 700a3bf5-1c4d: PR 42 is approved, please rebase
+
+Run `mailbox read` to read them.
 ```
 
-**`[agent-mailbox]` is the tag that says this skill applies.** If a message starts
-with it, the mailbox woke you: read your mail and act on it.
+A single event fits on the first line, with its link under it:
 
-Each `·` line is one event's **subject** — a pointer to what changed, with a link
+```text
+[agent-mailbox] one new message from your inbox — from 700a3bf5-1c4d: PR 42 is approved, please rebase
+
+Run `mailbox read` to read it.
+```
+
+**`[agent-mailbox]` is the tag that says this skill applies.** If the message text
+starts with it, the mailbox woke you: read your mail and act on it. It is not a peer
+Claude session, so there is no `SendMessage` reply address; reply to a peer with
+`mailbox send`. `your inbox` is your own `agent.<your session id>` topic.
+
+Each `·` line — or, for a single event, the text after the `—` on the first line —
+is one event's **subject**: a pointer to what changed, with a link
 straight to it. Use the links: they are why you do not have to re-derive the delta
 yourself. The subject is *not* the event, though; the body is in the durable log, so
 still:

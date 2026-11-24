@@ -6,8 +6,8 @@
 #   1. the four-verb agent loop works: subscribe -> (publish) -> read;
 #   2. an *idle* session wakes when mail lands (the daemon writes that session's
 #      Claude Code inbox socket as part of the publish, delivering an
-#      "[agent-mailbox] mail on ..." reminder that names the topic and what
-#      changed on it — never the event body);
+#      "[agent-mailbox] one new message from ..." reminder that names the topic
+#      and what changed on it — never the event body);
 #   3. a bridge-supervised adapter (the reference `stub` poller) publishes edges
 #      on its own and wakes the same way — no agent-owned background poller;
 #   4. `unwatch` / end-session tears the adapter down (no zombie pollers).
