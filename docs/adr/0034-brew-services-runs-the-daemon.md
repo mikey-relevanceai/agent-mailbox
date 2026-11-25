@@ -53,7 +53,7 @@ The block, in `scripts/render-formula.sh`:
 |---|---|
 | `run [opt_bin/"mailbox", "serve"]` | The `opt` path survives `brew upgrade`. The Cellar path does not ([ADR-0025](0025-hooks-point-at-a-stable-path.md)). |
 | `keep_alive true` | A crash restarts it. On Linux this is `Restart=on-failure`, so `systemctl --user stop` still stops it, and so does a `SIGTERM`, which the daemon answers with a clean exit. |
-| `throttle_interval 10` + `restart_delay 10` | At most one restart per 10 s on both platforms. Without `RestartSec`, systemd retries after 100 ms, hits its default limit of 5 starts in 10 s, and leaves the unit failed for good (systemd's documented defaults, not measured here). A daemon refused by another daemon's lock exits non-zero straight away, so it would hit that limit. |
+| `throttle_interval 10` + `restart_delay 10` | At most one start per 10 s on both platforms. launchd respawns at once but never more than once per `ThrottleInterval` since the last spawn (10 is launchd's default; stating it keeps both platforms visibly alike). systemd always waits `RestartSec`. Without `RestartSec`, systemd retries after 100 ms, hits its default limit of 5 starts in 10 s, and leaves the unit failed for good (systemd's documented defaults, not measured here). A daemon refused by another daemon's lock exits non-zero straight away, so it would hit that limit. |
 | `environment_variables PATH: std_service_path_env` | Without it the job's `PATH` lacks Homebrew's `bin`, so the github-pr adapter could not find `gh`. Measured: launchd's default is `/usr/bin:/bin:/usr/sbin:/sbin` (`launchctl print`), and the test container's systemd user manager had `/usr/local/sbin:…:/snap/bin`, with no `linuxbrew` (`systemctl --user show-environment`). |
 | `log_path` / `error_log_path` → `var/"log/mailbox.log"` | Homebrew's convention, created by `brew install`, and the same file on both platforms. The daemon logs to stderr. |
 
@@ -67,7 +67,7 @@ own `~/.agent-mailbox`, that an upgrade needs `brew services restart`, and, on L
 ## Consequences
 
 - **A Homebrew user gets a supervised daemon in one command.** It starts at login,
-  restarts 10 s after a crash, and logs to a known file.
+  restarts after a crash, at most once per 10 s, and logs to a known file.
 - **An upgrade is two commands, not one.** `brew upgrade` leaves the old daemon
   running the old code, holding the lock. The docs and caveats say
   `brew services restart mailbox`. On Linux the old daemon then runs from a deleted
@@ -86,13 +86,24 @@ own `~/.agent-mailbox`, that an upgrade needs `brew services restart`, and, on L
   Code sessions in a surviving `tmux` live on with nothing to wake them.
 - **Linux has no Slack.** Nothing changes from
   [ADR-0027](0027-adapter-secrets-live-in-the-keychain.md): the adapter reads its
-  tokens through the macOS `security` CLI, which Linux lacks. GitHub watches work.
+  tokens through the macOS `security` CLI, which Linux lacks. GitHub watches need
+  `gh` to find its credentials from the service's environment, which was not tested
+  under a lingering unit started at boot.
 - **The service does not see the user's shell environment.** `CLAUDE_CONFIG_DIR` or
   `MAILBOX_CLAUDE_SESSIONS_DIR` exported in a shell never reaches it, and a daemon
   looking in the wrong sessions directory wakes nobody. Homebrew merges
-  `~/.homebrew/services/mailbox.env` into the service definition (`service.rb`,
-  `effective_environment_variables`), so that file is where such overrides go. It
+  `$HOMEBREW_USER_CONFIG_HOME/services/mailbox.env` (default `~/.homebrew/`) into
+  the service definition (`service.rb`, `effective_environment_variables`, since
+  Homebrew 6.0.15), so that file is where such overrides go. It
   reached the daemon, and was still applied after an upgrade (measured).
+- **Upgrading needs the right restart.** `brew services restart` on a service that
+  was never started starts it. A user whose daemon runs some other way, following
+  "restart after an upgrade" literally, would start a second daemon into the lock
+  loop. The docs and caveats say the restart applies to the brew service only.
+- **The formula needs Homebrew 5.0.3 or later**, where `throttle_interval` arrived
+  (`git tag --contains` on the commit that added it). An older Homebrew fails to
+  load the formula at all. `brew install` auto-updates Homebrew first unless
+  `HOMEBREW_NO_AUTO_UPDATE` is set.
 - **Two daemons cannot run.** A service started while a hand-made daemon holds the
   lock exits and is restarted every 10 s until the other one stops (measured on
   Linux). The flock

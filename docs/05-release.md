@@ -56,6 +56,9 @@ never restarts it. Two things to keep when editing the renderer:
   like `$USER`, must be written `\$USER`, or the render bakes in the CI runner's
   value. `scripts/test-render-formula.sh` pins both.
 
+`throttle_interval` needs Homebrew 5.0.3 or later. An older Homebrew refuses to load
+the whole formula, not just the service.
+
 User-facing detail, including moving off a hand-made daemon: [04-usage](04-usage.md#run-the-daemon-as-a-service).
 
 ### Supported platforms

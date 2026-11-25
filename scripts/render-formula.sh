@@ -154,18 +154,21 @@ class Mailbox < Formula
 
           mailbox doctor
 
-      The daemon (\`mailbox serve\`) runs as a login service once you start it
-      with the \`brew services start\` command Homebrew prints after these notes.
-      Homebrew does not let a formula start its own service. Its log is
-      #{var}/log/mailbox.log.
+      Homebrew does not let a formula start its own service. Start the daemon
+      (\`mailbox serve\`) as a login service with:
+
+          brew services start mailbox
+
+      Its log is #{var}/log/mailbox.log.
 
       Only one daemon can own ~/.agent-mailbox. If you already run
       \`mailbox serve\` some other way (a hand-made LaunchAgent, a systemd unit,
       a tmux pane), stop that first, or this one restarts every 10 seconds
       against the lock.
 
-      \`brew upgrade mailbox\` does not restart the daemon. Afterwards restart it
-      and re-run the two setup commands above:
+      \`brew upgrade mailbox\` does not restart the daemon. If you started it
+      with \`brew services\`, restart it afterwards and re-run the two setup
+      commands above:
 
           brew services restart mailbox
 
