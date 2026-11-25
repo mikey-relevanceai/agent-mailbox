@@ -53,6 +53,22 @@ for pair in "aarch64-apple-darwin:a" "x86_64-apple-darwin:b" "x86_64-unknown-lin
   check "${line}" "      sha256 \"${expected}\"" "${target} url is followed by its own checksum"
 done
 
+# --- the service block (ADR-0034) -------------------------------------------
+# Each line here is a decision a later edit could quietly undo, and `brew style`
+# accepts every one of the wrong values.
+has() { if grep -qF -- "$1" "${out}"; then ok "$2"; else bad "$2 (no '$1')"; fi; }
+has 'run [opt_bin/"mailbox", "serve"]' "the service runs serve from the opt path, never the Cellar"
+has 'keep_alive true' "the service is restarted when it dies"
+has 'throttle_interval 10' "macOS waits between restarts"
+# Without it systemd retries after 100ms, hits its 5-in-10s limit and gives up.
+has 'restart_delay 10' "Linux waits between restarts"
+has 'environment_variables PATH: std_service_path_env' "the service PATH reaches brew's gh"
+check "$(grep -c '^  service do$' "${out}")" "1" "renders exactly one service block"
+
+# The formula is an unquoted heredoc, so a bare $USER in the caveats is expanded
+# by whoever renders it: the CI runner's name would ship to every user.
+has 'enable-linger "$USER"' "the linger caveat keeps \$USER for the reader's shell"
+
 # --- it is valid Ruby -------------------------------------------------------
 if command -v ruby >/dev/null 2>&1; then
   if ruby -c "${out}" >/dev/null 2>&1; then ok "output parses as Ruby"; else bad "output parses as Ruby"; fi

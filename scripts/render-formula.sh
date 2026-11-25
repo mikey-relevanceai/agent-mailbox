@@ -163,15 +163,15 @@ class Mailbox < Formula
       a tmux pane), stop that first, or this one restarts every 10 seconds
       against the lock.
 
-      \`brew upgrade mailbox\` does not restart the daemon. Afterwards run:
+      \`brew upgrade mailbox\` does not restart the daemon. Afterwards restart it
+      and re-run the two setup commands above:
 
           brew services restart mailbox
-          mailbox harness install-skills
 
       On Linux the service is a systemd user unit, which stops when you log out
       unless lingering is on:
 
-          loginctl enable-linger "$USER"
+          loginctl enable-linger "\$USER"
     EOS
   end
 
