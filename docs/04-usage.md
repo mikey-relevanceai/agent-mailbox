@@ -38,8 +38,39 @@ that failure is silent and partial: peers can no longer address the session whil
 topic wakes carry on working ([ADR-0025](adr/0025-hooks-point-at-a-stable-path.md)).
 `brew info mailbox` prints the same command back at you.
 
-Upgrades are then just `brew upgrade mailbox` — plus a `mailbox serve` restart,
-since the running daemon is still the old code and holds the lock.
+Then start the daemon as a login service ([ADR-0034](adr/0034-brew-services-runs-the-daemon.md)):
+
+```bash
+brew services start mikey-relevanceai/tap/mailbox
+```
+
+`brew install` cannot do this step for you. Homebrew gives a formula no way to start
+its own service, so the formula declares one and you start it, once. From then on it
+starts at login and restarts if it dies. On macOS it is a LaunchAgent, on Linux a
+systemd user unit. Its log is `$(brew --prefix)/var/log/mailbox.log`, and
+`brew services info mailbox` shows its state. Read
+[Run the daemon as a service](#run-the-daemon-as-a-service) before starting it if
+something else already runs `mailbox serve` on this machine.
+
+#### Upgrading
+
+```bash
+brew upgrade mailbox
+brew services restart mailbox   # only if you run the brew service; see below
+mailbox harness install-skills
+mailbox harness install-hooks --mailbox-bin "$(brew --prefix)/opt/mailbox/bin/mailbox"
+```
+
+`brew upgrade` does **not** restart the service, so the old daemon keeps running the
+old code, and keeps the lock, until you restart it. Run `brew services restart` only
+if you started the daemon with `brew services start`. On a service that was never
+started, `restart` starts it and registers it for login. If your daemon runs some
+other way, that second daemon then loops on the lock. In that case restart your own
+daemon instead, or move to the service first
+([Moving to `brew services`](#moving-to-brew-services-from-a-hand-made-daemon)). Run `install-skills` because the
+skill is embedded in the binary and an upgrade can change it. Run `install-hooks`
+because the re-run sweeps hooks that newer versions retired. The hook path itself
+survives the upgrade, because it is the `opt` path.
 
 ### From source
 
@@ -145,8 +176,9 @@ that socket — it keeps no per-session state of its own.
 
 Every command except `mailbox doctor` is a client of the `mailbox serve` daemon
 (`doctor` reads Claude Code's registry and the process table, not the store, so it
-works when the daemon is the broken thing). Start the daemon once — a login item, a `tmux` pane, or a user
-service:
+works when the daemon is the broken thing). On a Homebrew install, run it as a
+service (next section). Otherwise start it once, in a `tmux` pane or a login item of
+your own:
 
 ```bash
 mailbox serve
@@ -156,6 +188,104 @@ If the daemon is **down**, clients fail loudly — non-zero with
 `bridge not running; start it with 'mailbox serve'` — rather than silently
 opening the DB or spawning a second writer. A second `serve` on the same DB also
 fails loudly (the lock is held for the daemon's whole life).
+
+### Run the daemon as a service
+
+On a Homebrew install, `brew services start mikey-relevanceai/tap/mailbox` runs
+`mailbox serve` for you ([ADR-0034](adr/0034-brew-services-runs-the-daemon.md)).
+What the service does:
+
+| | macOS | Linux |
+|---|---|---|
+| Registered as | LaunchAgent `~/Library/LaunchAgents/sh.brew.mailbox.plist`, in your `gui/<uid>` login domain | systemd user unit `~/.config/systemd/user/sh.brew.mailbox.service` |
+| Runs | `$(brew --prefix)/opt/mailbox/bin/mailbox serve`: the `opt` path, so an upgrade cannot delete it ([ADR-0025](adr/0025-hooks-point-at-a-stable-path.md)) | same |
+| Starts | at login | at login, or at boot with lingering on (below) |
+| If it dies | restarted at once, but never more than once per 10 s (`KeepAlive` + `ThrottleInterval 10`) | restarted after 10 s if it failed (`Restart=on-failure`, `RestartSec=10`). A clean exit on `SIGTERM` is a stop, not a failure, so it stays stopped |
+| Log | `$(brew --prefix)/var/log/mailbox.log` | same |
+| `PATH` | `$(brew --prefix)/bin` first, so adapters find `gh` | same |
+| Slack tokens | read from your login Keychain ([ADR-0027](adr/0027-adapter-secrets-live-in-the-keychain.md)). Expected to work, not yet tested through `brew services`: a hand-made LaunchAgent in the same `gui/<uid>` domain reads them fine. If you start the service over SSH, `brew services` uses the `user/<uid>` domain instead, where Keychain access is untested | **none.** There is no Keychain, so Slack watches fail at start (ADR-0027). GitHub watches need `gh` authenticated for the service's environment, which is untested under a lingering unit |
+
+Older Homebrew versions name the job `homebrew.mxcl.mailbox` (plist) or
+`homebrew.mailbox` (unit). `brew services info mailbox` prints the name and file
+your Homebrew uses.
+
+**The service gets its environment from Homebrew, not your shell.** It has your
+`HOME` and the `PATH` above, and nothing else you exported. Two kinds of variable
+matter if you set them in your shell:
+
+- `CLAUDE_CONFIG_DIR` or `MAILBOX_CLAUDE_SESSIONS_DIR`. Without it the daemon looks
+  in the wrong sessions directory and wakes nobody (see the README's setup table).
+- `AGENT_MAILBOX_HOME` or `AGENT_MAILBOX_DB`. Without it the daemon serves a
+  different socket from the one your shell's clients dial, so every client reports
+  the bridge down while the service runs.
+
+Give them to the service in `services/mailbox.env` under Homebrew's user config
+directory: `~/.homebrew/` by default, or `$XDG_CONFIG_HOME/homebrew/` if you set
+`XDG_CONFIG_HOME`. Write one `KEY=value` per line, then `brew services restart mailbox`.
+Homebrew skips the file, with a warning, if it is group- or world-writable, so
+`chmod 600` it. The file needs Homebrew 6.0.15 or later. Homebrew merges it into
+the service definition, and it still applied after an upgrade in testing
+([ADR-0034](adr/0034-brew-services-runs-the-daemon.md#how-it-was-tested)). To
+confirm, look for the variable in the generated plist or unit file.
+
+**Linux: turn lingering on.** systemd runs user units only while you have a
+session. Without lingering, logging out of the last session stops the daemon, while
+Claude Code sessions in a surviving `tmux` keep running with nothing to wake them.
+`brew services` does not set lingering for you:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+With lingering on, the daemon starts at boot and survives logout.
+
+**Only one daemon.** The database lock admits one `mailbox serve`. A service started
+while another daemon holds the lock exits on the lock, is restarted 10 s later, and
+loops like that, logging the refusal, until the other one stops. Nothing is
+corrupted, but it is not running either. Stop the other daemon first.
+
+#### Moving to `brew services` from a hand-made daemon
+
+If you already run `mailbox serve` some other way (a LaunchAgent you wrote, a
+systemd unit, a `tmux` pane, a source install in `~/.local/bin`), move over in this
+order. The state in `~/.agent-mailbox` carries over: the brew daemon opens the
+same database, and watches resume when it starts ([ADR-0010](adr/0010-resume-watches-on-restart.md)).
+
+```bash
+# 1. Install, without starting anything yet.
+brew install mikey-relevanceai/tap/mailbox
+
+# 2. Point the hooks at the brew binary BEFORE removing the old one, or the
+#    SessionStart hook fails in every session that starts in between.
+"$(brew --prefix)/opt/mailbox/bin/mailbox" harness install-hooks \
+  --mailbox-bin "$(brew --prefix)/opt/mailbox/bin/mailbox"
+"$(brew --prefix)/opt/mailbox/bin/mailbox" harness install-skills
+
+# 3. Stop the old daemon and stop it coming back. A LaunchAgent, for example:
+launchctl bootout "gui/$(id -u)/<its label>"
+mv ~/Library/LaunchAgents/<its label>.plist ~/<its label>.plist.disabled
+#    ...or a systemd user unit:  systemctl --user disable --now <unit>
+
+# 4. Start the service, and check a client reaches it.
+brew services start mikey-relevanceai/tap/mailbox
+"$(brew --prefix)/opt/mailbox/bin/mailbox" status
+
+# 5. Make `mailbox` on your PATH the brew one. Sessions that were already running
+#    before step 2 still call the OLD path from their SessionEnd hook, so replace
+#    it with a link rather than deleting it.
+ln -sf "$(brew --prefix)/opt/mailbox/bin/mailbox" ~/.local/bin/mailbox
+rm -f ~/.local/bin/mailbox-stub-adapter ~/.local/bin/mailbox-github-pr-adapter \
+      ~/.local/bin/mailbox-slack-adapter
+hash -r; command -v mailbox
+```
+
+Once every session started before step 2 has ended, you can delete the link too.
+
+Between steps 3 and 4 there is no daemon, so keep the gap short. `mailbox`
+commands in it fail loudly. What a watch misses while the daemon is down depends on
+its kind, and each kind's design doc says what. The Slack bot watch, for example,
+loses messages sent while no connection is open for more than a few minutes
+([design/04](design/04-slack-bot-watch.md)).
 
 ---
 

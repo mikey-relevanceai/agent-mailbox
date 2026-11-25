@@ -153,7 +153,51 @@ class Mailbox < Formula
       Check what is missing with:
 
           mailbox doctor
+
+      Homebrew does not let a formula start its own service. Start the daemon
+      (\`mailbox serve\`) as a login service with:
+
+          brew services start mailbox
+
+      Its log is #{var}/log/mailbox.log.
+
+      Only one daemon can own ~/.agent-mailbox. If you already run
+      \`mailbox serve\` some other way (a hand-made LaunchAgent, a systemd unit,
+      a tmux pane), stop that first, or this one restarts every 10 seconds
+      against the lock.
+
+      \`brew upgrade mailbox\` does not restart the daemon. If you started it
+      with \`brew services\`, restart it afterwards and re-run the two setup
+      commands above:
+
+          brew services restart mailbox
+
+      On Linux the service is a systemd user unit, which stops when you log out
+      unless lingering is on:
+
+          loginctl enable-linger "\$USER"
     EOS
+  end
+
+  # \`mailbox serve\` as a per-user login service: a LaunchAgent on macOS, a
+  # systemd user unit on Linux. Never root: the daemon reads the user's Claude
+  # Code sessions and writes their inbox sockets.
+  service do
+    # opt_bin, not bin: \`brew upgrade\` deletes the versioned path (ADR-0025).
+    run [opt_bin/"mailbox", "serve"]
+    keep_alive true
+    # Wait 10s between restarts so a daemon that cannot start (another one holds
+    # the lock) retries quietly instead of spinning. throttle_interval is the
+    # macOS knob. restart_delay is the Linux one (RestartSec): without it systemd
+    # restarts after 100ms, hits its default 5-starts-in-10s limit and gives up
+    # for good. launchd ignores the TimeOut key restart_delay also writes.
+    throttle_interval 10
+    restart_delay 10
+    # launchd and systemd both start jobs with a PATH lacking Homebrew's bin, so
+    # the github-pr adapter would not find \`gh\`.
+    environment_variables PATH: std_service_path_env
+    log_path var/"log/mailbox.log"
+    error_log_path var/"log/mailbox.log"
   end
 
   test do

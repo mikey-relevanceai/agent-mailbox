@@ -41,6 +41,26 @@ collision if ever pushed to homebrew/core, but the tap install path is unambiguo
 and homebrew/core is out of reach anyway. Do not rename unless homebrew/core
 becomes realistic — it is cheaper before the first tag than after.
 
+### The daemon is a `brew services` service
+
+The formula carries a `service do` block, so `brew services start
+mikey-relevanceai/tap/mailbox` runs `mailbox serve` as a LaunchAgent or a systemd user
+unit ([ADR-0034](adr/0034-brew-services-runs-the-daemon.md)). Homebrew gives a formula
+no way to start its own service, so install never starts it, and `brew upgrade`
+never restarts it. Two things to keep when editing the renderer:
+
+- **`run` must use `opt_bin`.** It is the path an upgrade re-points. `bin` in a
+  formula is the versioned Cellar path, which an upgrade deletes
+  ([ADR-0025](adr/0025-hooks-point-at-a-stable-path.md)).
+- **The caveats are an unquoted heredoc.** A shell variable meant for the reader,
+  like `$USER`, must be written `\$USER`, or the render bakes in the CI runner's
+  value. `scripts/test-render-formula.sh` pins both.
+
+`throttle_interval` needs Homebrew 5.0.3 or later. An older Homebrew refuses to load
+the whole formula, not just the service.
+
+User-facing detail, including moving off a hand-made daemon: [04-usage](04-usage.md#run-the-daemon-as-a-service).
+
 ### Supported platforms
 
 Prebuilt tarballs cover **macOS arm64, macOS x86_64, and Linux x86_64**. Windows is

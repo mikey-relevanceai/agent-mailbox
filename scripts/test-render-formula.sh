@@ -53,6 +53,48 @@ for pair in "aarch64-apple-darwin:a" "x86_64-apple-darwin:b" "x86_64-unknown-lin
   check "${line}" "      sha256 \"${expected}\"" "${target} url is followed by its own checksum"
 done
 
+# --- the service block (ADR-0034) -------------------------------------------
+# Each setting is a decision a later edit could quietly undo. Match whole lines
+# inside the block only, so a setting commented out, or mentioned in the caveats
+# instead, does not count.
+check "$(grep -c '^  service do$' "${out}")" "1" "renders exactly one service block"
+service="$(awk '/^  service do$/ { inside = 1; next } inside && /^  end$/ { exit } inside' "${out}")"
+in_service() {
+  if grep -qxF -- "    $1" <<<"${service}"; then ok "$2"; else bad "$2 (no line '    $1' in the service block)"; fi
+}
+in_service 'run [opt_bin/"mailbox", "serve"]' "the service runs serve from the opt path (ADR-0025)"
+in_service 'keep_alive true' "the service is restarted when it dies"
+in_service 'throttle_interval 10' "macOS waits between restarts"
+# Without it systemd retries after 100ms, hits its 5-in-10s limit and gives up.
+in_service 'restart_delay 10' "Linux waits between restarts"
+in_service 'environment_variables PATH: std_service_path_env' "the service PATH reaches brew's gh"
+in_service 'log_path var/"log/mailbox.log"' "stdout goes to the documented log"
+in_service 'error_log_path var/"log/mailbox.log"' "stderr, where the daemon logs, goes there too"
+if grep -q 'require_root' <<<"${service}"; then
+  bad "the service runs as the user, not root"
+else
+  ok "the service runs as the user, not root"
+fi
+
+# The caveats are the one place a user is told these; the docs are not read at
+# `brew install` time.
+has() { if grep -qF -- "$1" "${out}"; then ok "$2"; else bad "$2 (no '$1')"; fi; }
+has '#{var}/log/mailbox.log' "the caveats name the log the service writes"
+has 'brew services restart mailbox' "the caveats say an upgrade needs a restart"
+
+# The formula is an unquoted heredoc, so anything shell-like in it is expanded by
+# whoever renders it: a bare $USER would ship the CI runner's name to every
+# user, and a pair of backticks would RUN a command in the release job. Render
+# with a poisoned environment and check none of it leaks and the literals survive.
+USER=leaked-user HOME=/leaked-home "${RENDER}" "${VERSION}" "${SUMS}" >"${WORK}/poisoned.rb"
+if grep -qE 'leaked-user|/leaked-home' "${WORK}/poisoned.rb"; then
+  bad "the render expands no variable from the renderer's environment"
+else
+  ok "the render expands no variable from the renderer's environment"
+fi
+has 'enable-linger "$USER"' "the linger caveat keeps \$USER for the reader's shell"
+has '`mailbox serve`' "backticks in the caveats survive the heredoc"
+
 # --- it is valid Ruby -------------------------------------------------------
 if command -v ruby >/dev/null 2>&1; then
   if ruby -c "${out}" >/dev/null 2>&1; then ok "output parses as Ruby"; else bad "output parses as Ruby"; fi
