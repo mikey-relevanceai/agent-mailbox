@@ -198,7 +198,7 @@ What the service does:
 | If it dies | restarted after 10 s (`KeepAlive` + `ThrottleInterval 10`) | restarted after 10 s if it failed (`Restart=on-failure`, `RestartSec=10`). A clean exit on `SIGTERM` is a stop, not a failure, so it stays stopped |
 | Log | `$(brew --prefix)/var/log/mailbox.log` | same |
 | `PATH` | `$(brew --prefix)/bin` first, so adapters find `gh` | same |
-| Slack tokens | read from your login Keychain, as for any other launch ([ADR-0027](adr/0027-adapter-secrets-live-in-the-keychain.md)) | **none.** There is no Keychain, so Slack watches fail at start (ADR-0027). GitHub watches work |
+| Slack tokens | read from your login Keychain ([ADR-0027](adr/0027-adapter-secrets-live-in-the-keychain.md)). Expected to work, not yet tested through `brew services`: a hand-made LaunchAgent in the same `gui/<uid>` domain reads them fine. If you start the service over SSH, `brew services` uses the `user/<uid>` domain instead, where Keychain access is untested | **none.** There is no Keychain, so Slack watches fail at start (ADR-0027). GitHub watches work |
 
 Older Homebrew versions name the job `homebrew.mxcl.mailbox` (plist) or
 `homebrew.mailbox` (unit). `brew services info mailbox` prints the name and file
@@ -211,7 +211,8 @@ shell, the daemon will not see them, and a daemon that looks in the wrong sessio
 directory wakes nobody (see the README's setup table). Give them to the service in
 `~/.homebrew/services/mailbox.env`, one `KEY=value` per line, then
 `brew services restart mailbox`. Homebrew merges that file into the service
-definition, and it survives upgrades.
+definition, and it still applied after an upgrade in testing
+([ADR-0034](adr/0034-brew-services-runs-the-daemon.md#how-it-was-tested)).
 
 **Linux: turn lingering on.** systemd runs user units only while you have a
 session. Without lingering, logging out of the last session stops the daemon, while

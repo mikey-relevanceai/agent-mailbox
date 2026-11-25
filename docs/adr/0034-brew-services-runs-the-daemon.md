@@ -38,6 +38,9 @@ Homebrew 7.0.14 source (`Library/Homebrew/service.rb`, `formula_installer.rb`,
   versions used `homebrew.mxcl.<formula>` (plist) and `homebrew.<formula>` (unit),
   and 7.0.14 still recognises them.
 
+The Linux test below ran Homebrew 7.0.16. Its `service.rb` differs from 7.0.14's
+only in refactored expressions that produce the same output (diffed).
+
 ## Decision
 
 **The formula declares a `service do` block, and the user starts it with one
@@ -50,8 +53,8 @@ The block, in `scripts/render-formula.sh`:
 |---|---|
 | `run [opt_bin/"mailbox", "serve"]` | The `opt` path survives `brew upgrade`. The Cellar path does not ([ADR-0025](0025-hooks-point-at-a-stable-path.md)). |
 | `keep_alive true` | A crash restarts it. On Linux this is `Restart=on-failure`, so `systemctl --user stop` still stops it, and so does a `SIGTERM`, which the daemon answers with a clean exit. |
-| `throttle_interval 10` + `restart_delay 10` | At most one restart per 10 s on both platforms. Without `RestartSec`, systemd retries after 100 ms, hits its default limit of 5 starts in 10 s, and leaves the unit failed for good. A daemon refused by another daemon's lock would do exactly that. |
-| `environment_variables PATH: std_service_path_env` | launchd and systemd start jobs with a `PATH` that lacks Homebrew's `bin`, so the github-pr adapter could not find `gh`. |
+| `throttle_interval 10` + `restart_delay 10` | At most one restart per 10 s on both platforms. Without `RestartSec`, systemd retries after 100 ms, hits its default limit of 5 starts in 10 s, and leaves the unit failed for good (systemd's documented defaults, not measured here). A daemon refused by another daemon's lock exits non-zero straight away, so it would hit that limit. |
+| `environment_variables PATH: std_service_path_env` | Without it the job's `PATH` lacks Homebrew's `bin`, so the github-pr adapter could not find `gh`. Measured: launchd's default is `/usr/bin:/bin:/usr/sbin:/sbin` (`launchctl print`), and the test container's systemd user manager had `/usr/local/sbin:…:/snap/bin`, with no `linuxbrew` (`systemctl --user show-environment`). |
 | `log_path` / `error_log_path` → `var/"log/mailbox.log"` | Homebrew's convention, created by `brew install`, and the same file on both platforms. The daemon logs to stderr. |
 
 It runs as the user, never as root: the daemon reads that user's Claude Code session
@@ -69,12 +72,12 @@ own `~/.agent-mailbox`, that an upgrade needs `brew services restart`, and, on L
   running the old code, holding the lock. The docs and caveats say
   `brew services restart mailbox`. On Linux the old daemon then runs from a deleted
   file: `brew upgrade` removed the old Cellar directory immediately, and
-  `/proc/<pid>/exe` read `…/Cellar/mailbox/0.3.0/bin/mailbox (deleted)` (measured,
-  below). It can still spawn adapters, but they come from the new version. Its
-  lookup beside its own executable finds nothing, so `resolver.rs` falls back to
-  the bare name on `PATH`. In the test, a watch started after the upgrade ran
-  `…/Cellar/mailbox/0.3.2/bin/mailbox-stub-adapter` under a daemon still running
-  0.3.1. So nothing fails, but bridge and adapters run different versions until
+  `/proc/<pid>/exe` read `…/Cellar/mailbox/<old>/bin/mailbox (deleted)` (measured;
+  see "How it was tested"). It can still spawn adapters, but they come from the new
+  version. Its lookup beside its own executable finds nothing, so `resolver.rs` falls
+  back to the bare name on `PATH`. In the test, a watch started after an upgrade
+  from 0.3.1 to 0.3.2 ran `…/Cellar/mailbox/0.3.2/bin/mailbox-stub-adapter` under a
+  daemon still running 0.3.1. So nothing fails, but bridge and adapters run different versions until
   the restart. On macOS `current_exe` keeps the `opt` path the daemon was started
   through, so its adapters are the new version too (inferred, not measured).
 - **Linux needs lingering.** A systemd user manager runs only while the user has a
@@ -87,10 +90,12 @@ own `~/.agent-mailbox`, that an upgrade needs `brew services restart`, and, on L
 - **The service does not see the user's shell environment.** `CLAUDE_CONFIG_DIR` or
   `MAILBOX_CLAUDE_SESSIONS_DIR` exported in a shell never reaches it, and a daemon
   looking in the wrong sessions directory wakes nobody. Homebrew merges
-  `~/.homebrew/services/mailbox.env` into the service definition, so that file is
-  where such overrides go.
+  `~/.homebrew/services/mailbox.env` into the service definition (`service.rb`,
+  `effective_environment_variables`), so that file is where such overrides go. It
+  reached the daemon, and was still applied after an upgrade (measured).
 - **Two daemons cannot run.** A service started while a hand-made daemon holds the
-  lock exits and is restarted every 10 s until the other one stops. The flock
+  lock exits and is restarted every 10 s until the other one stops (measured on
+  Linux). The flock
   ([ADR-0003](0003-single-writer-sqlite.md)) keeps the database safe, but nothing
   else announces the conflict. `docs/04-usage.md` gives the migration order.
 
@@ -113,9 +118,19 @@ On 2026-11-25, against the v0.3.0 release.
   - Reboot without lingering → not running until a login. Then it ran, and it
     stopped some seconds after the last session ended.
   - With lingering, a login and logout left it running.
-  - `brew upgrade` (a re-versioned formula) → the old daemon was not restarted, as
-    above. A stub watch started then ran the new version's adapter.
-    `brew services restart` moved the daemon to the new Cellar path.
+  - `brew upgrade` → the old Cellar directory was removed at once, and the daemon
+    was not restarted. Its `/proc/<pid>/exe` read `… (deleted)`. A stub watch
+    started then ran the new version's adapter. `brew services restart` moved the
+    daemon to the new Cellar path. The upgrades bumped the local tap's `version`
+    (0.3.0 → 0.3.1 → 0.3.2 → 0.3.3) over the same v0.3.0 binaries, so those numbers
+    name Cellar directories, not different code.
+  - `~/.homebrew/services/mailbox.env` → its variable was in the daemon's
+    environment after `brew services restart`, and again after an upgrade and a
+    restart.
+  - A manual `mailbox serve` holding the lock → the service sat in `activating`,
+    restarted every 10 s (`NRestarts=3` after 35 s), and logged "another
+    `mailbox serve` is already running". Once the manual daemon was stopped, the
+    service came up within 15 s.
 - **macOS, launchd without Homebrew's install step.** The plist came from Homebrew's
   own `Service#to_plist` for the rendered formula, and passed `plutil -lint`. A copy
   ran under a throwaway label, pointed at the v0.3.0 macOS binary with

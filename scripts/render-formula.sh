@@ -155,8 +155,9 @@ class Mailbox < Formula
           mailbox doctor
 
       The daemon (\`mailbox serve\`) runs as a login service once you start it
-      with the \`brew services start\` command below. Homebrew does not let a
-      formula start its own service. Its log is #{var}/log/mailbox.log.
+      with the \`brew services start\` command Homebrew prints after these notes.
+      Homebrew does not let a formula start its own service. Its log is
+      #{var}/log/mailbox.log.
 
       Only one daemon can own ~/.agent-mailbox. If you already run
       \`mailbox serve\` some other way (a hand-made LaunchAgent, a systemd unit,
