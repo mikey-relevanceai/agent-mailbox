@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox-github-pr-adapter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mailbox-protocol",
  "serde",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox-harness"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mailbox-protocol",
  "nix 0.31.3",
@@ -953,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox-slack-adapter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "mailbox-protocol",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "mailbox-stub-adapter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "mailbox-protocol",
  "serde",
