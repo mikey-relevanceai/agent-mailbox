@@ -115,7 +115,8 @@ only the honest choice, it is the *more deliverable* one: asserting `bypass` is
 precisely what causes a hold against every prompting-class receiver (rows 4 and 5
 above). The honest option and the effective option are the same option.
 
-**Wake stays payload-free.** The frame's `content` is `wake::reminder(&topics)` —
+**Wake stays payload-free.** The frame's `content` is `wake::reminder(&topics)` (since
+replaced by `reminder::Wake::render`; see ADR-0033) —
 the same topic-names-only string the exit-2 hook already writes to stderr, and
 already pinned payload-free by its own test. The body stays in the durable log for
 the agent's `read`. This invariant (ADR-0001, `docs/01-wake.md`) is preserved

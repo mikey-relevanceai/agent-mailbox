@@ -524,9 +524,52 @@ impl SubjectBudget {
 pub struct TopicDigest {
     pub topic: mailbox_protocol::Topic,
     /// Events on this topic beyond the session's delivery cursor.
-    pub unread: u64,
+    ///
+    /// Never zero: a topic with nothing unread has no digest at all. The wake's
+    /// wording branches on this count ("one new message" against "N new messages"),
+    /// so a zero would read as news.
+    pub unread: std::num::NonZeroU64,
     /// Subjects of the newest unread events that have one, newest first.
     pub subjects: Vec<mailbox_protocol::Subject>,
+}
+
+/// One session's unread mail, exactly as the digest query returned it for that
+/// session.
+///
+/// Built only inside `storage`, at the call that ran the query, so the session and
+/// the digests always belong together: the wake names the recipient's own inbox
+/// `your inbox`, and a digest paired with the wrong session would say that of
+/// somebody else's mail. The topics are distinct and in ascending order, because the
+/// query groups by topic; the wake's "on N topics" relies on that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDigest {
+    session: SessionId,
+    topics: Vec<TopicDigest>,
+}
+
+impl SessionDigest {
+    pub(in crate::storage) fn new(session: SessionId, topics: Vec<TopicDigest>) -> Self {
+        Self { session, topics }
+    }
+
+    /// A digest for tests that render wakes without a database.
+    #[cfg(test)]
+    pub(crate) fn for_test(session: SessionId, topics: Vec<TopicDigest>) -> Self {
+        Self { session, topics }
+    }
+
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// One entry per topic with unread mail, in ascending topic order.
+    pub fn topics(&self) -> &[TopicDigest] {
+        &self.topics
+    }
+
+    pub fn into_topics(self) -> Vec<TopicDigest> {
+        self.topics
+    }
 }
 
 /// A page of events plus the cursor to continue from.
